@@ -1050,9 +1050,6 @@
             "storage_lg_resu_time_of_use_price_periods": {
                 "name": "TOU price periods"
             },
-            "storage_charging_cutoff_capacity": {
-                "name": "End-of-charge SOC"
-            },
             "storage_maximum_charge_power": {
                 "name": "Maximum charge power"
             },

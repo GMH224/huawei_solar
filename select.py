@@ -248,6 +248,7 @@ class HuaweiSolarSelectEntity(
             self.entity_description.register_name, self._to_enum(option)
         )
         self._attr_current_option = option
+        self.coordinator.invalidate_cache(self.entity_description.register_name)
 
         await self.coordinator.async_request_refresh()
 

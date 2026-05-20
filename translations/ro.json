@@ -271,16 +271,16 @@
                 "name": "Power factor"
             },
             "active_power": {
-                "name": "Active power"
+                "name": "Putere activă"
             },
             "active_power_built_in_energy": {
-                "name": "Active power"
+                "name": "Putere activă"
             },
             "active_power_control_mode": {
                 "name": "Active power control mode"
             },
             "active_power_external_energy": {
-                "name": "Active power"
+                "name": "Putere activă"
             },
             "alarm": {
                 "name": "Alarm"
@@ -457,7 +457,7 @@
                 "name": "Line voltage A-B"
             },
             "meter_active_power": {
-                "name": "Active power"
+                "name": "Putere activă"
             },
             "meter_apparent_power": {
                 "name": "Apparent power"
@@ -724,7 +724,7 @@
                 "name": "Power factor"
             },
             "power_meter_active_power": {
-                "name": "Active power"
+                "name": "Putere activă"
             },
             "power_meter_reactive_power": {
                 "name": "[%key:component::sensor::entity_component::reactive_power::name%]"
@@ -922,7 +922,7 @@
                 "name": "Active ESS power"
             },
             "smartlogger_active_power": {
-                "name": "Active power"
+                "name": "Putere activă"
             },
             "smartlogger_active_pv_power": {
                 "name": "Active PV power"
@@ -1015,7 +1015,7 @@
                 "name": "DSP data collection"
             },
             "state_3_0": {
-                "name": "Off-grid status"
+                "name": "Stare off-grid"
             },
             "state_3_1": {
                 "name": "Off-grid switch"
@@ -1027,7 +1027,7 @@
                 "name": "Bus current"
             },
             "storage_bus_voltage": {
-                "name": "Bus voltage"
+                "name": "Tensiune pe bus"
             },
             "storage_capacity_control_periods": {
                 "name": "Capacity control periods"
@@ -1049,9 +1049,6 @@
             },
             "storage_lg_resu_time_of_use_price_periods": {
                 "name": "TOU price periods"
-            },
-            "storage_charging_cutoff_capacity": {
-                "name": "End-of-charge SOC"
             },
             "storage_maximum_charge_power": {
                 "name": "Maximum charge power"

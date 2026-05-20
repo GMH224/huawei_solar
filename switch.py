@@ -230,6 +230,7 @@ class HuaweiSolarSwitchEntity(
         """Turn the setting on."""
         if await self.device.set(self.entity_description.register_name, True):
             self._attr_is_on = True
+            self.coordinator.invalidate_cache(self.entity_description.register_name)
 
         await self.coordinator.async_request_refresh()
 
@@ -237,6 +238,7 @@ class HuaweiSolarSwitchEntity(
         """Turn the setting off."""
         if await self.device.set(self.entity_description.register_name, False):
             self._attr_is_on = False
+            self.coordinator.invalidate_cache(self.entity_description.register_name)
 
         await self.coordinator.async_request_refresh()
 

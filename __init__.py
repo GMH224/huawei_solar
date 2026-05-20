@@ -46,6 +46,8 @@ from .const import (
     OPTIMIZER_UPDATE_INTERVAL,
     POWER_METER_UPDATE_INTERVAL,
 )
+from .modbus_guard import ModbusGuard
+from .modbus_telemetry import ModbusTelemetry
 from .services import async_setup_services
 from .types import (
     HuaweiSolarConfigEntry,
@@ -216,6 +218,15 @@ async def async_unload_entry(
         primary_device = device_datas[0].device
         await primary_device.client.disconnect()
 
+        # Stop telemetry push timers and clean up singletons for all devices
+        for device_data in device_datas:
+            serial = device_data.device.serial_number
+            telemetry = ModbusTelemetry.get(serial)
+            if telemetry:
+                telemetry.stop()
+        ModbusGuard.clear_registry()
+        ModbusTelemetry.clear_registry()
+
     return unload_ok
 
 
@@ -271,6 +282,14 @@ async def _setup_inverter_device_data(
         update_interval=INVERTER_UPDATE_INTERVAL,
     )
 
+    # Create telemetry singleton and attach to the main coordinator.
+    # All sub-coordinators (power meter, battery, config) for this inverter
+    # share the same singleton so all Modbus traffic is aggregated.
+    telemetry = ModbusTelemetry.get_or_create(
+        hass, device.serial_number, inverter_device_info
+    )
+    update_coordinator.attach_telemetry(telemetry)
+
     # Add power meter device if a power meter is detected
     if device.power_meter_type is not None:
         power_meter_device_info = DeviceInfo(
@@ -287,6 +306,7 @@ async def _setup_inverter_device_data(
             name=f"{device.serial_number}_power_meter_data_update_coordinator",
             update_interval=POWER_METER_UPDATE_INTERVAL,
         )
+        power_meter_update_coordinator.attach_telemetry(telemetry)
     else:
         power_meter_device_info = None
         power_meter_update_coordinator = None
@@ -310,6 +330,7 @@ async def _setup_inverter_device_data(
             name=f"{device.serial_number}_battery_data_update_coordinator",
             update_interval=ENERGY_STORAGE_UPDATE_INTERVAL,
         )
+        energy_storage_update_coordinator.attach_telemetry(telemetry)
     else:
         battery_device_info = None
         energy_storage_update_coordinator = None
@@ -371,6 +392,7 @@ async def _setup_inverter_device_data(
                 optimizers_device_infos,
                 OPTIMIZER_UPDATE_INTERVAL,
             )
+            optimizer_update_coordinator.attach_telemetry(telemetry)
         except PermissionDeniedError as exception:
             _LOGGER.info(
                 "Cannot create optimizer sensor entities as the integration has insufficient permissions. "
@@ -391,6 +413,7 @@ async def _setup_inverter_device_data(
             name=f"{device.serial_number}_config_data_update_coordinator",
             update_interval=CONFIGURATION_UPDATE_INTERVAL,
         )
+        configuration_update_coordinator.attach_telemetry(telemetry)
     else:
         configuration_update_coordinator = None
 

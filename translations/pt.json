@@ -6,13 +6,13 @@
             "reconfigure_successful": "Re-configuration was successful"
         },
         "error": {
-            "cannot_connect": "Failed to connect",
+            "cannot_connect": "Falhou ao conectar",
             "connection_interrupted": "Connection interrupted — the inverter only supports one Modbus connection at a time. Check whether another app or device (SCharger, EMS, ...) is connected and close it, then try again.",
-            "invalid_auth": "Invalid authentication",
-            "invalid_slave_ids": "Slave IDs must be comma-separated list of ints",
-            "read_error": "Reading from the inverter failed.",
-            "slave_cannot_connect": "Failed to connect to additional slave",
-            "unknown": "Unexpected error"
+            "invalid_auth": "Autenticação inválida",
+            "invalid_slave_ids": "Os IDs escravos devem ser uma lista de inteiros separada por vírgulas",
+            "read_error": "Falha na leitura do inversor.",
+            "slave_cannot_connect": "Falha ao conectar ao escravo adicional",
+            "unknown": "Erro inesperado"
         },
         "step": {
             "auto_discovery": {
@@ -91,7 +91,7 @@
                     "port": "Select device",
                     "slave_ids": "Slave IDs: AUTO for auto-discovery, otherwise a comma separated list"
                 },
-                "title": "Device"
+                "title": "Dispositivo"
             },
             "setup_serial_manual_path": {
                 "data": {
@@ -102,7 +102,7 @@
             },
             "user": {
                 "data": {
-                    "type": "Connection type"
+                    "type": "Tipo de conexão"
                 },
                 "title": "Select connection type"
             }
@@ -157,10 +157,10 @@
                 "name": "Maximum power for charging batteries from grid"
             },
             "mppt_scanning_interval": {
-                "name": "MPPT-Scan Interval"
+                "name": "MPPT scan interval"
             },
             "storage_backup_power_state_of_charge": {
-                "name": "Backup power SOC"
+                "name": "SOC de segurança"
             },
             "storage_capacity_control_soc_peak_shaving": {
                 "name": "Peak Shaving SOC"
@@ -241,7 +241,7 @@
                 "name": "A-B line voltage"
             },
             "active_grid_a_current": {
-                "name": "Phase A current"
+                "name": "Fase \"A\" atual"
             },
             "active_grid_a_power": {
                 "name": "Phase A active power"
@@ -250,7 +250,7 @@
                 "name": "B-C line voltage"
             },
             "active_grid_b_current": {
-                "name": "Phase B current"
+                "name": "Fase B atual"
             },
             "active_grid_b_power": {
                 "name": "Phase B active power"
@@ -400,7 +400,7 @@
                 "name": "Input power"
             },
             "input_voltage": {
-                "name": "Input voltage"
+                "name": "Tensão de entrada"
             },
             "insulation_resistance": {
                 "name": "Insulation resistance"
@@ -475,7 +475,7 @@
                 "name": "Phase A active power"
             },
             "meter_phase_a_current": {
-                "name": "Phase A current"
+                "name": "Fase \"A\" atual"
             },
             "meter_phase_a_voltage": {
                 "name": "Phase A voltage"
@@ -649,13 +649,13 @@
                 "name": "Phase A active power"
             },
             "phase_a_current": {
-                "name": "Phase A current"
+                "name": "Fase \"A\" atual"
             },
             "phase_a_current_built_in_energy": {
-                "name": "Phase A current"
+                "name": "Fase \"A\" atual"
             },
             "phase_a_current_external_energy": {
-                "name": "Phase A current"
+                "name": "Fase \"A\" atual"
             },
             "phase_a_voltage": {
                 "name": "Phase A voltage"
@@ -1003,7 +1003,7 @@
                 "name": "Startup time"
             },
             "state_1": {
-                "name": "Inverter state"
+                "name": "Estado do Inverter"
             },
             "state_2_0": {
                 "name": "Locking status"
@@ -1049,9 +1049,6 @@
             },
             "storage_lg_resu_time_of_use_price_periods": {
                 "name": "TOU price periods"
-            },
-            "storage_charging_cutoff_capacity": {
-                "name": "End-of-charge SOC"
             },
             "storage_maximum_charge_power": {
                 "name": "Maximum charge power"
@@ -1128,7 +1125,7 @@
         },
         "switch": {
             "mppt_multimodal_scanning": {
-                "name": "MPPT-Scan"
+                "name": "MPPT scanning"
             },
             "startup": {
                 "name": "Inverter ON/OFF"
@@ -1233,7 +1230,7 @@
             "fields": {
                 "device_id": {
                     "description": "When an EMMA is present, it must be an 'EMMA' device. Otherwise: it must be an 'Inverter' device",
-                    "name": "Device"
+                    "name": "Dispositivo"
                 }
             },
             "name": "Set Active Power Control to Maximum Feed Grid Power"
@@ -1281,7 +1278,7 @@
             "fields": {
                 "device_id": {
                     "description": "When an EMMA is present, it must be an 'EMMA' device. Otherwise: it must be an 'Inverter' device",
-                    "name": "Device"
+                    "name": "Dispositivo"
                 },
                 "power": {
                     "description": "Maximum Wattage",
@@ -1295,7 +1292,7 @@
             "fields": {
                 "device_id": {
                     "description": "When an EMMA is present, it must be an 'EMMA' device. Otherwise: it must be an 'Inverter' device",
-                    "name": "Device"
+                    "name": "Dispositivo"
                 },
                 "power_percentage": {
                     "description": "Maximum Percentage",
@@ -1309,7 +1306,7 @@
             "fields": {
                 "device_id": {
                     "description": "When an EMMA is present, it must be an 'EMMA' device. Otherwise: it must be an 'Batteries' device",
-                    "name": "Device"
+                    "name": "Dispositivo"
                 },
                 "periods": {
                     "description": "One period per line. For Huawei LUNA2000 batteries: '[start time]-[end time]/[days effective]/[charge]', with 1=Monday, 7=Sunday (example: '12:00-14:00/1234567/-'). For LG RESU batteries: '[start time]-[end time]/[electricity price]' (example: 13:00-14:00/0.50)",
@@ -1323,7 +1320,7 @@
             "fields": {
                 "device_id": {
                     "description": "When an EMMA is present, it must be an 'EMMA' device. Otherwise: it must be an 'Inverter' device",
-                    "name": "Device"
+                    "name": "Dispositivo"
                 }
             },
             "name": "Set Active Power Control to 'Zero power grid connection'"

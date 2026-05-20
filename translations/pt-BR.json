@@ -1,75 +1,35 @@
 {
     "config": {
         "abort": {
-            "already_configured": "Device is already configured",
+            "already_configured": "O dispositivo já está configurado",
             "reauth_successful": "Re-authentication was successful",
             "reconfigure_successful": "Re-configuration was successful"
         },
         "error": {
-            "cannot_connect": "Failed to connect",
-            "connection_interrupted": "Connection interrupted — the inverter only supports one Modbus connection at a time. Check whether another app or device (SCharger, EMS, ...) is connected and close it, then try again.",
-            "invalid_auth": "Invalid authentication",
-            "invalid_slave_ids": "Slave IDs must be comma-separated list of ints",
-            "read_error": "Reading from the inverter failed.",
-            "slave_cannot_connect": "Failed to connect to additional slave",
-            "unknown": "Unexpected error"
+            "cannot_connect": "Falhou ao conectar",
+            "invalid_auth": "Autenticação inválida",
+            "invalid_slave_ids": "Os IDs escravos devem ser uma lista de inteiros separada por vírgulas",
+            "read_error": "Falha na leitura do inversor.",
+            "slave_cannot_connect": "Falha ao conectar ao escravo adicional",
+            "unknown": "Erro inesperado"
         },
         "step": {
-            "auto_discovery": {
-                "title": "Auto-discovering devices",
-                "description": "Scanning {host}:{port} for Huawei Solar devices using the Huawei discovery protocol. This may take up to a minute."
+            "login": {
+                "data": {
+                    "password": "Senha",
+                    "username": "Nome de usuário"
+                },
+                "description": "Por favor, insira as credenciais do instalador"
             },
-            "scan_discovery": {
-                "title": "Scanning for devices",
-                "description": "Auto-discovery found no devices on {host}:{port}. Scanning frequently used slave IDs individually. This may take up to a minute."
-            },
-            "serial_auto_discovery": {
-                "title": "Auto-discovering devices",
-                "description": "Scanning {serial_port} for Huawei Solar devices using the Huawei discovery protocol. This may take up to a minute."
-            },
-            "serial_scan_discovery": {
-                "title": "Scanning for devices",
-                "description": "Auto-discovery found no devices on {serial_port}. Scanning frequently used slave IDs individually. This may take up to a minute."
-            },
-            "serial_finish_setup": {
-                "title": "Connecting",
-                "description": "Connecting to the devices discovered on {serial_port} and reading their configuration."
-            },
-            "cannot_connect_serial": {
-                "title": "Could not connect",
-                "description": "Could not open serial port {serial_port}. Please verify that:\n- The device is connected and the port is correct\n- No other application is using the port\n\nPress Submit to go back and try again."
-            },
-            "connection_interrupted_serial": {
-                "title": "Connection interrupted",
-                "description": "The connection to the inverter on {serial_port} was interrupted. The inverter only supports **one Modbus connection at a time**.\n\nCheck whether another application or device is currently connected to the inverter, such as:\n- The Huawei SCharger\n- The Huawei FusionSolar Android/iPhone App (device commissioning via dongle or direct connection)\n- SolarmanPV or another monitoring tool\n\nClose the other connection and press Submit to try again."
-            },
-            "no_device_found_serial": {
-                "title": "No device found",
-                "description": "Connected to {serial_port} but no Huawei Solar device responded on slave ID {slave_id}. Please verify that:\n- The slave ID is correct\n- The inverter is powered on and its RS485 interface is enabled\n\nPress Submit to go back and try again."
-            },
-            "manual_connect": {
-                "title": "Connecting",
-                "description": "Connecting to {host}:{port} on slave ID(s): {slave_ids}."
-            },
-            "finish_network_setup": {
-                "title": "Connecting",
-                "description": "Connecting to the devices discovered at {host}:{port} and reading their configuration."
-            },
-            "confirm_setup": {
-                "title": "Device found",
-                "description": "Successfully connected to **{model_name}** (serial number: {serial_number}) on slave ID(s): {slave_ids}.\n\nPress Submit to add this device to Home Assistant."
-            },
-            "cannot_connect": {
-                "title": "Could not connect",
-                "description": "Could not connect to {host}:{port}. Please verify that:\n- The IP address and port are correct\n- The device is powered on and reachable on your network\n- No firewall is blocking the connection\n\nPress Submit to go back and try again."
-            },
-            "connection_interrupted": {
-                "title": "Connection interrupted",
-                "description": "The connection to {host}:{port} was interrupted. The inverter only supports **one Modbus connection at a time**.\n\nCheck whether another application or device is currently connected to the inverter, such as:\n- The Huawei SCharger\n- The Huawei FusionSolar Android/iPhone App (device commissioning via dongle or direct connection)\n- SolarmanPV or another monitoring tool\n\nClose the other connection and press Submit to try again."
-            },
-            "no_device_found": {
-                "title": "No device found",
-                "description": "Connected to {host}:{port} but no Huawei Solar device responded on slave ID {slave_id}. Please verify that:\n- The slave ID is correct\n- The inverter's Modbus TCP interface is enabled\n- The inverter is not in a state that blocks communication (e.g. night mode on some models)\n\nPress Submit to go back and try again."
+            "user": {
+                "data": {
+                    "enable_parameter_configuration": "Avançado: habilitar configuração de parâmetros",
+                    "host": "Host",
+                    "port": "Porta",
+                    "slave_ids": "IDs de escravos (separados por vírgulas)",
+                    "type": "Connection type"
+                },
+                "title": "Select connection type"
             },
             "network_login": {
                 "data": {
@@ -89,22 +49,15 @@
             "setup_serial": {
                 "data": {
                     "port": "Select device",
-                    "slave_ids": "Slave IDs: AUTO for auto-discovery, otherwise a comma separated list"
+                    "slave_ids": "Slave IDs (Comma separated)"
                 },
                 "title": "Device"
             },
             "setup_serial_manual_path": {
                 "data": {
-                    "port": "USB Device Path",
-                    "slave_ids": "Slave IDs: AUTO for auto-discovery, otherwise a comma separated list"
+                    "port": "USB Device Path"
                 },
                 "title": "Path"
-            },
-            "user": {
-                "data": {
-                    "type": "Connection type"
-                },
-                "title": "Select connection type"
             }
         }
     },
@@ -265,7 +218,7 @@
                 "name": "Phase C active power"
             },
             "active_grid_frequency": {
-                "name": "[%key:component::sensor::entity_component::frequency::name%]"
+                "name": "Frequency"
             },
             "active_grid_power_factor": {
                 "name": "Power factor"
@@ -453,68 +406,8 @@
             "load_power": {
                 "name": "Load power"
             },
-            "meter_a_b_line_voltage": {
-                "name": "Line voltage A-B"
-            },
-            "meter_active_power": {
-                "name": "Active power"
-            },
-            "meter_apparent_power": {
-                "name": "Apparent power"
-            },
-            "meter_b_c_line_voltage": {
-                "name": "Line voltage B-C"
-            },
-            "meter_c_a_line_voltage": {
-                "name": "Line voltage C-A"
-            },
-            "meter_negative_active_energy": {
-                "name": "Negative active energy"
-            },
-            "meter_phase_a_active_power": {
-                "name": "Phase A active power"
-            },
-            "meter_phase_a_current": {
-                "name": "Phase A current"
-            },
-            "meter_phase_a_voltage": {
-                "name": "Phase A voltage"
-            },
-            "meter_phase_b_active_power": {
-                "name": "Phase B active power"
-            },
-            "meter_phase_b_current": {
-                "name": "Phase B current"
-            },
-            "meter_phase_b_voltage": {
-                "name": "Phase B voltage"
-            },
-            "meter_phase_c_active_power": {
-                "name": "Phase C active power"
-            },
-            "meter_phase_c_current": {
-                "name": "Phase C current"
-            },
-            "meter_phase_c_voltage": {
-                "name": "Phase C voltage"
-            },
-            "meter_positive_active_energy": {
-                "name": "Positive active energy"
-            },
-            "meter_power_factor": {
-                "name": "Power factor"
-            },
-            "meter_reactive_power": {
-                "name": "Reactive power"
-            },
             "meter_status": {
                 "name": "Meter status"
-            },
-            "meter_total_active_energy": {
-                "name": "Total active energy"
-            },
-            "meter_total_reactive_energy": {
-                "name": "Total reactive energy"
             },
             "monthly_yield_energy": {
                 "name": "Monthly yield"
@@ -727,7 +620,7 @@
                 "name": "Active power"
             },
             "power_meter_reactive_power": {
-                "name": "[%key:component::sensor::entity_component::reactive_power::name%]"
+                "name": "Reactive power"
             },
             "pv_01_current": {
                 "name": "PV 1 current"
@@ -886,7 +779,7 @@
                 "name": "Rated power"
             },
             "reactive_power": {
-                "name": "[%key:component::sensor::entity_component::reactive_power::name%]"
+                "name": "Reactive power"
             },
             "running_status": {
                 "name": "Running status"
@@ -910,10 +803,10 @@
                 "name": "Shutdown time"
             },
             "single_phase_meter_current": {
-                "name": "[%key:component::sensor::entity_component::current::name%]"
+                "name": "Current"
             },
             "single_phase_meter_voltage": {
-                "name": "[%key:component::sensor::entity_component::voltage::name%]"
+                "name": "Voltage"
             },
             "smartlogger_a_b_line_voltage_of_grid": {
                 "name": "Grid A-B line voltage"
@@ -1050,9 +943,6 @@
             "storage_lg_resu_time_of_use_price_periods": {
                 "name": "TOU price periods"
             },
-            "storage_charging_cutoff_capacity": {
-                "name": "End-of-charge SOC"
-            },
             "storage_maximum_charge_power": {
                 "name": "Maximum charge power"
             },
@@ -1078,7 +968,7 @@
                 "name": "Supply from grid today"
             },
             "temperature": {
-                "name": "[%key:component::sensor::entity_component::temperature::name%]"
+                "name": "Temperature"
             },
             "total_active_energy_built_in_energy": {
                 "name": "Total active energy"

@@ -18,14 +18,32 @@ DATA_UPDATE_COORDINATORS = "update_coordinators"
 INVERTER_UPDATE_INTERVAL = timedelta(seconds=30)
 POWER_METER_UPDATE_INTERVAL = timedelta(seconds=30)
 ENERGY_STORAGE_UPDATE_INTERVAL = timedelta(seconds=30)
-UPDATE_TIMEOUT = timedelta(seconds=29)
+
+# UPDATE_TIMEOUT is intentionally shorter than the update intervals so that
+# a hung request is cancelled before the next poll cycle begins.
+# Raised from 29s → 35s to give slow/busy inverters a bit more breathing room
+# while still ensuring we don't stack back-to-back requests.
+UPDATE_TIMEOUT = timedelta(seconds=35)
+
 # configuration can only change when edited through FusionSolar web or app
 CONFIGURATION_UPDATE_INTERVAL = timedelta(minutes=15)
 CONFIGURATION_UPDATE_TIMEOUT = timedelta(minutes=1)
+
 # optimizer data is only refreshed every 5 minutes by the inverter.
 OPTIMIZER_UPDATE_INTERVAL = timedelta(minutes=5)
-OPTIMIZER_UPDATE_TIMEOUT = timedelta(minutes=1)
+OPTIMIZER_UPDATE_TIMEOUT = timedelta(minutes=2)
 
+# ── Modbus timeout / retry back-off ─────────────────────────────────────────
+# After this many consecutive timeouts the coordinator starts backing off to
+# avoid hammering an unresponsive inverter and let the Modbus bus recover.
+MAX_CONSECUTIVE_TIMEOUTS = 3
+
+# Initial wait after the first burst of timeouts (seconds).  Subsequent
+# bursts double the wait up to MODBUS_RETRY_MAX_WAIT.
+MODBUS_RETRY_BASE_WAIT = timedelta(seconds=10)
+MODBUS_RETRY_MAX_WAIT = timedelta(seconds=120)
+
+# ── Service names ────────────────────────────────────────────────────────────
 SERVICE_FORCIBLE_CHARGE = "forcible_charge"
 SERVICE_FORCIBLE_DISCHARGE = "forcible_discharge"
 SERVICE_FORCIBLE_CHARGE_SOC = "forcible_charge_soc"

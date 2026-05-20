@@ -1,9 +1,9 @@
 {
     "config": {
         "abort": {
-            "already_configured": "Device is already configured",
-            "reauth_successful": "Re-authentication was successful",
-            "reconfigure_successful": "Re-configuration was successful"
+            "already_configured": "[%key:common::config_flow::abort::already_configured_device%]",
+            "reauth_successful": "[%key:common::config_flow::abort::reauth_successful%]",
+            "reconfigure_successful": "[%key:common::config_flow::abort::reconfigure_successful%]"
         },
         "error": {
             "cannot_connect": "Failed to connect",
@@ -1049,9 +1049,6 @@
             },
             "storage_lg_resu_time_of_use_price_periods": {
                 "name": "TOU price periods"
-            },
-            "storage_charging_cutoff_capacity": {
-                "name": "End-of-charge SOC"
             },
             "storage_maximum_charge_power": {
                 "name": "Maximum charge power"

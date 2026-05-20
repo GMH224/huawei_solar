@@ -136,30 +136,45 @@ EMMA_NUMBER_DESCRIPTIONS: tuple[HuaweiSolarNumberEntityDescription, ...] = (
 )
 
 ENERGY_STORAGE_NUMBER_DESCRIPTIONS: tuple[HuaweiSolarNumberEntityDescription, ...] = (
+    # ── Maximum Charge Power ─────────────────────────────────────────────────
+    # Controls the upper bound of battery charging power.  Enabled by default
+    # so users can tune this without first having to un-hide the entity.
     HuaweiSolarNumberEntityDescription(
         key=rn.STORAGE_MAXIMUM_CHARGING_POWER,
         native_min_value=0,
+        native_step=100,
         static_maximum_key=rn.STORAGE_MAXIMUM_CHARGE_POWER,
         icon="mdi:battery-positive",
         native_unit_of_measurement=UnitOfPower.WATT,
         entity_category=EntityCategory.CONFIG,
+        entity_registry_enabled_default=True,
     ),
+    # ── Maximum Discharge Power ──────────────────────────────────────────────
+    # Controls the upper bound of battery discharging power.  Enabled by
+    # default for the same reason as Maximum Charge Power.
     HuaweiSolarNumberEntityDescription(
         key=rn.STORAGE_MAXIMUM_DISCHARGING_POWER,
         native_min_value=0,
+        native_step=100,
         static_maximum_key=rn.STORAGE_MAXIMUM_DISCHARGE_POWER,
         icon="mdi:battery-negative",
         native_unit_of_measurement=UnitOfPower.WATT,
         entity_category=EntityCategory.CONFIG,
+        entity_registry_enabled_default=True,
     ),
+    # ── End-of-charge SOC ────────────────────────────────────────────────────
+    # The battery will stop charging once it reaches this state-of-charge.
+    # Typical range: 90–100 %.  Enabled by default — commonly used in
+    # automations to extend battery cycle life.
     HuaweiSolarNumberEntityDescription(
         key=rn.STORAGE_CHARGING_CUTOFF_CAPACITY,
         native_min_value=90,
         native_max_value=100,
         native_step=0.1,
-        icon="mdi:battery-positive",
+        icon="mdi:battery-charging-high",
         native_unit_of_measurement=PERCENTAGE,
         entity_category=EntityCategory.CONFIG,
+        entity_registry_enabled_default=True,
     ),
     HuaweiSolarNumberEntityDescription(
         key=rn.STORAGE_BACKUP_POWER_STATE_OF_CHARGE,
@@ -430,6 +445,8 @@ class HuaweiSolarNumberEntity(
         """Set a new value."""
         if await self.device.set(self.entity_description.register_name, float(value)):
             self._attr_native_value = float(value)
+            # Invalidate the cached register so the next poll fetches a fresh value
+            self.coordinator.invalidate_cache(self.entity_description.register_name)
 
         await self.coordinator.async_request_refresh()
 
