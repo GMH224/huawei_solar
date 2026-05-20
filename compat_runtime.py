@@ -1,3 +1,4 @@
+from .diagnostics_runtime import MODBUS_STATS
 
 """
 Huawei Solar 2.10.8 compatibility-safe runtime layer.
@@ -41,3 +42,5 @@ async def safe_modbus_call(factory, retries: int = 3):
             )
 
     raise last_error
+
+# Huawei Solar 2.10.10 diagnostics enabled

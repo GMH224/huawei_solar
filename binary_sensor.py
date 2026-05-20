@@ -9,3 +9,10 @@ FIRMWARE_BINARY_SENSORS = [
         "name": "Firmware Update Available",
     }
 ]
+
+
+# Huawei Solar 2.10.10 communication health sensors
+MODBUS_BINARY_SENSORS = [
+    "modbus_communication_healthy",
+    "modbus_communication_degraded",
+]

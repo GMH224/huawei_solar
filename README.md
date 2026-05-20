@@ -243,3 +243,8 @@ Firmware telemetry entity release.
 Firmware telemetry entities now exposed through:
 - sensor.py
 - binary_sensor.py
+
+
+## Version 2.10.10
+
+Added full Modbus diagnostics framework and communication health metrics.

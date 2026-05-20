@@ -2894,3 +2894,16 @@ FIRMWARE_TELEMETRY = [
 # These entities are exposed as diagnostic sensors.
 # Actual Huawei register mapping depends on inverter model
 # and firmware generation support.
+
+
+# Huawei Solar 2.10.10 Modbus diagnostics sensors
+MODBUS_DIAGNOSTIC_SENSORS = [
+    "modbus_calls_per_hour",
+    "modbus_failures_per_hour",
+    "modbus_timeouts_per_hour",
+    "modbus_retries_per_hour",
+    "modbus_busy_errors_per_hour",
+    "modbus_average_latency",
+    "modbus_max_latency",
+    "modbus_availability_percent",
+]

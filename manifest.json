@@ -14,7 +14,7 @@
     "@wlcrs"
   ],
   "iot_class": "local_polling",
-  "version": "2.10.9",
+  "version": "2.10.10",
   "loggers": [
     "huawei_solar",
     "tmodbus"
