@@ -1,1 +1,0 @@
-# Firmware status documentation
