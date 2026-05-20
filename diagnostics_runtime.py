@@ -78,3 +78,22 @@ class ModbusStatistics:
 
 
 MODBUS_STATS = ModbusStatistics()
+
+
+# Huawei Solar 2.10.11 runtime diagnostics enhancements
+
+def record_success(latency):
+    MODBUS_STATS.record(
+        success=True,
+        latency=latency,
+    )
+
+
+def record_failure(latency=0, timeout=False, retry=False, busy=False):
+    MODBUS_STATS.record(
+        success=False,
+        latency=latency,
+        timeout=timeout,
+        retry=retry,
+        busy=busy,
+    )

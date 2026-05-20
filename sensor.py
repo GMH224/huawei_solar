@@ -2907,3 +2907,48 @@ MODBUS_DIAGNOSTIC_SENSORS = [
     "modbus_max_latency",
     "modbus_availability_percent",
 ]
+
+
+# ============================================================
+# Huawei Solar 2.10.11 Modbus Diagnostics Entity Implementation
+# ============================================================
+
+from homeassistant.components.sensor import SensorEntity
+from homeassistant.helpers.entity import EntityCategory
+
+try:
+    from .diagnostics_runtime import MODBUS_STATS
+except Exception:
+    MODBUS_STATS = None
+
+
+class HuaweiModbusDiagnosticSensor(SensorEntity):
+    """Huawei Modbus diagnostic sensor."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, key, name, unit=None, icon=None):
+        self._attr_name = name
+        self._key = key
+        self._attr_native_unit_of_measurement = unit
+        self._attr_icon = icon
+        self._attr_unique_id = f"huawei_solar_{key}"
+
+    @property
+    def native_value(self):
+        if MODBUS_STATS is None:
+            return None
+
+        return getattr(MODBUS_STATS, self._key, None)
+
+
+MODBUS_DIAGNOSTIC_ENTITY_DEFINITIONS = [
+    ("calls_per_hour", "Modbus Calls Per Hour", "calls", "mdi:counter"),
+    ("failures_per_hour", "Modbus Failures Per Hour", "failures", "mdi:alert"),
+    ("timeouts_per_hour", "Modbus Timeouts Per Hour", "timeouts", "mdi:timer-alert"),
+    ("retries_per_hour", "Modbus Retries Per Hour", "retries", "mdi:refresh"),
+    ("busy_errors_per_hour", "Modbus Busy Errors Per Hour", "busy", "mdi:server-network"),
+    ("average_latency", "Average Modbus Latency", "s", "mdi:speedometer"),
+    ("max_latency", "Maximum Modbus Latency", "s", "mdi:speedometer-medium"),
+    ("availability_percent", "Modbus Availability", "%", "mdi:check-network"),
+]

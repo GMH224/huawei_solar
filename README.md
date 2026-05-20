@@ -248,3 +248,16 @@ Firmware telemetry entities now exposed through:
 ## Version 2.10.10
 
 Added full Modbus diagnostics framework and communication health metrics.
+
+
+## Version 2.10.11
+
+Fully implemented Home Assistant Modbus diagnostics entities.
+
+### Added
+- Real diagnostic sensor entities
+- Real communication health binary sensors
+- Availability % sensors
+- Latency metrics
+- Failure/hour metrics
+- Retry/hour metrics
