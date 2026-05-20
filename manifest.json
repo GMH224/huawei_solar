@@ -8,8 +8,7 @@
   "documentation": "https://github.com/wlcrs/huawei_solar/wiki",
   "issue_tracker": "https://github.com/wlcrs/huawei_solar/issues",
   "requirements": [
-    "huawei-solar>=3.0.5",
-    "huawei-solar>=3.1.0"
+    "huawei-solar>=3.0.5"
   ],
   "codeowners": [
     "@wlcrs"

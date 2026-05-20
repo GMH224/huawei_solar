@@ -215,15 +215,14 @@ Do you want to help out by translating this integration? This project uses Crowd
 
 ## Version 2.10.8
 
-Production-ready Home Assistant compatibility release.
+Final Home Assistant compatibility release.
 
-### Fixes
-- Fixed invalid Home Assistant manifest version issue
-- Added compatibility-safe retry wrapper
-- Added serialized Modbus protection
-- Preserved HA-native lifecycle behavior
+### Fixed
+- invalid semantic version issue
+- incompatible dependency version issue
+- startup loading failures
 
-### Reliability Improvements
-- Reduced timeout frequency
-- Reduced Modbus concurrency issues
-- Improved startup reliability
+### Improvements
+- retry-safe Modbus wrapper
+- serialized Modbus protection
+- preserved HA lifecycle compatibility

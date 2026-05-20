@@ -1,6 +1,6 @@
 
 """
-Huawei Solar 2.10.8 compatibility-safe runtime helpers.
+Huawei Solar 2.10.8 compatibility-safe runtime layer.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ _MODBUS_LOCK = asyncio.Lock()
 
 async def safe_modbus_call(factory, retries: int = 3):
     """
-    Serialized retry-safe Modbus wrapper.
+    Serialized retry-safe wrapper for Modbus operations.
     """
 
     last_error = None
@@ -30,7 +30,7 @@ async def safe_modbus_call(factory, retries: int = 3):
             last_error = err
 
             _LOGGER.warning(
-                "Retrying Modbus operation (%s/%s): %s",
+                "Huawei Solar retry %s/%s failed: %s",
                 attempt + 1,
                 retries,
                 err,
