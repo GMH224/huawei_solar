@@ -211,3 +211,22 @@ By providing logs directly when creating the issue, you will likely get help muc
 ## Translations
 
 Do you want to help out by translating this integration? This project uses Crowdin to make it easy to contribute translations. Use [this invite link to get started](https://crowdin.com/project/huawei-solar/invite?h=4cc071611aab39bd38409ea013f224d12239065).
+
+
+## Version 2.10f
+
+Production architecture release.
+
+### Major Runtime Enhancements
+- Async read batching
+- Dynamic register scheduler
+- Event-driven internal state bus
+- Coordinator decomposition
+- Async cancellation hardening
+
+### Reliability Improvements
+- Lower Modbus traffic
+- Lower timeout frequency
+- Improved HA restart handling
+- Better scalability
+- Reduced polling overhead
