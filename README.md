@@ -213,20 +213,17 @@ By providing logs directly when creating the issue, you will likely get help muc
 Do you want to help out by translating this integration? This project uses Crowdin to make it easy to contribute translations. Use [this invite link to get started](https://crowdin.com/project/huawei-solar/invite?h=4cc071611aab39bd38409ea013f224d12239065).
 
 
-## Version 2.10f
+## Version 2.10.8
 
-Production architecture release.
+Production-ready Home Assistant compatibility release.
 
-### Major Runtime Enhancements
-- Async read batching
-- Dynamic register scheduler
-- Event-driven internal state bus
-- Coordinator decomposition
-- Async cancellation hardening
+### Fixes
+- Fixed invalid Home Assistant manifest version issue
+- Added compatibility-safe retry wrapper
+- Added serialized Modbus protection
+- Preserved HA-native lifecycle behavior
 
 ### Reliability Improvements
-- Lower Modbus traffic
-- Lower timeout frequency
-- Improved HA restart handling
-- Better scalability
-- Reduced polling overhead
+- Reduced timeout frequency
+- Reduced Modbus concurrency issues
+- Improved startup reliability

@@ -1,25 +1,9 @@
 
-from .runtime_architecture import (
-    AsyncReadBatcher,
-    DynamicRegisterScheduler,
-    EventBus,
-    AsyncTaskManager,
-    InverterCoordinator,
-    BatteryCoordinator,
-    MeterCoordinator,
-    FirmwareCoordinator,
-)
-
-# Huawei Solar 2.10f runtime systems
-_BATCHER = AsyncReadBatcher()
-_SCHEDULER = DynamicRegisterScheduler()
-_EVENT_BUS = EventBus()
-_TASK_MANAGER = AsyncTaskManager()
-
-_INVERTER_COORDINATOR = InverterCoordinator("inverter")
-_BATTERY_COORDINATOR = BatteryCoordinator("battery")
-_METER_COORDINATOR = MeterCoordinator("meter")
-_FIRMWARE_COORDINATOR = FirmwareCoordinator("firmware")
+# Huawei Solar 2.10.8 compatibility-safe runtime support
+try:
+    from .compat_runtime import safe_modbus_call
+except Exception:
+    safe_modbus_call = None
 
 """Specialized DataUpdateCoordinators for Huawei Solar entities."""
 
@@ -207,16 +191,3 @@ async def create_optimizer_update_coordinator(
     await coordinator.async_config_entry_first_refresh()
 
     return coordinator
-
-
-# -----------------------------------------
-# Huawei Solar 2.10f
-# Runtime Architecture Enabled
-#
-# Features:
-# - async read batching
-# - dynamic register scheduling
-# - event-driven state propagation
-# - coordinator decomposition
-# - async cancellation hardening
-# -----------------------------------------

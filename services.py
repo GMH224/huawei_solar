@@ -912,10 +912,3 @@ async def async_setup_services(
             set_capacity_control_periods,
             schema=CAPACITY_CONTROL_PERIODS_SCHEMA,
         )
-
-
-# Huawei Solar 2.10f:
-# All async write operations should use:
-# - serialized transaction handling
-# - task manager lifecycle control
-# - cancellation-safe execution
