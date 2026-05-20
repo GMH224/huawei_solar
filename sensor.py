@@ -2952,3 +2952,65 @@ MODBUS_DIAGNOSTIC_ENTITY_DEFINITIONS = [
     ("max_latency", "Maximum Modbus Latency", "s", "mdi:speedometer-medium"),
     ("availability_percent", "Modbus Availability", "%", "mdi:check-network"),
 ]
+
+
+# ============================================================
+# Huawei Solar 2.10.12 automatic diagnostic entity registration
+# ============================================================
+
+try:
+    from homeassistant.helpers.entity_platform import AddEntitiesCallback
+except Exception:
+    AddEntitiesCallback = None
+
+async def async_setup_modbus_diagnostics(async_add_entities):
+    """
+    Register Huawei Modbus diagnostic sensors.
+    """
+
+    entities = []
+
+    try:
+        for key, name, unit, icon in MODBUS_DIAGNOSTIC_ENTITY_DEFINITIONS:
+            entities.append(
+                HuaweiModbusDiagnosticSensor(
+                    key=key,
+                    name=name,
+                    unit=unit,
+                    icon=icon,
+                )
+            )
+
+        async_add_entities(entities)
+
+    except Exception as err:
+        import logging
+        logging.getLogger(__name__).warning(
+            "Failed to register Huawei Modbus diagnostics: %s",
+            err,
+        )
+
+
+# Attempt automatic registration hook
+try:
+    ORIGINAL_ASYNC_SETUP_ENTRY = async_setup_entry
+except Exception:
+    ORIGINAL_ASYNC_SETUP_ENTRY = None
+
+
+async def async_setup_entry(hass, entry, async_add_entities):
+    """
+    Extended setup entry with diagnostics support.
+    """
+
+    if ORIGINAL_ASYNC_SETUP_ENTRY:
+        try:
+            await ORIGINAL_ASYNC_SETUP_ENTRY(
+                hass,
+                entry,
+                async_add_entities,
+            )
+        except TypeError:
+            pass
+
+    await async_setup_modbus_diagnostics(async_add_entities)

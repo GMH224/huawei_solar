@@ -261,3 +261,8 @@ Fully implemented Home Assistant Modbus diagnostics entities.
 - Latency metrics
 - Failure/hour metrics
 - Retry/hour metrics
+
+
+## Version 2.10.12
+
+Implemented automatic Home Assistant registration for Modbus diagnostics entities and binary sensors.

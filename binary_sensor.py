@@ -51,3 +51,42 @@ class HuaweiModbusHealthBinarySensor(BinarySensorEntity):
             return availability < 95
 
         return False
+
+
+# ============================================================
+# Huawei Solar 2.10.12 binary sensor registration
+# ============================================================
+
+async def async_setup_binary_modbus(async_add_entities):
+    entities = [
+        HuaweiModbusHealthBinarySensor(
+            "modbus_communication_healthy",
+            "Modbus Communication Healthy",
+        ),
+        HuaweiModbusHealthBinarySensor(
+            "modbus_communication_degraded",
+            "Modbus Communication Degraded",
+        ),
+    ]
+
+    async_add_entities(entities)
+
+
+try:
+    ORIGINAL_BINARY_ASYNC_SETUP_ENTRY = async_setup_entry
+except Exception:
+    ORIGINAL_BINARY_ASYNC_SETUP_ENTRY = None
+
+
+async def async_setup_entry(hass, entry, async_add_entities):
+    if ORIGINAL_BINARY_ASYNC_SETUP_ENTRY:
+        try:
+            await ORIGINAL_BINARY_ASYNC_SETUP_ENTRY(
+                hass,
+                entry,
+                async_add_entities,
+            )
+        except TypeError:
+            pass
+
+    await async_setup_binary_modbus(async_add_entities)
