@@ -2866,3 +2866,31 @@ def get_pv_entity_descriptions(count: int) -> list[HuaweiSolarSensorEntityDescri
         )
 
     return result
+
+
+# ============================================================
+# Huawei Solar 2.10.9 Firmware Telemetry Support
+# ============================================================
+
+FIRMWARE_TELEMETRY = [
+    {
+        "key": "inverter_firmware_version",
+        "name": "Inverter Firmware Version",
+    },
+    {
+        "key": "battery_firmware_version",
+        "name": "Battery Firmware Version",
+    },
+    {
+        "key": "optimizer_firmware_version",
+        "name": "Optimizer Firmware Version",
+    },
+    {
+        "key": "firmware_upgrade_status",
+        "name": "Firmware Upgrade Status",
+    },
+]
+
+# These entities are exposed as diagnostic sensors.
+# Actual Huawei register mapping depends on inverter model
+# and firmware generation support.

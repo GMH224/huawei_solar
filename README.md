@@ -226,3 +226,20 @@ Final Home Assistant compatibility release.
 - retry-safe Modbus wrapper
 - serialized Modbus protection
 - preserved HA lifecycle compatibility
+
+
+## Version 2.10.9
+
+Firmware telemetry entity release.
+
+### Added
+- Inverter firmware version entities
+- Battery firmware version entities
+- Optimizer firmware version entities
+- Firmware update availability entity
+- Firmware upgrade status entity
+
+### Home Assistant Support
+Firmware telemetry entities now exposed through:
+- sensor.py
+- binary_sensor.py
