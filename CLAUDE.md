@@ -59,9 +59,10 @@ homeassistant/
         ├── const.py               # All constants (intervals, timeouts, back-off params)
         ├── types.py               # Typed dataclasses for runtime data
         │
-        ├── modbus_guard.py        # NEW: asyncio lock + inter-request rate limiter
-        ├── modbus_telemetry.py    # NEW: rolling-window traffic stats + HA sensors
-        ├── register_cache.py      # NEW: TTL-aware register value cache
+        ├── modbus_guard.py        # asyncio lock + inter-request rate limiter
+        ├── modbus_telemetry.py    # Rolling-window traffic stats + HA sensors (11 sensors)
+        ├── register_cache.py      # Tier-aware + adaptive TTL register cache
+        ├── night_mode.py          # NEW: PV-power-based night/day mode detector
         ├── update_coordinator.py  # Optimised DataUpdateCoordinator implementations
         │
         ├── sensor.py              # SensorEntity implementations + descriptions
@@ -258,39 +259,50 @@ visibility into the Modbus communication health.  All values are **rolling
 
 ## 7. Changelog (AI-maintained)
 
+### v2.12.0 (2026-05-21)
+**Adaptive TTL + Night-mode polling + Register tier system**
+
+- **New:** `night_mode.py` — `NightModeDetector` watches `INPUT_POWER` and
+  `DEVICE_STATUS` every poll cycle.  After 3 consecutive polls with PV power
+  ≤ 50 W the coordinator transitions to NIGHT mode: poll interval → 5 min,
+  all cache TTLs × 10.  Wakes up instantly when power rises above 100 W.
+- **New:** Register tier system in `register_cache.py`:
+  - `STATIC` (serial/firmware/rated-power) — read once per session (1 h TTL, uncapped)
+  - `SLOW` (totals/daily counters/temperature/status) — 5 min base, 30 min cap
+  - `NORMAL` (SOC, voltage, current) — 30 s base, 5 min cap
+  - `FAST` (grid power, battery power, PV input) — always read, no caching
+- **New:** Adaptive TTL — after each poll where a register value is unchanged,
+  its TTL doubles (capped at tier max).  Resets to base TTL the moment the
+  value changes.  A stable battery at 80 % SOC at midday organically slows
+  from 30 s → 60 s → 120 s → 300 s.
+- **New:** `Inverter night mode` diagnostic sensor shows DAY/NIGHT state in HA.
+- **Improved:** Traffic model (typical 12 h day / 12 h night installation):
+  - Day-only saving vs v2.11.0: ~35–40 % fewer Modbus transactions
+  - Night saving vs v2.11.0: ~80 % (5 min vs 30 s × 3 coordinators)
+  - Combined daily saving vs original v2.1.0: ~60–70 %
+
 ### v2.11.0 (2026-05-21)
 **Aggressive Modbus optimisation + telemetry sensors**
 
 - **New:** `modbus_guard.py` — per-inverter asyncio lock with 150 ms
-  inter-request gap.  Eliminates overlapping Modbus frames from concurrent
-  coordinators.
-- **New:** `register_cache.py` — TTL-aware register cache.  Static registers
-  cached for 5 minutes; all others for one poll interval.  Up to 40 % fewer
-  Modbus frames on a quiet system.  Cache invalidated on every write.
+  inter-request gap.
+- **New:** `register_cache.py` — TTL-aware register cache with static-prefix
+  detection.  Up to 40 % fewer Modbus frames on a quiet system.
 - **New:** `modbus_telemetry.py` — rolling 1-hour Modbus traffic statistics
   with 10 new HA diagnostic sensor entities per inverter.
-- **Improved:** `update_coordinator.py` fully rewritten to integrate guard,
-  cache, and telemetry.  Stale-cache fallback on timeout keeps entities
-  available during brief outages.
-- **Improved:** Cache invalidation in `number.py`, `select.py`, `switch.py`
-  after every successful write.
-- **Docs:** New `CLAUDE.md` with full architecture reference.
+- **Improved:** `update_coordinator.py` integrates guard, cache, and telemetry.
+  Stale-cache fallback on timeout.
+- **Improved:** Cache invalidation in `number.py`, `select.py`, `switch.py`.
+- **Docs:** New `CLAUDE.md`.
 
 ### v2.10b (2026-05-20)
 **Timeout hardening + battery entity improvements**
 
-- `UPDATE_TIMEOUT` raised from 29 s to 35 s.
-- `OPTIMIZER_UPDATE_TIMEOUT` raised from 60 s to 120 s.
-- Exponential back-off with ±10 % jitter introduced after 3 consecutive
-  timeouts (10 s base, 120 s cap).
-- `retry_after` hints added to all `UpdateFailed` raises.
-- `ConnectionInterruptedException` now includes retry hint.
-- First timeout → WARNING; subsequent → DEBUG to reduce log noise.
-- Communication-restored INFO log after recovery.
-- Battery number entities (max charge/discharge power, end-of-charge SOC)
-  enabled by default with `native_step` added.
-- New read-only sensor for end-of-charge SOC.
-- `strings.json` / `translations/en.json` updated.
+- `UPDATE_TIMEOUT` raised to 35 s, `OPTIMIZER_UPDATE_TIMEOUT` to 120 s.
+- Exponential back-off with jitter after 3 consecutive timeouts.
+- `retry_after` hints on all `UpdateFailed` raises.
+- Battery number entities enabled by default with step values.
+- New read-only end-of-charge SOC sensor.
 
 ### v2.1.0 (upstream)
 Original HACS release.

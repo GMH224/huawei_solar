@@ -33,6 +33,11 @@ CONFIGURATION_UPDATE_TIMEOUT = timedelta(minutes=1)
 OPTIMIZER_UPDATE_INTERVAL = timedelta(minutes=5)
 OPTIMIZER_UPDATE_TIMEOUT = timedelta(minutes=2)
 
+# When the inverter is in night/sleep mode (PV power ≈ 0) all coordinators
+# slow to this interval.  Most registers are frozen at night so polling faster
+# than 5 minutes is wasteful and stresses the Modbus interface.
+NIGHT_POLL_INTERVAL = timedelta(minutes=5)
+
 # ── Modbus timeout / retry back-off ─────────────────────────────────────────
 # After this many consecutive timeouts the coordinator starts backing off to
 # avoid hammering an unresponsive inverter and let the Modbus bus recover.

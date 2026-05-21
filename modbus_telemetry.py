@@ -108,6 +108,7 @@ class ModbusTelemetry:
         self.total_timeouts: int = 0
         self.total_cache_hits: int = 0
         self.total_skipped_polls: int = 0
+        self._night_mode: bool = False
 
         # Derived metrics updated on each call to snapshot()
         self._last_snapshot: dict[str, Any] = {}
@@ -152,6 +153,10 @@ class ModbusTelemetry:
     def record_skipped_poll(self) -> None:
         """Record a poll that was entirely skipped (back-off / dedup)."""
         self.total_skipped_polls += 1
+
+    def record_night_mode(self, active: bool) -> None:
+        """Record the current night-mode state (for snapshot reporting)."""
+        self._night_mode = active
 
     # ── derived metric helpers ────────────────────────────────────────────────
 
@@ -201,6 +206,7 @@ class ModbusTelemetry:
             "total_timeouts": self.total_timeouts,
             "total_cache_hits": self.total_cache_hits,
             "total_skipped_polls": self.total_skipped_polls,
+            "night_mode_active": self._night_mode,
         }
         self._last_snapshot = snap
         return snap
@@ -319,6 +325,13 @@ _TELEMETRY_SENSORS: list[tuple[str, str, str | None, str, dict]] = [
             "state_class": SensorStateClass.TOTAL_INCREASING,
             "entity_registry_enabled_default": False,
         },
+    ),
+    (
+        "night_mode_active",
+        "Inverter night mode",
+        None,
+        "mdi:weather-night",
+        {},   # no state_class — this is a boolean-ish string sensor
     ),
 ]
 
