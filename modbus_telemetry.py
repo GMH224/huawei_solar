@@ -109,6 +109,8 @@ class ModbusTelemetry:
         self.total_cache_hits: int = 0
         self.total_skipped_polls: int = 0
         self._night_mode: bool = False
+        self._guard_gap_ms: float = 150.0
+        self._mppt_sweeps_detected: int = 0
 
         # Derived metrics updated on each call to snapshot()
         self._last_snapshot: dict[str, Any] = {}
@@ -157,6 +159,14 @@ class ModbusTelemetry:
     def record_night_mode(self, active: bool) -> None:
         """Record the current night-mode state (for snapshot reporting)."""
         self._night_mode = active
+
+    def record_guard_gap(self, gap_ms: float) -> None:
+        """Record the current dynamic guard gap for reporting."""
+        self._guard_gap_ms = gap_ms
+
+    def record_mppt_sweep(self) -> None:
+        """Record a detected MPPT sweep event."""
+        self._mppt_sweeps_detected += 1
 
     # ── derived metric helpers ────────────────────────────────────────────────
 
@@ -207,6 +217,8 @@ class ModbusTelemetry:
             "total_cache_hits": self.total_cache_hits,
             "total_skipped_polls": self.total_skipped_polls,
             "night_mode_active": self._night_mode,
+            "guard_gap_ms": round(self._guard_gap_ms, 1),
+            "mppt_sweeps_detected": self._mppt_sweeps_detected,
         }
         self._last_snapshot = snap
         return snap
@@ -332,6 +344,23 @@ _TELEMETRY_SENSORS: list[tuple[str, str, str | None, str, dict]] = [
         None,
         "mdi:weather-night",
         {},   # no state_class — this is a boolean-ish string sensor
+    ),
+    (
+        "guard_gap_ms",
+        "Modbus guard gap",
+        "ms",
+        "mdi:timer-sand",
+        {"state_class": SensorStateClass.MEASUREMENT},
+    ),
+    (
+        "mppt_sweeps_detected",
+        "MPPT sweeps detected",
+        None,
+        "mdi:sine-wave",
+        {
+            "state_class": SensorStateClass.TOTAL_INCREASING,
+            "entity_registry_enabled_default": False,
+        },
     ),
 ]
 

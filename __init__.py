@@ -56,7 +56,9 @@ from .types import (
     HuaweiSolarInverterData,
 )
 from .update_coordinator import (
+    HuaweiSolarOptimizerUpdateCoordinator,
     HuaweiSolarUpdateCoordinator,
+    UnifiedPollHub,
     create_optimizer_update_coordinator,
 )
 
@@ -291,6 +293,11 @@ async def _setup_inverter_device_data(
     )
     update_coordinator.attach_telemetry(telemetry)
 
+    # Idea 4: start the keepalive background task on the main coordinator.
+    # It fires a 1-register ping every 4 minutes when the bus is otherwise idle,
+    # preventing the inverter from silently closing the TCP connection.
+    update_coordinator.attach_keepalive()
+
     # Add power meter device if a power meter is detected
     if device.power_meter_type is not None:
         power_meter_device_info = DeviceInfo(
@@ -332,6 +339,12 @@ async def _setup_inverter_device_data(
             update_interval=ENERGY_STORAGE_UPDATE_INTERVAL,
         )
         energy_storage_update_coordinator.attach_telemetry(telemetry)
+
+        # Idea 1: attach a shared UnifiedPollHub so inverter + battery
+        # coordinators share a single guard lock cycle per poll.
+        unified_hub = UnifiedPollHub(device, update_coordinator.guard)
+        update_coordinator.attach_hub(unified_hub)
+        energy_storage_update_coordinator.attach_hub(unified_hub)
     else:
         battery_device_info = None
         energy_storage_update_coordinator = None

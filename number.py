@@ -442,11 +442,31 @@ class HuaweiSolarNumberEntity(
         self.async_write_ha_state()
 
     async def async_set_native_value(self, value: float) -> None:
-        """Set a new value."""
-        if await self.device.set(self.entity_description.register_name, float(value)):
-            self._attr_native_value = float(value)
-            # Invalidate the cached register so the next poll fetches a fresh value
-            self.coordinator.invalidate_cache(self.entity_description.register_name)
+        """Set a new value with write coalescing and shadow readback.
+
+        Idea 5 (write coalescing): if the user moves a slider rapidly, the
+        300 ms debounce window in ModbusGuard ensures only the final value
+        reaches the inverter, eliminating spurious intermediate writes.
+
+        Idea 6 (shadow readback): 500 ms after the write completes, a
+        targeted 1-register read confirms the inverter accepted the value.
+        A mismatch triggers a warning and an immediate cache update.
+        """
+        reg = self.entity_description.register_name
+        guard = self.coordinator.guard
+        final_value = float(value)
+
+        # Idea 5: debounce rapid writes for the same register
+        event, holder = guard.coalesced_write(str(reg), final_value)
+        holder[0] = final_value
+        await event.wait()
+        final_value = float(holder[0])
+
+        if await self.device.set(reg, final_value):
+            self._attr_native_value = final_value
+            self.coordinator.invalidate_cache(reg)
+            # Idea 6: schedule async verification read
+            self.coordinator.schedule_readback(reg, final_value)
 
         await self.coordinator.async_request_refresh()
 
