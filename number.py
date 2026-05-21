@@ -444,28 +444,27 @@ class HuaweiSolarNumberEntity(
     async def async_set_native_value(self, value: float) -> None:
         """Set a new value with write coalescing and shadow readback.
 
-        Idea 5 (write coalescing): if the user moves a slider rapidly, the
-        300 ms debounce window in ModbusGuard ensures only the final value
-        reaches the inverter, eliminating spurious intermediate writes.
+        Idea 5 (write coalescing): rapid slider moves are debounced over
+        300 ms.  All concurrent callers share the same value_holder list;
+        each new call updates holder[0] in-place so every waiter reads the
+        most-recent value when the event fires.
 
-        Idea 6 (shadow readback): 500 ms after the write completes, a
-        targeted 1-register read confirms the inverter accepted the value.
-        A mismatch triggers a warning and an immediate cache update.
+        Idea 6 (shadow readback): 500 ms after the write a 1-register read
+        confirms the inverter accepted the value.
         """
         reg = self.entity_description.register_name
         guard = self.coordinator.guard
-        final_value = float(value)
 
-        # Idea 5: debounce rapid writes for the same register
-        event, holder = guard.coalesced_write(str(reg), final_value)
-        holder[0] = final_value
+        # Register with the coalescing debouncer.
+        # Do NOT overwrite holder[0] here — the guard already stored our value
+        # in the shared holder.  Overwriting would revert a later caller's value.
+        event, holder = guard.coalesced_write(str(reg), float(value))
         await event.wait()
-        final_value = float(holder[0])
+        final_value = float(holder[0])  # read the most-recent coalesced value
 
         if await self.device.set(reg, final_value):
             self._attr_native_value = final_value
             self.coordinator.invalidate_cache(reg)
-            # Idea 6: schedule async verification read
             self.coordinator.schedule_readback(reg, final_value)
 
         await self.coordinator.async_request_refresh()

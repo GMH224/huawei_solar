@@ -238,10 +238,22 @@ class ModbusTelemetry:
 
     @callback
     def _push_to_listeners(self, _now: datetime) -> None:
-        """Push updated telemetry to all registered HA entities."""
+        """Push updated telemetry to all registered HA entities.
+
+        Each listener is called in a try/except so that a failing callback
+        does not prevent the remaining listeners from receiving the update.
+        """
         snap = self.snapshot()
-        for cb_fn in self._listeners:
-            cb_fn(snap)
+        for cb_fn in list(self._listeners):  # iterate a copy — listener may remove itself
+            try:
+                cb_fn(snap)
+            except Exception:  # noqa: BLE001
+                _LOGGER.debug(
+                    "Telemetry[%s]: listener %r raised, skipping",
+                    self.serial_number,
+                    cb_fn,
+                    exc_info=True,
+                )
 
     def stop(self) -> None:
         """Cancel the periodic push timer."""

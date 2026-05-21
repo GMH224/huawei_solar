@@ -141,11 +141,14 @@ class UnifiedPollHub:
     def __init__(self, device: HuaweiSolarDevice, guard: ModbusGuard) -> None:
         self.device = device
         self.guard = guard
-        self._lock = asyncio.Lock()
+        # _fetch_lock serialises the entire fetch cycle.
+        # Held by the first coordinator from reset through to event.set().
+        # Instantiated inside __init__ which is always called from async context.
+        self._fetch_lock = asyncio.Lock()
+        # Signals waiting coordinators that the shared result is ready.
+        self._in_flight_event = asyncio.Event()
         self._result: dict[RegisterName, Result[Any]] | None = None
-        self._error: Exception | None = None
-        self._event = asyncio.Event()
-        self._subscribers: int = 0
+        self._error: BaseException | None = None
 
     async def fetch(
         self,
@@ -154,46 +157,60 @@ class UnifiedPollHub:
         telemetry: ModbusTelemetry | None,
         coordinator_name: str,
     ) -> dict[RegisterName, Result[Any]]:
-        """Execute or wait for the shared batch_update().
+        """Execute or piggyback on the shared batch_update() for this cycle.
 
-        The first caller acquires the hub lock and performs the request.
-        Subsequent callers with overlapping stale_names wait for the first
-        result and use it directly — no second Modbus request issued.
+        Race-condition-free design
+        --------------------------
+        The ``_fetch_lock`` is held for the entire cycle (reset → request →
+        event.set).  Any coordinator that arrives while the lock is held
+        immediately parks on ``_in_flight_event.wait()`` — it never touches
+        ``_result`` or ``_error`` until the event fires.  There is no
+        check-then-act window where two coordinators could both believe they
+        are first.
         """
-        async with self._lock:
-            # Reset the shared state for this cycle
-            self._result = None
-            self._error = None
-            self._event.clear()
-            self._subscribers = 0
-
-        # First caller races to set the result
-        if not self._event.is_set():
-            async with self.guard.request(merge_key=f"{self.device.serial_number}_unified"):
-                sorted_names = _sort_by_address(stale_names)   # Idea 3
-                if telemetry:
-                    telemetry.record_request(len(sorted_names))
-                try:
-                    async with asyncio.timeout(timeout_s):
-                        result = await self.device.batch_update(sorted_names)
-                    self._result = result
-                except Exception as exc:
-                    self._error = exc
-                finally:
-                    self._event.set()
-        else:
-            # Another coordinator already fired — wait for it
+        # Fast path: another coordinator is already fetching — wait for it.
+        if self._fetch_lock.locked():
             _LOGGER.debug(
-                "%s: waiting for shared poll result from UnifiedPollHub",
+                "%s: piggybacking on in-flight UnifiedPollHub request",
                 coordinator_name,
             )
-            await asyncio.wait_for(
-                asyncio.shield(self._event.wait()),
-                timeout=timeout_s,
-            )
+            try:
+                async with asyncio.timeout(timeout_s):
+                    await self._in_flight_event.wait()
+            except asyncio.TimeoutError:
+                _LOGGER.debug(
+                    "%s: UnifiedPollHub piggyback timed out; issuing own request",
+                    coordinator_name,
+                )
+                # Fall through: do our own direct request below
+            else:
+                if self._error is not None:
+                    raise self._error  # type: ignore[misc]
+                return self._result or {}
 
-        if self._error is not None:
-            raise self._error
+        # Slow path: we are first this cycle — acquire, reset, fetch.
+        async with self._fetch_lock:
+            # Reset within the lock — no other task can read stale state.
+            self._in_flight_event.clear()
+            self._result = None
+            self._error = None
+
+            try:
+                async with self.guard.request(
+                    merge_key=f"{self.device.serial_number}_unified"
+                ):
+                    sorted_names = _sort_by_address(stale_names)  # Idea 3
+                    if telemetry:
+                        telemetry.record_request(len(sorted_names))
+                    async with asyncio.timeout(timeout_s):
+                        self._result = await self.device.batch_update(sorted_names)
+            except BaseException as exc:
+                self._error = exc
+                raise
+            finally:
+                # Always signal waiters — even on error or cancellation.
+                self._in_flight_event.set()
+
         return self._result or {}
 
 
@@ -269,17 +286,23 @@ class HuaweiSolarUpdateCoordinator(
         self._hub = hub
 
     def attach_keepalive(self) -> None:
-        """Register a keepalive ping with the guard (idea 4)."""
+        """Register a keepalive ping with the guard (idea 4).
+
+        Sends a minimal 1-register read every KEEPALIVE_INTERVAL when idle,
+        preventing the inverter from silently closing the TCP connection.
+        Uses the public cache.get_any_name() API — no private attribute access.
+        """
         async def _ping() -> None:
+            name = self.cache.any_cached_name()
+            if name is None:
+                return
             try:
                 async with self.guard.request(urgent=False):
                     async with asyncio.timeout(5.0):
-                        await self.device.batch_update(
-                            [next(iter(self.cache._store))]  # any cached register
-                            if self.cache._store else []
-                        )
+                        await self.device.batch_update([name])
             except Exception:  # noqa: BLE001
                 pass
+
         self.guard.start_keepalive(_ping)
 
     # ── night-mode callback ────────────────────────────────────────────────────
@@ -308,7 +331,9 @@ class HuaweiSolarUpdateCoordinator(
         """Schedule a verification read for a register 500 ms after a write.
 
         If the read-back value differs from *expected*, a warning is logged and
-        an immediate coordinator refresh is triggered.
+        the cache is updated with the real value immediately.  Uses
+        asyncio.get_running_loop().create_task() (not the deprecated
+        asyncio.ensure_future()).
         """
         async def _readback() -> None:
             await asyncio.sleep(SHADOW_READBACK_DELAY.total_seconds())
@@ -316,22 +341,34 @@ class HuaweiSolarUpdateCoordinator(
                 async with self.guard.request(urgent=True):
                     async with asyncio.timeout(5.0):
                         result = await self.device.batch_update([name])
-                actual = result.get(name)
-                if actual is not None:
-                    actual_val = actual.value if hasattr(actual, "value") else actual
+                actual_result = result.get(name)
+                if actual_result is not None:
+                    actual_val = (
+                        actual_result.value
+                        if hasattr(actual_result, "value")
+                        else actual_result
+                    )
                     if actual_val != expected:
                         _LOGGER.warning(
                             "%s: write verification mismatch for %s: "
-                            "wrote %r, read back %r — triggering refresh",
+                            "wrote %r, read back %r",
                             self.name, name, expected, actual_val,
                         )
-                    # Update cache with confirmed value regardless
-                    self.cache.update({name: actual})
-                    self.async_set_updated_data({**self.data, name: actual})
+                    # Update the cache with the confirmed on-device value
+                    self.cache.update({name: actual_result})
+                    # Merge with existing data safely — guard against None/unset data
+                    current = self.data if self.data is not None else {}
+                    self.async_set_updated_data({**current, name: actual_result})
             except Exception as exc:  # noqa: BLE001
-                _LOGGER.debug("%s: shadow readback for %s failed: %s", self.name, name, exc)
+                _LOGGER.debug(
+                    "%s: shadow readback for %s failed: %s", self.name, name, exc
+                )
 
-        task = asyncio.ensure_future(_readback())
+        loop = asyncio.get_running_loop()
+        task = loop.create_task(
+            _readback(),
+            name=f"huawei_solar_readback_{self.device.serial_number}_{name}",
+        )
         self._readback_tasks.add(task)
         task.add_done_callback(self._readback_tasks.discard)
 
