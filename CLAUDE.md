@@ -55,24 +55,22 @@ homeassistant/
 └── custom_components/
     └── huawei_solar/
         ├── __init__.py            # Entry setup, device discovery, coordinator wiring
-        ├── manifest.json          # HACS / HA metadata, version 2.13.0
-        ├── const.py               # All constants (intervals, timeouts, back-off, readback delay)
+        ├── manifest.json          # HACS / HA metadata, version
+        ├── const.py               # All constants (intervals, timeouts, back-off params)
         ├── types.py               # Typed dataclasses for runtime data
         │
-        ├── modbus_guard.py        # Serialiser: dynamic gap, priority queue, keepalive,
-        │                          #             write coalescing, coordinator merge
-        ├── modbus_telemetry.py    # Rolling-window traffic stats + 13 HA sensor entities
-        ├── register_cache.py      # Tier-aware (STATIC/SLOW/NORMAL/FAST) + adaptive TTL cache
-        ├── night_mode.py          # PV-power night/day detector + MPPT sweep detector
-        ├── update_coordinator.py  # Coordinator: UnifiedPollHub, shadow readback,
-        │                          #              address sort, all 8 ideas wired
+        ├── modbus_guard.py        # asyncio lock + inter-request rate limiter
+        ├── modbus_telemetry.py    # Rolling-window traffic stats + HA sensors (11 sensors)
+        ├── register_cache.py      # Tier-aware + adaptive TTL register cache
+        ├── night_mode.py          # NEW: PV-power-based night/day mode detector
+        ├── update_coordinator.py  # Optimised DataUpdateCoordinator implementations
         │
         ├── sensor.py              # SensorEntity implementations + descriptions
-        ├── number.py              # NumberEntity — write coalescing + shadow readback
-        ├── select.py              # SelectEntity — shadow readback on writes
-        ├── switch.py              # SwitchEntity — shadow readback on writes
+        ├── number.py              # NumberEntity (writable numeric registers)
+        ├── select.py              # SelectEntity (enum registers)
+        ├── switch.py              # SwitchEntity (boolean registers)
         ├── button.py              # ButtonEntity (one-shot actions)
-        ├── services.py            # HA service definitions
+        ├── services.py            # HA service definitions (TOU, forcible charge, …)
         ├── config_flow.py         # UI-based configuration flow
         └── diagnostics.py        # HA diagnostics dump
 ```
@@ -260,72 +258,6 @@ visibility into the Modbus communication health.  All values are **rolling
 ---
 
 ## 7. Changelog (AI-maintained)
-
-### v2.13.0 (2026-05-21)
-**All 8 targeted Modbus performance ideas implemented**
-
-Root-cause analysis showed 90 % of each poll cycle was consumed by guard gaps,
-not actual inverter processing.  All 8 ideas address this directly.
-
-#### Idea 1 — Coordinator merge (`UnifiedPollHub` in `update_coordinator.py`)
-The inverter and battery coordinators previously acquired the guard lock
-independently — two lock cycles, two 150 ms gaps per poll.  A shared
-`UnifiedPollHub` routes both coordinators through one `batch_update()` call.
-The second coordinator waits for the first's result via an asyncio.Event,
-paying zero additional bus time.  **Saves ~150 ms per 30 s cycle.**
-
-#### Idea 2 — Dynamic guard gap (`modbus_guard.py`)
-The fixed 150 ms gap is replaced by an adaptive value derived from the
-rolling failure rate (last 30 polls):
-- 0 % failures → **80 ms** (SUN2000 minimum safe gap)
-- 2 %+ failures → **300 ms** (stressed — back off)
-- Post-timeout cycle → **500 ms** (recovery)
-The guard gap is now also surfaced as a live HA sensor ("Modbus guard gap").
-
-#### Idea 3 — Register address sort (`update_coordinator.py`)
-`stale_names` are sorted by Modbus register address before `batch_update()`.
-Contiguous address ranges are merged by the library into fewer TCP frames.
-**20–30 % fewer TCP frames per batch at zero cost.**
-
-#### Idea 4 — TCP keepalive (`modbus_guard.py`)
-A background task pings the inverter with a 1-register read every 4 minutes
-when the bus is otherwise idle.  Prevents the inverter's server-side TCP close
-that caused spurious first-poll failures after night-mode silence.
-
-#### Idea 5 — Write coalescing (`modbus_guard.py` + `number.py`)
-`coalesced_write()` debounces rapid `set()` calls for the same register over
-a 300 ms window.  Only the final value reaches the inverter.  Eliminates
-burst writes when a user drags a number entity slider.  **−60 % write operations
-on slider interactions.**
-
-#### Idea 6 — Shadow write readback (`update_coordinator.py` + `number.py` / `select.py` / `switch.py`)
-500 ms after every `set()` a targeted 1-register read confirms the inverter
-accepted the value.  Mismatches (BMS reject, value out of operating range)
-are logged as warnings and the cache is updated immediately.
-**Confirmation latency: 30 s → 500 ms.**
-
-#### Idea 7 — Priority queue (`modbus_guard.py`)
-The guard queue is now a 2-tier priority queue.  User writes and FAST-tier
-reads are marked `urgent=True` and jump ahead of background NORMAL polls.
-Anti-starvation: NORMAL waiters are promoted to URGENT after 5 s.
-
-#### Idea 8 — MPPT sweep pause (`night_mode.py` + `update_coordinator.py`)
-`MpptSweepDetector` watches PV string voltage across consecutive polls.  A
-≥ 2 % sudden voltage dip signals an MPPT sweep.  A 120 ms pause is inserted
-before the next Modbus request so it lands after the inverter's sweep window.
-Sweep events are counted in the "MPPT sweeps detected" diagnostic sensor.
-
-#### New telemetry sensors (total: 13)
-- **Modbus guard gap** (ms) — live dynamic gap value
-- **MPPT sweeps detected** — lifetime counter (disabled by default)
-
-#### Combined traffic reduction (v2.13.0 vs v2.1.0 original)
-
-| Period      | v2.1.0     | v2.13.0    | Reduction |
-|-------------|-----------|-----------|-----------|
-| Daytime     | 4 320 tx/h | ~900 tx/h | **~79 %** |
-| Night       | 4 320 tx/h | ~72 tx/h  | **~98 %** |
-| **Daily**   | **8 640**  | **~972**  | **~89 %** |
 
 ### v2.12.0 (2026-05-21)
 **Adaptive TTL + Night-mode polling + Register tier system**

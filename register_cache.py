@@ -380,23 +380,6 @@ class RegisterCache:
         entry = self._store.get(name)
         return self._effective_ttl(entry) if entry else 0.0
 
-    def any_cached_name(self) -> "RegisterName | None":
-        """Return any non-dirty cached register name, or None if cache is empty.
-
-        Used by the keepalive ping to perform a minimal 1-register read without
-        accessing private internals.  Prefers STATIC-tier registers (cheapest
-        to read and never expected to change).
-        """
-        # Prefer STATIC tier first (cheapest + most stable)
-        for name, entry in self._store.items():
-            if not entry.dirty and entry.tier == RegisterTier.STATIC:
-                return name
-        # Fall back to any non-dirty entry
-        for name, entry in self._store.items():
-            if not entry.dirty:
-                return name
-        return None
-
     @property
     def size(self) -> int:
         return len(self._store)

@@ -227,28 +227,18 @@ class HuaweiSolarSwitchEntity(
         self.async_write_ha_state()
 
     async def async_turn_on(self, **kwargs: Any) -> None:
-        """Turn the setting on.
-
-        Idea 6 (shadow readback): verify the inverter accepted the write.
-        """
-        reg = self.entity_description.register_name
-        if await self.device.set(reg, True):
+        """Turn the setting on."""
+        if await self.device.set(self.entity_description.register_name, True):
             self._attr_is_on = True
-            self.coordinator.invalidate_cache(reg)
-            self.coordinator.schedule_readback(reg, True)
+            self.coordinator.invalidate_cache(self.entity_description.register_name)
 
         await self.coordinator.async_request_refresh()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        """Turn the setting off.
-
-        Idea 6 (shadow readback): verify the inverter accepted the write.
-        """
-        reg = self.entity_description.register_name
-        if await self.device.set(reg, False):
+        """Turn the setting off."""
+        if await self.device.set(self.entity_description.register_name, False):
             self._attr_is_on = False
-            self.coordinator.invalidate_cache(reg)
-            self.coordinator.schedule_readback(reg, False)
+            self.coordinator.invalidate_cache(self.entity_description.register_name)
 
         await self.coordinator.async_request_refresh()
 

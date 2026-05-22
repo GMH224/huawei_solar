@@ -442,30 +442,11 @@ class HuaweiSolarNumberEntity(
         self.async_write_ha_state()
 
     async def async_set_native_value(self, value: float) -> None:
-        """Set a new value with write coalescing and shadow readback.
-
-        Idea 5 (write coalescing): rapid slider moves are debounced over
-        300 ms.  All concurrent callers share the same value_holder list;
-        each new call updates holder[0] in-place so every waiter reads the
-        most-recent value when the event fires.
-
-        Idea 6 (shadow readback): 500 ms after the write a 1-register read
-        confirms the inverter accepted the value.
-        """
-        reg = self.entity_description.register_name
-        guard = self.coordinator.guard
-
-        # Register with the coalescing debouncer.
-        # Do NOT overwrite holder[0] here — the guard already stored our value
-        # in the shared holder.  Overwriting would revert a later caller's value.
-        event, holder = guard.coalesced_write(str(reg), float(value))
-        await event.wait()
-        final_value = float(holder[0])  # read the most-recent coalesced value
-
-        if await self.device.set(reg, final_value):
-            self._attr_native_value = final_value
-            self.coordinator.invalidate_cache(reg)
-            self.coordinator.schedule_readback(reg, final_value)
+        """Set a new value."""
+        if await self.device.set(self.entity_description.register_name, float(value)):
+            self._attr_native_value = float(value)
+            # Invalidate the cached register so the next poll fetches a fresh value
+            self.coordinator.invalidate_cache(self.entity_description.register_name)
 
         await self.coordinator.async_request_refresh()
 

@@ -243,18 +243,12 @@ class HuaweiSolarSelectEntity(
         self.async_write_ha_state()
 
     async def async_select_option(self, option: str) -> None:
-        """Change the selected option.
-
-        Idea 6 (shadow readback): 500 ms after the write a targeted read
-        confirms the inverter accepted the new enum value.
-        """
-        reg = self.entity_description.register_name
-        enum_val = self._to_enum(option)
-        await self.device.set(reg, enum_val)
+        """Change the selected option."""
+        await self.device.set(
+            self.entity_description.register_name, self._to_enum(option)
+        )
         self._attr_current_option = option
-        self.coordinator.invalidate_cache(reg)
-        # Idea 6: verify the write was accepted
-        self.coordinator.schedule_readback(reg, enum_val)
+        self.coordinator.invalidate_cache(self.entity_description.register_name)
 
         await self.coordinator.async_request_refresh()
 

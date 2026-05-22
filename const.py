@@ -78,16 +78,3 @@ SERVICES = (
     SERVICE_SET_CAPACITY_CONTROL_PERIODS,
     SERVICE_SET_FIXED_CHARGE_PERIODS,
 )
-
-# ── v2.13.0 performance constants ────────────────────────────────────────────
-
-# Idea 6: Shadow write readback — delay before verifying a written register
-SHADOW_READBACK_DELAY = timedelta(milliseconds=500)
-
-# Idea 8: MPPT sweep detection — extra pause inserted when a voltage dip is
-# detected (inverter is mid-sweep and cannot service Modbus reliably)
-MPPT_SWEEP_PAUSE = timedelta(milliseconds=120)
-
-# Idea 5: Write coalescing is configured in modbus_guard.py (WRITE_COALESCE_MS)
-# Idea 2: Dynamic gap floor/ceiling in modbus_guard.py (GAP_MIN_MS, GAP_STRESSED_MS)
-# Idea 4: Keepalive interval in modbus_guard.py (KEEPALIVE_INTERVAL)
