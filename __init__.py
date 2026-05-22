@@ -1,5 +1,6 @@
-"""The Huawei Solar integration."""
+"""The Huawei Solar integration — v2.12.2."""
 
+from datetime import timedelta
 import logging
 
 from huawei_solar import (
@@ -39,6 +40,7 @@ from .const import (
     CONF_ENABLE_PARAMETER_CONFIGURATION,
     CONF_SLAVE_IDS,
     CONFIGURATION_UPDATE_INTERVAL,
+    COORDINATOR_STAGGER_SECONDS,
     DATA_DEVICE_DATAS,
     DOMAIN,
     ENERGY_STORAGE_UPDATE_INTERVAL,
@@ -49,6 +51,8 @@ from .const import (
 )
 from .modbus_guard import ModbusGuard
 from .modbus_telemetry import ModbusTelemetry
+from .night_mode import NightModeDetector
+from .register_cache import LiveRegisterBus, StaticRegisterCache
 from .services import async_setup_services
 from .types import (
     HuaweiSolarConfigEntry,
@@ -73,32 +77,8 @@ PLATFORMS: list[Platform] = [
 
 async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) -> bool:
     """Set up Huawei Solar from a config entry."""
-
     primary_device = None
     try:
-        # Multiple inverters can be connected to each other via a daisy chain,
-        # via an internal modbus-network (ie. not the same modbus network that we are
-        # using to talk to the inverter).
-        #
-        # Each inverter receives it's own 'slave id' in that case.
-        # The inverter that we use as 'gateway' will then forward the request to
-        # the proper inverter.
-
-        #               ┌─────────────┐
-        #               │  EXTERNAL   │
-        #               │ APPLICATION │
-        #               └──────┬──────┘
-        #                      │
-        #                 ┌────┴────┐
-        #                 │PRIMARY  │
-        #                 │INVERTER │
-        #                 └────┬────┘
-        #       ┌──────────────┼───────────────┐
-        #       │              │               │
-        #  ┌────┴────┐     ┌───┴─────┐    ┌────┴────┐
-        #  │ SLAVE X │     │ SLAVE Y │    │SLAVE ...│
-        #  └─────────┘     └─────────┘    └─────────┘
-
         if entry.data[CONF_HOST] is None:
             client = create_rtu_client(
                 port=entry.data[CONF_PORT], unit_id=entry.data[CONF_SLAVE_IDS][0]
@@ -125,133 +105,139 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
                 except InvalidCredentials as err:
                     raise ConfigEntryAuthFailed from err
 
-        primary_device_data = await _setup_device_data(
-            hass,
-            entry,
-            primary_device,
-        )
-
+        primary_device_data = await _setup_device_data(hass, entry, primary_device)
         device_datas: list[HuaweiSolarDeviceData] = [primary_device_data]
 
         for extra_unit_id in entry.data[CONF_SLAVE_IDS][1:]:
             sub_device = await create_sub_device_instance(primary_device, extra_unit_id)
             sub_device_data = await _setup_device_data(hass, entry, sub_device)
-
             device_datas.append(sub_device_data)
 
-        entry.runtime_data = {
-            DATA_DEVICE_DATAS: device_datas,
-        }
+        entry.runtime_data = {DATA_DEVICE_DATAS: device_datas}
+
     except ConnectionInterruptedException as err:
-        if primary_device is not None:
+        if primary_device:
             await primary_device.stop()
         host = entry.data.get(CONF_HOST) or entry.data.get(CONF_PORT)
-        _LOGGER.warning(
-            "Connection to the inverter at %s was interrupted during setup. "
-            "The inverter only supports one Modbus connection at a time. "
-            "Check whether another device is currently connected to the inverter",
-            host,
-        )
         raise ConfigEntryNotReady(
-            f"Connection to the inverter at {host} was interrupted, probably by another device. "
+            f"Connection to {host} was interrupted — another device may be connected. "
             "The inverter only supports one Modbus connection at a time."
         ) from err
     except ConnectionException as err:
-        if primary_device is not None:
+        if primary_device:
             await primary_device.stop()
         host = entry.data.get(CONF_HOST) or entry.data.get(CONF_PORT)
-        _LOGGER.warning(
-            "Cannot connect to the inverter at %s. "
-            "Verify the address and that the device is reachable on the network. "
-            "If the inverter's IP address has changed, reconfigure the integration",
-            host,
-        )
         raise ConfigEntryNotReady(
-            f"Cannot connect to the inverter at {host}. "
-            "Verify the address and that the device is reachable. "
-            "If the IP address has changed, reconfigure the integration."
+            f"Cannot connect to {host}. Verify the address and network reachability."
         ) from err
-
     except TimeoutError as err:
-        if primary_device is not None:
+        if primary_device:
             await primary_device.stop()
-        _LOGGER.warning(
-            "The inverter is not responding to requests. "
-            "The connection was established but no data was received. "
-            "The device may be starting up, overloaded, or blocking Modbus requests"
-        )
         raise ConfigEntryNotReady(
-            "The inverter is not responding to requests. "
-            "It may be starting up or temporarily busy."
+            "The inverter is not responding. It may be starting up or temporarily busy."
         ) from err
-
     except HuaweiSolarException as err:
-        if primary_device is not None:
+        if primary_device:
             await primary_device.stop()
-        _LOGGER.warning(
-            "Failed to communicate with the inverter during setup: %s. ",
-            err,
-            exc_info=err,
-        )
-        raise ConfigEntryNotReady(
-            f"Failed to communicate with the inverter: {err}"
-        ) from err
-
+        raise ConfigEntryNotReady(f"Failed to communicate with inverter: {err}") from err
     except Exception:
-        # always try to stop the bridge, as it will keep retrying
-        # in the background otherwise!
-        if primary_device is not None:
+        if primary_device:
             await primary_device.stop()
         raise
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     await async_setup_services(hass, entry)
-
     return True
 
 
-async def async_unload_entry(
-    hass: HomeAssistant, entry: HuaweiSolarConfigEntry
-) -> bool:
+async def async_unload_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) -> bool:
     """Unload a config entry."""
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
-        device_datas: list[HuaweiSolarDeviceData] = entry.runtime_data["device_datas"]
-        primary_device = device_datas[0].device
-        await primary_device.client.disconnect()
+        device_datas: list[HuaweiSolarDeviceData] = entry.runtime_data[DATA_DEVICE_DATAS]
 
-        # Stop telemetry push timers and clean up singletons for all devices
+        await device_datas[0].device.client.disconnect()
+
         for device_data in device_datas:
             serial = device_data.device.serial_number
+
+            # Stop telemetry push timers
             telemetry = ModbusTelemetry.get(serial)
             if telemetry:
                 telemetry.stop()
+
+            # Unregister all night-mode callbacks
+            detector = NightModeDetector.get_or_create(serial)
+            for attr in (
+                "update_coordinator",
+                "configuration_update_coordinator",
+                "power_meter_update_coordinator",
+                "energy_storage_update_coordinator",
+                "optimizer_update_coordinator",
+            ):
+                coord = getattr(device_data, attr, None)
+                if coord is not None:
+                    if hasattr(coord, "_on_mode_change"):
+                        detector.unregister_callback(coord._on_mode_change)
+                    # B3: stop independent keepalive timer if running
+                    if hasattr(coord, "_stop_keepalive_timer"):
+                        coord._stop_keepalive_timer()
+
+        # Clear all per-inverter singletons
         ModbusGuard.clear_registry()
         ModbusTelemetry.clear_registry()
+        NightModeDetector.clear_registry()
+        StaticRegisterCache.clear_registry()
+        LiveRegisterBus.clear_registry()
 
     return unload_ok
 
 
-def _battery_product_model_to_manufacturer(spm: rv.StorageProductModel) -> str | None:
-    if spm == rv.StorageProductModel.HUAWEI_LUNA2000:
-        return "Huawei"
-    if spm == rv.StorageProductModel.LG_RESU:
-        return "LG Chem"
-    return None
+# ── Device data factory helpers ───────────────────────────────────────────────
+
+def _battery_manufacturer(spm: rv.StorageProductModel) -> str | None:
+    return {
+        rv.StorageProductModel.HUAWEI_LUNA2000: "Huawei",
+        rv.StorageProductModel.LG_RESU: "LG Chem",
+    }.get(spm)
 
 
-def _battery_product_model_to_model(spm: rv.StorageProductModel) -> str | None:
-    if spm == rv.StorageProductModel.HUAWEI_LUNA2000:
-        return "LUNA 2000"
-    if spm == rv.StorageProductModel.LG_RESU:
-        return "RESU"
-    return None
+def _battery_model(spm: rv.StorageProductModel) -> str | None:
+    return {
+        rv.StorageProductModel.HUAWEI_LUNA2000: "LUNA 2000",
+        rv.StorageProductModel.LG_RESU: "RESU",
+    }.get(spm)
+
+
+def _make_coordinator(
+    hass: HomeAssistant,
+    device: HuaweiSolarDevice,
+    name_suffix: str,
+    update_interval: timedelta,
+    telemetry: ModbusTelemetry,
+    stagger_index: int,
+    is_night: bool,
+) -> HuaweiSolarUpdateCoordinator:
+    """Create one HuaweiSolarUpdateCoordinator with stagger offset and night mode applied."""
+    coord = HuaweiSolarUpdateCoordinator(
+        hass,
+        _LOGGER,
+        device=device,
+        name=f"{device.serial_number}_{name_suffix}",
+        update_interval=update_interval,
+        stagger_offset=timedelta(seconds=COORDINATOR_STAGGER_SECONDS * stagger_index),
+    )
+    coord.attach_telemetry(telemetry)
+    if is_night:
+        coord.update_interval = NIGHT_POLL_INTERVAL
+        coord.cache.set_night_mode(True)
+        coord._is_night = True
+    return coord
 
 
 async def _setup_inverter_device_data(
     hass: HomeAssistant,
     entry: ConfigEntry,
     device: SUN2000Device,
-    connecting_inverter_device_id: tuple[str, str] | None,
 ) -> HuaweiSolarInverterData:
     device_registry = dr.async_get(hass)
 
@@ -262,10 +248,7 @@ async def _setup_inverter_device_data(
         model=device.model_name,
         serial_number=device.serial_number,
         sw_version=device.software_version,
-        via_device=connecting_inverter_device_id,  # type: ignore[typeddict-item]
     )
-
-    # Add inverter device to device registery
     device_registry.async_get_or_create(
         config_entry_id=entry.entry_id,
         identifiers={(DOMAIN, device.serial_number)},
@@ -275,148 +258,105 @@ async def _setup_inverter_device_data(
         sw_version=device.software_version,
     )
 
-    update_coordinator = HuaweiSolarUpdateCoordinator(
-        hass,
-        _LOGGER,
-        device=device,
-        name=f"{device.serial_number}_data_update_coordinator",
-        update_interval=INVERTER_UPDATE_INTERVAL,
+    # ── Night mode singleton — restore from storage ───────────────────────────
+    night_detector = NightModeDetector.get_or_create(device.serial_number)
+    night_detector.attach_hass(hass)
+    await night_detector.async_restore()
+    is_night = night_detector.is_night
+
+    # ── Shared telemetry singleton ────────────────────────────────────────────
+    telemetry = ModbusTelemetry.get_or_create(hass, device.serial_number, inverter_device_info)
+
+    # ── Coordinator 0: main inverter (no stagger — fires immediately) ─────────
+    update_coordinator = _make_coordinator(
+        hass, device, "data_update_coordinator",
+        INVERTER_UPDATE_INTERVAL, telemetry, 0, is_night,
     )
 
-    # Create telemetry singleton and attach to the main coordinator.
-    # All sub-coordinators (power meter, battery, config) for this inverter
-    # share the same singleton so all Modbus traffic is aggregated.
-    telemetry = ModbusTelemetry.get_or_create(
-        hass, device.serial_number, inverter_device_info
-    )
-    update_coordinator.attach_telemetry(telemetry)
-
-    # Add power meter device if a power meter is detected
+    # ── Coordinator 1: power meter ────────────────────────────────────────────
+    power_meter_device_info = None
+    power_meter_update_coordinator = None
     if device.power_meter_type is not None:
         power_meter_device_info = DeviceInfo(
-            identifiers={
-                (DOMAIN, f"{device.serial_number}/power_meter"),
-            },
+            identifiers={(DOMAIN, f"{device.serial_number}/power_meter")},
             translation_key="power_meter",
             via_device=(DOMAIN, device.serial_number),
         )
-        power_meter_update_coordinator = HuaweiSolarUpdateCoordinator(
-            hass,
-            _LOGGER,
-            device=device,
-            name=f"{device.serial_number}_power_meter_data_update_coordinator",
-            update_interval=POWER_METER_UPDATE_INTERVAL,
+        power_meter_update_coordinator = _make_coordinator(
+            hass, device, "power_meter_data_update_coordinator",
+            POWER_METER_UPDATE_INTERVAL, telemetry, 1, is_night,
         )
-        power_meter_update_coordinator.attach_telemetry(telemetry)
-    else:
-        power_meter_device_info = None
-        power_meter_update_coordinator = None
 
-    # Add battery device if a battery is detected
+    # ── Coordinator 2: energy storage ─────────────────────────────────────────
+    battery_device_info = None
+    energy_storage_update_coordinator = None
+    battery_1_device_info = None
+    battery_2_device_info = None
+
     if device.battery_type != rv.StorageProductModel.NONE:
         battery_device_info = DeviceInfo(
-            identifiers={
-                (DOMAIN, f"{device.serial_number}/connected_energy_storage"),
-            },
+            identifiers={(DOMAIN, f"{device.serial_number}/connected_energy_storage")},
             translation_key="connected_energy_storage",
             model="Batteries",
             manufacturer=inverter_device_info.get("manufacturer"),
             via_device=(DOMAIN, device.serial_number),
         )
-
-        energy_storage_update_coordinator = HuaweiSolarUpdateCoordinator(
-            hass,
-            _LOGGER,
-            device=device,
-            name=f"{device.serial_number}_battery_data_update_coordinator",
-            update_interval=ENERGY_STORAGE_UPDATE_INTERVAL,
+        energy_storage_update_coordinator = _make_coordinator(
+            hass, device, "battery_data_update_coordinator",
+            ENERGY_STORAGE_UPDATE_INTERVAL, telemetry, 2, is_night,
         )
-        energy_storage_update_coordinator.attach_telemetry(telemetry)
-    else:
-        battery_device_info = None
-        energy_storage_update_coordinator = None
 
     if device.battery_1_type != rv.StorageProductModel.NONE:
         battery_1_device_info = DeviceInfo(
-            identifiers={
-                (DOMAIN, f"{device.serial_number}/battery_1"),
-            },
+            identifiers={(DOMAIN, f"{device.serial_number}/battery_1")},
             translation_key="battery_1",
-            manufacturer=_battery_product_model_to_manufacturer(device.battery_1_type),
-            model=_battery_product_model_to_model(device.battery_1_type),
+            manufacturer=_battery_manufacturer(device.battery_1_type),
+            model=_battery_model(device.battery_1_type),
             via_device=(DOMAIN, device.serial_number),
         )
-    else:
-        battery_1_device_info = None
-
     if device.battery_2_type != rv.StorageProductModel.NONE:
         battery_2_device_info = DeviceInfo(
-            identifiers={
-                (DOMAIN, f"{device.serial_number}/battery_2"),
-            },
+            identifiers={(DOMAIN, f"{device.serial_number}/battery_2")},
             translation_key="battery_2",
-            manufacturer=_battery_product_model_to_manufacturer(device.battery_2_type),
-            model=_battery_product_model_to_model(device.battery_2_type),
+            manufacturer=_battery_manufacturer(device.battery_2_type),
+            model=_battery_model(device.battery_2_type),
             via_device=(DOMAIN, device.serial_number),
         )
-    else:
-        battery_2_device_info = None
 
-    optimizers_device_infos = {}
+    # ── Optimizer coordinator ─────────────────────────────────────────────────
+    optimizers_device_infos: dict = {}
     optimizer_update_coordinator = None
 
-    # Add optimizer devices if optimizers are detected
-    if device.has_optimizers and (
-        # Optimizers are not accessible when connected through a SmartLogger
-        not isinstance(device.primary_device, SmartLoggerDevice)
-    ):
+    if device.has_optimizers and not isinstance(device.primary_device, SmartLoggerDevice):
         try:
-            optimizer_system_infos = (
-                await device.get_optimizer_system_information_data()
-            )
-
+            optimizer_system_infos = await device.get_optimizer_system_information_data()
             optimizers_device_infos = {
-                optimizer_id: DeviceInfo(
-                    identifiers={(DOMAIN, optimizer.sn)},
-                    name=optimizer.sn,
+                oid: DeviceInfo(
+                    identifiers={(DOMAIN, opt.sn)},
+                    name=opt.sn,
                     manufacturer="Huawei",
-                    model=optimizer.model,
-                    sw_version=optimizer.software_version,
+                    model=opt.model,
+                    sw_version=opt.software_version,
                     via_device=(DOMAIN, device.serial_number),
                 )
-                for optimizer_id, optimizer in optimizer_system_infos.items()
+                for oid, opt in optimizer_system_infos.items()
             }
-
             optimizer_update_coordinator = await create_optimizer_update_coordinator(
-                hass,
-                device,
-                optimizers_device_infos,
-                OPTIMIZER_UPDATE_INTERVAL,
+                hass, device, optimizers_device_infos, OPTIMIZER_UPDATE_INTERVAL,
             )
             optimizer_update_coordinator.attach_telemetry(telemetry)
-        except PermissionDeniedError as exception:
-            _LOGGER.info(
-                "Cannot create optimizer sensor entities as the integration has insufficient permissions. "
-                "Consider enabling elevated permissions to get more optimizer data",
-                exc_info=exception,
-            )
-        except Exception as exc:  # pylint: disable=broad-except
-            _LOGGER.exception(
-                "Cannot create optimizer sensor entities due to an unexpected error",
-                exc_info=exc,
-            )
+        except PermissionDeniedError as exc:
+            _LOGGER.info("Optimizer entities skipped — insufficient permissions.", exc_info=exc)
+        except Exception as exc:
+            _LOGGER.exception("Optimizer setup failed.", exc_info=exc)
 
+    # ── Coordinator 3: configuration ──────────────────────────────────────────
+    configuration_update_coordinator = None
     if entry.data.get(CONF_ENABLE_PARAMETER_CONFIGURATION, False):
-        configuration_update_coordinator = HuaweiSolarUpdateCoordinator(
-            hass,
-            _LOGGER,
-            device=device,
-            name=f"{device.serial_number}_config_data_update_coordinator",
-            update_interval=CONFIGURATION_UPDATE_INTERVAL,
+        configuration_update_coordinator = _make_coordinator(
+            hass, device, "config_data_update_coordinator",
+            CONFIGURATION_UPDATE_INTERVAL, telemetry, 3, is_night,
         )
-        configuration_update_coordinator.attach_telemetry(telemetry)
-    else:
-        configuration_update_coordinator = None
 
     return HuaweiSolarInverterData(
         device=device,
@@ -448,12 +388,10 @@ async def _setup_device_data(
     entry: ConfigEntry,
     device: HuaweiSolarDevice,
 ) -> HuaweiSolarDeviceData:
-    """Create the correct DeviceInfo-objects, which can be used to correctly assign to entities in this integration."""
     if isinstance(device, SUN2000Device):
-        return await _setup_inverter_device_data(hass, entry, device, None)
+        return await _setup_inverter_device_data(hass, entry, device)
 
     device_registry = dr.async_get(hass)
-
     sw_version = getattr(device, "software_version", None)
 
     device_info = DeviceInfo(
@@ -464,8 +402,6 @@ async def _setup_device_data(
         serial_number=device.serial_number,
         sw_version=sw_version,
     )
-
-    # Add device to device registery
     device_registry.async_get_or_create(
         config_entry_id=entry.entry_id,
         identifiers={(DOMAIN, device.serial_number)},
@@ -476,23 +412,18 @@ async def _setup_device_data(
     )
 
     update_coordinator = HuaweiSolarUpdateCoordinator(
-        hass,
-        _LOGGER,
-        device=device,
+        hass, _LOGGER, device=device,
         name=f"{device.serial_number}_data_update_coordinator",
         update_interval=INVERTER_UPDATE_INTERVAL,
     )
-
+    configuration_update_coordinator = None
     if entry.data.get(CONF_ENABLE_PARAMETER_CONFIGURATION, False):
         configuration_update_coordinator = HuaweiSolarUpdateCoordinator(
-            hass,
-            _LOGGER,
-            device=device,
+            hass, _LOGGER, device=device,
             name=f"{device.serial_number}_config_data_update_coordinator",
             update_interval=CONFIGURATION_UPDATE_INTERVAL,
+            stagger_offset=timedelta(seconds=COORDINATOR_STAGGER_SECONDS),
         )
-    else:
-        configuration_update_coordinator = None
 
     return HuaweiSolarDeviceData(
         device=device,

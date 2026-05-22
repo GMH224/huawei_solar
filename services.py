@@ -1,4 +1,10 @@
-"""The Huawei Solar services."""
+"""The Huawei Solar services.
+
+v2.12.1: All device.set() calls are now wrapped in ``guard.request()`` so
+writes are serialised with coordinator polls on the shared Modbus bus.
+Written registers are also invalidated in the register cache so stale values
+are not served to HA entities after a service call.
+"""
 
 from __future__ import annotations
 
@@ -84,6 +90,23 @@ _LOGGER = logging.getLogger(__name__)
 
 class HuaweiSolarServiceException(Exception):
     """Exception while executing Huawei Solar Service Call."""
+
+
+# ── Guard + cache invalidation helpers ───────────────────────────────────────
+
+def _invalidate(dd: HuaweiSolarDeviceData, *register_names: RegisterName) -> None:
+    """Invalidate registers on all coordinators of a device."""
+    coordinators = [dd.update_coordinator]
+    if dd.configuration_update_coordinator:
+        coordinators.append(dd.configuration_update_coordinator)
+    if isinstance(dd, HuaweiSolarInverterData):
+        if dd.energy_storage_update_coordinator:
+            coordinators.append(dd.energy_storage_update_coordinator)
+        if dd.power_meter_update_coordinator:
+            coordinators.append(dd.power_meter_update_coordinator)
+    for coord in coordinators:
+        for name in register_names:
+            coord.cache.invalidate(name)
 
 
 #############################################
@@ -380,52 +403,61 @@ async def forcible_charge(service_call: ServiceCall) -> None:
     power = await _validate_power_value(
         service_call.data[DATA_POWER], dd, rn.STORAGE_MAXIMUM_CHARGE_POWER
     )
-
     duration = service_call.data[DATA_DURATION]
     if duration > 1440:
         raise ValueError("Maximum duration is 1440 minutes")
 
-    await dd.device.set(rn.STORAGE_FORCIBLE_CHARGE_POWER, power)
-    await dd.device.set(
-        rn.STORAGE_FORCED_CHARGING_AND_DISCHARGING_PERIOD,
-        duration,
-    )
-    await dd.device.set(
-        rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SETTING_MODE,
-        rv.StorageForcibleChargeDischargeTargetMode.TIME,
-    )
-    await dd.device.set(
-        rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_WRITE,
-        rv.StorageForcibleChargeDischarge.CHARGE,
-    )
+    async with dd.update_coordinator.guard.request():
+        await dd.device.set(rn.STORAGE_FORCIBLE_CHARGE_POWER, power)
+        await dd.device.set(rn.STORAGE_FORCED_CHARGING_AND_DISCHARGING_PERIOD, duration)
+        await dd.device.set(
+            rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SETTING_MODE,
+            rv.StorageForcibleChargeDischargeTargetMode.TIME,
+        )
+        await dd.device.set(
+            rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_WRITE,
+            rv.StorageForcibleChargeDischarge.CHARGE,
+        )
 
+    _invalidate(
+        dd,
+        rn.STORAGE_FORCIBLE_CHARGE_POWER,
+        rn.STORAGE_FORCED_CHARGING_AND_DISCHARGING_PERIOD,
+        rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SETTING_MODE,
+        rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_WRITE,
+    )
     assert dd.configuration_update_coordinator
     await dd.configuration_update_coordinator.async_refresh()
 
 
 async def forcible_discharge(service_call: ServiceCall) -> None:
-    """Start a forcible charge on the battery."""
+    """Start a forcible discharge on the battery."""
     dd = get_battery_device_data(service_call)
     power = await _validate_power_value(
         service_call.data[DATA_POWER], dd, rn.STORAGE_MAXIMUM_DISCHARGE_POWER
     )
-
     duration = service_call.data[DATA_DURATION]
     if duration > 1440:
         raise ValueError("Maximum duration is 1440 minutes")
 
-    await dd.device.set(rn.STORAGE_FORCIBLE_DISCHARGE_POWER, power)
-    await dd.device.set(
+    async with dd.update_coordinator.guard.request():
+        await dd.device.set(rn.STORAGE_FORCIBLE_DISCHARGE_POWER, power)
+        await dd.device.set(rn.STORAGE_FORCED_CHARGING_AND_DISCHARGING_PERIOD, duration)
+        await dd.device.set(
+            rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SETTING_MODE,
+            rv.StorageForcibleChargeDischargeTargetMode.TIME,
+        )
+        await dd.device.set(
+            rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_WRITE,
+            rv.StorageForcibleChargeDischarge.DISCHARGE,
+        )
+
+    _invalidate(
+        dd,
+        rn.STORAGE_FORCIBLE_DISCHARGE_POWER,
         rn.STORAGE_FORCED_CHARGING_AND_DISCHARGING_PERIOD,
-        duration,
-    )
-    await dd.device.set(
         rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SETTING_MODE,
-        rv.StorageForcibleChargeDischargeTargetMode.TIME,
-    )
-    await dd.device.set(
         rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_WRITE,
-        rv.StorageForcibleChargeDischarge.DISCHARGE,
     )
     assert dd.configuration_update_coordinator
     await dd.configuration_update_coordinator.async_refresh()
@@ -439,15 +471,24 @@ async def forcible_charge_soc(service_call: ServiceCall) -> None:
         service_call.data[DATA_POWER], dd, rn.STORAGE_MAXIMUM_CHARGE_POWER
     )
 
-    await dd.device.set(rn.STORAGE_FORCIBLE_CHARGE_POWER, power)
-    await dd.device.set(rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SOC, target_soc)
-    await dd.device.set(
+    async with dd.update_coordinator.guard.request():
+        await dd.device.set(rn.STORAGE_FORCIBLE_CHARGE_POWER, power)
+        await dd.device.set(rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SOC, target_soc)
+        await dd.device.set(
+            rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SETTING_MODE,
+            rv.StorageForcibleChargeDischargeTargetMode.SOC,
+        )
+        await dd.device.set(
+            rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_WRITE,
+            rv.StorageForcibleChargeDischarge.CHARGE,
+        )
+
+    _invalidate(
+        dd,
+        rn.STORAGE_FORCIBLE_CHARGE_POWER,
+        rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SOC,
         rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SETTING_MODE,
-        rv.StorageForcibleChargeDischargeTargetMode.SOC,
-    )
-    await dd.device.set(
         rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_WRITE,
-        rv.StorageForcibleChargeDischarge.CHARGE,
     )
     assert dd.configuration_update_coordinator
     await dd.configuration_update_coordinator.async_refresh()
@@ -461,15 +502,24 @@ async def forcible_discharge_soc(service_call: ServiceCall) -> None:
         service_call.data[DATA_POWER], dd, rn.STORAGE_MAXIMUM_DISCHARGE_POWER
     )
 
-    await dd.device.set(rn.STORAGE_FORCIBLE_DISCHARGE_POWER, power)
-    await dd.device.set(rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SOC, target_soc)
-    await dd.device.set(
+    async with dd.update_coordinator.guard.request():
+        await dd.device.set(rn.STORAGE_FORCIBLE_DISCHARGE_POWER, power)
+        await dd.device.set(rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SOC, target_soc)
+        await dd.device.set(
+            rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SETTING_MODE,
+            rv.StorageForcibleChargeDischargeTargetMode.SOC,
+        )
+        await dd.device.set(
+            rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_WRITE,
+            rv.StorageForcibleChargeDischarge.DISCHARGE,
+        )
+
+    _invalidate(
+        dd,
+        rn.STORAGE_FORCIBLE_DISCHARGE_POWER,
+        rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SOC,
         rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SETTING_MODE,
-        rv.StorageForcibleChargeDischargeTargetMode.SOC,
-    )
-    await dd.device.set(
         rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_WRITE,
-        rv.StorageForcibleChargeDischarge.DISCHARGE,
     )
     assert dd.configuration_update_coordinator
     await dd.configuration_update_coordinator.async_refresh()
@@ -478,20 +528,26 @@ async def forcible_discharge_soc(service_call: ServiceCall) -> None:
 async def stop_forcible_charge(service_call: ServiceCall) -> None:
     """Stop a forcible charge or discharge."""
     dd = get_battery_device_data(service_call)
-    await dd.device.set(
-        rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_WRITE,
-        rv.StorageForcibleChargeDischarge.STOP,
-    )
-    await dd.device.set(rn.STORAGE_FORCIBLE_DISCHARGE_POWER, 0)
-    await dd.device.set(
-        rn.STORAGE_FORCED_CHARGING_AND_DISCHARGING_PERIOD,
-        0,
-    )
-    await dd.device.set(
-        rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SETTING_MODE,
-        rv.StorageForcibleChargeDischargeTargetMode.TIME,
-    )
 
+    async with dd.update_coordinator.guard.request():
+        await dd.device.set(
+            rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_WRITE,
+            rv.StorageForcibleChargeDischarge.STOP,
+        )
+        await dd.device.set(rn.STORAGE_FORCIBLE_DISCHARGE_POWER, 0)
+        await dd.device.set(rn.STORAGE_FORCED_CHARGING_AND_DISCHARGING_PERIOD, 0)
+        await dd.device.set(
+            rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SETTING_MODE,
+            rv.StorageForcibleChargeDischargeTargetMode.TIME,
+        )
+
+    _invalidate(
+        dd,
+        rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_WRITE,
+        rn.STORAGE_FORCIBLE_DISCHARGE_POWER,
+        rn.STORAGE_FORCED_CHARGING_AND_DISCHARGING_PERIOD,
+        rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SETTING_MODE,
+    )
     assert dd.configuration_update_coordinator
     await dd.configuration_update_coordinator.async_refresh()
 
@@ -533,17 +589,14 @@ async def reset_maximum_feed_grid_power(
 ) -> None:
     """Set Active Power Control to 'Unlimited'."""
     dd = _get_power_control_device_data(manager_type, service_call)
+    regs = POWER_CONTROL_REGISTERS[manager_type]
 
-    await dd.device.set(
-        POWER_CONTROL_REGISTERS[manager_type]["MODE_REGISTER"],
-        rv.ActivePowerControlMode.UNLIMITED,
-    )
-    await dd.device.set(POWER_CONTROL_REGISTERS[manager_type]["POWER_WATT_REGISTER"], 0)
-    await dd.device.set(
-        POWER_CONTROL_REGISTERS[manager_type]["POWER_PERCENT_REGISTER"],
-        0,
-    )
+    async with dd.update_coordinator.guard.request():
+        await dd.device.set(regs["MODE_REGISTER"], rv.ActivePowerControlMode.UNLIMITED)
+        await dd.device.set(regs["POWER_WATT_REGISTER"], 0)
+        await dd.device.set(regs["POWER_PERCENT_REGISTER"], 0)
 
+    _invalidate(dd, regs["MODE_REGISTER"], regs["POWER_WATT_REGISTER"], regs["POWER_PERCENT_REGISTER"])
     assert dd.configuration_update_coordinator
     await dd.configuration_update_coordinator.async_refresh()
 
@@ -552,16 +605,21 @@ async def reset_maximum_feed_grid_power(
 async def set_di_active_power_scheduling(service_call: ServiceCall) -> None:
     """Set Active Power Control to 'DI active scheduling'."""
     dd = get_inverter_data(service_call)
-    await dd.device.set(
-        rn.ACTIVE_POWER_CONTROL_MODE,
-        rv.ActivePowerControlMode.DI_ACTIVE_SCHEDULING,
-    )
-    await dd.device.set(rn.MAXIMUM_FEED_GRID_POWER_WATT, 0)
-    await dd.device.set(
-        rn.MAXIMUM_FEED_GRID_POWER_PERCENT,
-        0,
-    )
 
+    async with dd.update_coordinator.guard.request():
+        await dd.device.set(
+            rn.ACTIVE_POWER_CONTROL_MODE,
+            rv.ActivePowerControlMode.DI_ACTIVE_SCHEDULING,
+        )
+        await dd.device.set(rn.MAXIMUM_FEED_GRID_POWER_WATT, 0)
+        await dd.device.set(rn.MAXIMUM_FEED_GRID_POWER_PERCENT, 0)
+
+    _invalidate(
+        dd,
+        rn.ACTIVE_POWER_CONTROL_MODE,
+        rn.MAXIMUM_FEED_GRID_POWER_WATT,
+        rn.MAXIMUM_FEED_GRID_POWER_PERCENT,
+    )
     assert dd.configuration_update_coordinator
     await dd.configuration_update_coordinator.async_refresh()
 
@@ -572,16 +630,17 @@ async def set_zero_power_grid_connection(
 ) -> None:
     """Set Active Power Control to 'Zero-Power Grid Connection'."""
     dd = _get_power_control_device_data(manager_type, service_call)
-    await dd.device.set(
-        POWER_CONTROL_REGISTERS[manager_type]["MODE_REGISTER"],
-        rv.ActivePowerControlMode.ZERO_POWER_GRID_CONNECTION,
-    )
-    await dd.device.set(POWER_CONTROL_REGISTERS[manager_type]["POWER_WATT_REGISTER"], 0)
-    await dd.device.set(
-        POWER_CONTROL_REGISTERS[manager_type]["POWER_PERCENT_REGISTER"],
-        0,
-    )
+    regs = POWER_CONTROL_REGISTERS[manager_type]
 
+    async with dd.update_coordinator.guard.request():
+        await dd.device.set(
+            regs["MODE_REGISTER"],
+            rv.ActivePowerControlMode.ZERO_POWER_GRID_CONNECTION,
+        )
+        await dd.device.set(regs["POWER_WATT_REGISTER"], 0)
+        await dd.device.set(regs["POWER_PERCENT_REGISTER"], 0)
+
+    _invalidate(dd, regs["MODE_REGISTER"], regs["POWER_WATT_REGISTER"], regs["POWER_PERCENT_REGISTER"])
     assert dd.configuration_update_coordinator
     await dd.configuration_update_coordinator.async_refresh()
 
@@ -593,15 +652,16 @@ async def set_maximum_feed_grid_power(
     """Set Active Power Control to 'Power-limited grid connection' with the given wattage."""
     dd = _get_power_control_device_data(manager_type, service_call)
     power = await _validate_power_value(service_call.data[DATA_POWER], dd, rn.P_MAX)
+    regs = POWER_CONTROL_REGISTERS[manager_type]
 
-    await dd.device.set(
-        POWER_CONTROL_REGISTERS[manager_type]["POWER_WATT_REGISTER"], power
-    )
-    await dd.device.set(
-        POWER_CONTROL_REGISTERS[manager_type]["MODE_REGISTER"],
-        rv.ActivePowerControlMode.POWER_LIMITED_GRID_CONNECTION_WATT,
-    )
+    async with dd.update_coordinator.guard.request():
+        await dd.device.set(regs["POWER_WATT_REGISTER"], power)
+        await dd.device.set(
+            regs["MODE_REGISTER"],
+            rv.ActivePowerControlMode.POWER_LIMITED_GRID_CONNECTION_WATT,
+        )
 
+    _invalidate(dd, regs["POWER_WATT_REGISTER"], regs["MODE_REGISTER"])
     assert dd.configuration_update_coordinator
     await dd.configuration_update_coordinator.async_refresh()
 
@@ -613,16 +673,16 @@ async def set_maximum_feed_grid_power_percentage(
     """Set Active Power Control to 'Power-limited grid connection' with the given percentage."""
     dd = _get_power_control_device_data(manager_type, service_call)
     power_percentage = service_call.data[DATA_POWER_PERCENTAGE]
+    regs = POWER_CONTROL_REGISTERS[manager_type]
 
-    await dd.device.set(
-        POWER_CONTROL_REGISTERS[manager_type]["POWER_PERCENT_REGISTER"],
-        power_percentage,
-    )
-    await dd.device.set(
-        POWER_CONTROL_REGISTERS[manager_type]["MODE_REGISTER"],
-        rv.ActivePowerControlMode.POWER_LIMITED_GRID_CONNECTION_PERCENT,
-    )
+    async with dd.update_coordinator.guard.request():
+        await dd.device.set(regs["POWER_PERCENT_REGISTER"], power_percentage)
+        await dd.device.set(
+            regs["MODE_REGISTER"],
+            rv.ActivePowerControlMode.POWER_LIMITED_GRID_CONNECTION_PERCENT,
+        )
 
+    _invalidate(dd, regs["POWER_PERCENT_REGISTER"], regs["MODE_REGISTER"])
     assert dd.configuration_update_coordinator
     await dd.configuration_update_coordinator.async_refresh()
 
@@ -631,7 +691,6 @@ async def set_battery_tou_periods(
     service_call: ServiceCall,
 ) -> None:
     """Set the TOU periods of the battery."""
-
     dd = get_battery_device_data(service_call)
 
     if dd.device.battery_type == rv.StorageProductModel.HUAWEI_LUNA2000:
@@ -641,19 +700,25 @@ async def set_battery_tou_periods(
             raise ValueError(
                 f"Invalid periods: validation failed for '{service_call.data[DATA_PERIODS]}' as LUNA2000 TOU periods"
             )
-        await dd.device.set(
-            rn.STORAGE_HUAWEI_LUNA2000_TIME_OF_USE_CHARGING_AND_DISCHARGING_PERIODS,
-            _parse_huawei_luna2000_periods(service_call.data[DATA_PERIODS]),
-        )
+        tou_reg = rn.STORAGE_HUAWEI_LUNA2000_TIME_OF_USE_CHARGING_AND_DISCHARGING_PERIODS
+        async with dd.update_coordinator.guard.request():
+            await dd.device.set(
+                tou_reg,
+                _parse_huawei_luna2000_periods(service_call.data[DATA_PERIODS]),
+            )
+        _invalidate(dd, tou_reg)
     elif dd.device.battery_type == rv.StorageProductModel.LG_RESU:
         if not re.fullmatch(LG_RESU_TOU_PATTERN, service_call.data[DATA_PERIODS]):
             raise ValueError(
                 f"Invalid periods: validation failed for '{service_call.data[DATA_PERIODS]}' as LG RESU TOU periods"
             )
-        await dd.device.set(
-            rn.STORAGE_LG_RESU_TIME_OF_USE_PRICE_PERIODS,
-            _parse_lg_resu_periods(service_call.data[DATA_PERIODS]),
-        )
+        tou_reg = rn.STORAGE_LG_RESU_TIME_OF_USE_PRICE_PERIODS
+        async with dd.update_coordinator.guard.request():
+            await dd.device.set(
+                tou_reg,
+                _parse_lg_resu_periods(service_call.data[DATA_PERIODS]),
+            )
+        _invalidate(dd, tou_reg)
 
     assert dd.configuration_update_coordinator
     await dd.configuration_update_coordinator.async_refresh()
@@ -663,18 +728,20 @@ async def set_emma_tou_periods(
     service_call: ServiceCall,
 ) -> None:
     """Set the TOU periods of a battery controlled by an EMMA."""
-
     dd = get_emma_device(service_call)
 
     if not re.fullmatch(HUAWEI_LUNA2000_TOU_PATTERN, service_call.data[DATA_PERIODS]):
         raise ValueError(
             f"Invalid periods: validation failed for '{service_call.data[DATA_PERIODS]}' as TOU periods"
         )
-    await dd.device.set(
-        rn.EMMA_TOU_PERIODS,
-        _parse_huawei_luna2000_periods(service_call.data[DATA_PERIODS]),
-    )
 
+    async with dd.update_coordinator.guard.request():
+        await dd.device.set(
+            rn.EMMA_TOU_PERIODS,
+            _parse_huawei_luna2000_periods(service_call.data[DATA_PERIODS]),
+        )
+
+    _invalidate(dd, rn.EMMA_TOU_PERIODS)
     assert dd.configuration_update_coordinator
     await dd.configuration_update_coordinator.async_refresh()
 
@@ -698,7 +765,6 @@ def _parse_capacity_control_periods(text: str) -> list[PeakSettingPeriod]:
 
 async def set_capacity_control_periods(service_call: ServiceCall) -> None:
     """Set the Capacity Control Periods of the battery."""
-
     dd = get_battery_device_data(service_call)
 
     if not re.fullmatch(
@@ -708,11 +774,13 @@ async def set_capacity_control_periods(service_call: ServiceCall) -> None:
             f"Invalid periods: could not validate '{service_call.data[DATA_PERIODS]}' as capacity control periods"
         )
 
-    await dd.device.set(
-        rn.STORAGE_CAPACITY_CONTROL_PERIODS,
-        _parse_capacity_control_periods(service_call.data[DATA_PERIODS]),
-    )
+    async with dd.update_coordinator.guard.request():
+        await dd.device.set(
+            rn.STORAGE_CAPACITY_CONTROL_PERIODS,
+            _parse_capacity_control_periods(service_call.data[DATA_PERIODS]),
+        )
 
+    _invalidate(dd, rn.STORAGE_CAPACITY_CONTROL_PERIODS)
     assert dd.configuration_update_coordinator
     await dd.configuration_update_coordinator.async_refresh()
 
@@ -742,11 +810,13 @@ async def set_fixed_charge_periods(service_call: ServiceCall) -> None:
             f"Invalid periods: could not validate '{service_call.data[DATA_PERIODS]}' as fixed charging periods"
         )
 
-    await dd.device.set(
-        rn.STORAGE_FIXED_CHARGING_AND_DISCHARGING_PERIODS,
-        _parse_fixed_charge_periods(service_call.data[DATA_PERIODS]),
-    )
+    async with dd.update_coordinator.guard.request():
+        await dd.device.set(
+            rn.STORAGE_FIXED_CHARGING_AND_DISCHARGING_PERIODS,
+            _parse_fixed_charge_periods(service_call.data[DATA_PERIODS]),
+        )
 
+    _invalidate(dd, rn.STORAGE_FIXED_CHARGING_AND_DISCHARGING_PERIODS)
     assert dd.configuration_update_coordinator
     await dd.configuration_update_coordinator.async_refresh()
 
@@ -779,136 +849,85 @@ async def async_setup_services(
     )
     has_emma = any(isinstance(uc.device, EMMADevice) for uc in hsucs)
 
-    # Register functions that are available on all inverters, no battery/emma required
     if has_emma:
         hass.services.async_register(
-            DOMAIN,
-            SERVICE_RESET_MAXIMUM_FEED_GRID_POWER,
-            partial(reset_maximum_feed_grid_power, "emma"),
-            schema=EMMA_DEVICE_SCHEMA,
+            DOMAIN, SERVICE_RESET_MAXIMUM_FEED_GRID_POWER,
+            partial(reset_maximum_feed_grid_power, "emma"), schema=EMMA_DEVICE_SCHEMA,
         )
-
         hass.services.async_register(
-            DOMAIN,
-            SERVICE_SET_ZERO_POWER_GRID_CONNECTION,
-            partial(set_zero_power_grid_connection, "emma"),
-            schema=EMMA_DEVICE_SCHEMA,
+            DOMAIN, SERVICE_SET_ZERO_POWER_GRID_CONNECTION,
+            partial(set_zero_power_grid_connection, "emma"), schema=EMMA_DEVICE_SCHEMA,
         )
-
         hass.services.async_register(
-            DOMAIN,
-            SERVICE_SET_MAXIMUM_FEED_GRID_POWER,
+            DOMAIN, SERVICE_SET_MAXIMUM_FEED_GRID_POWER,
             partial(set_maximum_feed_grid_power, "emma"),
             schema=EMMA_DEVICE_SCHEMA.extend(MAXIMUM_FEED_GRID_POWER_SCHEMA),
         )
-
         hass.services.async_register(
-            DOMAIN,
-            SERVICE_SET_MAXIMUM_FEED_GRID_POWER_PERCENT,
+            DOMAIN, SERVICE_SET_MAXIMUM_FEED_GRID_POWER_PERCENT,
             partial(set_maximum_feed_grid_power_percentage, "emma"),
             schema=EMMA_DEVICE_SCHEMA.extend(MAXIMUM_FEED_GRID_POWER_PERCENTAGE_SCHEMA),
         )
-
     else:
         hass.services.async_register(
-            DOMAIN,
-            SERVICE_RESET_MAXIMUM_FEED_GRID_POWER,
-            partial(reset_maximum_feed_grid_power, "inverter"),
-            schema=INVERTER_DEVICE_SCHEMA,
+            DOMAIN, SERVICE_RESET_MAXIMUM_FEED_GRID_POWER,
+            partial(reset_maximum_feed_grid_power, "inverter"), schema=INVERTER_DEVICE_SCHEMA,
         )
-
         hass.services.async_register(
-            DOMAIN,
-            SERVICE_SET_ZERO_POWER_GRID_CONNECTION,
-            partial(set_zero_power_grid_connection, "inverter"),
-            schema=INVERTER_DEVICE_SCHEMA,
+            DOMAIN, SERVICE_SET_ZERO_POWER_GRID_CONNECTION,
+            partial(set_zero_power_grid_connection, "inverter"), schema=INVERTER_DEVICE_SCHEMA,
         )
-
         hass.services.async_register(
-            DOMAIN,
-            SERVICE_SET_MAXIMUM_FEED_GRID_POWER,
+            DOMAIN, SERVICE_SET_MAXIMUM_FEED_GRID_POWER,
             partial(set_maximum_feed_grid_power, "inverter"),
             schema=INVERTER_DEVICE_SCHEMA.extend(MAXIMUM_FEED_GRID_POWER_SCHEMA),
         )
-
         hass.services.async_register(
-            DOMAIN,
-            SERVICE_SET_MAXIMUM_FEED_GRID_POWER_PERCENT,
+            DOMAIN, SERVICE_SET_MAXIMUM_FEED_GRID_POWER_PERCENT,
             partial(set_maximum_feed_grid_power_percentage, "inverter"),
-            schema=INVERTER_DEVICE_SCHEMA.extend(
-                MAXIMUM_FEED_GRID_POWER_PERCENTAGE_SCHEMA
-            ),
+            schema=INVERTER_DEVICE_SCHEMA.extend(MAXIMUM_FEED_GRID_POWER_PERCENTAGE_SCHEMA),
         )
-
-        # this service is only available on inverters, not on EMMA
         hass.services.async_register(
-            DOMAIN,
-            SERVICE_SET_DI_ACTIVE_POWER_SCHEDULING,
-            set_di_active_power_scheduling,
-            schema=INVERTER_DEVICE_SCHEMA,
+            DOMAIN, SERVICE_SET_DI_ACTIVE_POWER_SCHEDULING,
+            set_di_active_power_scheduling, schema=INVERTER_DEVICE_SCHEMA,
         )
 
     if has_battery:
-        # When an EMMA is present, it is responsible for managing the battery.
-        # No direct control of the battery is possible.
         if has_emma:
             hass.services.async_register(
-                DOMAIN,
-                SERVICE_SET_TOU_PERIODS,
-                set_emma_tou_periods,
-                schema=EMMA_TOU_PERIODS_SCHEMA,
+                DOMAIN, SERVICE_SET_TOU_PERIODS,
+                set_emma_tou_periods, schema=EMMA_TOU_PERIODS_SCHEMA,
             )
         else:
             hass.services.async_register(
-                DOMAIN,
-                SERVICE_SET_TOU_PERIODS,
-                set_battery_tou_periods,
-                schema=BATTERY_TOU_PERIODS_SCHEMA,
+                DOMAIN, SERVICE_SET_TOU_PERIODS,
+                set_battery_tou_periods, schema=BATTERY_TOU_PERIODS_SCHEMA,
             )
 
         hass.services.async_register(
-            DOMAIN,
-            SERVICE_FORCIBLE_CHARGE,
-            forcible_charge,
-            schema=DURATION_SCHEMA,
+            DOMAIN, SERVICE_FORCIBLE_CHARGE, forcible_charge, schema=DURATION_SCHEMA,
         )
         hass.services.async_register(
-            DOMAIN,
-            SERVICE_FORCIBLE_DISCHARGE,
-            forcible_discharge,
-            schema=DURATION_SCHEMA,
+            DOMAIN, SERVICE_FORCIBLE_DISCHARGE, forcible_discharge, schema=DURATION_SCHEMA,
         )
         hass.services.async_register(
-            DOMAIN,
-            SERVICE_FORCIBLE_CHARGE_SOC,
-            forcible_charge_soc,
-            schema=SOC_SCHEMA,
+            DOMAIN, SERVICE_FORCIBLE_CHARGE_SOC, forcible_charge_soc, schema=SOC_SCHEMA,
         )
         hass.services.async_register(
-            DOMAIN,
-            SERVICE_FORCIBLE_DISCHARGE_SOC,
-            forcible_discharge_soc,
-            schema=SOC_SCHEMA,
+            DOMAIN, SERVICE_FORCIBLE_DISCHARGE_SOC, forcible_discharge_soc, schema=SOC_SCHEMA,
         )
         hass.services.async_register(
-            DOMAIN,
-            SERVICE_STOP_FORCIBLE_CHARGE,
-            stop_forcible_charge,
-            schema=BATTERY_DEVICE_SCHEMA,
+            DOMAIN, SERVICE_STOP_FORCIBLE_CHARGE, stop_forcible_charge, schema=BATTERY_DEVICE_SCHEMA,
         )
 
     if has_lg_battery:
         hass.services.async_register(
-            DOMAIN,
-            SERVICE_SET_FIXED_CHARGE_PERIODS,
-            set_fixed_charge_periods,
-            schema=FIXED_CHARGE_PERIODS_SCHEMA,
+            DOMAIN, SERVICE_SET_FIXED_CHARGE_PERIODS,
+            set_fixed_charge_periods, schema=FIXED_CHARGE_PERIODS_SCHEMA,
         )
 
     if has_capacity_control:
         hass.services.async_register(
-            DOMAIN,
-            SERVICE_SET_CAPACITY_CONTROL_PERIODS,
-            set_capacity_control_periods,
-            schema=CAPACITY_CONTROL_PERIODS_SCHEMA,
+            DOMAIN, SERVICE_SET_CAPACITY_CONTROL_PERIODS,
+            set_capacity_control_periods, schema=CAPACITY_CONTROL_PERIODS_SCHEMA,
         )
