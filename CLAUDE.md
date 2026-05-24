@@ -15,6 +15,7 @@
 6. [Modbus telemetry sensors](#6-modbus-telemetry-sensors)
 7. [Changelog (AI-maintained)](#7-changelog-ai-maintained)
 8. [Developer guide](#8-developer-guide)
+9. [Bug fixes reference](#9-bug-fixes-reference)
 
 ---
 
@@ -60,9 +61,9 @@ homeassistant/
         ├── types.py               # Typed dataclasses for runtime data
         │
         ├── modbus_guard.py        # asyncio lock + inter-request rate limiter
-        ├── modbus_telemetry.py    # Rolling-window traffic stats + HA sensors (11 sensors)
+        ├── modbus_telemetry.py    # Rolling-window traffic stats + HA sensors
         ├── register_cache.py      # Tier-aware + adaptive TTL register cache
-        ├── night_mode.py          # NEW: PV-power-based night/day mode detector
+        ├── night_mode.py          # PV-power-based night/day mode detector
         ├── update_coordinator.py  # Optimised DataUpdateCoordinator implementations
         │
         ├── sensor.py              # SensorEntity implementations + descriptions
@@ -72,7 +73,17 @@ homeassistant/
         ├── button.py              # ButtonEntity (one-shot actions)
         ├── services.py            # HA service definitions (TOU, forcible charge, …)
         ├── config_flow.py         # UI-based configuration flow
-        └── diagnostics.py        # HA diagnostics dump
+        ├── diagnostics.py         # HA diagnostics dump
+        │
+        └── tests/                 # Standalone unit tests (no HA runtime required)
+            ├── conftest.py
+            ├── test_modbus_guard.py
+            ├── test_modbus_telemetry.py
+            ├── test_register_cache.py
+            ├── test_services.py
+            ├── test_init_unload.py
+            ├── test_const_services.py
+            └── test_update_coordinator.py
 ```
 
 ---
@@ -83,7 +94,7 @@ homeassistant/
 > only one TCP/RTU connection at a time, and will return error codes (or silently
 > drop responses) when requests arrive too fast or overlap.
 
-Three new modules address this problem at different levels:
+Three modules address this at different levels:
 
 ---
 
@@ -107,17 +118,12 @@ async with self.guard.request():
     result = await device.batch_update(stale_names)
 ```
 
-All coordinators for the same inverter share one `ModbusGuard` singleton.  When
-a coordinator poll fires, it acquires the lock, performs the request, releases
-the lock, then the next coordinator in the queue starts — respecting the 150 ms
-gap.
-
-**Why this reduces errors:**
-The original code had four independent coordinators (inverter, power meter,
-battery, config) each calling `batch_update()` without coordination.  During an
-HA startup or after a network hiccup all four would fire within milliseconds of
-each other, causing the inverter to see overlapping Modbus frames and respond
-with error codes.
+**`_queue_depth` accounting (v1.0.0 fix):**
+The `_queue_depth` counter tracks how many callers are currently waiting for the
+lock.  It is incremented at the start of `__aenter__` and decremented exactly
+once in the outer `except Exception` block.  A previous inner `except TimeoutError`
+block that also decremented it has been removed — it caused `_queue_depth` to go
+negative on lock-acquire timeouts.
 
 ---
 
@@ -127,32 +133,24 @@ with error codes.
 RegisterCache (per coordinator instance)
 │
 ├── filter_stale(names, ttl)    →  returns only names that need a fresh read
-│                                  (others are served from cache → 0 Modbus traffic)
-│
 ├── update(fresh_results)       →  stores new values with a timestamp
-│
 ├── merge(fresh, all_requested) →  combines fresh results with cached values
-│                                  for a complete response to the coordinator
-│
-└── invalidate(name)            →  marks a register dirty after a write so it
-                                   is unconditionally re-read next cycle
+└── invalidate(name)            →  marks a register dirty after a write
 ```
 
-**TTL rules:**
+**Volatility tiers:**
 
-| Register group | TTL | Rationale |
-|---|---|---|
-| Static registers (`rated_power`, `storage_maximum_charge_power`, …) | 5 minutes | These are set at factory / commissioning and almost never change |
-| All other registers | Coordinator's own `update_interval` | Default: 30 s for inverter/battery/meter, 15 min for config |
+| Tier | Base TTL | Adaptive cap | Examples |
+|---|---|---|---|
+| STATIC | 60 min | session | serial, firmware, rated_power |
+| SLOW | 5 min | 30 min | daily totals, alarm, temperature |
+| NORMAL | 30 s | 5 min | SOC, voltage, current |
+| FAST | 0 s (always) | 60 s (night) | grid power, PV input, battery power |
 
-**Traffic reduction (typical 30 s poll, 5-min static TTL):**
-- Static registers (~10–15 registers): polled 12 times/hour instead of 120 → **~90 % reduction for static group**
-- All registers: on a quiet network with no write operations, up to **30–40 % fewer Modbus frames** overall
-
-**Cache invalidation:**
-After every successful `number`, `select`, or `switch` write, the affected
-register is marked dirty so the next poll fetches a fresh value.  This prevents
-stale readings after configuration changes.
+**Adaptive TTL algorithm:**
+After each poll, for SLOW/NORMAL registers:
+- Value **unchanged** → `new_ttl = min(current_ttl × 2, tier_cap)`
+- Value **changed** → `new_ttl = tier_base_ttl` (reset)
 
 ---
 
@@ -161,148 +159,164 @@ stale readings after configuration changes.
 ```
 Consecutive timeouts → sleep before next attempt
 
-0–2  : no back-off (first few timeouts are normal during night shutdown)
-3    : ~10 s ± 1 s jitter
-4    : ~20 s ± 2 s
-5    : ~40 s ± 4 s
-6+   : 120 s ± 12 s  (cap)
+0–2  : no back-off
+3    : ~10 s ± 10 % jitter
+4    : ~20 s ± 10 %
+5    : ~40 s ± 10 %
+6+   : 120 s ± 10 % (cap)
 ```
 
-**Jitter** (±10 %) prevents multiple inverters (or a HA restart storm) from all
-retrying at exactly the same moment.
-
-After a successful poll the counter resets and the full cache is invalidated
-to ensure a fresh read after an outage.
+**`_day_interval` sentinel (v1.0.0 fix):**
+When no `update_interval` is passed (push-driven coordinators), `_day_interval`
+is now set to `timedelta(0)` rather than `UPDATE_TIMEOUT` (35 s).  This prevents
+the 35 s request timeout from being misused as a poll cadence by
+`NightModeDetector` and `RegisterCache.filter_stale()`.
 
 ---
 
 ### 3.4 Stale-cache fallback
 
-On a timeout the coordinator now tries to return the last cached values before
-raising `UpdateFailed`.  This keeps HA entities available (instead of showing
-"unavailable") during brief network interruptions or inverter night-mode sleeps.
+On timeout the coordinator returns the last cached values before raising
+`UpdateFailed`, keeping HA entities available during brief outages.
 
 ---
 
 ## 4. Coordinator decomposition
 
-The integration uses **four independent coordinators** per SUN2000 inverter,
-each with its own poll interval:
+Four independent coordinators per SUN2000 inverter:
 
 | Coordinator | Poll interval | Registers |
 |---|---|---|
-| `update_coordinator` | 30 s | PV strings, AC output, alarms, optimizer summary |
+| `update_coordinator` | 30 s | PV strings, AC output, alarms |
 | `power_meter_update_coordinator` | 30 s | Grid import/export, voltage, current |
 | `energy_storage_update_coordinator` | 30 s | Battery SOC, power, temperature |
-| `configuration_update_coordinator` | 15 min | Working mode, TOU periods, storage settings |
+| `configuration_update_coordinator` | 15 min | Working mode, TOU, storage settings |
 
-All four share:
-- The same `ModbusGuard` singleton → serialised Modbus access
-- The same `ModbusTelemetry` singleton → aggregated traffic stats
-- Independent `RegisterCache` instances → per-group TTL management
-
-The optimizer coordinator is separate (5-min interval) and also uses the shared
-`ModbusGuard`.
+All four share one `ModbusGuard` singleton and one `ModbusTelemetry` singleton.
 
 ---
 
 ## 5. Battery entities
 
-### Sensor entities (read-only, always available)
+### Sensor entities (read-only)
 
 | Entity ID suffix | Unit | Notes |
 |---|---|---|
-| `storage_maximum_charge_power` | W | Hardware-rated max — from device register |
+| `storage_maximum_charge_power` | W | Hardware-rated max |
 | `storage_maximum_discharge_power` | W | Hardware-rated max |
-| `storage_charging_cutoff_capacity` | % | End-of-charge SOC (read-only view) |
+| `storage_charging_cutoff_capacity` | % | End-of-charge SOC |
 
-### Number entities (writable, requires parameter configuration enabled)
+### Number entities (writable, requires parameter configuration)
 
-| Entity ID suffix | Unit | Range | Step | Notes |
-|---|---|---|---|---|
-| `storage_maximum_charging_power` | W | 0 – rated max | 100 W | Soft limit ≤ hardware max |
-| `storage_maximum_discharging_power` | W | 0 – rated max | 100 W | Soft limit |
-| `storage_charging_cutoff_capacity` | % | 90–100 | 0.1 % | Battery stops charging at this SOC |
+| Entity ID suffix | Unit | Range | Step |
+|---|---|---|---|
+| `storage_maximum_charging_power` | W | 0–rated max | 100 W |
+| `storage_maximum_discharging_power` | W | 0–rated max | 100 W |
+| `storage_charging_cutoff_capacity` | % | 90–100 | 0.1 % |
 
-All three number entities are **enabled by default** (previous versions had them
-hidden).
+### `stop_forcible_charge` service (v1.0.0 fix)
+
+`stop_forcible_charge` now resets **both** `STORAGE_FORCIBLE_CHARGE_POWER` and
+`STORAGE_FORCIBLE_DISCHARGE_POWER` to 0 when stopping a forcible charge or
+discharge operation.  Previously only the discharge register was cleared, leaving
+a stale power value in the inverter.
 
 ---
 
 ## 6. Modbus telemetry sensors
 
-A new set of diagnostic sensors (grouped under the inverter device) provides
-visibility into the Modbus communication health.  All values are **rolling
-1-hour windows** except the `total_*` counters which are lifetime.
+Diagnostic sensors (grouped under the inverter device) with rolling 1-hour windows:
 
 | Sensor name | Unit | Notes |
 |---|---|---|
-| Modbus requests / hour | — | Total batch_update() calls in the last hour |
+| Modbus requests / hour | — | Total batch_update() calls |
 | Modbus failures / hour | — | Timeouts + other errors |
-| Modbus timeouts / hour | — | Timeout-specific subset of failures |
-| Modbus cache hits / hour | — | Registers served from cache (no Modbus traffic) |
+| Modbus timeouts / hour | — | Timeout-specific subset |
+| Modbus cache hits / hour | — | Registers served from cache |
 | Modbus failure rate | % | `failures / requests × 100` |
 | Avg Modbus batch size | — | Average registers per request |
-| Modbus total requests | — | Lifetime total (disabled by default) |
-| Modbus total failures | — | Lifetime total (disabled by default) |
-| Modbus total cache hits | — | Lifetime total (disabled by default) |
-| Modbus skipped polls | — | Polls skipped because all registers were cached (disabled by default) |
+| Modbus total requests | — | Lifetime total |
+| Modbus total failures | — | Lifetime total |
+| Modbus total cache hits | — | Lifetime total |
+| Modbus skipped polls | — | Polls where all registers were cached |
+| Night mode active | bool | DAY/NIGHT state |
 
-> **Tip:** Use **Modbus failure rate** and **timeouts / hour** to tune your
-> polling intervals.  A healthy installation should see 0 failures/hour under
-> normal conditions.  If you see a consistent failure rate, consider:
-> - Increasing `INVERTER_UPDATE_INTERVAL` in `const.py`
-> - Checking for other Modbus clients connecting to the inverter
-> - Verifying network stability (packet loss, high latency)
+**Rolling-window eviction (v1.0.0 fix):**
+`record_failure()` and `record_timeout()` now call `_evict()` so the
+`_failures` and `_timeouts` deques are pruned even during prolonged outages
+where no successful requests are made.  Previously only `record_request()` and
+`snapshot()` triggered eviction, allowing unbounded deque growth.
 
 ---
 
 ## 7. Changelog (AI-maintained)
 
+### v1.0.0 (2026-05-24)
+**Bug fix release — 7 correctness issues resolved**
+
+- **Fix (High):** `modbus_guard.py` — `_queue_depth` was decremented twice on
+  lock-acquire timeout (inner `except TimeoutError` + outer `except Exception`),
+  driving the counter negative and making `queue_depth` / `is_busy` unreliable.
+  Removed the inner decrement; the outer handler is now the sole cleanup path.
+
+- **Fix (High):** `services.py` — `EMMA_DEVICE_SCHEMA` was assigned on two
+  consecutive lines (identical content).  The duplicate assignment has been
+  removed.
+
+- **Fix (High):** `__init__.py` — `async_unload_entry` accessed
+  `entry.runtime_data["device_datas"]` via a raw string literal instead of the
+  `DATA_DEVICE_DATAS` constant.  Changed to use the constant so a rename cannot
+  silently break unloading.
+
+- **Fix (Medium):** `services.py` — `stop_forcible_charge` reset
+  `STORAGE_FORCIBLE_DISCHARGE_POWER` to 0 but left `STORAGE_FORCIBLE_CHARGE_POWER`
+  at its previous value.  Both registers are now explicitly zeroed on stop.
+
+- **Fix (Medium):** `modbus_telemetry.py` — `record_failure()` and
+  `record_timeout()` did not call `_evict()`, so `_failures` and `_timeouts`
+  deques could grow unboundedly during prolonged inverter outages.  Both methods
+  now call `_evict(now)`.
+
+- **Fix (Medium):** `const.py` — `SERVICE_SET_MAXIMUM_FEED_GRID_POWER_PERCENT`
+  was missing from the `SERVICES` tuple used for bulk service
+  registration/deregistration, meaning it would not be cleaned up on integration
+  unload.
+
+- **Fix (Low):** `update_coordinator.py` — `_day_interval` fell back to
+  `UPDATE_TIMEOUT` (35 s) when `update_interval=None`, causing
+  `NightModeDetector` and `RegisterCache.filter_stale()` to treat the request
+  timeout as a poll interval.  Changed to `timedelta(0)` sentinel.
+
+- **New:** `tests/` — standalone unit test suite covering all 7 fixes plus
+  `RegisterCache` tier/adaptive-TTL/night-mode behaviour.  Tests run without a
+  Home Assistant environment (`pytest tests/`).
+
 ### v2.12.0 (2026-05-21)
 **Adaptive TTL + Night-mode polling + Register tier system**
 
 - **New:** `night_mode.py` — `NightModeDetector` watches `INPUT_POWER` and
-  `DEVICE_STATUS` every poll cycle.  After 3 consecutive polls with PV power
-  ≤ 50 W the coordinator transitions to NIGHT mode: poll interval → 5 min,
-  all cache TTLs × 10.  Wakes up instantly when power rises above 100 W.
-- **New:** Register tier system in `register_cache.py`:
-  - `STATIC` (serial/firmware/rated-power) — read once per session (1 h TTL, uncapped)
-  - `SLOW` (totals/daily counters/temperature/status) — 5 min base, 30 min cap
-  - `NORMAL` (SOC, voltage, current) — 30 s base, 5 min cap
-  - `FAST` (grid power, battery power, PV input) — always read, no caching
-- **New:** Adaptive TTL — after each poll where a register value is unchanged,
-  its TTL doubles (capped at tier max).  Resets to base TTL the moment the
-  value changes.  A stable battery at 80 % SOC at midday organically slows
-  from 30 s → 60 s → 120 s → 300 s.
-- **New:** `Inverter night mode` diagnostic sensor shows DAY/NIGHT state in HA.
-- **Improved:** Traffic model (typical 12 h day / 12 h night installation):
-  - Day-only saving vs v2.11.0: ~35–40 % fewer Modbus transactions
-  - Night saving vs v2.11.0: ~80 % (5 min vs 30 s × 3 coordinators)
-  - Combined daily saving vs original v2.1.0: ~60–70 %
+  `DEVICE_STATUS`.  After 3 consecutive polls with PV power ≤ 50 W the
+  coordinator transitions to NIGHT mode: poll interval → 5 min, all cache TTLs
+  × 10.  Wakes up instantly when power rises above 100 W.
+- **New:** Register tier system (`STATIC` / `SLOW` / `NORMAL` / `FAST`) in
+  `register_cache.py`.
+- **New:** Adaptive TTL — TTL doubles each poll cycle the value is unchanged,
+  capped at the tier maximum.
+- **New:** `Inverter night mode` diagnostic sensor.
+- **Improved:** Combined daily Modbus traffic saving vs v2.1.0: ~60–70 %.
 
 ### v2.11.0 (2026-05-21)
 **Aggressive Modbus optimisation + telemetry sensors**
 
-- **New:** `modbus_guard.py` — per-inverter asyncio lock with 150 ms
-  inter-request gap.
-- **New:** `register_cache.py` — TTL-aware register cache with static-prefix
-  detection.  Up to 40 % fewer Modbus frames on a quiet system.
-- **New:** `modbus_telemetry.py` — rolling 1-hour Modbus traffic statistics
-  with 10 new HA diagnostic sensor entities per inverter.
-- **Improved:** `update_coordinator.py` integrates guard, cache, and telemetry.
-  Stale-cache fallback on timeout.
-- **Improved:** Cache invalidation in `number.py`, `select.py`, `switch.py`.
-- **Docs:** New `CLAUDE.md`.
+- **New:** `modbus_guard.py`, `register_cache.py`, `modbus_telemetry.py`.
+- **Improved:** Stale-cache fallback on timeout; cache invalidation on write.
+- **Docs:** Initial `CLAUDE.md`.
 
 ### v2.10b (2026-05-20)
 **Timeout hardening + battery entity improvements**
 
-- `UPDATE_TIMEOUT` raised to 35 s, `OPTIMIZER_UPDATE_TIMEOUT` to 120 s.
-- Exponential back-off with jitter after 3 consecutive timeouts.
-- `retry_after` hints on all `UpdateFailed` raises.
-- Battery number entities enabled by default with step values.
-- New read-only end-of-charge SOC sensor.
+- `UPDATE_TIMEOUT` raised to 35 s, exponential back-off with jitter.
+- Battery number entities enabled by default.
 
 ### v2.1.0 (upstream)
 Original HACS release.
@@ -311,6 +325,18 @@ Original HACS release.
 
 ## 8. Developer guide
 
+### Running the tests
+
+```bash
+# From the integration directory (no HA environment required)
+pip install pytest pytest-asyncio
+pytest tests/ -v
+```
+
+All tests are designed to run in isolation — they stub HA imports and the
+`huawei-solar` library so the test environment needs only the Python standard
+library plus `pytest` and `pytest-asyncio`.
+
 ### Adding a new register sensor
 
 1. Find the register name constant in `huawei-solar`'s `register_names.py`.
@@ -318,20 +344,19 @@ Original HACS release.
    `*_SENSOR_DESCRIPTIONS` tuple in `sensor.py`.
 3. Add a translation string to `strings.json` and `translations/en.json`
    under `entity.sensor.<translation_key>.name`.
-4. Run `python3 .github/verify_translation_strings.py` from the repo root.
 
-### Adding a new writable number entity
+### Adding a new HA service
 
-1. Add a `HuaweiSolarNumberEntityDescription` to `ENERGY_STORAGE_NUMBER_DESCRIPTIONS`
-   (or the appropriate group) in `number.py`.
-2. Set `entity_registry_enabled_default=True` if it should be visible without
-   extra configuration.
-3. Add translation strings as above (under `entity.number.<key>`).
+1. Define `SERVICE_<NAME> = "name"` in `const.py`.
+2. Add the constant to the `SERVICES` tuple in `const.py`.
+3. Add the constant to `ALL_SERVICES` in `services.py`.
+4. Implement the handler and register it in `async_setup_services`.
+5. The test `tests/test_const_services.py::test_services_tuple_contains_all_service_constants`
+   will fail if you forget step 2 or 3.
 
-### Running syntax + JSON checks locally
+### Syntax + JSON checks
 
 ```bash
-# From repo root (not from inside the custom_components directory)
 cd /path/to/parent
 python3 -c "
 import ast, json, pathlib, sys
@@ -345,7 +370,7 @@ for f in ['strings.json', 'manifest.json']:
 "
 ```
 
-### Key constants to tune (`const.py`)
+### Key constants (`const.py`)
 
 | Constant | Default | Effect |
 |---|---|---|
@@ -354,15 +379,27 @@ for f in ['strings.json', 'manifest.json']:
 | `MAX_CONSECUTIVE_TIMEOUTS` | 3 | Back-off activation threshold |
 | `MODBUS_RETRY_BASE_WAIT` | 10 s | Back-off base delay |
 | `MODBUS_RETRY_MAX_WAIT` | 120 s | Back-off cap |
+| `NIGHT_POLL_INTERVAL` | 5 min | Poll interval in night/sleep mode |
 
 ### `ModbusGuard` tuning (`modbus_guard.py`)
 
 | Constant | Default | Effect |
 |---|---|---|
 | `MIN_INTER_REQUEST_GAP` | 150 ms | Minimum pause between requests |
-| `QUEUE_WAIT_TIMEOUT` | 10 s | Max queue wait before abandoning |
+| `QUEUE_WAIT_TIMEOUT` | 10 s | Max wait before abandoning queued request |
 
-### `RegisterCache` static TTL (`register_cache.py`)
+---
 
-Extend `_STATIC_PREFIXES` to add more register names that should be cached for
-5 minutes.  Use lowercase prefixes matching the start of the register name.
+## 9. Bug fixes reference
+
+Quick-reference table for the 7 bugs fixed in v1.0.0:
+
+| # | Severity | File | Root cause | Symptom |
+|---|---|---|---|---|
+| 1 | High | `modbus_guard.py` | `_queue_depth` decremented twice on `TimeoutError` | Counter goes negative; `is_busy`/`queue_depth` unreliable |
+| 2 | High | `services.py` | `EMMA_DEVICE_SCHEMA` assigned twice | Latent: second assignment silently shadows first |
+| 3 | High | `__init__.py` | Raw string `"device_datas"` in unload instead of `DATA_DEVICE_DATAS` | `KeyError` on unload if constant is renamed |
+| 4 | Medium | `services.py` | `stop_forcible_charge` only zeros `DISCHARGE_POWER` | Stale charge-power value left on inverter after stop |
+| 5 | Medium | `modbus_telemetry.py` | `record_failure`/`record_timeout` never call `_evict()` | Deques grow unboundedly during outages; inaccurate rolling rates |
+| 6 | Medium | `const.py` | `SERVICE_SET_MAXIMUM_FEED_GRID_POWER_PERCENT` not in `SERVICES` | Service not unregistered on integration unload |
+| 7 | Low | `update_coordinator.py` | `_day_interval` falls back to `UPDATE_TIMEOUT` (35 s) when `None` | Night-mode and cache use request timeout as poll interval |

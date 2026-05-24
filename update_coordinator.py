@@ -128,7 +128,13 @@ class HuaweiSolarUpdateCoordinator(
         )
         self.device = device
         self.update_timeout = update_timeout
-        self._day_interval = update_interval or UPDATE_TIMEOUT
+        # _day_interval is used by NightModeDetector and RegisterCache to know
+        # the coordinator's intended poll cadence.  When no interval is given the
+        # coordinator is driven by push/telemetry rather than by a periodic timer;
+        # use a zero-length sentinel so callers can detect this case rather than
+        # silently substituting UPDATE_TIMEOUT (35 s) which would wrongly cap
+        # NORMAL-tier TTLs and mislead the night-mode interval restoration logic.
+        self._day_interval = update_interval if update_interval is not None else timedelta(0)
 
         self.guard = ModbusGuard.get_or_create(device.serial_number)
         self.cache = RegisterCache()

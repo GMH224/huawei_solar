@@ -136,6 +136,7 @@ class ModbusTelemetry:
         now = time.monotonic()
         self._failures.append(now)
         self.total_failures += 1
+        self._evict(now)
 
     def record_timeout(self) -> None:
         """Record a timeout."""
@@ -143,6 +144,7 @@ class ModbusTelemetry:
         self._timeouts.append(now)
         self.total_timeouts += 1
         self.total_failures += 1
+        self._evict(now)
 
     def record_cache_hit(self) -> None:
         """Record a register cache hit (request skipped)."""

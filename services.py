@@ -170,8 +170,7 @@ def _get_device_of_type_data[T](
 def get_emma_device(call: ServiceCall) -> HuaweiSolarDeviceData:
     """Return the HuaweiEMMABridge associated with the emma device_id in the service call."""
     return _get_device_of_type_data(call, EMMADevice)
-    
-EMMA_DEVICE_SCHEMA = vol.Schema({DATA_DEVICE_ID: vol.All(cv.string, str)})
+
 
 EMMA_DEVICE_SCHEMA = vol.Schema({DATA_DEVICE_ID: vol.All(cv.string, str)})
 
@@ -482,6 +481,9 @@ async def stop_forcible_charge(service_call: ServiceCall) -> None:
         rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_WRITE,
         rv.StorageForcibleChargeDischarge.STOP,
     )
+    # Reset both charge and discharge power registers so no stale power value
+    # remains on the inverter after the operation is cancelled.
+    await dd.device.set(rn.STORAGE_FORCIBLE_CHARGE_POWER, 0)
     await dd.device.set(rn.STORAGE_FORCIBLE_DISCHARGE_POWER, 0)
     await dd.device.set(
         rn.STORAGE_FORCED_CHARGING_AND_DISCHARGING_PERIOD,

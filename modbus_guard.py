@@ -76,15 +76,12 @@ class ModbusGuard:
             guard = self._guard
             guard._queue_depth += 1
             try:
-                # Wait for the lock — with a timeout to avoid piling up requests
-                try:
-                    async with asyncio.timeout(
-                        QUEUE_WAIT_TIMEOUT.total_seconds()
-                    ):
-                        await guard._lock.acquire()
-                except TimeoutError:
-                    guard._queue_depth -= 1
-                    raise
+                # Wait for the lock — with a timeout to avoid piling up requests.
+                # NOTE: do NOT decrement _queue_depth inside the inner except block;
+                # the outer except Exception is the single place that handles all
+                # failure paths, preventing a double-decrement on TimeoutError.
+                async with asyncio.timeout(QUEUE_WAIT_TIMEOUT.total_seconds()):
+                    await guard._lock.acquire()
 
                 # Enforce minimum inter-request gap
                 now = time.monotonic()
