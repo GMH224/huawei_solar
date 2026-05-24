@@ -15,66 +15,54 @@ CONF_ENABLE_PARAMETER_CONFIGURATION = "enable_parameter_configuration"
 DATA_DEVICE_DATAS = "device_datas"
 DATA_UPDATE_COORDINATORS = "update_coordinators"
 
-INVERTER_UPDATE_INTERVAL      = timedelta(seconds=30)
-POWER_METER_UPDATE_INTERVAL   = timedelta(seconds=30)
+INVERTER_UPDATE_INTERVAL = timedelta(seconds=30)
+POWER_METER_UPDATE_INTERVAL = timedelta(seconds=30)
 ENERGY_STORAGE_UPDATE_INTERVAL = timedelta(seconds=30)
 
-# UPDATE_TIMEOUT must be shorter than update intervals so a hung request is
-# cancelled before the next poll cycle begins.  25 s leaves a 5 s buffer.
-UPDATE_TIMEOUT = timedelta(seconds=25)
+# UPDATE_TIMEOUT is intentionally shorter than the update intervals so that
+# a hung request is cancelled before the next poll cycle begins.
+# Raised from 29s → 35s to give slow/busy inverters a bit more breathing room
+# while still ensuring we don't stack back-to-back requests.
+UPDATE_TIMEOUT = timedelta(seconds=35)
 
+# configuration can only change when edited through FusionSolar web or app
 CONFIGURATION_UPDATE_INTERVAL = timedelta(minutes=15)
-CONFIGURATION_UPDATE_TIMEOUT  = timedelta(minutes=1)
+CONFIGURATION_UPDATE_TIMEOUT = timedelta(minutes=1)
 
+# optimizer data is only refreshed every 5 minutes by the inverter.
 OPTIMIZER_UPDATE_INTERVAL = timedelta(minutes=5)
-OPTIMIZER_UPDATE_TIMEOUT  = timedelta(minutes=2)
+OPTIMIZER_UPDATE_TIMEOUT = timedelta(minutes=2)
 
-# Night / sleep mode: all coordinators slow to this when PV power ≈ 0.
+# When the inverter is in night/sleep mode (PV power ≈ 0) all coordinators
+# slow to this interval.  Most registers are frozen at night so polling faster
+# than 5 minutes is wasteful and stresses the Modbus interface.
 NIGHT_POLL_INTERVAL = timedelta(minutes=5)
 
-# ── Modbus back-off ──────────────────────────────────────────────────────────
+# ── Modbus timeout / retry back-off ─────────────────────────────────────────
+# After this many consecutive timeouts the coordinator starts backing off to
+# avoid hammering an unresponsive inverter and let the Modbus bus recover.
 MAX_CONSECUTIVE_TIMEOUTS = 3
-MODBUS_RETRY_BASE_WAIT   = timedelta(seconds=10)
-MODBUS_RETRY_MAX_WAIT    = timedelta(seconds=120)
 
-# ── v2.12.2: Phase staggering ────────────────────────────────────────────────
-# Each subsequent coordinator is delayed by this offset on its very first poll
-# so all four coordinators don't pile into the ModbusGuard queue together.
-# With 4 coordinators and 7 s stagger the last one starts at ~21 s, well
-# within the 30 s poll window.
-COORDINATOR_STAGGER_SECONDS = 7
-
-# ── v2.12.2: TCP keep-alive (night mode) ────────────────────────────────────
-# The SUN2000 drops idle TCP connections after ~30 s.  In night mode (5-min
-# polls) we send a single-register ping at this interval to keep the socket
-# open and avoid the ~200–500 ms TCP handshake overhead on every poll.
-KEEP_ALIVE_INTERVAL = timedelta(seconds=25)
-
-# ── v2.12.2: Adaptive poll interval self-tuning ──────────────────────────────
-# Number of consecutive high-failure polls before backing off.
-POLL_AUTOTUNE_HIGH_THRESHOLD = 10
-# Number of consecutive healthy polls before recovering toward minimum.
-POLL_AUTOTUNE_LOW_THRESHOLD  = 60
-# Multiplicative step applied when backing off or recovering.
-POLL_AUTOTUNE_STEP           = 2.0
-# Hard floor / ceiling for auto-tuned intervals (day mode only).
-POLL_AUTOTUNE_MIN_INTERVAL   = timedelta(seconds=30)
-POLL_AUTOTUNE_MAX_INTERVAL   = timedelta(minutes=5)
+# Initial wait after the first burst of timeouts (seconds).  Subsequent
+# bursts double the wait up to MODBUS_RETRY_MAX_WAIT.
+MODBUS_RETRY_BASE_WAIT = timedelta(seconds=10)
+MODBUS_RETRY_MAX_WAIT = timedelta(seconds=120)
 
 # ── Service names ────────────────────────────────────────────────────────────
-SERVICE_FORCIBLE_CHARGE                  = "forcible_charge"
-SERVICE_FORCIBLE_DISCHARGE               = "forcible_discharge"
-SERVICE_FORCIBLE_CHARGE_SOC              = "forcible_charge_soc"
-SERVICE_FORCIBLE_DISCHARGE_SOC           = "forcible_discharge_soc"
-SERVICE_STOP_FORCIBLE_CHARGE             = "stop_forcible_charge"
-SERVICE_RESET_MAXIMUM_FEED_GRID_POWER    = "reset_maximum_feed_grid_power"
-SERVICE_SET_DI_ACTIVE_POWER_SCHEDULING   = "set_di_active_power_scheduling"
-SERVICE_SET_ZERO_POWER_GRID_CONNECTION   = "set_zero_power_grid_connection"
-SERVICE_SET_MAXIMUM_FEED_GRID_POWER      = "set_maximum_feed_grid_power"
+SERVICE_FORCIBLE_CHARGE = "forcible_charge"
+SERVICE_FORCIBLE_DISCHARGE = "forcible_discharge"
+SERVICE_FORCIBLE_CHARGE_SOC = "forcible_charge_soc"
+SERVICE_FORCIBLE_DISCHARGE_SOC = "forcible_discharge_soc"
+SERVICE_STOP_FORCIBLE_CHARGE = "stop_forcible_charge"
+
+SERVICE_RESET_MAXIMUM_FEED_GRID_POWER = "reset_maximum_feed_grid_power"
+SERVICE_SET_DI_ACTIVE_POWER_SCHEDULING = "set_di_active_power_scheduling"
+SERVICE_SET_ZERO_POWER_GRID_CONNECTION = "set_zero_power_grid_connection"
+SERVICE_SET_MAXIMUM_FEED_GRID_POWER = "set_maximum_feed_grid_power"
 SERVICE_SET_MAXIMUM_FEED_GRID_POWER_PERCENT = "set_maximum_feed_grid_power_percent"
-SERVICE_SET_TOU_PERIODS                  = "set_tou_periods"
-SERVICE_SET_CAPACITY_CONTROL_PERIODS     = "set_capacity_control_periods"
-SERVICE_SET_FIXED_CHARGE_PERIODS         = "set_fixed_charge_periods"
+SERVICE_SET_TOU_PERIODS = "set_tou_periods"
+SERVICE_SET_CAPACITY_CONTROL_PERIODS = "set_capacity_control_periods"
+SERVICE_SET_FIXED_CHARGE_PERIODS = "set_fixed_charge_periods"
 
 SERVICES = (
     SERVICE_FORCIBLE_CHARGE,

@@ -1,23 +1,52 @@
 """Register value cache for Huawei Solar.
 
-v2.12.2 additions
------------------
-- filter_stale() now includes registers within one poll interval of TTL expiry
-  (speculative pre-fetch) so registers don't all expire simultaneously and
-  create large bursty batches.
-- sort_by_address() helper: sorts a register name list by Modbus address so
-  batch_update() can merge contiguous reads into fewer frames.
-- Cross-coordinator LiveRegisterBus: a per-inverter singleton that lets
-  coordinators "publish" freshly read non-STATIC values and "subscribe" to
-  them, so a register read by one coordinator is served to others for one
-  poll cycle without a second Modbus request.
+The SUN2000 inverter reacts badly to excessive Modbus traffic.  Many registers
+never change (rated power, serial number, battery capacity) and others change
+slowly.  This module provides a time-aware, adaptive cache that:
+
+  • Assigns TTLs per-register based on observed volatility (adaptive TTL).
+  • Groups registers into STATIC / SLOW / NORMAL / FAST tiers.
+  • Doubles a register's effective TTL every time its value is unchanged
+    (up to a per-tier cap), and resets the TTL as soon as the value changes.
+  • Tracks dirty flags so writes immediately invalidate the cache.
+  • Reports hit/miss statistics to ModbusTelemetry.
 
 Volatility tiers
 ----------------
-STATIC   – Hardware constants. Base TTL: 60 min. Shared via StaticRegisterCache.
-SLOW     – Changes at most once per event. Base TTL: 5 min, cap 30 min.
-NORMAL   – SOC, voltage, current. Base TTL: 30 s, cap 5 min.
-FAST     – Real-time power. Always read, no adaptive stretching.
+STATIC   – Hardware constants that never change in normal operation:
+           serial numbers, firmware versions, model names, rated power,
+           battery pack capacities, manufacturer strings.
+           Base TTL: 60 min.  Cap: never re-read after first successful read
+           (effectively ∞ during a session; invalidated on reconnect).
+
+SLOW     – Values that change at most once per day or once per event:
+           daily/total energy counters, working mode, alarm status,
+           temperature (changes slowly), SOH calibration status.
+           Base TTL: 5 min.  Adaptive cap: 30 min.
+
+NORMAL   – Typical sensor values: SOC, power, voltage, current.
+           Base TTL: 30 s (== poll interval).  Adaptive cap: 5 min.
+
+FAST     – High-priority real-time values: grid import/export power,
+           battery charge/discharge power, PV input power.
+           Base TTL: 0 (always read).  No adaptive stretching.
+
+Adaptive TTL algorithm
+----------------------
+After each successful poll, for every register in SLOW or NORMAL tier:
+  - If value UNCHANGED → new_ttl = min(current_ttl * ADAPTIVE_FACTOR, tier_cap)
+  - If value CHANGED   → new_ttl = tier_base_ttl   (reset to minimum)
+
+This means a stable reading (e.g. battery idle at 80 % SOC at night) will
+organically slow its own polling from 30 s → 60 s → 120 s → … → 300 s,
+while a changing reading stays at 30 s.
+
+Night-mode interaction
+----------------------
+When the coordinator sets ``night_mode=True`` on the cache, the effective TTL
+for NORMAL registers is stretched by NIGHT_TTL_MULTIPLIER (default 10×),
+turning a 30 s poll into 300 s.  FAST registers are also stretched to 60 s
+so the inverter is not completely silent.
 """
 
 from __future__ import annotations
@@ -39,12 +68,13 @@ _LOGGER = logging.getLogger(__name__)
 # ── Tier definitions ──────────────────────────────────────────────────────────
 
 class RegisterTier(IntEnum):
-    FAST   = auto()
-    NORMAL = auto()
-    SLOW   = auto()
-    STATIC = auto()
+    FAST   = auto()   # always polled — real-time power/grid values
+    NORMAL = auto()   # standard 30 s poll
+    SLOW   = auto()   # 5 min base, adaptive up to 30 min
+    STATIC = auto()   # read once per session
 
 
+# Base TTLs (seconds)
 _TIER_BASE_TTL: dict[RegisterTier, float] = {
     RegisterTier.FAST:   0.0,
     RegisterTier.NORMAL: 30.0,
@@ -52,63 +82,105 @@ _TIER_BASE_TTL: dict[RegisterTier, float] = {
     RegisterTier.STATIC: 3600.0,
 }
 
+# Adaptive cap TTLs (seconds) — TTL will not grow beyond this
 _TIER_CAP_TTL: dict[RegisterTier, float] = {
-    RegisterTier.FAST:   60.0,
-    RegisterTier.NORMAL: 300.0,
-    RegisterTier.SLOW:   1800.0,
-    RegisterTier.STATIC: 86400.0,
+    RegisterTier.FAST:   60.0,    # even FAST stretches to 60 s in night mode
+    RegisterTier.NORMAL: 300.0,   # 5 min cap
+    RegisterTier.SLOW:   1800.0,  # 30 min cap
+    RegisterTier.STATIC: 86400.0, # effectively "read once"
 }
 
+# Multiplier applied to TTL each poll cycle the value is unchanged
 ADAPTIVE_FACTOR: float = 2.0
-NIGHT_TTL_MULTIPLIER: float = 10.0
-OPTIMISTIC_TTL: float = 8.0
 
-# Speculative pre-fetch: include registers whose TTL will expire within this
-# fraction of the poll interval on the *next* cycle, so we fetch them now
-# while we already have the bus, instead of triggering a solo round-trip later.
-PREFETCH_LEAD_FRACTION: float = 0.5   # fetch if < 50 % of poll interval remains
+# Multiplier applied to all non-FAST TTLs during inverter night/sleep mode
+NIGHT_TTL_MULTIPLIER: float = 10.0
 
 
 # ── Register classification ───────────────────────────────────────────────────
+#
+# Rules applied in order; first match wins.
+# Patterns are tested against the lowercase string form of the RegisterName.
 
 _STATIC_SUBSTRINGS: tuple[str, ...] = (
-    "serial_number", "firmware_version", "software_version",
-    "model_name", "model_id", "rated_power", "rated_capacity",
-    "p_max", "manufacturer", "inverter_rated_power",
-    "storage_rated_capacity", "storage_maximum_charge_power",
-    "storage_maximum_discharge_power",
-    "storage_maximum_power_of_charge_from_grid", "charger_rated_power",
+    "serial_number",
+    "firmware_version",
+    "software_version",
+    "model_name",
+    "model_id",
+    "rated_power",
+    "rated_capacity",
+    "p_max",
+    "manufacturer",
+    "inverter_rated_power",
+    "storage_rated_capacity",
+    "storage_maximum_charge_power",    # hardware-rated max (not the soft limit)
+    "storage_maximum_discharge_power", # hardware-rated max
+    "storage_maximum_power_of_charge_from_grid",
+    "charger_rated_power",
 )
 
 _SLOW_SUBSTRINGS: tuple[str, ...] = (
-    "daily_", "current_day_", "total_", "accumulated_", "yearly_",
-    "total_charge", "total_discharge", "total_energy", "total_active",
-    "total_negative", "total_positive", "total_feed_in", "total_supply",
-    "total_pv_energy", "grid_accumulated",
-    "device_status", "running_status", "working_mode", "alarm",
-    "temperature", "soh_calibration", "remaining_charge_dis",
-    "storage_unit_1_working_mode", "storage_unit_2_working_mode",
-    "phase_a_active_power_built_in", "phase_b_active_power_built_in",
-    "phase_c_active_power_built_in", "phase_a_active_power_external",
-    "phase_b_active_power_external", "phase_c_active_power_external",
-    "active_power_built_in", "active_power_external",
+    "daily_",
+    "current_day_",
+    "total_",
+    "accumulated_",
+    "yearly_",
+    "total_charge",
+    "total_discharge",
+    "total_energy",
+    "total_active",
+    "total_negative",
+    "total_positive",
+    "total_feed_in",
+    "total_supply",
+    "total_pv_energy",
+    "grid_accumulated",
+    "device_status",
+    "running_status",
+    "working_mode",
+    "alarm",
+    "temperature",          # changes slowly
+    "soh_calibration",
+    "remaining_charge_dis",
+    "storage_unit_1_working_mode",
+    "storage_unit_2_working_mode",
+    "phase_a_active_power_built_in",
+    "phase_b_active_power_built_in",
+    "phase_c_active_power_built_in",
+    "phase_a_active_power_external",
+    "phase_b_active_power_external",
+    "phase_c_active_power_external",
+    "active_power_built_in",
+    "active_power_external",
 )
 
 _FAST_SUBSTRINGS: tuple[str, ...] = (
-    "power_meter_active_power", "power_meter_reactive_power",
-    "storage_charge_discharge_power",
-    "storage_unit_1_charge_discharge", "storage_unit_2_charge_discharge",
-    "battery_pack_1_charge_discharge", "battery_pack_2_charge_discharge",
+    "power_meter_active_power",
+    "power_meter_reactive_power",
+    "storage_charge_discharge_power",   # battery charge/discharge — real-time
+    "storage_unit_1_charge_discharge",
+    "storage_unit_2_charge_discharge",
+    "battery_pack_1_charge_discharge",
+    "battery_pack_2_charge_discharge",
     "battery_pack_3_charge_discharge",
-    "input_power", "total_dc_input_power",
-    "inverter_active_power", "inverter_reactive_power",
-    "sdongle_total_active", "sdongle_total_input", "sdongle_total_battery",
-    "smartlogger_active_power", "smartlogger_input_power",
-    "smartlogger_external_meter_active", "smartlogger_external_meter_reactive",
+    "input_power",                      # PV input
+    "total_dc_input_power",
+    "active_power",                     # AC output
+    "reactive_power",
+    "sdongle_total_active",
+    "sdongle_total_input",
+    "sdongle_total_battery",
+    "smartlogger_active_power",
+    "smartlogger_input_power",
+    "smartlogger_external_meter_active",
+    "smartlogger_external_meter_reactive",
+    "inverter_active_power",
 )
 
 
 def _classify(name: RegisterName) -> RegisterTier:
+    """Return the volatility tier for a register name."""
     s = str(name).lower()
     for sub in _STATIC_SUBSTRINGS:
         if sub in s:
@@ -122,34 +194,14 @@ def _classify(name: RegisterName) -> RegisterTier:
     return RegisterTier.NORMAL
 
 
-def sort_by_address(names: list[RegisterName]) -> list[RegisterName]:
-    """Sort register names by their Modbus address (ascending).
-
-    Presenting registers in address order to batch_update() gives the
-    underlying library the best chance of merging contiguous reads into a
-    single Modbus frame, reducing total frame count.
-    """
-    def _addr(n: RegisterName) -> int:
-        return getattr(n, "register", getattr(n, "address", 0)) or 0
-    return sorted(names, key=_addr)
-
-
-# ── Optimistic result wrapper ─────────────────────────────────────────────────
-
-class _OptimisticResult:
-    __slots__ = ("value",)
-    def __init__(self, value: Any) -> None:
-        self.value = value
-
-
 # ── Cache entry ───────────────────────────────────────────────────────────────
 
 class _CacheEntry:
     __slots__ = ("value", "raw", "ts", "dirty", "tier", "effective_ttl")
 
     def __init__(self, value: Any, raw: Any, ts: float, tier: RegisterTier) -> None:
-        self.value = value
-        self.raw = raw
+        self.value = value                          # full Result object
+        self.raw = raw                              # comparable raw value for change detection
         self.ts = ts
         self.dirty = False
         self.tier = tier
@@ -157,6 +209,7 @@ class _CacheEntry:
 
 
 def _raw(result: "Result[Any]") -> Any:
+    """Extract a comparable value from a Result for change detection."""
     try:
         return result.value
     except Exception:
@@ -166,17 +219,31 @@ def _raw(result: "Result[Any]") -> Any:
 # ── Main cache class ──────────────────────────────────────────────────────────
 
 class RegisterCache:
-    """Adaptive, tier-aware register value cache."""
+    """Adaptive, tier-aware register value cache.
+
+    Parameters
+    ----------
+    telemetry:
+        Optional ModbusTelemetry instance.  When provided, cache hits are
+        reported so they appear in the Modbus diagnostic sensors.
+    night_mode:
+        When True, non-FAST TTLs are multiplied by NIGHT_TTL_MULTIPLIER.
+        Set via set_night_mode(); controlled by the coordinator.
+    """
 
     def __init__(self, telemetry: "ModbusTelemetry | None" = None) -> None:
         self._store: dict[RegisterName, _CacheEntry] = {}
         self._telemetry = telemetry
         self._night_mode: bool = False
 
+    # ── night-mode control ────────────────────────────────────────────────────
+
     def set_night_mode(self, active: bool) -> None:
+        """Enable or disable night-mode TTL stretching."""
         if active != self._night_mode:
             _LOGGER.debug("Register cache: night mode %s", "ON" if active else "OFF")
             self._night_mode = active
+            # On wakeup, reset all NORMAL adaptive TTLs so we get fresh data immediately
             if not active:
                 for entry in self._store.values():
                     if entry.tier in (RegisterTier.NORMAL, RegisterTier.FAST):
@@ -186,27 +253,33 @@ class RegisterCache:
     def night_mode(self) -> bool:
         return self._night_mode
 
+    # ── effective TTL helper ──────────────────────────────────────────────────
+
     def _effective_ttl(self, entry: _CacheEntry) -> float:
+        """Return the actual TTL to use for a cache entry, respecting night mode."""
         ttl = entry.effective_ttl
         if self._night_mode and entry.tier != RegisterTier.STATIC:
             ttl = min(ttl * NIGHT_TTL_MULTIPLIER, _TIER_CAP_TTL[entry.tier])
         return ttl
+
+    # ── public API ────────────────────────────────────────────────────────────
 
     def filter_stale(
         self,
         names: list[RegisterName],
         default_ttl: timedelta,
     ) -> list[RegisterName]:
-        """Return register names that need a fresh read.
+        """Return only those register names that need a fresh read.
 
-        v2.12.2: also includes registers approaching TTL expiry within
-        PREFETCH_LEAD_FRACTION × poll_interval so they're fetched during the
-        current batch rather than triggering a solo round-trip next cycle.
+        Parameters
+        ----------
+        names:
+            All register names requested by active HA entities.
+        default_ttl:
+            Fallback TTL for NORMAL-tier registers (should equal the
+            coordinator's poll interval).  Ignored for other tiers.
         """
         now = time.monotonic()
-        poll_s = default_ttl.total_seconds()
-        lead = poll_s * PREFETCH_LEAD_FRACTION
-
         stale: list[RegisterName] = []
         cache_hits = 0
 
@@ -217,18 +290,15 @@ class RegisterCache:
                 continue
 
             ttl = self._effective_ttl(entry)
+
+            # For NORMAL tier, never use a TTL shorter than default_ttl so that
+            # the coordinator's own interval is always respected as a minimum.
             if entry.tier == RegisterTier.NORMAL:
-                ttl = max(ttl, poll_s)
+                ttl = max(ttl, default_ttl.total_seconds())
 
             age = now - entry.ts
-            remaining = ttl - age
-
-            if remaining <= 0:
+            if age >= ttl:
                 stale.append(name)
-            elif entry.tier not in (RegisterTier.STATIC, RegisterTier.FAST) and remaining <= lead:
-                # Speculative pre-fetch: will expire before next poll anyway
-                stale.append(name)
-                _LOGGER.debug("Cache pre-fetch: %s (expires in %.1f s)", name, remaining)
             else:
                 cache_hits += 1
                 if self._telemetry:
@@ -242,6 +312,7 @@ class RegisterCache:
         return stale
 
     def update(self, results: dict[RegisterName, "Result[Any]"]) -> None:
+        """Store fresh results, update adaptive TTLs, and clear dirty flags."""
         now = time.monotonic()
         for name, result in results.items():
             raw_new = _raw(result)
@@ -249,11 +320,13 @@ class RegisterCache:
             tier = existing.tier if existing else _classify(name)
 
             if existing is not None and not existing.dirty:
+                # Adaptive TTL: stretch if value unchanged, reset if changed
                 if raw_new == existing.raw:
-                    existing.effective_ttl = min(
+                    new_ttl = min(
                         existing.effective_ttl * ADAPTIVE_FACTOR,
                         _TIER_CAP_TTL[tier],
                     )
+                    existing.effective_ttl = new_ttl
                     existing.value = result
                     existing.ts = now
                 else:
@@ -265,20 +338,12 @@ class RegisterCache:
             else:
                 self._store[name] = _CacheEntry(result, raw_new, now, tier)
 
-    def write_optimistic(self, name: RegisterName, value: Any, ttl: float = OPTIMISTIC_TTL) -> None:
-        now = time.monotonic()
-        tier = _classify(name)
-        entry = _CacheEntry(_OptimisticResult(value), value, now, tier)
-        entry.effective_ttl = ttl
-        entry.dirty = False
-        self._store[name] = entry
-        _LOGGER.debug("Register cache: optimistic write %s = %r (TTL %.0f s)", name, value, ttl)
-
     def merge(
         self,
         fresh: dict[RegisterName, "Result[Any]"],
         requested: list[RegisterName],
     ) -> dict[RegisterName, "Result[Any]"]:
+        """Merge fresh results with cached values to produce a complete response."""
         merged: dict[RegisterName, "Result[Any]"] = {}
         for name in requested:
             if name in fresh:
@@ -288,24 +353,30 @@ class RegisterCache:
         return merged
 
     def invalidate(self, name: RegisterName) -> None:
+        """Mark a single register dirty (after a write)."""
         if name in self._store:
             self._store[name].dirty = True
+            _LOGGER.debug("Cache invalidated: %s", name)
 
     def invalidate_all(self) -> None:
+        """Mark every cached register dirty (after reconnect / outage recovery)."""
         for entry in self._store.values():
             entry.dirty = True
 
     def get(self, name: RegisterName) -> "Result[Any] | None":
+        """Return a cached value or None."""
         entry = self._store.get(name)
         if entry and not entry.dirty:
             return entry.value
         return None
 
     def tier_of(self, name: RegisterName) -> "RegisterTier | None":
+        """Return the tier of a cached register, or None if not cached."""
         entry = self._store.get(name)
         return entry.tier if entry else None
 
     def effective_ttl_of(self, name: RegisterName) -> float:
+        """Return the current effective TTL of a cached register in seconds."""
         entry = self._store.get(name)
         return self._effective_ttl(entry) if entry else 0.0
 
@@ -315,124 +386,3 @@ class RegisterCache:
 
     def clear(self) -> None:
         self._store.clear()
-
-
-# ── Shared STATIC cache ───────────────────────────────────────────────────────
-
-class StaticRegisterCache:
-    """Inverter-scoped singleton for STATIC-tier registers shared across coordinators."""
-
-    _registry: dict[str, "StaticRegisterCache"] = {}
-
-    @classmethod
-    def get_or_create(cls, serial_number: str) -> "StaticRegisterCache":
-        if serial_number not in cls._registry:
-            cls._registry[serial_number] = cls(serial_number)
-        return cls._registry[serial_number]
-
-    @classmethod
-    def clear_registry(cls) -> None:
-        cls._registry.clear()
-
-    def __init__(self, serial_number: str) -> None:
-        self._serial = serial_number
-        self._store: dict[RegisterName, Any] = {}
-
-    def filter_stale(self, names: list[RegisterName]) -> list[RegisterName]:
-        return [n for n in names if n not in self._store]
-
-    def update(self, results: dict[RegisterName, Any]) -> None:
-        self._store.update(results)
-
-    def get_all(self, names: list[RegisterName]) -> dict[RegisterName, Any]:
-        return {n: self._store[n] for n in names if n in self._store}
-
-    def invalidate_all(self) -> None:
-        self._store.clear()
-
-    @property
-    def size(self) -> int:
-        return len(self._store)
-
-
-# ── Live register bus ─────────────────────────────────────────────────────────
-
-class LiveRegisterBus:
-    """Per-inverter singleton for cross-coordinator register sharing.
-
-    A coordinator that reads a non-STATIC register publishes the result here.
-    Other coordinators that need the same register in the same poll window
-    receive the cached value without issuing a second Modbus request.
-
-    Entries expire after one poll interval (TTL = publish_ttl_seconds) so
-    stale values never persist across poll cycles.
-
-    Usage
-    -----
-        bus = LiveRegisterBus.get_or_create(serial_number)
-
-        # After a successful batch_update():
-        bus.publish(fresh_results, ttl=poll_interval.total_seconds())
-
-        # Before issuing a request, check if some names are already known:
-        already_known = bus.query(stale_names)
-        still_needed = [n for n in stale_names if n not in already_known]
-    """
-
-    _registry: dict[str, "LiveRegisterBus"] = {}
-
-    @classmethod
-    def get_or_create(cls, serial_number: str) -> "LiveRegisterBus":
-        if serial_number not in cls._registry:
-            cls._registry[serial_number] = cls(serial_number)
-        return cls._registry[serial_number]
-
-    @classmethod
-    def clear_registry(cls) -> None:
-        cls._registry.clear()
-
-    def __init__(self, serial_number: str) -> None:
-        self._serial = serial_number
-        self._store: dict[RegisterName, tuple[Any, float]] = {}  # name → (result, expires_at)
-
-    def publish(
-        self,
-        results: dict[RegisterName, Any],
-        ttl: float,
-    ) -> None:
-        """Publish freshly read results so other coordinators can consume them."""
-        expires = time.monotonic() + ttl
-        for name, result in results.items():
-            self._store[name] = (result, expires)
-
-    def query(
-        self,
-        names: list[RegisterName],
-    ) -> dict[RegisterName, Any]:
-        """Return results for names that are available and not yet expired."""
-        now = time.monotonic()
-        found: dict[RegisterName, Any] = {}
-        expired = []
-        for name in names:
-            entry = self._store.get(name)
-            if entry is None:
-                continue
-            result, expires_at = entry
-            if now < expires_at:
-                found[name] = result
-            else:
-                expired.append(name)
-        for name in expired:
-            del self._store[name]
-        return found
-
-    def evict_expired(self) -> None:
-        """Remove expired entries (called periodically to keep memory bounded)."""
-        now = time.monotonic()
-        expired = [n for n, (_, exp) in self._store.items() if now >= exp]
-        for name in expired:
-            del self._store[name]
-
-    @property
-    def size(self) -> int:
-        return len(self._store)
