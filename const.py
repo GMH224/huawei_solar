@@ -109,16 +109,16 @@ ADAPTIVE_TRANSITION_DURATION_MINUTES: int = 10
 # ── Adaptive parameter bounds ─────────────────────────────────────────────────
 # Poll interval: 30 s (normal) to 120 s (high-failure slots).
 # Night mode (5 min) takes precedence when active.
-ADAPTIVE_POLL_MIN = timedelta(seconds=30)
-ADAPTIVE_POLL_MAX = timedelta(seconds=120)
+ADAPTIVE_POLL_MIN = timedelta(seconds=15)     # 30
+ADAPTIVE_POLL_MAX = timedelta(seconds=300)    # 120
 
 # Inter-request gap: 150 ms (normal) to 500 ms (high-RTT / transition).
-ADAPTIVE_GAP_MIN = timedelta(milliseconds=150)
-ADAPTIVE_GAP_MAX = timedelta(milliseconds=500)
+ADAPTIVE_GAP_MIN = timedelta(milliseconds=30)  # 150
+ADAPTIVE_GAP_MAX = timedelta(milliseconds=500)  # 500
 
 # Per-request timeout: 35 s (normal) to 90 s (slow/busy inverter).
-ADAPTIVE_TIMEOUT_MIN = timedelta(seconds=35)
-ADAPTIVE_TIMEOUT_MAX = timedelta(seconds=90)
+ADAPTIVE_TIMEOUT_MIN = timedelta(seconds=10)   # 35
+ADAPTIVE_TIMEOUT_MAX = timedelta(seconds=45)   # 90
 
 # Failure rate thresholds used to derive queue depth and poll interval.
 # Above HIGH → use max params; between LOW and HIGH → interpolate.
