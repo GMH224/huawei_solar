@@ -90,6 +90,7 @@ from .const import (
     ADAPTIVE_FULL_CONFIDENCE_N,
     ADAPTIVE_GAP_MAX,
     ADAPTIVE_GAP_MIN,
+    ADAPTIVE_POLL_COLD_START,
     ADAPTIVE_POLL_MAX,
     ADAPTIVE_POLL_MIN,
     ADAPTIVE_RTT_SAMPLE_SIZE,
@@ -466,17 +467,20 @@ class AdaptiveModbusController:
             1.0,
         )
 
-        # ── Poll interval: 30 s → 120 s ───────────────────────────────────────
+        # ── Poll interval: 20 s → 180 s ───────────────────────────────────────
+        # At full confidence: use slot-derived value (failure-rate interpolation).
+        # At zero confidence: use ADAPTIVE_POLL_COLD_START (60 s) — deliberately
+        # independent of ADAPTIVE_POLL_MIN so that lowering the minimum (20 s)
+        # never makes unknown slots poll at their most aggressive rate.
         poll_s_derived = (
             ADAPTIVE_POLL_MIN.total_seconds()
             + t * (ADAPTIVE_POLL_MAX.total_seconds() - ADAPTIVE_POLL_MIN.total_seconds())
         )
-        # Blend: low confidence → conservative (slow) baseline
-        poll_s_baseline = ADAPTIVE_POLL_MIN.total_seconds()
+        poll_s_baseline = ADAPTIVE_POLL_COLD_START.total_seconds()  # 60 s cold start
         poll_s = confidence * poll_s_derived + (1 - confidence) * poll_s_baseline
         poll_interval = timedelta(seconds=round(poll_s))
 
-        # ── Gap: 150 ms → 500 ms ──────────────────────────────────────────────
+        # ── Gap: 150 ms → 500 ms (floor is a hardware constraint, not configurable) ──
         # Base on P95 RTT: gap should be at least RTT_P95 × 0.4 so the inverter
         # FSM has recovered before the next request arrives.
         rtt_based_gap_ms = slot.rtt_p95_ms * 0.4
@@ -488,14 +492,19 @@ class AdaptiveModbusController:
         gap_ms = confidence * gap_ms_derived + (1 - confidence) * gap_ms_baseline
         request_gap = timedelta(milliseconds=gap_ms)
 
-        # ── Timeout: 35 s → 90 s ──────────────────────────────────────────────
+        # ── Timeout: 15 s → 60 s ──────────────────────────────────────────────
         # Set timeout to at least 5× the P95 RTT so that a slow-but-responding
-        # inverter is not cut off prematurely.
+        # inverter is not cut off prematurely.  The keep-alive probe (opt. 3)
+        # handles dead-connection detection independently, so this timeout is
+        # purely a 'live-but-slow' guard — 60 s max is sufficient.
         rtt_based_timeout_s = (slot.rtt_p95_ms / 1000) * 5
         timeout_s_derived = max(
             ADAPTIVE_TIMEOUT_MIN.total_seconds(),
             min(rtt_based_timeout_s + t * 20, ADAPTIVE_TIMEOUT_MAX.total_seconds()),
         )
+        # Cold-start timeout baseline: use ADAPTIVE_TIMEOUT_MIN (15 s) — already
+        # conservative enough; no separate cold-start constant needed here because
+        # a 15 s timeout during a low-confidence poll is correctly cautious.
         timeout_s_baseline = ADAPTIVE_TIMEOUT_MIN.total_seconds()
         timeout_s = confidence * timeout_s_derived + (1 - confidence) * timeout_s_baseline
         request_timeout = timedelta(seconds=round(timeout_s))

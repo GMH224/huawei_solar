@@ -52,6 +52,7 @@ from .const import (
 )
 from .adaptive_modbus import AdaptiveModbusController
 from .modbus_guard import ModbusGuard
+from .modbus_keepalive import ModbusKeepAlive
 from .modbus_telemetry import ModbusTelemetry
 from .services import async_setup_services
 from .synchronized_power_coordinator import SynchronizedPowerCoordinator
@@ -134,6 +135,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
 
         primary_device = await create_device_instance(client)
 
+        # Derive the bus endpoint once from the config entry.
+        # All inverters on the same physical RS485 bus share this endpoint
+        # and will therefore share one ModbusGuard (bus-level serialisation).
+        bus_endpoint = ModbusGuard.endpoint_for(dict(entry.data))
+        _LOGGER.debug("Bus endpoint: %s", bus_endpoint)
+
         if entry.data.get(CONF_ENABLE_PARAMETER_CONFIGURATION):
             if (
                 isinstance(primary_device, HuaweiSolarDeviceWithLogin)
@@ -151,13 +158,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
             hass,
             entry,
             primary_device,
+            bus_endpoint=bus_endpoint,
         )
 
         device_datas: list[HuaweiSolarDeviceData] = [primary_device_data]
 
         for extra_unit_id in entry.data[CONF_SLAVE_IDS][1:]:
             sub_device = await create_sub_device_instance(primary_device, extra_unit_id)
-            sub_device_data = await _setup_device_data(hass, entry, sub_device)
+            # sub_device shares the same physical RS485 bus as primary_device
+            # — passing bus_endpoint gives it the same ModbusGuard instance.
+            sub_device_data = await _setup_device_data(
+                hass, entry, sub_device, bus_endpoint=bus_endpoint
+            )
 
             device_datas.append(sub_device_data)
 
@@ -306,6 +318,14 @@ async def async_unload_entry(
                 controller.stop()
         AdaptiveModbusController.clear_registry()
 
+        # Stop keep-alive probes and clear registry
+        for device_data in device_datas:
+            serial = device_data.device.serial_number
+            keepalive = ModbusKeepAlive.get(serial)
+            if keepalive:
+                keepalive.stop()
+        ModbusKeepAlive.clear_registry()
+
         # The SynchronizedPowerCoordinator has no background tasks of its own —
         # HA cancels its scheduled refresh when the config entry is unloaded.
         # We only need to drop the reference so it can be garbage-collected.
@@ -335,6 +355,7 @@ async def _setup_inverter_device_data(
     entry: ConfigEntry,
     device: SUN2000Device,
     connecting_inverter_device_id: tuple[str, str] | None,
+    bus_endpoint: str = "",
 ) -> HuaweiSolarInverterData:
     device_registry = dr.async_get(hass)
 
@@ -365,6 +386,7 @@ async def _setup_inverter_device_data(
         name=f"{device.serial_number}_data_update_coordinator",
         update_interval=INVERTER_UPDATE_INTERVAL,
         start_delay=_COORDINATOR_START_DELAYS["main"],
+        bus_endpoint=bus_endpoint,
     )
 
     # Create telemetry singleton and attach to the main coordinator.
@@ -384,6 +406,19 @@ async def _setup_inverter_device_data(
     await adaptive.async_load()
     update_coordinator.attach_adaptive(adaptive)
 
+    # Create the keep-alive / connection health probe.
+    # The callbacks wire directly into the main coordinator so that a
+    # dead-connection detection immediately invalidates the cache and
+    # resets failure counters on all coordinators for this inverter.
+    keepalive = ModbusKeepAlive.get_or_create(
+        serial_number=device.serial_number,
+        device=device,
+        guard=update_coordinator.guard,
+        on_connection_lost=update_coordinator.on_connection_lost,
+        on_connection_restored=update_coordinator.on_connection_restored,
+    )
+    await keepalive.start()
+
     # Add power meter device if a power meter is detected
     if device.power_meter_type is not None:
         power_meter_device_info = DeviceInfo(
@@ -400,6 +435,7 @@ async def _setup_inverter_device_data(
             name=f"{device.serial_number}_power_meter_data_update_coordinator",
             update_interval=POWER_METER_UPDATE_INTERVAL,
             start_delay=_COORDINATOR_START_DELAYS["power_meter"],
+            bus_endpoint=bus_endpoint,
         )
         power_meter_update_coordinator.attach_telemetry(telemetry)
         power_meter_update_coordinator.attach_adaptive(adaptive)
@@ -426,6 +462,7 @@ async def _setup_inverter_device_data(
             name=f"{device.serial_number}_battery_data_update_coordinator",
             update_interval=ENERGY_STORAGE_UPDATE_INTERVAL,
             start_delay=_COORDINATOR_START_DELAYS["energy_storage"],
+            bus_endpoint=bus_endpoint,
         )
         energy_storage_update_coordinator.attach_telemetry(telemetry)
         energy_storage_update_coordinator.attach_adaptive(adaptive)
@@ -489,6 +526,7 @@ async def _setup_inverter_device_data(
                 device,
                 optimizers_device_infos,
                 OPTIMIZER_UPDATE_INTERVAL,
+                bus_endpoint=bus_endpoint,
             )
             optimizer_update_coordinator.attach_telemetry(telemetry)
             optimizer_update_coordinator.attach_adaptive(adaptive)
@@ -512,6 +550,7 @@ async def _setup_inverter_device_data(
             name=f"{device.serial_number}_config_data_update_coordinator",
             update_interval=CONFIGURATION_UPDATE_INTERVAL,
             start_delay=_COORDINATOR_START_DELAYS["configuration"],
+            bus_endpoint=bus_endpoint,
         )
         configuration_update_coordinator.attach_telemetry(telemetry)
         configuration_update_coordinator.attach_adaptive(adaptive)
@@ -547,10 +586,13 @@ async def _setup_device_data(
     hass: HomeAssistant,
     entry: ConfigEntry,
     device: HuaweiSolarDevice,
+    bus_endpoint: str = "",
 ) -> HuaweiSolarDeviceData:
     """Create the correct DeviceInfo-objects, which can be used to correctly assign to entities in this integration."""
     if isinstance(device, SUN2000Device):
-        return await _setup_inverter_device_data(hass, entry, device, None)
+        return await _setup_inverter_device_data(
+            hass, entry, device, None, bus_endpoint=bus_endpoint
+        )
 
     device_registry = dr.async_get(hass)
 

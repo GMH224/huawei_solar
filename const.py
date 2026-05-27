@@ -96,8 +96,11 @@ ADAPTIVE_SLOT_COUNT: int = 96          # 24 * 60 // ADAPTIVE_SLOT_MINUTES
 ADAPTIVE_DECAY_FACTOR: float = 0.85
 
 # Number of weighted requests per slot for "full" confidence (1.0).
-# At 30 s polling: 30 requests/slot/day → ~10 days for full confidence.
-ADAPTIVE_FULL_CONFIDENCE_N: float = 300.0
+# At 20–30 s polling: ~30 requests/slot/day → ~5 days for full confidence.
+# 150 is the sweet spot: statistically stable (a single bad day contributes
+# < 33 % weight at full confidence) while adapting meaningfully within a week.
+# Gemini suggested 60 (too fast — one bad day dominates); we use 150.
+ADAPTIVE_FULL_CONFIDENCE_N: float = 150.0
 
 # How many raw RTT samples to store per slot for P95 estimation.
 ADAPTIVE_RTT_SAMPLE_SIZE: int = 50
@@ -107,20 +110,91 @@ ADAPTIVE_RTT_SAMPLE_SIZE: int = 50
 ADAPTIVE_TRANSITION_DURATION_MINUTES: int = 10
 
 # ── Adaptive parameter bounds ─────────────────────────────────────────────────
-# Poll interval: 30 s (normal) to 120 s (high-failure slots).
-# Night mode (5 min) takes precedence when active.
-ADAPTIVE_POLL_MIN = timedelta(seconds=15)     # 30
-ADAPTIVE_POLL_MAX = timedelta(seconds=300)    # 120
+# Poll interval: 20 s (healthy slots) → 180 s (high-failure slots).
+# Night mode (5 min) always takes precedence.
+# 20 s: meaningful improvement for power-flow card; safe with bus-level guard.
+# 180 s: significant daytime back-off without reaching night-mode territory.
+# Gemini suggested 15 s min (too aggressive for inverter CPU) and 300 s max
+# (indistinguishable from night mode; confusing to users).
+ADAPTIVE_POLL_MIN = timedelta(seconds=20)
+ADAPTIVE_POLL_MAX = timedelta(seconds=180)
+
+# Cold-start (zero-confidence) poll baseline — expressed as a SEPARATE
+# constant so it is independent of ADAPTIVE_POLL_MIN.  At confidence=0 the
+# blending formula uses this value rather than ADAPTIVE_POLL_MIN, ensuring
+# unknown slots default to a moderate rate rather than the fastest rate.
+# Lowering ADAPTIVE_POLL_MIN to 20 s must not change cold-start behaviour.
+ADAPTIVE_POLL_COLD_START = timedelta(seconds=60)
 
 # Inter-request gap: 150 ms (normal) to 500 ms (high-RTT / transition).
-ADAPTIVE_GAP_MIN = timedelta(milliseconds=30)  # 150
-ADAPTIVE_GAP_MAX = timedelta(milliseconds=500)  # 500
+# INTENTIONALLY NOT REDUCED BELOW 150 ms despite Gemini's 30 ms suggestion.
+# The SUN2000 Modbus FSM needs ~100 ms to reset its receive buffer after each
+# response, regardless of TCP link quality.  150 ms is the safe hardware floor.
+# Lowering to 30 ms causes pervasive 0x06 SLAVE_DEVICE_BUSY responses —
+# the exact failure mode the BUSY retry logic (opt. 2) is designed to handle.
+ADAPTIVE_GAP_MIN = timedelta(milliseconds=150)
+ADAPTIVE_GAP_MAX = timedelta(milliseconds=500)
 
-# Per-request timeout: 35 s (normal) to 90 s (slow/busy inverter).
-ADAPTIVE_TIMEOUT_MIN = timedelta(seconds=10)   # 35
-ADAPTIVE_TIMEOUT_MAX = timedelta(seconds=45)   # 90
+# Per-request timeout: 15 s (healthy) → 60 s (stressed inverter).
+# 15 s min: safe floor for transition-window slow responses.  Gemini's 10 s
+# would fire during legitimate 8–12 s responses on a loaded inverter.
+# 60 s max: the keep-alive probe (opt. 3) now handles dead-connection
+# detection within 45 s, so the coordinator timeout is purely a
+# 'live-but-slow' guard.  60 s covers multi-chunk slow reads; 90 s was
+# needed only when the timeout was also the dead-socket detector.
+ADAPTIVE_TIMEOUT_MIN = timedelta(seconds=15)
+ADAPTIVE_TIMEOUT_MAX = timedelta(seconds=60)
 
 # Failure rate thresholds used to derive queue depth and poll interval.
 # Above HIGH → use max params; between LOW and HIGH → interpolate.
 ADAPTIVE_FAILURE_RATE_LOW: float = 0.03    # 3 %
 ADAPTIVE_FAILURE_RATE_HIGH: float = 0.15   # 15 %
+
+# ── Optimisation 1: Bus-level guard ──────────────────────────────────────────
+# ModbusGuard is keyed on connection endpoint (host:port) rather than serial
+# number for multi-inverter (sub-device) topologies.  All slaves on the same
+# physical RS485 bus share one guard so their requests never overlap on the wire.
+# (No runtime constant needed — the key is derived in __init__.py)
+
+# ── Optimisation 2: SLAVE_DEVICE_BUSY (0x06) retry ───────────────────────────
+# On Modbus exception 0x06, pause this long then retry once before counting
+# the request as a failure.  The 0x06 response means the inverter is alive but
+# its CPU is saturated — a brief pause almost always succeeds on the retry.
+BUSY_RETRY_PAUSE = timedelta(milliseconds=600)
+# Maximum number of 0x06 retries per original request before giving up.
+BUSY_MAX_RETRIES: int = 2
+
+# ── Optimisation 3: Keep-alive / connection health probe ─────────────────────
+# A lightweight background task reads a single static register every
+# KEEPALIVE_INTERVAL seconds to prevent the SUN2000 from silently dropping the
+# TCP connection after ~60 s of idle.  Also used as a health probe: if the
+# read fails the task triggers a reconnect before the next poll cycle hits a
+# dead socket.
+KEEPALIVE_INTERVAL = timedelta(seconds=45)
+# Register used for the keep-alive read (must be STATIC and single-word).
+# Model ID is 1 register, always readable, never causes side effects.
+KEEPALIVE_REGISTER = "model_id"
+
+# ── Optimisation 4: Batch chunking ───────────────────────────────────────────
+# Stale register lists larger than this threshold are split into chunks before
+# being passed to batch_update(), with a short pause between chunks.  This
+# prevents a single Modbus burst from occupying the inverter CPU for > ~300 ms,
+# which is a primary trigger for 0x06 BUSY responses during high-load windows.
+BATCH_CHUNK_SIZE: int = 40
+# Pause inserted between chunks (inside the guard lock — gap enforced by guard).
+BATCH_INTER_CHUNK_PAUSE = timedelta(milliseconds=80)
+
+# ── Optimisation 5: Write-back verification ───────────────────────────────────
+# Delay before the post-write verification read is issued.  Long enough for the
+# inverter to apply the setting, short enough to catch a missed write quickly.
+WRITE_VERIFY_DELAY = timedelta(seconds=3)
+# Maximum number of re-read retries if the first verification read still shows
+# the old value (covers slow-applying settings like working-mode changes).
+WRITE_VERIFY_RETRIES: int = 2
+
+# ── Optimisation 6: Priority polling during back-off ─────────────────────────
+# Tier names eligible for reduced-frequency reads during back-off.
+# FAST registers are always read; NORMAL may be polled at BACKOFF_NORMAL_DIVISOR
+# (every Nth poll cycle); SLOW/STATIC are deferred entirely until recovery.
+BACKOFF_FAST_ALWAYS: bool = True
+BACKOFF_NORMAL_DIVISOR: int = 4   # read NORMAL registers every 4th back-off cycle
