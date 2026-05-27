@@ -1,7 +1,7 @@
 # CLAUDE.md — Huawei Solar Integration
 
 > **Maintained by Claude (Anthropic) on behalf of the community.**
-> Current version: **1.0.4** — see `manifest.json`.
+> Current version: **1.0.6** — see `manifest.json`.
 
 ---
 
@@ -307,6 +307,52 @@ fix that calls `_evict()` from `record_failure()` and `record_timeout()`.
 ---
 
 ## 8. Changelog
+
+### v1.0.6 (2026-05-27)
+**Adaptive parameter bound tuning — evidence-based review of Gemini's proposal**
+
+Reviewed all six parameter bounds proposed by Gemini Pro against hardware
+constraints, statistical theory, and the v1.0.5 architecture.  Accepted 3,
+rejected 2, modified 1, and introduced one new structural constant.
+
+| Parameter | v1.0.5 | Gemini | v1.0.6 | Decision rationale |
+|---|---|---|---|---|
+| Poll interval min | 30 s | 15 s | **20 s** | 15 s excessive inverter CPU load; 20 s safe with bus-level guard, meaningful for power-flow card |
+| Poll interval max | 120 s | 300 s | **180 s** | 300 s indistinguishable from night mode during daytime; 180 s allows real back-off without confusion |
+| Modbus gap min | 150 ms | 30 ms | **150 ms (unchanged)** | **Rejected.** 150 ms is a hardware FSM reset constraint, not a network variable. 30 ms causes pervasive 0x06 BUSY on all SUN2000 hardware |
+| Modbus gap max | 500 ms | 500 ms | **500 ms (unchanged)** | Agreed |
+| Timeout min | 35 s | 10 s | **15 s** | 10 s fires during legitimate 8–12 s transition-window responses; 15 s is the safe floor |
+| Timeout max | 90 s | 45 s | **60 s** | Keep-alive (v1.0.5) now handles dead-socket detection; 60 s covers multi-chunk slow reads |
+| Queue depth max | 3 | 4 | **3 (unchanged)** | **Rejected.** Guard is a serialiser, not a thread pool; depth 4 worsens outage pile-up |
+| Cold-start baseline | 30 s (= POLL_MIN) | 60 s | **60 s as `ADAPTIVE_POLL_COLD_START`** | Accepted direction; implemented as a *separate* constant so lowering POLL_MIN never affects unknown-slot behaviour |
+| Confidence ceiling | 300 samples | 60 samples | **150 samples (~5 days)** | 60 too fast (single bad day = 67% weight at full confidence); 300 too slow (10 days); 150 balances stability and adaptation speed |
+
+**Files changed:** `const.py`, `adaptive_modbus.py`, `modbus_guard.py`, `update_coordinator.py`
+**New constant:** `ADAPTIVE_POLL_COLD_START = timedelta(seconds=60)`
+
+### v1.0.5 (2026-05-27)
+**Six high-impact Modbus reliability improvements**
+
+Targets the two structural failure modes identified in telemetry:
+(A) RS485 bus collisions between 10K and 5K inverters sharing the same physical
+    wire — the direct cause of the 5K's 20× higher failure rate.
+(B) Silent TCP connection death during night-mode idle gaps causing 35–90 s dead
+    timeouts on the first post-night poll.
+
+| # | Opt | Files changed | What & why |
+|---|-----|---------------|------------|
+| 1 | Bus-level guard | `modbus_guard.py`, `update_coordinator.py`, `__init__.py` | Guard registry key changed from `serial_number` to `connection_endpoint` (host:port or rtu:port). All sub-devices on the same RS485 bus now share one guard. `endpoint_for(entry.data)` derives the key once in `async_setup_entry`; it is passed through `_setup_device_data` → `_setup_inverter_device_data` → every coordinator constructor and `create_optimizer_update_coordinator`. **Expected result: 5K failure rate drops from ~13% to near-baseline.** |
+| 2 | 0x06 BUSY retry | `update_coordinator.py`, `const.py` | `ReadException` with `modbus_exception_code == 0x06` (SLAVE_DEVICE_BUSY) is now handled separately in `_execute_batch()`. On first BUSY: pause `BUSY_RETRY_PAUSE` (600 ms) then retry the chunk. Up to `BUSY_MAX_RETRIES` (2) retries before counting as a failure. First BUSY also calls `notify_transition()` on the adaptive controller — BUSY at runtime is a reliable signal of an inverter state change (MPPT ramp, mode switch, BMS wake). **Expected result: transition-period failure spikes turn into slow-but-successful requests.** |
+| 3 | Keep-alive + health probe | `modbus_keepalive.py` *(new)*, `__init__.py`, `update_coordinator.py` | `ModbusKeepAlive` runs a background task per inverter that reads `model_id` (1 static register) every 45 s via `guard.request(priority=True)`. Keeps TCP alive through night-mode idle gaps. On failure: calls `on_connection_lost()` → cache invalidated, failure counters reset. On recovery: calls `on_connection_restored()`. Priority requests bypass queue-depth shedding but still wait for the lock and respect the inter-request gap. **Expected result: post-night poll no longer hits a dead socket; eliminates the 35–90 s reconnect timeout.** |
+| 4 | Batch chunking | `update_coordinator.py`, `const.py` | `_execute_batch()` splits stale register lists into chunks of ≤ `BATCH_CHUNK_SIZE` (40) registers. Between chunks: 80 ms pause (`BATCH_INTER_CHUNK_PAUSE`) outside the guard lock, letting other clients interleave. Limits each Modbus burst to ~300 ms of inverter CPU time, reducing the probability of triggering 0x06 BUSY responses during the burst. |
+| 5 | Write-back verification | `update_coordinator.py`, `const.py` | `verify_write(name, expected)` reads the register back 3 s after a write and compares against the expected value. Up to `WRITE_VERIFY_RETRIES` (2) additional retries with 3 s spacing. Logs a warning if the inverter did not apply the setting (common for working-mode changes during state transitions). Callers: number/select/switch entities after any `set_*` call. |
+| 6 | Priority polling during back-off | `update_coordinator.py`, `const.py` | During exponential back-off (`_consecutive_timeouts ≥ MAX_CONSECUTIVE_TIMEOUTS`), stale registers are filtered by tier: FAST always read (real-time power, SOC, grid values), NORMAL read every `BACKOFF_NORMAL_DIVISOR` (4th) cycle, SLOW/STATIC deferred entirely. This keeps the most critical HA automations (battery rules, grid limits) informed even during a partial outage, while reducing Modbus traffic when the inverter is under stress. |
+
+**New file:** `modbus_keepalive.py`
+**New constants:** `BUSY_RETRY_PAUSE`, `BUSY_MAX_RETRIES`, `KEEPALIVE_INTERVAL`,
+`KEEPALIVE_REGISTER`, `BATCH_CHUNK_SIZE`, `BATCH_INTER_CHUNK_PAUSE`,
+`WRITE_VERIFY_DELAY`, `WRITE_VERIFY_RETRIES`, `BACKOFF_FAST_ALWAYS`,
+`BACKOFF_NORMAL_DIVISOR`
 
 ### v1.0.4 (2026-05-27)
 **Circadian adaptive Modbus learning — reliability over speed**
