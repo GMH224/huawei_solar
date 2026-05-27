@@ -46,8 +46,10 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DATA_DEVICE_DATAS, DOMAIN
+from .const import DATA_DEVICE_DATAS, DATA_SYNC_POWER_COORDINATOR, DOMAIN
+from .adaptive_modbus import AdaptiveModbusController, create_adaptive_entities
 from .modbus_telemetry import ModbusTelemetry, create_telemetry_entities
+from .synchronized_power_coordinator import SynchronizedPowerCoordinator, SynchronizedPowerData
 from .types import (
     HuaweiSolarConfigEntry,
     HuaweiSolarDeviceData,
@@ -2250,6 +2252,35 @@ async def async_setup_entry(
     if telemetry_entities:
         async_add_entities(telemetry_entities)
 
+    # Register adaptive Modbus learning diagnostic sensors for each inverter
+    adaptive_entities = []
+    for ucs in device_datas:
+        controller = AdaptiveModbusController.get(ucs.device.serial_number)
+        if controller:
+            adaptive_entities.extend(create_adaptive_entities(controller))
+    if adaptive_entities:
+        async_add_entities(adaptive_entities)
+
+
+    # Register synchronized power-flow sensors if the coordinator was created.
+    # These entities provide a coherent power snapshot (all values from the same
+    # poll tick) for use in the HA Energy dashboard power-flow card.
+    sync_coordinator: SynchronizedPowerCoordinator | None = (
+        entry.runtime_data.get(DATA_SYNC_POWER_COORDINATOR)
+    )
+    if sync_coordinator is not None:
+        # Attach to the primary inverter device for grouping in HA.
+        primary_inverter_data = next(
+            (d for d in device_datas if isinstance(d, HuaweiSolarInverterData)),
+            None,
+        )
+        if primary_inverter_data is not None:
+            async_add_entities(
+                create_synchronized_power_entities(
+                    sync_coordinator, primary_inverter_data.device_info
+                )
+            )
+
 
 class HuaweiSolarSensorEntity(
     CoordinatorEntity[HuaweiSolarUpdateCoordinator], HuaweiSolarEntity, SensorEntity
@@ -2888,3 +2919,128 @@ def get_pv_entity_descriptions(count: int) -> list[HuaweiSolarSensorEntityDescri
         )
 
     return result
+
+
+# ── Synchronized power-flow entities ─────────────────────────────────────────
+#
+# These four sensors all update from the same SynchronizedPowerCoordinator tick
+# so their last_updated timestamps are identical.  Use them — not the per-device
+# INPUT_POWER / POWER_METER_ACTIVE_POWER / STORAGE_CHARGE_DISCHARGE_POWER
+# sensors — as the sources for the HA Energy power-flow card.
+
+class SynchronizedPowerSensorEntity(
+    CoordinatorEntity[SynchronizedPowerCoordinator], SensorEntity
+):
+    """A sensor driven by SynchronizedPowerCoordinator.
+
+    All instances of this class share the same coordinator, so HA writes their
+    state in the same dispatcher cycle — their last_updated timestamps are equal.
+    This eliminates the timing-spread error that affects per-device sensors when
+    multiple coordinators fire at different moments.
+    """
+
+    _attr_has_entity_name = True
+    _attr_device_class = SensorDeviceClass.POWER
+    _attr_native_unit_of_measurement = UnitOfPower.WATT
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_should_poll = False
+
+    def __init__(
+        self,
+        coordinator: SynchronizedPowerCoordinator,
+        device_info: DeviceInfo,
+        *,
+        unique_id_suffix: str,
+        translation_key: str,
+        icon: str | None = None,
+    ) -> None:
+        super().__init__(coordinator)
+        self._unique_id_suffix = unique_id_suffix
+        self._attr_translation_key = translation_key
+        self._attr_device_info = device_info
+        self._attr_unique_id = f"sync_power_{unique_id_suffix}"
+        if icon:
+            self._attr_icon = icon
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Extract the relevant field from the shared SynchronizedPowerData."""
+        data: SynchronizedPowerData | None = self.coordinator.data
+        self._attr_native_value = self._get_value(data)
+        self._attr_available = self._attr_native_value is not None
+        self.async_write_ha_state()
+
+    def _get_value(self, data: SynchronizedPowerData | None) -> float | None:
+        """Subclasses override this to pick their field from the snapshot."""
+        raise NotImplementedError
+
+
+class _PvTotalSensor(SynchronizedPowerSensorEntity):
+    def _get_value(self, data: SynchronizedPowerData | None) -> float | None:
+        return data.pv_power_total if data else None
+
+
+class _GridPowerSensor(SynchronizedPowerSensorEntity):
+    def _get_value(self, data: SynchronizedPowerData | None) -> float | None:
+        return data.grid_power if data else None
+
+
+class _BatteryPowerSensor(SynchronizedPowerSensorEntity):
+    def _get_value(self, data: SynchronizedPowerData | None) -> float | None:
+        return data.battery_power if data else None
+
+
+class _HomeConsumptionSensor(SynchronizedPowerSensorEntity):
+    def _get_value(self, data: SynchronizedPowerData | None) -> float | None:
+        return data.home_consumption if data else None
+
+
+def create_synchronized_power_entities(
+    coordinator: SynchronizedPowerCoordinator,
+    device_info: DeviceInfo,
+) -> list[SynchronizedPowerSensorEntity]:
+    """Build the four power-flow sensor entities for the given coordinator.
+
+    Returns
+    -------
+    list[SynchronizedPowerSensorEntity]
+        Entities to register via ``async_add_entities``.  All share the same
+        ``coordinator`` so HA dispatches their state update in a single batch.
+
+    Entity IDs created
+    ------------------
+    • ``sensor.huawei_solar_pv_power_total``       — sum of all PV strings (W)
+    • ``sensor.huawei_solar_grid_power``           — signed grid power (W)
+    • ``sensor.huawei_solar_battery_power``        — signed battery power (W)
+    • ``sensor.huawei_solar_home_consumption``     — derived home load (W)
+    """
+    return [
+        _PvTotalSensor(
+            coordinator,
+            device_info,
+            unique_id_suffix="pv_power_total",
+            translation_key="sync_pv_power_total",
+            icon="mdi:solar-panel-large",
+        ),
+        _GridPowerSensor(
+            coordinator,
+            device_info,
+            unique_id_suffix="grid_power",
+            translation_key="sync_grid_power",
+            icon="mdi:transmission-tower",
+        ),
+        _BatteryPowerSensor(
+            coordinator,
+            device_info,
+            unique_id_suffix="battery_power",
+            translation_key="sync_battery_power",
+            icon="mdi:battery-charging",
+        ),
+        _HomeConsumptionSensor(
+            coordinator,
+            device_info,
+            unique_id_suffix="home_consumption",
+            translation_key="sync_home_consumption",
+            icon="mdi:home-lightning-bolt",
+        ),
+    ]

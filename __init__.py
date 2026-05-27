@@ -1,6 +1,7 @@
 """The Huawei Solar integration."""
 
 import logging
+from datetime import timedelta
 
 from huawei_solar import (
     ConnectionException,
@@ -40,16 +41,20 @@ from .const import (
     CONF_SLAVE_IDS,
     CONFIGURATION_UPDATE_INTERVAL,
     DATA_DEVICE_DATAS,
+    DATA_SYNC_POWER_COORDINATOR,
     DOMAIN,
     ENERGY_STORAGE_UPDATE_INTERVAL,
     INVERTER_UPDATE_INTERVAL,
     NIGHT_POLL_INTERVAL,
     OPTIMIZER_UPDATE_INTERVAL,
     POWER_METER_UPDATE_INTERVAL,
+    SYNC_POWER_UPDATE_INTERVAL,
 )
+from .adaptive_modbus import AdaptiveModbusController
 from .modbus_guard import ModbusGuard
 from .modbus_telemetry import ModbusTelemetry
 from .services import async_setup_services
+from .synchronized_power_coordinator import SynchronizedPowerCoordinator
 from .types import (
     HuaweiSolarConfigEntry,
     HuaweiSolarDeviceData,
@@ -59,6 +64,23 @@ from .update_coordinator import (
     HuaweiSolarUpdateCoordinator,
     create_optimizer_update_coordinator,
 )
+
+# Stagger offsets applied to the first poll of each coordinator sharing the
+# same ModbusGuard.  Without jitter all four coordinators (main, power_meter,
+# energy_storage, configuration) fire simultaneously at t=0 and again at every
+# shared interval boundary, pushing the guard queue depth to 4 and triggering
+# load-shedding under normal conditions.  These fixed offsets spread them
+# evenly across the 30 s poll window so the guard never sees more than one
+# in-flight request at a time during steady-state operation.
+#
+# The configuration coordinator uses a 15-minute interval and is staggered by
+# 10 s — small relative to its own cadence, large enough to clear the guard.
+_COORDINATOR_START_DELAYS = {
+    "main":          timedelta(seconds=0),
+    "power_meter":   timedelta(seconds=7),
+    "energy_storage": timedelta(seconds=14),
+    "configuration": timedelta(seconds=10),
+}
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -139,8 +161,56 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
 
             device_datas.append(sub_device_data)
 
+        # ── SynchronizedPowerCoordinator ──────────────────────────────────────
+        # Build a coordinator that reads all instantaneous power registers in one
+        # contiguous Modbus block, eliminating the timing spread that causes
+        # power-flow card arithmetic errors when multiple coordinators fire at
+        # different moments.
+        #
+        # Conditions for enabling:
+        #  • At least one SUN2000 inverter is present (always true at this point)
+        #  • Primary inverter has a meter OR battery — otherwise there is nothing
+        #    interesting to synchronise beyond INV1's own PV reading, which the
+        #    existing update_coordinator already handles.
+
+        inverter_datas = [d for d in device_datas if isinstance(d, HuaweiSolarInverterData)]
+        sync_coordinator: SynchronizedPowerCoordinator | None = None
+
+        if inverter_datas:
+            inv1_data = inverter_datas[0]
+            inv2_data = inverter_datas[1] if len(inverter_datas) > 1 else None
+            has_meter = inv1_data.power_meter is not None
+            has_battery = inv1_data.connected_energy_storage is not None
+
+            if has_meter or has_battery or inv2_data is not None:
+                sync_coordinator = SynchronizedPowerCoordinator(
+                    hass,
+                    inv1_device=inv1_data.device,
+                    inv2_device=inv2_data.device if inv2_data is not None else None,
+                    has_meter=has_meter,
+                    has_battery=has_battery,
+                    update_interval=SYNC_POWER_UPDATE_INTERVAL,
+                )
+                # Attach INV1's telemetry so sync-coordinator reads are counted
+                # in the same Modbus traffic dashboard as the other coordinators.
+                telemetry = ModbusTelemetry.get(inv1_data.device.serial_number)
+                if telemetry:
+                    sync_coordinator.attach_telemetry(telemetry)
+
+                await sync_coordinator.async_config_entry_first_refresh()
+                _LOGGER.info(
+                    "SynchronizedPowerCoordinator enabled: INV1=%s, INV2=%s, "
+                    "meter=%s, battery=%s, interval=%ss",
+                    inv1_data.device.serial_number,
+                    inv2_data.device.serial_number if inv2_data else "none",
+                    has_meter,
+                    has_battery,
+                    SYNC_POWER_UPDATE_INTERVAL.total_seconds(),
+                )
+
         entry.runtime_data = {
             DATA_DEVICE_DATAS: device_datas,
+            DATA_SYNC_POWER_COORDINATOR: sync_coordinator,
         }
     except ConnectionInterruptedException as err:
         if primary_device is not None:
@@ -228,6 +298,19 @@ async def async_unload_entry(
         ModbusGuard.clear_registry()
         ModbusTelemetry.clear_registry()
 
+        # Stop adaptive controllers and clear their registry
+        for device_data in device_datas:
+            serial = device_data.device.serial_number
+            controller = AdaptiveModbusController.get(serial)
+            if controller:
+                controller.stop()
+        AdaptiveModbusController.clear_registry()
+
+        # The SynchronizedPowerCoordinator has no background tasks of its own —
+        # HA cancels its scheduled refresh when the config entry is unloaded.
+        # We only need to drop the reference so it can be garbage-collected.
+        entry.runtime_data.pop(DATA_SYNC_POWER_COORDINATOR, None)
+
     return unload_ok
 
 
@@ -281,6 +364,7 @@ async def _setup_inverter_device_data(
         device=device,
         name=f"{device.serial_number}_data_update_coordinator",
         update_interval=INVERTER_UPDATE_INTERVAL,
+        start_delay=_COORDINATOR_START_DELAYS["main"],
     )
 
     # Create telemetry singleton and attach to the main coordinator.
@@ -290,6 +374,15 @@ async def _setup_inverter_device_data(
         hass, device.serial_number, inverter_device_info
     )
     update_coordinator.attach_telemetry(telemetry)
+
+    # Create the circadian adaptive learning controller and load persisted
+    # statistics from HA storage.  All coordinators for this inverter share
+    # one controller so every Modbus request contributes to the same model.
+    adaptive = AdaptiveModbusController.get_or_create(
+        hass, device.serial_number, inverter_device_info
+    )
+    await adaptive.async_load()
+    update_coordinator.attach_adaptive(adaptive)
 
     # Add power meter device if a power meter is detected
     if device.power_meter_type is not None:
@@ -306,8 +399,10 @@ async def _setup_inverter_device_data(
             device=device,
             name=f"{device.serial_number}_power_meter_data_update_coordinator",
             update_interval=POWER_METER_UPDATE_INTERVAL,
+            start_delay=_COORDINATOR_START_DELAYS["power_meter"],
         )
         power_meter_update_coordinator.attach_telemetry(telemetry)
+        power_meter_update_coordinator.attach_adaptive(adaptive)
     else:
         power_meter_device_info = None
         power_meter_update_coordinator = None
@@ -330,8 +425,10 @@ async def _setup_inverter_device_data(
             device=device,
             name=f"{device.serial_number}_battery_data_update_coordinator",
             update_interval=ENERGY_STORAGE_UPDATE_INTERVAL,
+            start_delay=_COORDINATOR_START_DELAYS["energy_storage"],
         )
         energy_storage_update_coordinator.attach_telemetry(telemetry)
+        energy_storage_update_coordinator.attach_adaptive(adaptive)
     else:
         battery_device_info = None
         energy_storage_update_coordinator = None
@@ -394,6 +491,7 @@ async def _setup_inverter_device_data(
                 OPTIMIZER_UPDATE_INTERVAL,
             )
             optimizer_update_coordinator.attach_telemetry(telemetry)
+            optimizer_update_coordinator.attach_adaptive(adaptive)
         except PermissionDeniedError as exception:
             _LOGGER.info(
                 "Cannot create optimizer sensor entities as the integration has insufficient permissions. "
@@ -413,8 +511,10 @@ async def _setup_inverter_device_data(
             device=device,
             name=f"{device.serial_number}_config_data_update_coordinator",
             update_interval=CONFIGURATION_UPDATE_INTERVAL,
+            start_delay=_COORDINATOR_START_DELAYS["configuration"],
         )
         configuration_update_coordinator.attach_telemetry(telemetry)
+        configuration_update_coordinator.attach_adaptive(adaptive)
     else:
         configuration_update_coordinator = None
 

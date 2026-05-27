@@ -17,7 +17,7 @@ Integration wiring
 1. ModbusTelemetry.get_or_create(hass, serial_number) in __init__.py after
    each coordinator is built — returns the singleton.
 2. Coordinators call record_request() / record_failure() / record_timeout() /
-   record_cache_hit() on the singleton.
+   record_cache_hits() on the singleton.
 3. sensor.py calls create_telemetry_entities() to register the HA sensors.
 """
 
@@ -146,11 +146,24 @@ class ModbusTelemetry:
         self.total_failures += 1
         self._evict(now)
 
-    def record_cache_hit(self) -> None:
-        """Record a register cache hit (request skipped)."""
+    def record_cache_hits(self, count: int) -> None:
+        """Record *count* register cache hits in a single operation.
+
+        Replaces the old per-register record_cache_hit() with one
+        time.monotonic() call and a single deque.extend(), which is
+        meaningfully cheaper when count is large (30-80 registers/poll).
+        """
+        if count <= 0:
+            return
         now = time.monotonic()
-        self._cache_hits.append(now)
-        self.total_cache_hits += 1
+        self._cache_hits.extend([now] * count)
+        self.total_cache_hits += count
+
+    # Thin compatibility shim — callers outside register_cache may still use
+    # the singular form; route them through the batched version.
+    def record_cache_hit(self) -> None:
+        """Record a single register cache hit."""
+        self.record_cache_hits(1)
 
     def record_skipped_poll(self) -> None:
         """Record a poll that was entirely skipped (back-off / dedup)."""

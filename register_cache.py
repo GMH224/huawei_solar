@@ -9,7 +9,7 @@ slowly.  This module provides a time-aware, adaptive cache that:
   • Doubles a register's effective TTL every time its value is unchanged
     (up to a per-tier cap), and resets the TTL as soon as the value changes.
   • Tracks dirty flags so writes immediately invalidate the cache.
-  • Reports hit/miss statistics to ModbusTelemetry.
+  • Reports hit/miss statistics to ModbusTelemetry via a single batched call.
 
 Volatility tiers
 ----------------
@@ -55,6 +55,7 @@ import logging
 import time
 from datetime import timedelta
 from enum import IntEnum, auto
+from functools import lru_cache
 from typing import Any, TYPE_CHECKING
 
 from huawei_solar import RegisterName, Result
@@ -179,8 +180,14 @@ _FAST_SUBSTRINGS: tuple[str, ...] = (
 )
 
 
+@lru_cache(maxsize=256)
 def _classify(name: RegisterName) -> RegisterTier:
-    """Return the volatility tier for a register name."""
+    """Return the volatility tier for a register name.
+
+    Results are memoised with lru_cache: the set of unique RegisterNames seen
+    in a session is bounded (≤ ~200), so this eliminates repeated O(N_strings)
+    substring scans after the first lookup for each name.
+    """
     s = str(name).lower()
     for sub in _STATIC_SUBSTRINGS:
         if sub in s:
@@ -238,12 +245,22 @@ class RegisterCache:
 
     # ── night-mode control ────────────────────────────────────────────────────
 
+    def set_telemetry(self, telemetry: "ModbusTelemetry") -> None:
+        """Swap the telemetry reference without discarding cached values.
+
+        Preferred over replacing the whole RegisterCache instance (which would
+        discard all cached values and adaptive TTL state) when the telemetry
+        singleton becomes available after construction.
+        """
+        self._telemetry = telemetry
+
     def set_night_mode(self, active: bool) -> None:
         """Enable or disable night-mode TTL stretching."""
         if active != self._night_mode:
             _LOGGER.debug("Register cache: night mode %s", "ON" if active else "OFF")
             self._night_mode = active
-            # On wakeup, reset all NORMAL adaptive TTLs so we get fresh data immediately
+            # On wakeup, reset all NORMAL/FAST adaptive TTLs so we get fresh
+            # data immediately on the first post-wakeup poll.
             if not active:
                 for entry in self._store.values():
                     if entry.tier in (RegisterTier.NORMAL, RegisterTier.FAST):
@@ -282,6 +299,7 @@ class RegisterCache:
         now = time.monotonic()
         stale: list[RegisterName] = []
         cache_hits = 0
+        default_ttl_s = default_ttl.total_seconds()
 
         for name in names:
             entry = self._store.get(name)
@@ -294,17 +312,19 @@ class RegisterCache:
             # For NORMAL tier, never use a TTL shorter than default_ttl so that
             # the coordinator's own interval is always respected as a minimum.
             if entry.tier == RegisterTier.NORMAL:
-                ttl = max(ttl, default_ttl.total_seconds())
+                ttl = max(ttl, default_ttl_s)
 
             age = now - entry.ts
             if age >= ttl:
                 stale.append(name)
             else:
                 cache_hits += 1
-                if self._telemetry:
-                    self._telemetry.record_cache_hit()
 
+        # Report all hits in a single batched call — one time.monotonic() and
+        # one deque.extend() instead of N individual calls.
         if cache_hits:
+            if self._telemetry:
+                self._telemetry.record_cache_hits(cache_hits)
             _LOGGER.debug(
                 "Register cache: %d hit(s) / %d miss(es) / %d total  [night=%s]",
                 cache_hits, len(stale), len(names), self._night_mode,
@@ -359,7 +379,24 @@ class RegisterCache:
             _LOGGER.debug("Cache invalidated: %s", name)
 
     def invalidate_all(self) -> None:
-        """Mark every cached register dirty (after reconnect / outage recovery)."""
+        """Mark every non-STATIC cached register dirty after reconnect.
+
+        STATIC registers (serial numbers, firmware versions, rated power, etc.)
+        are hardware constants that cannot change between connection attempts.
+        Skipping them saves one batch read of ~10-15 registers on every
+        reconnect / outage recovery, reducing the initial post-outage burst.
+        """
+        for entry in self._store.values():
+            if entry.tier != RegisterTier.STATIC:
+                entry.dirty = True
+
+    def invalidate_all_including_static(self) -> None:
+        """Mark every cached register dirty, including STATIC tier.
+
+        Use only when the device itself may have changed (firmware update,
+        hardware replacement).  Normal outage recovery should call
+        invalidate_all() instead.
+        """
         for entry in self._store.values():
             entry.dirty = True
 
@@ -386,3 +423,57 @@ class RegisterCache:
 
     def clear(self) -> None:
         self._store.clear()
+
+
+# ── Energy counter register identification ─────────────────────────────────────
+#
+# These are monotonically-increasing kWh accumulator registers written by the
+# inverter's own metering IC.  They must NEVER be served from a stale cache
+# fallback after a Modbus timeout.
+#
+# Why: serving a stale cached value makes HA's statistics recorder see a flat
+# line during the outage, then a sudden jump on recovery.  HA assigns that jump
+# to the wrong hourly bucket, producing the incorrect consumption bars visible
+# in the Energy dashboard.  Returning None/unavailable instead gives HA an
+# honest gap, which it handles correctly via interpolation — no wrong totals.
+
+_ENERGY_COUNTER_SUBSTRINGS: tuple[str, ...] = (
+    "daily_yield",
+    "daily_energy",
+    "total_yield",
+    "total_energy",
+    "accumulated_energy",
+    "accumulated_yield",
+    "yearly_energy",
+    "yearly_yield",
+    "total_charged_energy",
+    "total_discharged_energy",
+    "total_charge_energy",
+    "total_discharge_energy",
+    "grid_accumulated",
+    "total_feed_in",
+    "total_supply",
+    "total_pv_energy",
+    "total_active_energy",
+    "total_positive_active",
+    "total_negative_active",
+    "energy_import",
+    "energy_export",
+    "current_day_charge",
+    "current_day_discharge",
+    "current_day_yield",
+)
+
+
+@lru_cache(maxsize=256)
+def is_energy_counter(name: "RegisterName") -> bool:
+    """Return True if *name* is a monotonically-increasing kWh accumulator.
+
+    Energy counter registers must not be served from a stale cache fallback
+    after a Modbus timeout — see module docstring for the full rationale.
+
+    Results are memoised: the set of unique RegisterNames in a session is
+    bounded (≤ ~200), so this is effectively O(1) after the first lookup.
+    """
+    s = str(name).lower()
+    return any(sub in s for sub in _ENERGY_COUNTER_SUBSTRINGS)

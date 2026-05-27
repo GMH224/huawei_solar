@@ -5,21 +5,19 @@ Optimisation history
 v2.10b  Exponential back-off, tiered logging, retry_after hints.
 v2.11.0 ModbusGuard (serialise + 150 ms gap), RegisterCache (static TTL),
         ModbusTelemetry (10 diagnostic sensors), cache invalidation on write.
-v2.12.0 Adaptive TTL (RegisterTier system — STATIC/SLOW/NORMAL/FAST),
-        night-mode detection (slow all polls to 5 min when PV power = 0),
-        stale-cache fallback (entities stay available during brief outages),
-        poll-interval dynamic adjustment driven by NightModeDetector.
-
-Traffic reduction summary (v2.12.0 vs original v2.1.0)
--------------------------------------------------------
-| Optimisation               | Reduction          |
-|----------------------------|--------------------|
-| ModbusGuard dedup          | 0 tx (correctness) |
-| RegisterCache static tier  | ~25 %              |
-| RegisterCache adaptive TTL | ~15 % additional   |
-| Night-mode slow-polling    | ~45 % (12 h/day)   |
-| Combined (day-only)        | ~35–40 %           |
-| Combined (full day)        | ~55–65 %           |
+v2.12.0 Adaptive TTL (RegisterTier — STATIC/SLOW/NORMAL/FAST), night-mode
+        detection, stale-cache fallback, poll-interval dynamic adjustment.
+v1.0.2  ModbusGuard load shedding, lru_cache on _classify(), batched
+        telemetry cache-hit recording, invalidate_all() skips STATIC tier.
+v1.0.3  Energy-counter stale-cache exclusion, coordinator start-time jitter,
+        contiguous register sorting, set_telemetry() on RegisterCache.
+v1.0.4  Full circadian adaptive learning: AdaptiveModbusController drives
+        poll_interval, request_gap, request_timeout and max_queue_depth from
+        15-minute time-slot statistics that persist across HA restarts.
+        RTT is measured per batch_update() call and fed back to the controller.
+        State transitions (day↔night, battery reversal) trigger a transition
+        window of maximum-tolerance parameters regardless of learned history.
+        10 new diagnostic sensor entities expose the controller's state.
 """
 
 from __future__ import annotations
@@ -31,6 +29,7 @@ from itertools import chain
 import logging
 import math
 import random
+import time
 from typing import Any
 
 from huawei_solar import (
@@ -50,7 +49,10 @@ from homeassistant.helpers.debounce import Debouncer
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
+from .adaptive_modbus import AdaptiveModbusController
 from .const import (
+    ADAPTIVE_POLL_MAX,
+    ADAPTIVE_POLL_MIN,
     MAX_CONSECUTIVE_TIMEOUTS,
     MODBUS_RETRY_BASE_WAIT,
     MODBUS_RETRY_MAX_WAIT,
@@ -61,7 +63,7 @@ from .const import (
 from .modbus_guard import ModbusGuard
 from .modbus_telemetry import ModbusTelemetry
 from .night_mode import InverterMode, NightModeDetector
-from .register_cache import RegisterCache
+from .register_cache import RegisterCache, is_energy_counter
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -77,6 +79,33 @@ def _backoff_seconds(consecutive: int) -> float:
     return max(0.0, delay + jitter)
 
 
+# ── contiguous register sort ───────────────────────────────────────────────────
+
+def _sort_by_modbus_address(names: list[RegisterName]) -> list[RegisterName]:
+    """Sort register names by Modbus address for contiguous PDU reads."""
+    def _addr(name: RegisterName) -> int:
+        for attr_path in (
+            "register_definition.register",
+            "register_definition.address",
+            "address",
+            "value",
+        ):
+            try:
+                obj: Any = name
+                for part in attr_path.split("."):
+                    obj = getattr(obj, part)
+                if isinstance(obj, int):
+                    return obj
+            except AttributeError:
+                continue
+        return 0
+
+    try:
+        return sorted(names, key=_addr)
+    except Exception:  # noqa: BLE001
+        return names
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Main coordinator
 # ──────────────────────────────────────────────────────────────────────────────
@@ -88,20 +117,29 @@ class HuaweiSolarUpdateCoordinator(
 
     Key behaviours
     --------------
-    • All Modbus traffic is serialised through ``ModbusGuard`` (one request
-      in-flight at a time, 150 ms inter-request gap).
-    • ``RegisterCache`` filters out registers that are still within their
-      effective TTL, ranging from 30 s (NORMAL) to session-long (STATIC).
-      Adaptive TTL doubles the TTL on each poll where the value is unchanged,
-      up to a per-tier cap.
-    • ``NightModeDetector`` watches PV input power.  When the inverter has been
-      idle for 3 consecutive polls it switches to NIGHT mode, slowing the poll
-      interval to ``NIGHT_POLL_INTERVAL`` (5 min) and stretching all cache TTLs
-      by 10×.  On wakeup it reverts to the normal interval immediately.
-    • On timeout the coordinator attempts to return stale cached data so HA
-      entities stay available during brief outages.
-    • Exponential back-off (10 s → 120 s, ±10 % jitter) after
-      MAX_CONSECUTIVE_TIMEOUTS failures.
+    Adaptive learning (v1.0.4)
+      AdaptiveModbusController maintains 96 circadian time slots (15 min each).
+      At the start of every poll cycle, get_params() returns recommended values
+      for poll_interval, request_gap, request_timeout and max_queue_depth based
+      on the slot's historical failure rate, P95 RTT, and whether a state
+      transition is active.  RTT is measured around each batch_update() and fed
+      back via record_request().  State changes (night↔day, battery reversal)
+      trigger notify_transition() which forces maximum-tolerance parameters for
+      ADAPTIVE_TRANSITION_DURATION_MINUTES regardless of learned history.
+
+    ModbusGuard serialisation
+      One request in-flight at a time; adaptive gap and queue_depth.
+
+    RegisterCache
+      Tier-aware TTL; adaptive TTL doubles on stable values; STATIC never re-read.
+      Energy counter registers excluded from stale-cache fallback.
+
+    Coordinator jitter
+      start_delay offsets the first poll per coordinator so four sharing the
+      same guard never fire simultaneously.
+
+    Contiguous register sorting
+      stale_names sorted by Modbus address for fewer TCP round-trips per poll.
     """
 
     device: HuaweiSolarDevice
@@ -117,6 +155,7 @@ class HuaweiSolarUpdateCoordinator(
         | None = None,
         request_refresh_debouncer: Debouncer | None = None,
         update_timeout: timedelta = UPDATE_TIMEOUT,
+        start_delay: timedelta = timedelta(0),
     ) -> None:
         super().__init__(
             hass,
@@ -128,19 +167,15 @@ class HuaweiSolarUpdateCoordinator(
         )
         self.device = device
         self.update_timeout = update_timeout
-        # _day_interval is used by NightModeDetector and RegisterCache to know
-        # the coordinator's intended poll cadence.  When no interval is given the
-        # coordinator is driven by push/telemetry rather than by a periodic timer;
-        # use a zero-length sentinel so callers can detect this case rather than
-        # silently substituting UPDATE_TIMEOUT (35 s) which would wrongly cap
-        # NORMAL-tier TTLs and mislead the night-mode interval restoration logic.
         self._day_interval = update_interval if update_interval is not None else timedelta(0)
+        self._start_delay = start_delay
+        self._first_poll_done: bool = False
 
         self.guard = ModbusGuard.get_or_create(device.serial_number)
         self.cache = RegisterCache()
         self.telemetry: ModbusTelemetry | None = None
+        self._adaptive: AdaptiveModbusController | None = None
 
-        # Night-mode detector — wired up after construction via _on_mode_change
         self._night_detector = NightModeDetector(
             on_mode_change=self._on_mode_change,
             poll_interval_day=self._day_interval,
@@ -153,35 +188,41 @@ class HuaweiSolarUpdateCoordinator(
     # ── wiring ─────────────────────────────────────────────────────────────────
 
     def attach_telemetry(self, telemetry: ModbusTelemetry) -> None:
-        """Connect a ModbusTelemetry instance (called from __init__.py)."""
         self.telemetry = telemetry
-        self.cache = RegisterCache(telemetry)
+        self.cache.set_telemetry(telemetry)
+
+    def attach_adaptive(self, controller: AdaptiveModbusController) -> None:
+        """Attach the circadian adaptive learning controller."""
+        self._adaptive = controller
 
     def invalidate_cache(self, name: RegisterName) -> None:
-        """Invalidate a cached register after a write (called from number/select/switch)."""
         self.cache.invalidate(name)
 
-    # ── night-mode callback ────────────────────────────────────────────────────
+    # ── night-mode / transition callback ───────────────────────────────────────
 
     def _on_mode_change(self, new_mode: InverterMode) -> None:
-        """Called by NightModeDetector on every DAY ↔ NIGHT transition."""
         is_night = new_mode == InverterMode.NIGHT
         self.cache.set_night_mode(is_night)
-
         if self.telemetry:
             self.telemetry.record_night_mode(is_night)
-
-        # Dynamically adjust the HA coordinator poll interval
-        new_interval = (
-            NIGHT_POLL_INTERVAL if is_night else self._day_interval
-        )
+        # A day↔night transition is the highest-impact inverter state change.
+        # Notify the adaptive controller immediately so it raises parameters.
+        if self._adaptive:
+            self._adaptive.notify_transition(
+                "night→day" if not is_night else "day→night"
+            )
+        new_interval = NIGHT_POLL_INTERVAL if is_night else self._adaptive_poll_interval()
         self.update_interval = new_interval
         _LOGGER.info(
             "%s: switching to %s mode — poll interval → %s",
-            self.name,
-            new_mode.name,
-            new_interval,
+            self.name, new_mode.name, new_interval,
         )
+
+    def _adaptive_poll_interval(self) -> timedelta:
+        """Return the current adaptive poll interval, or the configured day interval."""
+        if self._adaptive:
+            return self._adaptive.get_params().poll_interval
+        return self._day_interval
 
     # ── poll logic ─────────────────────────────────────────────────────────────
 
@@ -190,48 +231,62 @@ class HuaweiSolarUpdateCoordinator(
 
         Steps
         -----
-        1. Collect the set of registers requested by active HA entities.
-        2. Ask the cache which registers are stale (need a fresh read).
-           Adaptive TTL means stable registers are asked less and less often.
-        3. If nothing is stale, return the fully-cached response (0 Modbus traffic).
-        4. Apply back-off sleep if many consecutive timeouts have occurred.
-        5. Acquire ModbusGuard lock (serialises against other coordinators).
-        6. Fetch only stale registers in a single batch_update() call.
-        7. Merge fresh results with cached values.
-        8. Update cache (adaptive TTL recalculated here).
-        9. Feed result to NightModeDetector for mode evaluation.
-        10. Record telemetry.
+        0.  First-poll start_delay (stagger).
+        1.  Fetch adaptive params; apply gap + queue_depth to guard.
+        2.  Collect register names from active HA entities.
+        3.  Cache filter — skip fresh registers.
+        4.  If nothing stale, return fully cached result.
+        5.  Apply back-off sleep if consecutive timeouts are high.
+        6.  Sort stale_names by Modbus address.
+        7.  Acquire guard + measure RTT around batch_update().
+        8.  On timeout: record failure; stale-cache fallback excluding energy counters.
+        9.  On success: record RTT; update cache; dynamically adjust poll interval.
         """
-        # ── 1. Collect register names ─────────────────────────────────────────
-        all_names: list[RegisterName] = list(
-            set(
-                chain.from_iterable(
-                    ctx["register_names"] for ctx in self.async_contexts()
+        # ── 0. First-poll stagger ─────────────────────────────────────────────
+        if not self._first_poll_done:
+            self._first_poll_done = True
+            if self._start_delay.total_seconds() > 0:
+                _LOGGER.debug(
+                    "%s: first-poll start_delay %.1f s",
+                    self.name, self._start_delay.total_seconds(),
                 )
-            )
+                await asyncio.sleep(self._start_delay.total_seconds())
+
+        # ── 1. Adaptive params ────────────────────────────────────────────────
+        if self._adaptive:
+            params = self._adaptive.get_params()
+            self.guard.update_gap(params.request_gap.total_seconds())
+            self.guard.update_max_queue_depth(params.max_queue_depth)
+            effective_timeout = params.request_timeout
+            # Dynamically adjust the coordinator's poll interval (outside night mode)
+            if not self.cache.night_mode:
+                self.update_interval = params.poll_interval
+        else:
+            effective_timeout = self.update_timeout
+
+        # ── 2. Collect register names ─────────────────────────────────────────
+        all_names: list[RegisterName] = list(
+            set(chain.from_iterable(
+                ctx["register_names"] for ctx in self.async_contexts()
+            ))
         )
         if not all_names:
             return {}
 
-        # ── 2. Cache filter — skip fresh registers ────────────────────────────
+        # ── 3. Cache filter ───────────────────────────────────────────────────
         stale_names = self.cache.filter_stale(all_names, self._day_interval)
 
-        # ── 3. Fully cached — zero Modbus traffic ─────────────────────────────
+        # ── 4. Fully cached ───────────────────────────────────────────────────
         if not stale_names:
             _LOGGER.debug(
-                "%s: %d register(s) all cached — skipping Modbus request  [night=%s]",
+                "%s: %d register(s) all cached — skipping Modbus [night=%s]",
                 self.name, len(all_names), self.cache.night_mode,
             )
             if self.telemetry:
                 self.telemetry.record_skipped_poll()
-            merged: dict[RegisterName, Result[Any]] = {}
-            for n in all_names:
-                val = self.cache.get(n)
-                if val is not None:
-                    merged[n] = val
-            return merged
+            return {n: v for n in all_names if (v := self.cache.get(n)) is not None}
 
-        # ── 4. Back-off ───────────────────────────────────────────────────────
+        # ── 5. Back-off ───────────────────────────────────────────────────────
         if self._consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS:
             wait = _backoff_seconds(
                 self._consecutive_timeouts - MAX_CONSECUTIVE_TIMEOUTS + 1
@@ -242,49 +297,65 @@ class HuaweiSolarUpdateCoordinator(
             )
             await asyncio.sleep(wait)
 
-        # ── 5–6. Acquire guard + batch request ────────────────────────────────
+        # ── 6. Sort by address ────────────────────────────────────────────────
+        stale_names = _sort_by_modbus_address(stale_names)
+
+        # ── 7. Acquire guard + batch_update with RTT measurement ──────────────
+        rtt_ms: float = 0.0
         try:
             async with self.guard.request():
-                async with asyncio.timeout(self.update_timeout.total_seconds()):
+                t0 = time.monotonic()
+                async with asyncio.timeout(effective_timeout.total_seconds()):
                     if self.telemetry:
                         self.telemetry.record_request(len(stale_names))
                     fresh = await self.device.batch_update(stale_names)
+                rtt_ms = (time.monotonic() - t0) * 1000
 
         except TimeoutError as err:
             self._consecutive_timeouts += 1
             self._consecutive_failures += 1
             if self.telemetry:
                 self.telemetry.record_timeout()
+            # Feed failure to adaptive controller
+            if self._adaptive:
+                self._adaptive.record_request(0.0, success=False, timeout=True)
 
             if self._consecutive_timeouts == 1:
                 _LOGGER.warning(
                     "%s: Modbus timeout (no response in %.0f s). "
                     "Back-off after %d consecutive timeouts.",
                     self.name,
-                    self.update_timeout.total_seconds(),
+                    effective_timeout.total_seconds(),
                     MAX_CONSECUTIVE_TIMEOUTS,
                 )
             else:
                 _LOGGER.debug(
-                    "%s: Modbus timeout #%d (back-off active: %s)",
+                    "%s: Modbus timeout #%d (back-off: %s)",
                     self.name,
                     self._consecutive_timeouts,
                     self._consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS,
                 )
 
-            # Stale-cache fallback: return last-known values so entities stay available
-            cached_fallback = self.cache.merge({}, all_names)
-            if cached_fallback:
+            # ── 8. Stale-cache fallback — energy counters excluded ────────────
+            cached_fallback = {
+                n: v
+                for n in all_names
+                if not is_energy_counter(n)
+                and (v := self.cache.get(n)) is not None
+            }
+            energy_withheld = sum(1 for n in all_names if is_energy_counter(n))
+            if cached_fallback or energy_withheld:
                 _LOGGER.debug(
-                    "%s: serving %d register(s) from stale cache after timeout",
-                    self.name, len(cached_fallback),
+                    "%s: stale-cache fallback — %d served, %d energy counter(s) withheld",
+                    self.name, len(cached_fallback), energy_withheld,
                 )
-                return cached_fallback
+                if cached_fallback:
+                    return cached_fallback
 
             retry_after = int(_backoff_seconds(max(1, self._consecutive_timeouts)))
             raise UpdateFailed(
                 f"Timeout communicating with {self.device.serial_number}: "
-                f"no response in {self.update_timeout.total_seconds():.0f} s "
+                f"no response in {effective_timeout.total_seconds():.0f} s "
                 f"(consecutive: {self._consecutive_timeouts})",
                 retry_after=retry_after,
             ) from err
@@ -293,6 +364,8 @@ class HuaweiSolarUpdateCoordinator(
             self._consecutive_failures += 1
             if self.telemetry:
                 self.telemetry.record_failure()
+            if self._adaptive:
+                self._adaptive.record_request(0.0, success=False, timeout=False)
             if err.modbus_exception_code == 0x02:
                 _LOGGER.error(
                     "%s: ILLEGAL_DATA_ADDRESS — disable sensors one-by-one "
@@ -307,6 +380,8 @@ class HuaweiSolarUpdateCoordinator(
             self._consecutive_failures += 1
             if self.telemetry:
                 self.telemetry.record_failure()
+            if self._adaptive:
+                self._adaptive.record_request(0.0, success=False, timeout=False)
             _LOGGER.warning(
                 "%s: connection interrupted — another Modbus client may have connected.",
                 self.device.serial_number,
@@ -320,11 +395,16 @@ class HuaweiSolarUpdateCoordinator(
             self._consecutive_failures += 1
             if self.telemetry:
                 self.telemetry.record_failure()
+            if self._adaptive:
+                self._adaptive.record_request(0.0, success=False, timeout=False)
             raise UpdateFailed(
                 f"Could not update {self.device.serial_number}: {err}"
             ) from err
 
-        # ── 7–10. Success path ────────────────────────────────────────────────
+        # ── 9. Success path ───────────────────────────────────────────────────
+        if self._adaptive:
+            self._adaptive.record_request(rtt_ms, success=True, timeout=False)
+
         if self._consecutive_timeouts > 0 or self._consecutive_failures > 0:
             _LOGGER.info(
                 "%s: communication restored (after %d timeout(s) / %d failure(s))",
@@ -337,13 +417,8 @@ class HuaweiSolarUpdateCoordinator(
         self._consecutive_timeouts = 0
         self._consecutive_failures = 0
 
-        # Update cache (triggers adaptive TTL recalculation per register)
         self.cache.update(fresh)
-
-        # Build complete response: fresh results merged with still-valid cache
         merged_result = self.cache.merge(fresh, all_names)
-
-        # Evaluate night mode from the merged result
         self._night_detector.evaluate(merged_result)
 
         return merged_result
@@ -356,11 +431,7 @@ class HuaweiSolarUpdateCoordinator(
 class HuaweiSolarOptimizerUpdateCoordinator(
     DataUpdateCoordinator[dict[int, OptimizerRealTimeData]]
 ):
-    """DataUpdateCoordinator for Huawei Solar optimizers.
-
-    Optimizers generate a new data file every 5 minutes; polling more often is
-    wasteful.  The guard still serialises access alongside inverter coordinators.
-    """
+    """DataUpdateCoordinator for Huawei Solar optimizers."""
 
     def __init__(
         self,
@@ -383,10 +454,15 @@ class HuaweiSolarOptimizerUpdateCoordinator(
         self.optimizer_device_infos = optimizer_device_infos
         self.guard = ModbusGuard.get_or_create(device.serial_number)
         self.telemetry: ModbusTelemetry | None = None
+        self._adaptive: AdaptiveModbusController | None = None
         self._consecutive_timeouts: int = 0
+        self._consecutive_failures: int = 0
 
     def attach_telemetry(self, telemetry: ModbusTelemetry) -> None:
         self.telemetry = telemetry
+
+    def attach_adaptive(self, controller: AdaptiveModbusController) -> None:
+        self._adaptive = controller
 
     async def _async_update_data(self) -> dict[int, OptimizerRealTimeData]:
         if self._consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS:
@@ -395,22 +471,34 @@ class HuaweiSolarOptimizerUpdateCoordinator(
             )
             await asyncio.sleep(wait)
 
+        if self._adaptive:
+            params = self._adaptive.get_params()
+            self.guard.update_gap(params.request_gap.total_seconds())
+            self.guard.update_max_queue_depth(params.max_queue_depth)
+            effective_timeout = params.request_timeout
+        else:
+            effective_timeout = OPTIMIZER_UPDATE_TIMEOUT
+
         try:
             async with self.guard.request():
-                async with asyncio.timeout(OPTIMIZER_UPDATE_TIMEOUT.total_seconds()):
+                t0 = time.monotonic()
+                async with asyncio.timeout(effective_timeout.total_seconds()):
                     if self.telemetry:
                         self.telemetry.record_request(1)
                     result = await self.device.get_latest_optimizer_history_data()
+                rtt_ms = (time.monotonic() - t0) * 1000
 
         except TimeoutError as err:
             self._consecutive_timeouts += 1
+            self._consecutive_failures += 1
             if self.telemetry:
                 self.telemetry.record_timeout()
+            if self._adaptive:
+                self._adaptive.record_request(0.0, success=False, timeout=True)
             if self._consecutive_timeouts == 1:
                 _LOGGER.warning(
                     "Optimizer %s: Modbus timeout (attempt %d).",
-                    self.device.serial_number,
-                    self._consecutive_timeouts,
+                    self.device.serial_number, self._consecutive_timeouts,
                 )
             retry_after = int(_backoff_seconds(max(1, self._consecutive_timeouts)))
             raise UpdateFailed(
@@ -420,8 +508,11 @@ class HuaweiSolarOptimizerUpdateCoordinator(
             ) from err
 
         except ConnectionInterruptedException as err:
+            self._consecutive_failures += 1
             if self.telemetry:
                 self.telemetry.record_failure()
+            if self._adaptive:
+                self._adaptive.record_request(0.0, success=False, timeout=False)
             _LOGGER.warning("Optimizer %s: connection interrupted.", self.device.serial_number)
             raise UpdateFailed(
                 f"Connection to {self.device.serial_number} interrupted.",
@@ -429,27 +520,38 @@ class HuaweiSolarOptimizerUpdateCoordinator(
             ) from err
 
         except DecodeError as err:
+            self._consecutive_failures += 1
             if self.telemetry:
                 self.telemetry.record_failure()
+            if self._adaptive:
+                self._adaptive.record_request(0.0, success=False, timeout=False)
             raise UpdateFailed(
                 f"Could not decode optimizer data from {self.device.serial_number}: {err}.",
                 retry_after=15 * 60,
             ) from err
 
         except HuaweiSolarException as err:
+            self._consecutive_failures += 1
             if self.telemetry:
                 self.telemetry.record_failure()
+            if self._adaptive:
+                self._adaptive.record_request(0.0, success=False, timeout=False)
             raise UpdateFailed(
                 f"Could not update {self.device.serial_number} optimizers: {err}"
             ) from err
 
-        if self._consecutive_timeouts > 0:
+        if self._adaptive:
+            self._adaptive.record_request(rtt_ms, success=True, timeout=False)
+
+        if self._consecutive_timeouts > 0 or self._consecutive_failures > 0:
             _LOGGER.info(
-                "Optimizer %s: communication restored after %d timeout(s).",
+                "Optimizer %s: communication restored after %d timeout(s) / %d failure(s).",
                 self.device.serial_number,
                 self._consecutive_timeouts,
+                self._consecutive_failures,
             )
         self._consecutive_timeouts = 0
+        self._consecutive_failures = 0
         return result
 
 
@@ -461,7 +563,6 @@ async def create_optimizer_update_coordinator(
     optimizer_device_infos: dict[int, DeviceInfo],
     update_interval: timedelta | None,
 ) -> HuaweiSolarOptimizerUpdateCoordinator:
-    """Create and perform the first refresh of an optimizer coordinator."""
     coordinator = HuaweiSolarOptimizerUpdateCoordinator(
         hass,
         _LOGGER,
