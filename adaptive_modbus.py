@@ -308,11 +308,20 @@ class AdaptiveModbusController:
                     self.serial_number,
                     exc,
                 )
+                # BUG-5 FIX: reset ALL state, not just slots.  Without this,
+                # a partial _deserialize() could leave stale date fields that
+                # would cause incorrect decay calculations on the fresh empty slots.
                 self._reset_slots()
+                self._last_decay_date = None
+                self._first_data_date = None
 
         self._apply_startup_decay()
 
-        # Start periodic sensor push
+        # BUG-6 FIX: cancel any existing push subscription before creating a new
+        # one.  If async_load() is called twice (e.g., config-entry reload) the
+        # previous subscription must be cleaned up to prevent memory leaks.
+        if self._unsub_push:
+            self._unsub_push()
         self._unsub_push = async_track_time_interval(
             self.hass, self._push_to_listeners, _SENSOR_PUSH_INTERVAL
         )
@@ -417,7 +426,8 @@ class AdaptiveModbusController:
     def days_of_data(self) -> int:
         if self._first_data_date is None:
             return 0
-        return (date.today() - self._first_data_date).days + 1
+        # BUG-7 FIX: clamp to 0 so clock-skew/drift never returns a negative value
+        return max(0, (date.today() - self._first_data_date).days + 1)
 
     # ── internal helpers ──────────────────────────────────────────────────────
 

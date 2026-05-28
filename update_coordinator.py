@@ -318,7 +318,7 @@ class HuaweiSolarUpdateCoordinator(
         self,
         names: list[RegisterName],
         effective_timeout: timedelta,
-    ) -> dict[RegisterName, Result[Any]]:
+    ) -> tuple[dict[RegisterName, Result[Any]], float]:
         """Execute batch_update() in address-sorted chunks with 0x06 retry.
 
         Each chunk is executed inside the shared bus guard.  On a 0x06
@@ -332,6 +332,7 @@ class HuaweiSolarUpdateCoordinator(
         sorted_names = _sort_by_modbus_address(names)
         chunks = _chunk(sorted_names, BATCH_CHUNK_SIZE)
         merged: dict[RegisterName, Result[Any]] = {}
+        total_rtt_ms: float = 0.0  # BUG-10: accumulated across all chunks
 
         for chunk_idx, chunk in enumerate(chunks):
             if chunk_idx > 0:
@@ -346,12 +347,8 @@ class HuaweiSolarUpdateCoordinator(
                         t0 = time.monotonic()
                         async with asyncio.timeout(effective_timeout.total_seconds()):
                             chunk_result = await self.device.batch_update(chunk)
-                        rtt_ms = (time.monotonic() - t0) * 1000
-
                     merged.update(chunk_result)
-                    # Feed successful chunk RTT to adaptive controller
-                    if self._adaptive:
-                        self._adaptive.record_request(rtt_ms, success=True, timeout=False)
+                    total_rtt_ms += (time.monotonic() - t0) * 1000
                     break  # chunk succeeded
 
                 except ReadException as exc:
@@ -373,12 +370,11 @@ class HuaweiSolarUpdateCoordinator(
                         await asyncio.sleep(BUSY_RETRY_PAUSE.total_seconds())
                         continue  # retry this chunk
 
-                    # Non-BUSY ReadException or retries exhausted — re-raise
-                    if self._adaptive:
-                        self._adaptive.record_request(0.0, success=False, timeout=False)
+                    # Non-BUSY ReadException or retries exhausted.
+                    # BUG-4 FIX: do NOT record failure here; outer handlers do it.
                     raise
 
-        return merged
+        return merged, total_rtt_ms  # BUG-10 FIX: return rtt to caller
 
     # ── poll logic ────────────────────────────────────────────────────────────
 
@@ -457,9 +453,10 @@ class HuaweiSolarUpdateCoordinator(
 
         # ── 6–8. Execute chunked batch with 0x06 retry ────────────────────────
         try:
+            # BUG-10 FIX: record_request after batch so count is accurate
+            fresh, total_rtt_ms = await self._execute_batch(stale_names, effective_timeout)
             if self.telemetry:
                 self.telemetry.record_request(len(stale_names))
-            fresh = await self._execute_batch(stale_names, effective_timeout)
 
         except TimeoutError as err:
             self._consecutive_timeouts += 1
@@ -557,6 +554,10 @@ class HuaweiSolarUpdateCoordinator(
         self._consecutive_timeouts = 0
         self._consecutive_failures = 0
         self._backoff_cycle = 0
+
+        # BUG-4 FIX: record_request called exactly once here (not in _execute_batch)
+        if self._adaptive:
+            self._adaptive.record_request(total_rtt_ms, success=True, timeout=False)
 
         self.cache.update(fresh)
         merged_result = self.cache.merge(fresh, all_names)
@@ -681,6 +682,7 @@ class HuaweiSolarOptimizerUpdateCoordinator(
             ) from err
 
         if self._adaptive:
+            # Optimizer measures rtt_ms directly (not via _execute_batch)
             self._adaptive.record_request(rtt_ms, success=True, timeout=False)
 
         if self._consecutive_timeouts > 0 or self._consecutive_failures > 0:

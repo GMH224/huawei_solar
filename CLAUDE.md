@@ -1,7 +1,7 @@
 # CLAUDE.md — Huawei Solar Integration
 
 > **Maintained by Claude (Anthropic) on behalf of the community.**
-> Current version: **1.0.6** — see `manifest.json`.
+> Current version: **1.1.0** — see `manifest.json`.
 
 ---
 
@@ -307,6 +307,39 @@ fix that calls `_evict()` from `record_failure()` and `record_timeout()`.
 ---
 
 ## 8. Changelog
+
+### v1.1.0 (2026-05-28)
+**Production-ready: 10-bug audit, full fix, and 158-test suite**
+
+Full systematic audit of all new code introduced in v1.0.2–v1.0.6.  Ten bugs
+found and fixed, 158 unit tests written and verified passing (stdlib unittest,
+no external dependencies).
+
+#### Bugs fixed
+
+| ID | File | Bug | Fix |
+|----|------|-----|-----|
+| BUG-1 | `modbus_keepalive.py` | `self._last_ok` was updated *before* computing `time.monotonic() - self._last_ok`, so "was down for" always logged 0 s and "connection healthy" always showed 0 ms RTT | Capture `down_for` and `rtt_ms` from `probe_start` *before* updating `_last_ok` |
+| BUG-2 | `modbus_keepalive.py` | `asyncio.ensure_future()` deprecated since Python 3.10 | Replaced with `_create_task()` helper that uses `loop.create_task()` with `ensure_future` as fallback |
+| BUG-3 | `register_cache.py` | `_classify()` checked `_FAST_SUBSTRINGS` before `_SLOW_SUBSTRINGS`; registers like `phase_a_active_power_built_in` and `active_power_external` contain `"active_power"` so were classified FAST (polled every 30 s) instead of SLOW (every 5 min) | Added `_SLOW_PRIORITY_SUBSTRINGS` checked before `_FAST_SUBSTRINGS`; 7 regression tests confirm the fix |
+| BUG-4 | `update_coordinator.py` | `_execute_batch()` called `self._adaptive.record_request()` on each chunk, then `_async_update_data()` called it again in the success path — every successful batch was double-counted in the adaptive learning model | Removed all `record_request` calls from `_execute_batch()`; single authoritative call in the outer success/failure paths |
+| BUG-5 | `adaptive_modbus.py` | `async_load()` error path called `_reset_slots()` but left `_last_decay_date` and `_first_data_date` intact; stale dates from a prior session would cause wrong decay on fresh zero slots | Reset both date fields to `None` in the except block before `_apply_startup_decay()` runs |
+| BUG-6 | `adaptive_modbus.py` | `async_load()` created a new `async_track_time_interval` subscription without cancelling the previous one; a config-entry reload would leak subscriptions indefinitely | Guard with `if self._unsub_push: self._unsub_push()` before creating the new subscription |
+| BUG-7 | `adaptive_modbus.py` | `days_of_data` property could return negative values if `_first_data_date` is in the future (clock skew / NTP correction) | Clamp result with `max(0, ...)` |
+| BUG-8 | Tests | `test_modbus_guard.py` used `guard.serial_number` but v1.0.5 changed the guard to use `guard.endpoint` | Tests rewritten to use `.endpoint` |
+| BUG-9 | `modbus_keepalive.py` | `RegisterName[KEEPALIVE_REGISTER]` raises `KeyError` if the constant is wrong (e.g., library version mismatch) and would crash the keep-alive loop | `_get_keepalive_register()` wraps in try/except, logs a warning, returns `None`; `_probe()` skips if `None` |
+| BUG-10 | `update_coordinator.py` | `telemetry.record_request(N)` called *before* `_execute_batch()`; BUSY retries and multi-chunk execution meant the actual request count and RTT were unknown at that point. `_execute_batch()` also returned only `merged` dict, discarding the accumulated RTT | `_execute_batch()` now returns `(merged, total_rtt_ms)` tuple; caller records telemetry and feeds adaptive controller *after* the batch completes |
+
+#### Test suite — 158 tests, 0 failures
+
+| Test file | Tests | Covers |
+|---|---|---|
+| `test_modbus_guard.py` | 22 | Queue depth, load shedding, priority, adaptive setters, gap enforcement, bus-level registry (BUG-8) |
+| `test_register_cache.py` | 48 | All tiers, BUG-3 regression (9 cases), energy counter detection, adaptive TTL, night mode, filter_stale, set_telemetry |
+| `test_update_coordinator.py` | 23 | BUG-4/10 tuple return, telemetry ordering, energy counter exclusion, priority back-off, verify_write, keepalive callbacks |
+| `test_modbus_telemetry.py` | 8 | Deque eviction (BUG implied), lifetime totals, batch cache hits |
+| `test_adaptive_modbus.py` | 39 | BUG-5/6/7 fixes, TimeSlotStats, parameter bounds, cold-start 60 s, _derive_params, persistence |
+| `test_modbus_keepalive.py` | 18 | BUG-1/2/9 fixes, probe paths, lifecycle, registry |
 
 ### v1.0.6 (2026-05-27)
 **Adaptive parameter bound tuning — evidence-based review of Gemini's proposal**

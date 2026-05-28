@@ -180,6 +180,27 @@ _FAST_SUBSTRINGS: tuple[str, ...] = (
 )
 
 
+# ── SLOW-priority overrides (must be checked BEFORE _FAST_SUBSTRINGS) ───────
+#
+# BUG-3 FIX: Some register names contain substrings present in _FAST_SUBSTRINGS
+# but semantically belong to the SLOW tier.  For example:
+#   "phase_a_active_power_built_in" contains "active_power" (FAST)
+#   "active_power_external"         contains "active_power" (FAST)
+# Without this pre-check, they were wrongly classified as FAST and read on
+# every poll instead of every 5 minutes.
+#
+# Rule: list here any SLOW pattern that is a superset of a FAST pattern.
+_SLOW_PRIORITY_SUBSTRINGS: tuple[str, ...] = (
+    "phase_a_active_power",
+    "phase_b_active_power",
+    "phase_c_active_power",
+    "active_power_built_in",
+    "active_power_external",
+    "reactive_power_built_in",
+    "reactive_power_external",
+)
+
+
 @lru_cache(maxsize=256)
 def _classify(name: RegisterName) -> RegisterTier:
     """Return the volatility tier for a register name.
@@ -187,11 +208,22 @@ def _classify(name: RegisterName) -> RegisterTier:
     Results are memoised with lru_cache: the set of unique RegisterNames seen
     in a session is bounded (≤ ~200), so this eliminates repeated O(N_strings)
     substring scans after the first lookup for each name.
+
+    Classification order (first match wins):
+      1. STATIC priority substrings
+      2. SLOW priority substrings (BUG-3 FIX: before FAST to prevent misclassification)
+      3. FAST substrings
+      4. SLOW substrings
+      5. NORMAL (default)
     """
     s = str(name).lower()
     for sub in _STATIC_SUBSTRINGS:
         if sub in s:
             return RegisterTier.STATIC
+    # BUG-3 FIX: check SLOW-priority patterns before FAST
+    for sub in _SLOW_PRIORITY_SUBSTRINGS:
+        if sub in s:
+            return RegisterTier.SLOW
     for sub in _FAST_SUBSTRINGS:
         if sub in s:
             return RegisterTier.FAST
