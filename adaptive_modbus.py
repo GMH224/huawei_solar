@@ -122,6 +122,7 @@ class TimeSlotStats:
     without losing fractional information.  They represent *weighted* event
     counts, not raw integers.
     """
+    slot_index: int = 0      # BUG-005 FIX: store index so label property works
     n: float = 0.0           # weighted request count
     failures: float = 0.0    # weighted failure count (includes timeouts)
     timeouts: float = 0.0    # weighted timeout count
@@ -139,8 +140,9 @@ class TimeSlotStats:
         }
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "TimeSlotStats":
+    def from_dict(cls, d: dict[str, Any], slot_index: int = 0) -> "TimeSlotStats":
         return cls(
+            slot_index=slot_index,
             n=float(d.get("n", 0)),
             failures=float(d.get("f", 0)),
             timeouts=float(d.get("t", 0)),
@@ -193,9 +195,18 @@ class TimeSlotStats:
 
     @property
     def label(self) -> str:
-        """Slot descriptor e.g. '11:30–11:45'."""
-        # Computed on-the-fly from the slot index — call via controller
-        return ""
+        """Slot descriptor e.g. '11:30–11:45'.
+
+        BUG-005 FIX: previously always returned '' because the slot index was
+        not stored on the dataclass.  slot_index is now set at construction time
+        so the label can be derived without calling back into the controller.
+        """
+        start_min = self.slot_index * ADAPTIVE_SLOT_MINUTES
+        end_min = start_min + ADAPTIVE_SLOT_MINUTES
+        return (
+            f"{start_min // 60:02d}:{start_min % 60:02d}"
+            f"\u2013{end_min // 60:02d}:{end_min % 60:02d}"
+        )
 
 
 @dataclass(frozen=True)
@@ -267,7 +278,7 @@ class AdaptiveModbusController:
 
         # 96 time slots covering the 24-hour day
         self._slots: list[TimeSlotStats] = [
-            TimeSlotStats() for _ in range(ADAPTIVE_SLOT_COUNT)
+            TimeSlotStats(slot_index=i) for i in range(ADAPTIVE_SLOT_COUNT)
         ]
 
         # Transition state (elevated params for ADAPTIVE_TRANSITION_DURATION_MINUTES)
@@ -327,12 +338,22 @@ class AdaptiveModbusController:
         )
 
     def stop(self) -> None:
-        """Cancel background tasks (called on integration unload)."""
+        """Cancel background tasks (called on integration unload).
+
+        BUG-004 FIX: if a save is pending (dirty flag set, task in-flight),
+        persist synchronously before cancelling so no learning data is lost on
+        reload or shutdown.  ``async_create_task`` is used so the save runs on
+        the HA event loop without requiring ``stop()`` itself to be a coroutine.
+        """
         if self._unsub_push:
             self._unsub_push()
             self._unsub_push = None
         if self._save_task and not self._save_task.done():
             self._save_task.cancel()
+            self._save_task = None
+        # Flush any unsaved data synchronously before the integration tears down.
+        if self._dirty:
+            self.hass.async_create_task(self._async_save())
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -400,8 +421,20 @@ class AdaptiveModbusController:
     @callback
     def _push_to_listeners(self, _now: Any) -> None:
         snap = self._snapshot()
-        for cb_fn in self._listeners:
-            cb_fn(snap)
+        # BUG-003 FIX: snapshot the list before iteration so that a listener
+        # calling remove_listener() during its own callback does not cause
+        # subsequent listeners to be skipped (Python list mutation semantics).
+        for cb_fn in list(self._listeners):
+            try:
+                cb_fn(snap)
+            except Exception:  # noqa: BLE001
+                # BUG-011 FIX: isolate each callback so one failing listener
+                # cannot abort delivery to all subsequent listeners.
+                _LOGGER.exception(
+                    "AdaptiveModbus[%s]: listener callback %r raised an exception",
+                    self.serial_number,
+                    cb_fn,
+                )
 
     def _snapshot(self) -> dict[str, Any]:
         """Produce a point-in-time diagnostic snapshot for sensor entities."""
@@ -541,14 +574,31 @@ class AdaptiveModbusController:
     # ── persistence ───────────────────────────────────────────────────────────
 
     def _schedule_save(self) -> None:
-        """Debounced save: write at most once per _SAVE_DEBOUNCE_SECONDS."""
+        """Debounced save: write at most once per _SAVE_DEBOUNCE_SECONDS.
+
+        BUG-010 FIX: the previous implementation silently discarded calls that
+        arrived while a debounce sleep was in-flight — any data recorded after
+        the task was created but before its 60 s sleep expired would never be
+        persisted unless another _schedule_save() fired after the task finished.
+        The fix always sets _dirty=True so that when the in-flight task wakes up
+        it will still see the flag and persist the latest state.  If no task is
+        running, a new one is created as before.
+        """
+        self._dirty = True          # mark dirty unconditionally
         if self._save_task and not self._save_task.done():
+            # A debounce task is already sleeping; it will see _dirty=True when
+            # it wakes and will persist the latest state.  No new task needed.
             return
-        self._dirty = True
         self._save_task = self.hass.async_create_task(self._deferred_save())
 
     async def _deferred_save(self) -> None:
-        await asyncio.sleep(_SAVE_DEBOUNCE_SECONDS)
+        try:
+            await asyncio.sleep(_SAVE_DEBOUNCE_SECONDS)
+        except asyncio.CancelledError:
+            # BUG-009 FIX: if the task is cancelled (e.g. during stop()),
+            # honour the cancellation cleanly without suppressing it.  The
+            # dirty-flag flush in stop() takes responsibility for persistence.
+            raise
         if self._dirty:
             await self._async_save()
 
@@ -583,7 +633,7 @@ class AdaptiveModbusController:
             try:
                 idx = int(idx_str)
                 if 0 <= idx < ADAPTIVE_SLOT_COUNT:
-                    self._slots[idx] = TimeSlotStats.from_dict(slot_dict)
+                    self._slots[idx] = TimeSlotStats.from_dict(slot_dict, slot_index=idx)
             except (ValueError, KeyError):
                 pass
         last_str = raw.get("last_decay_date")
@@ -592,7 +642,7 @@ class AdaptiveModbusController:
         self._first_data_date = date.fromisoformat(first_str) if first_str else None
 
     def _reset_slots(self) -> None:
-        self._slots = [TimeSlotStats() for _ in range(ADAPTIVE_SLOT_COUNT)]
+        self._slots = [TimeSlotStats(slot_index=i) for i in range(ADAPTIVE_SLOT_COUNT)]
 
     def _apply_startup_decay(self) -> None:
         """Apply accumulated daily decay since the last save."""

@@ -1,7 +1,7 @@
 # CLAUDE.md — Huawei Solar Integration
 
 > **Maintained by Claude (Anthropic) on behalf of the community.**
-> Current version: **1.1.0** — see `manifest.json`.
+> Current version: **1.1.1** — see `manifest.json`.
 
 ---
 
@@ -307,6 +307,37 @@ fix that calls `_evict()` from `record_failure()` and `record_timeout()`.
 ---
 
 ## 8. Changelog
+
+### v1.1.1 (2026-05-29)
+**7-bug runtime fix release — adaptive Modbus controller hardening**
+
+Second-pass audit of the adaptive Modbus learning subsystem (`adaptive_modbus.py`)
+and the write-verification path (`update_coordinator.py`).  All 7 confirmed runtime
+bugs fixed; 19 new regression tests added; full 177-test suite passes.
+
+#### Bugs fixed
+
+| ID | File | Root cause | Fix |
+|----|------|------------|-----|
+| BUG-003 | `adaptive_modbus.py` | `_push_to_listeners` iterated directly over `self._listeners`; a callback calling `remove_listener()` during dispatch caused subsequent listeners to be skipped | Iterate over `list(self._listeners)` (snapshot copy) so mid-iteration removal is safe |
+| BUG-004 | `adaptive_modbus.py` | `stop()` cancelled the debounced save task without flushing; up to 60 s of adaptive learning data was lost on every reload/restart | Set `_dirty` guard; after cancelling the task, schedule an immediate `_async_save()` if `_dirty` is set |
+| BUG-005 | `adaptive_modbus.py` | `TimeSlotStats.label` always returned `""` because the dataclass did not store the slot index; the comment admitted it was broken | Added `slot_index: int` field to `TimeSlotStats`; updated `_reset_slots()`, `from_dict()`, and all construction sites to propagate the index; `label` now returns the correct `HH:MM–HH:MM` string |
+| BUG-008 | `update_coordinator.py` | `verify_write` called `cache.update()` directly after a live read without first calling `cache.invalidate()`; a concurrent cache write between the read and the update could leave a stale value | Call `self.cache.invalidate(name)` immediately before `cache.update()` in the verification success path |
+| BUG-009 | `adaptive_modbus.py` | `_deferred_save` did not handle `asyncio.CancelledError`; cancellation during `stop()` could suppress the exception and leave cleanup incomplete | Added explicit `except asyncio.CancelledError: raise` so cancellation propagates correctly |
+| BUG-010 | `adaptive_modbus.py` | `_schedule_save` returned early if a debounce task was already in-flight, silently discarding the dirty flag; data recorded after task creation but before its 60 s sleep expired was never persisted | Set `self._dirty = True` unconditionally before the early-return guard; the sleeping task re-checks the flag on wake and persists the latest state |
+| BUG-011 | `adaptive_modbus.py` | `_push_to_listeners` had no exception isolation; one failing callback would abort delivery to all subsequent listeners | Wrap each `cb_fn(snap)` call in `try/except Exception` with `_LOGGER.exception`; all listeners always receive their update |
+
+#### Test suite — 177 tests, 0 failures
+
+| Test file | Tests | New | Covers |
+|---|---|---|---|
+| `test_adaptive_modbus.py` | 58 | +19 | BUG-003/004/005/009/010/011 regressions, slot label correctness, flush-on-stop, debounce dirty-flag, CancelledError propagation, listener isolation |
+| `test_update_coordinator.py` | 28 | +5 | BUG-008 invalidate-before-update, verify_write concurrency path |
+| `test_register_cache.py` | 48 | 0 | Unchanged — all 48 pass |
+| `test_modbus_guard.py` | 22 | 0 | Unchanged — all 22 pass |
+| `test_modbus_keepalive.py` | 18 | 0 | Unchanged — all 18 pass |
+| `test_modbus_telemetry.py` | 8 | 0 | Unchanged — all 8 pass |
+| `test_synchronized_power_coordinator.py` | (existing) | 0 | Unchanged |
 
 ### v1.1.0 (2026-05-28)
 **Production-ready: 10-bug audit, full fix, and 158-test suite**

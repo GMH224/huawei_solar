@@ -263,6 +263,11 @@ class HuaweiSolarUpdateCoordinator(
                         "%s: write verification OK for %s = %s",
                         self.name, name, actual,
                     )
+                    # BUG-008 FIX: invalidate the register before updating so
+                    # that any stale cache entry is evicted first.  Without this
+                    # a concurrent cache write between our live read and the
+                    # update call could leave a stale value behind.
+                    self.cache.invalidate(name)
                     self.cache.update({name: result[name]})
                     return True
 

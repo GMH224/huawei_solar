@@ -86,7 +86,7 @@ def _make_ctrl() -> AdaptiveModbusController:
     ctrl.hass = hass
     ctrl.serial_number = "SN-TEST"
     ctrl.device_info = {}
-    ctrl._slots = [TimeSlotStats() for _ in range(ADAPTIVE_SLOT_COUNT)]
+    ctrl._slots = [TimeSlotStats(slot_index=i) for i in range(ADAPTIVE_SLOT_COUNT)]
     ctrl._in_transition = False
     ctrl._transition_expires = 0.0
     ctrl._store = MagicMock()
@@ -418,3 +418,263 @@ class TestPersistence(unittest.TestCase):
         ctrl._slots[0].n = 100.0
         ctrl._apply_startup_decay()
         self.assertAlmostEqual(ctrl._slots[0].n, 100.0, places=4)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# v1.1.1 regression tests — BUG-003, 004, 005, 009, 010, 011
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── BUG-003: listener iteration mutation ──────────────────────────────────────
+
+class TestListenerIterationMutation(unittest.TestCase):
+    """BUG-003: removing a listener during dispatch must not skip later ones."""
+
+    def _make_ctrl_with_listeners(self):
+        ctrl = _make_ctrl()
+        results = []
+
+        def cb_a(snap):
+            results.append("a")
+
+        def cb_b(snap):
+            # self-removing callback — previously caused b→c skip
+            ctrl.remove_listener(cb_b)
+            results.append("b")
+
+        def cb_c(snap):
+            results.append("c")
+
+        ctrl.add_listener(cb_a)
+        ctrl.add_listener(cb_b)
+        ctrl.add_listener(cb_c)
+        return ctrl, results
+
+    def test_all_listeners_called_when_one_self_removes(self):
+        ctrl, results = self._make_ctrl_with_listeners()
+        ctrl._push_to_listeners(None)
+        self.assertEqual(results, ["a", "b", "c"],
+            "BUG-003: listener 'c' was skipped because 'b' removed itself during iteration")
+
+    def test_listener_list_shrinks_after_self_remove(self):
+        ctrl, _ = self._make_ctrl_with_listeners()
+        ctrl._push_to_listeners(None)
+        self.assertEqual(len(ctrl._listeners), 2,
+            "After self-removal during dispatch, only 2 listeners should remain")
+
+    def test_empty_listeners_ok(self):
+        ctrl = _make_ctrl()
+        ctrl._push_to_listeners(None)  # must not raise
+
+
+# ── BUG-011: listener callback exception isolation ────────────────────────────
+
+class TestListenerCallbackIsolation(unittest.TestCase):
+    """BUG-011: a failing callback must not prevent subsequent listeners from receiving their update."""
+
+    def test_exception_in_one_callback_does_not_abort_others(self):
+        ctrl = _make_ctrl()
+        results = []
+
+        def bad_cb(snap):
+            raise RuntimeError("simulated listener crash")
+
+        def good_cb(snap):
+            results.append("delivered")
+
+        ctrl.add_listener(bad_cb)
+        ctrl.add_listener(good_cb)
+        # Must not raise, and good_cb must still be called
+        ctrl._push_to_listeners(None)
+        self.assertEqual(results, ["delivered"],
+            "BUG-011: good_cb should still be called even though bad_cb raised")
+
+    def test_multiple_bad_callbacks_all_attempted(self):
+        ctrl = _make_ctrl()
+        call_log = []
+
+        for i in range(3):
+            def make_bad(idx):
+                def bad(snap):
+                    call_log.append(f"bad_{idx}")
+                    raise ValueError(f"error from cb {idx}")
+                return bad
+            ctrl.add_listener(make_bad(i))
+
+        ctrl._push_to_listeners(None)
+        self.assertEqual(len(call_log), 3,
+            "All 3 bad callbacks should be attempted even though they all raise")
+
+
+# ── BUG-004: flush pending save on stop() ────────────────────────────────────
+
+class TestFlushOnStop(unittest.TestCase):
+    """BUG-004: stop() must persist pending data instead of silently cancelling it."""
+
+    def test_dirty_flag_triggers_save_on_stop(self):
+        ctrl = _make_ctrl()
+        ctrl._dirty = True
+        ctrl.stop()
+        # async_create_task must have been called to schedule the save
+        ctrl.hass.async_create_task.assert_called_once()
+
+    def test_clean_flag_no_save_on_stop(self):
+        ctrl = _make_ctrl()
+        ctrl._dirty = False
+        ctrl.stop()
+        ctrl.hass.async_create_task.assert_not_called()
+
+    def test_unsub_push_cancelled_on_stop(self):
+        ctrl = _make_ctrl()
+        unsub = MagicMock()
+        ctrl._unsub_push = unsub
+        ctrl.stop()
+        unsub.assert_called_once()
+        self.assertIsNone(ctrl._unsub_push)
+
+    def test_pending_save_task_cancelled_on_stop(self):
+        ctrl = _make_ctrl()
+        task = MagicMock()
+        task.done.return_value = False
+        ctrl._save_task = task
+        ctrl._dirty = False
+        ctrl.stop()
+        task.cancel.assert_called_once()
+
+
+# ── BUG-005: TimeSlotStats.label correctness ─────────────────────────────────
+
+class TestTimeSlotStatsLabel(unittest.TestCase):
+    """BUG-005: label must return HH:MM–HH:MM, not empty string."""
+
+    def test_slot_0_label(self):
+        s = TimeSlotStats(slot_index=0)
+        self.assertEqual(s.label, "00:00\u201300:15",
+            "BUG-005: slot 0 label should be '00:00–00:15'")
+
+    def test_slot_47_label(self):
+        # slot 47 = 47 * 15 = 705 min = 11:45–12:00
+        s = TimeSlotStats(slot_index=47)
+        self.assertEqual(s.label, "11:45\u201312:00")
+
+    def test_slot_95_label(self):
+        # slot 95 = 95 * 15 = 1425 min = 23:45–24:00
+        s = TimeSlotStats(slot_index=95)
+        self.assertEqual(s.label, "23:45\u201324:00")
+
+    def test_label_never_empty(self):
+        for i in range(96):
+            s = TimeSlotStats(slot_index=i)
+            self.assertTrue(len(s.label) > 0,
+                f"BUG-005: slot {i} label is empty string")
+
+    def test_from_dict_preserves_label(self):
+        """round-tripping through from_dict must keep correct label."""
+        s = TimeSlotStats(slot_index=32)
+        original_label = s.label
+        s2 = TimeSlotStats.from_dict(s.to_dict(), slot_index=32)
+        self.assertEqual(s2.label, original_label)
+
+    def test_reset_slots_preserves_indices(self):
+        ctrl = _make_ctrl()
+        for i, slot in enumerate(ctrl._slots):
+            self.assertEqual(slot.slot_index, i,
+                f"Slot {i} has wrong slot_index={slot.slot_index} after _reset_slots()")
+
+    def test_default_label_no_longer_empty(self):
+        """Guard against regression to the broken empty-string default."""
+        s = TimeSlotStats(slot_index=10)
+        self.assertNotEqual(s.label, "",
+            "BUG-005 regression: label must not be empty string")
+
+
+# ── BUG-009: CancelledError propagation in _deferred_save ────────────────────
+
+class TestDeferredSaveCancelledError(unittest.TestCase):
+    """BUG-009: cancellation must propagate, not be swallowed."""
+
+    def test_cancelled_error_propagates(self):
+        ctrl = _make_ctrl()
+
+        async def _run_and_cancel():
+            task = asyncio.get_event_loop().create_task(ctrl._deferred_save())
+            await asyncio.sleep(0)  # let task start
+            task.cancel()
+            try:
+                await task
+                return False  # CancelledError was swallowed — bug still present
+            except asyncio.CancelledError:
+                return True   # correct behaviour
+
+        result = _LOOP.run_until_complete(_run_and_cancel())
+        self.assertTrue(result,
+            "BUG-009: CancelledError must not be swallowed inside _deferred_save")
+
+    def test_save_not_called_on_cancel_before_sleep(self):
+        ctrl = _make_ctrl()
+        ctrl._dirty = True
+
+        async def _run_and_cancel():
+            task = asyncio.get_event_loop().create_task(ctrl._deferred_save())
+            await asyncio.sleep(0)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        _LOOP.run_until_complete(_run_and_cancel())
+        ctrl._store.async_save.assert_not_called()
+
+
+# ── BUG-010: debounce dirty-flag not dropped ──────────────────────────────────
+
+class TestDebounceDirtyFlag(unittest.TestCase):
+    """BUG-010: calling _schedule_save while a task is in-flight must keep _dirty=True."""
+
+    def test_dirty_set_unconditionally(self):
+        ctrl = _make_ctrl()
+        # Simulate an in-flight task
+        mock_task = MagicMock()
+        mock_task.done.return_value = False
+        ctrl._save_task = mock_task
+        ctrl._dirty = False
+
+        ctrl._schedule_save()
+
+        self.assertTrue(ctrl._dirty,
+            "BUG-010: _dirty must be True even when an in-flight task exists; "
+            "otherwise data recorded during the debounce window is silently lost")
+
+    def test_no_new_task_when_in_flight(self):
+        ctrl = _make_ctrl()
+        mock_task = MagicMock()
+        mock_task.done.return_value = False
+        ctrl._save_task = mock_task
+
+        ctrl._schedule_save()
+
+        ctrl.hass.async_create_task.assert_not_called()
+
+    def test_new_task_created_when_idle(self):
+        ctrl = _make_ctrl()
+        ctrl._save_task = None
+        ctrl._schedule_save()
+        ctrl.hass.async_create_task.assert_called_once()
+
+    def test_deferred_save_persists_if_dirty_on_wake(self):
+        ctrl = _make_ctrl()
+        ctrl._first_data_date = date.today()
+        ctrl._dirty = True
+
+        async def short_save():
+            # Shorten the sleep so the test doesn't block for 60 s
+            import unittest.mock
+            with unittest.mock.patch("asyncio.sleep", new=AsyncMock()):
+                await ctrl._deferred_save()
+
+        _LOOP.run_until_complete(short_save())
+        ctrl._store.async_save.assert_called_once()
+
+
+if __name__ == "__main__":
+    unittest.main()
