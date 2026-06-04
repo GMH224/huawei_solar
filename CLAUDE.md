@@ -1,7 +1,7 @@
 # CLAUDE.md — Huawei Solar Integration
 
 > **Maintained by Claude (Anthropic) on behalf of the community.**
-> Current version: **1.1.1** — see `manifest.json`.
+> Current version: **1.1.2** — see `manifest.json`.
 
 ---
 
@@ -307,6 +307,90 @@ fix that calls `_evict()` from `record_failure()` and `record_timeout()`.
 ---
 
 ## 8. Changelog
+
+### v1.1.2 (2026-06-05)
+**Energy dashboard negative-bar fix — state_class audit + suspicious-zero guard**
+
+Two distinct but related bugs caused negative kWh bars and corrupted hourly
+totals in the HA Energy dashboard, both visible at sunset/sunrise transitions.
+
+#### Bug 1 — Wrong `state_class` on 24 lifetime-accumulator energy sensors (`sensor.py`)
+
+**Root cause:** 24 kWh registers that can only ever increase were declared as
+`state_class=TOTAL` instead of `TOTAL_INCREASING`.
+
+With `TOTAL`, Home Assistant computes the hourly bar as `new_value − old_value`
+and records the result verbatim — including **negative** deltas. When the
+inverter briefly returns `0` for any of these registers (sleep entry, startup
+flush, state-transition race), HA computes `0 − prev_value` and writes a large
+negative bar to the statistics database.
+
+With `TOTAL_INCREASING`, HA detects the downward movement and treats it as a
+counter reset instead of a negative contribution, preventing the negative bar.
+
+**Fix:** Changed all 24 affected sensors to `SensorStateClass.TOTAL_INCREASING`:
+
+| Register | Description |
+|---|---|
+| `ACCUMULATED_YIELD_ENERGY` | Inverter lifetime yield |
+| `TOTAL_DC_INPUT_POWER` | DC input energy total |
+| `accumulated_energy_yield` | Secondary inverter accumulated yield |
+| `STORAGE_TOTAL_CHARGE` | Battery lifetime charge |
+| `STORAGE_TOTAL_DISCHARGE` | Battery lifetime discharge |
+| `INVERTER_TOTAL_ABSORBED_ENERGY` | EMMA total absorbed |
+| `TOTAL_CHARGED_ENERGY` | EMMA total charged |
+| `TOTAL_ENERGY_CONSUMPTION` | EMMA total consumption |
+| `TOTAL_FEED_IN_TO_GRID` | EMMA total feed-in |
+| `TOTAL_SUPPLY_FROM_GRID` | EMMA total supply |
+| `INVERTER_TOTAL_ENERGY_YIELD` | EMMA inverter yield |
+| `TOTAL_PV_ENERGY_YIELD` | EMMA PV yield |
+| `TOTAL_ACTIVE/POSITIVE/NEGATIVE_ENERGY_BUILT_IN` | Built-in meter totals (×3) |
+| `TOTAL_ACTIVE/POSITIVE/NEGATIVE_ENERGY_EXTERNAL` | External meter totals (×3) |
+| `SMARTLOGGER_TOTAL_POWER_SUPPLY_FROM_GRID` | SmartLogger grid supply |
+| `SMARTLOGGER_TOTAL_ENERGY_CHARGED` | SmartLogger battery charge |
+| `SMARTLOGGER_TOTAL_ENERGY_DISCHARGE_D` | SmartLogger battery discharge |
+| `SMARTLOGGER_TOTAL_ENERGY_YIELD` | SmartLogger yield |
+| `SMARTLOGGER_EXTERNAL_METER_TOTAL_ACTIVE/REACTIVE` | External meter (×2) |
+
+#### Bug 2 — Suspicious-zero guard for live Modbus reads (`update_coordinator.py`)
+
+**Root cause:** The v1.0.3 stale-cache exclusion correctly withholds energy
+counters during Modbus *timeouts*, but a *successful* live read returning `0`
+(e.g., the SUN2000 flushing registers during sleep-mode entry) bypassed that
+protection entirely. The `0` was cached and forwarded to HA as a valid value.
+
+- With `TOTAL` sensors (Bug 1): produced a **negative bar** (immediate, visible)
+- With `TOTAL_INCREASING` sensors: produced a **positive spike** in the wrong
+  hourly bucket on recovery (subtler, but still corrupts totals)
+
+**Fix:** In the success path of `_async_update_data()`, before `cache.update()`,
+any energy-counter register that arrives as `0` from a live read is dropped from
+`fresh` if the cache already holds a non-zero value for that register. The
+sensor entity then finds the register absent from `coordinator.data` and marks
+itself `unavailable` — an honest gap that HA interpolates correctly, consistent
+with the v1.0.3 design philosophy.
+
+A genuine midnight reset of a daily counter is **not** affected: by the time
+the inverter clocks midnight, the cached prior value is already at or near `0`
+from declining end-of-day production, so the guard condition (`prior.value > 0`)
+does not fire.
+
+#### Files changed
+
+| File | Change |
+|---|---|
+| `sensor.py` | 24 × `TOTAL` → `TOTAL_INCREASING` for kWh lifetime accumulators |
+| `update_coordinator.py` | Step 11: suspicious-zero guard before `cache.update()` |
+| `manifest.json` | Version bumped to `1.1.2` |
+
+#### HA statistics database note
+
+The `state_class` change is **not retroactive**. Existing long-term statistics
+rows already recorded as `TOTAL` will remain in the database unchanged. Going
+forward, HA will use the new `TOTAL_INCREASING` logic for all new rows. If
+historical negative bars are visible in your Energy dashboard, they can be
+cleared via **Developer Tools → Statistics → Fix issue** for each affected
+sensor, or by deleting the statistics rows for those entities.
 
 ### v1.1.1 (2026-05-29)
 **7-bug runtime fix release — adaptive Modbus controller hardening**

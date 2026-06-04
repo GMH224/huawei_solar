@@ -564,6 +564,34 @@ class HuaweiSolarUpdateCoordinator(
         if self._adaptive:
             self._adaptive.record_request(total_rtt_ms, success=True, timeout=False)
 
+        # ── 11. Suspicious-zero guard for energy counters ─────────────────────
+        # A live Modbus read can return 0 for kWh accumulators during inverter
+        # sleep entry (~sunset), startup flash, or state-transition races even
+        # though no timeout occurred.  The stale-cache exclusion (step 9) only
+        # covers the timeout path; this guard covers the success path.
+        #
+        # Rule: if an energy-counter register comes back as 0 from a live read,
+        # AND the cache already holds a non-zero value for that register, drop
+        # it from 'fresh'.  The sensor entity will not find it in coordinator.data
+        # and will mark itself unavailable — an honest gap that HA interpolates
+        # correctly, consistent with the v1.0.3 design philosophy.
+        #
+        # A genuine midnight reset (daily_yield going 0→0 or decreasing
+        # naturally to 0 as production ends) is NOT affected: in that case the
+        # cached prior value is already at or near 0 so the guard does not fire.
+        for _name in list(fresh):
+            if is_energy_counter(_name):
+                _result = fresh[_name]
+                if _result is not None and _result.value == 0:
+                    _prior = self.cache.get(_name)
+                    if _prior is not None and _prior.value > 0:
+                        _LOGGER.debug(
+                            "%s: suspicious zero dropped for energy counter '%s' "
+                            "(prior cached value: %s kWh) — marking unavailable",
+                            self.name, _name, _prior.value,
+                        )
+                        del fresh[_name]
+
         self.cache.update(fresh)
         merged_result = self.cache.merge(fresh, all_names)
         self._night_detector.evaluate(merged_result)
