@@ -166,7 +166,6 @@ _FAST_SUBSTRINGS: tuple[str, ...] = (
     "battery_pack_2_charge_discharge",
     "battery_pack_3_charge_discharge",
     "input_power",                      # PV input
-    "total_dc_input_power",
     "active_power",                     # AC output
     "reactive_power",
     "sdongle_total_active",
@@ -191,6 +190,7 @@ _FAST_SUBSTRINGS: tuple[str, ...] = (
 #
 # Rule: list here any SLOW pattern that is a superset of a FAST pattern.
 _SLOW_PRIORITY_SUBSTRINGS: tuple[str, ...] = (
+    "total_dc_input_power",   # kWh energy accumulator, NOT instantaneous power
     "phase_a_active_power",
     "phase_b_active_power",
     "phase_c_active_power",
@@ -496,16 +496,87 @@ _ENERGY_COUNTER_SUBSTRINGS: tuple[str, ...] = (
     "current_day_yield",
 )
 
+# ── Authoritative energy-counter name set (source of truth) ────────────────────
+#
+# The substring heuristic above missed ~half of the monotonically-increasing
+# kWh/kVarh accumulators that sensor.py declares with
+# `state_class=TOTAL_INCREASING` (e.g. storage_total_charge, total_dc_input_power,
+# every *_today daily counter, several SmartLogger/external-meter totals).
+# Those gaps silently disabled the stale-cache exclusion AND the suspicious-zero
+# guard for the affected registers, re-introducing the Energy-dashboard
+# negative-bar / wrong-bucket corruption at sunrise/sunset.
+#
+# This explicit set is the source of truth.  It MUST stay in sync with the
+# TOTAL_INCREASING energy sensors in sensor.py.  The regression test
+# tests/test_energy_counter_coverage.py re-derives the list from sensor.py and
+# fails if the two ever drift, so a newly-added energy sensor cannot silently
+# lose protection.
+_ENERGY_COUNTER_NAMES: frozenset[str] = frozenset({
+    "accumulated_yield_energy",
+    "charger_total_energy_charged",
+    "consumption_today",
+    "daily_yield_energy",
+    "energy_charged_today",
+    "energy_discharged_today",
+    "feed_in_to_grid_today",
+    "grid_accumulated_energy",
+    "grid_accumulated_reactive_power",
+    "grid_exported_energy",
+    "hourly_yield_energy",
+    "inverter_energy_yield_today",
+    "inverter_total_absorbed_energy",
+    "inverter_total_energy_yield",
+    "monthly_yield_energy",
+    "pv_yield_today",
+    "smartlogger_energy_charged_today",
+    "smartlogger_energy_discharged_today",
+    "smartlogger_external_meter_negative_active_electricity",
+    "smartlogger_external_meter_positive_active_electricity_total",
+    "smartlogger_external_meter_total_active_electricity",
+    "smartlogger_external_meter_total_reactive_electricity",
+    "smartlogger_power_supply_from_grid_today",
+    "smartlogger_total_energy_charged",
+    "smartlogger_total_energy_discharge_d",
+    "smartlogger_total_energy_yield",
+    "smartlogger_total_power_supply_from_grid",
+    "smartlogger_yield_today",
+    "storage_current_day_charge_capacity",
+    "storage_current_day_discharge_capacity",
+    "storage_total_charge",
+    "storage_total_discharge",
+    "supply_from_grid_today",
+    "total_active_energy_built_in_energy",
+    "total_active_energy_external_energy",
+    "total_charged_energy",
+    "total_dc_input_power",
+    "total_discharged_energy",
+    "total_energy_consumption",
+    "total_feed_in_to_grid",
+    "total_negative_active_energy_built_in_energy",
+    "total_negative_active_energy_external_energy",
+    "total_positive_active_energy_built_in_energy",
+    "total_positive_active_energy_external_energy",
+    "total_pv_energy_yield",
+    "total_supply_from_grid",
+    "yearly_yield_energy",
+})
+
 
 @lru_cache(maxsize=256)
 def is_energy_counter(name: "RegisterName") -> bool:
     """Return True if *name* is a monotonically-increasing kWh accumulator.
 
     Energy counter registers must not be served from a stale cache fallback
-    after a Modbus timeout — see module docstring for the full rationale.
+    after a Modbus timeout, nor accept a suspicious live zero — see module
+    docstring for the full rationale.
+
+    Matching is by exact name (the authoritative _ENERGY_COUNTER_NAMES set)
+    OR by substring (a coarse safety net for library register-name variants).
 
     Results are memoised: the set of unique RegisterNames in a session is
     bounded (≤ ~200), so this is effectively O(1) after the first lookup.
     """
     s = str(name).lower()
+    if s in _ENERGY_COUNTER_NAMES:
+        return True
     return any(sub in s for sub in _ENERGY_COUNTER_SUBSTRINGS)

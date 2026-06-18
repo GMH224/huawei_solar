@@ -118,26 +118,46 @@ class SynchronizedPowerData:
     #: ``None`` if no battery is connected.
     battery_power: float | None
 
+    #: Topology flags — distinguish "not installed" (a missing input legitimately
+    #: contributes 0) from "installed but this tick's read failed" (a missing
+    #: input means the derived value is unknown and must be reported as
+    #: unavailable, not silently computed with a wrong term).  Default False so
+    #: that a single-inverter / no-battery / no-meter system is unaffected.
+    has_inv2: bool = False
+    has_meter: bool = False
+    has_battery: bool = False
+
     # ── Derived properties ────────────────────────────────────────────────────
 
     @property
     def pv_power_total(self) -> float | None:
-        """Sum of all PV string power across both inverters."""
+        """Sum of all PV string power across both inverters.
+
+        Returns ``None`` if INV1 is unavailable, or if a second inverter is
+        installed but its reading failed this tick (otherwise the total would
+        silently omit INV2's contribution and report a wrong number).
+        """
         if self.inv1_pv_power is None:
             return None
-        return (self.inv1_pv_power or 0) + (self.inv2_pv_power or 0)
+        if self.has_inv2 and self.inv2_pv_power is None:
+            return None
+        return self.inv1_pv_power + (self.inv2_pv_power or 0)
 
     @property
     def home_consumption(self) -> float | None:
         """Estimated home consumption derived from the power balance equation.
 
-        Returns ``None`` if any required reading is unavailable.
+        Returns ``None`` if any required reading is unavailable — including a
+        battery that is installed but failed to read this tick (substituting 0
+        would over/under-count home by the actual battery power).
         A small negative result (measurement noise) is clamped to 0.
         """
         pv = self.pv_power_total
         grid = self.grid_power
         batt = self.battery_power
         if pv is None or grid is None:
+            return None
+        if self.has_battery and batt is None:
             return None
         # Battery contribution: discharging (negative) feeds home so we subtract
         # battery_power (positive = charging reduces available power).
@@ -325,6 +345,9 @@ class SynchronizedPowerCoordinator(DataUpdateCoordinator[SynchronizedPowerData])
             inv2_pv_power=inv2_pv,
             grid_power=grid,
             battery_power=battery,
+            has_inv2=self._inv2 is not None,
+            has_meter=self._has_meter,
+            has_battery=self._has_battery,
         )
 
 

@@ -56,6 +56,18 @@ _cstub.KEEPALIVE_INTERVAL = __import__("datetime").timedelta(seconds=45)
 _cstub.KEEPALIVE_REGISTER = "model_id"
 sys.modules["huawei_solar.const"] = _cstub
 
+# modbus_keepalive does `from .modbus_guard import ModbusGuard`; the relative
+# import resolves to huawei_solar.modbus_guard, so it must be registered before
+# the module is exec'd (previously missing — the whole test module errored at
+# import and none of its tests ran).
+_guard_mod = types.ModuleType("huawei_solar.modbus_guard")
+class _StubGuard:  # minimal stand-in; individual tests inject their own mock
+    @classmethod
+    def get_or_create(cls, *a, **k):
+        return cls()
+_guard_mod.ModbusGuard = _StubGuard
+sys.modules["huawei_solar.modbus_guard"] = _guard_mod
+
 _SRC = pathlib.Path(__file__).parent.parent / "modbus_keepalive.py"
 _SPEC = importlib.util.spec_from_file_location("modbus_keepalive_test", str(_SRC))
 _MOD = importlib.util.module_from_spec(_SPEC)

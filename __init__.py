@@ -301,30 +301,33 @@ async def async_unload_entry(
         primary_device = device_datas[0].device
         await primary_device.client.disconnect()
 
-        # Stop telemetry push timers and clean up singletons for all devices
+        # Tear down ONLY this entry's singletons.  These registries are
+        # process-global and may hold instances belonging to other config
+        # entries that are still loaded (e.g. a second inverter added as a
+        # separate entry).  clear_registry() would wipe those too — breaking
+        # bus serialisation for the surviving entry and orphaning its
+        # keep-alive tasks.  Remove per-serial / per-endpoint instead.
         for device_data in device_datas:
             serial = device_data.device.serial_number
+
             telemetry = ModbusTelemetry.get(serial)
             if telemetry:
                 telemetry.stop()
-        ModbusGuard.clear_registry()
-        ModbusTelemetry.clear_registry()
+            ModbusTelemetry.remove(serial)
 
-        # Stop adaptive controllers and clear their registry
-        for device_data in device_datas:
-            serial = device_data.device.serial_number
             controller = AdaptiveModbusController.get(serial)
             if controller:
                 controller.stop()
-        AdaptiveModbusController.clear_registry()
+            AdaptiveModbusController.remove(serial)
 
-        # Stop keep-alive probes and clear registry
-        for device_data in device_datas:
-            serial = device_data.device.serial_number
             keepalive = ModbusKeepAlive.get(serial)
             if keepalive:
                 keepalive.stop()
-        ModbusKeepAlive.clear_registry()
+            ModbusKeepAlive.remove(serial)
+
+        # The ModbusGuard is keyed on the connection endpoint shared by all
+        # sub-devices of this entry; remove just that endpoint's guard.
+        ModbusGuard.remove(ModbusGuard.endpoint_for(entry.data))
 
         # The SynchronizedPowerCoordinator has no background tasks of its own —
         # HA cancels its scheduled refresh when the config entry is unloaded.

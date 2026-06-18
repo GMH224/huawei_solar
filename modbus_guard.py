@@ -78,6 +78,15 @@ class ModbusGuard:
     def clear_registry(cls) -> None:
         cls._registry.clear()
 
+    @classmethod
+    def remove(cls, endpoint: str) -> None:
+        """Remove a single guard from the registry (per-entry unload).
+
+        Unlike clear_registry(), this does not disturb guards belonging to
+        other still-loaded config entries that share the registry.
+        """
+        cls._registry.pop(endpoint, None)
+
     # ── instance ──────────────────────────────────────────────────────────────
 
     def __init__(self, endpoint: str) -> None:
@@ -127,9 +136,11 @@ class ModbusGuard:
                 )
 
             guard._queue_depth += 1
+            lock_acquired = False
             try:
                 async with asyncio.timeout(QUEUE_WAIT_TIMEOUT.total_seconds()):
                     await guard._lock.acquire()
+                lock_acquired = True
 
                 now = time.monotonic()
                 elapsed = now - guard._last_request_end
@@ -141,8 +152,15 @@ class ModbusGuard:
                     )
                     await asyncio.sleep(wait)
 
-            except Exception:
+            except BaseException:
+                # MUST be BaseException, not Exception: asyncio.CancelledError is a
+                # BaseException.  A cancellation during lock.acquire() or during the
+                # inter-request gap sleep (after the lock was granted) would
+                # otherwise leak both the queue counter and — fatally — the lock,
+                # deadlocking the entire Modbus bus until HA is restarted.
                 guard._queue_depth -= 1
+                if lock_acquired:
+                    guard._lock.release()
                 raise
 
         async def __aexit__(self, *_: object) -> None:

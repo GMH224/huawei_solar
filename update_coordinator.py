@@ -447,7 +447,10 @@ class HuaweiSolarUpdateCoordinator(
                     if self._backoff_cycle % BACKOFF_NORMAL_DIVISOR == 0:
                         priority_names.append(n)
                 # SLOW and STATIC are skipped entirely during back-off
-            stale_names = priority_names or stale_names[:BATCH_CHUNK_SIZE]
+            # If nothing is due this cycle (no FAST stale, not a NORMAL cycle),
+            # read nothing and serve the cached snapshot — do NOT fall back to
+            # reading SLOW/STATIC, which would defeat the deferral.
+            stale_names = priority_names
         else:
             self._backoff_cycle = 0
 
@@ -584,13 +587,23 @@ class HuaweiSolarUpdateCoordinator(
                 _result = fresh[_name]
                 if _result is not None and _result.value == 0:
                     _prior = self.cache.get(_name)
-                    if _prior is not None and _prior.value > 0:
+                    if (
+                        _prior is not None
+                        and _prior.value is not None
+                        and _prior.value > 0
+                    ):
                         _LOGGER.debug(
                             "%s: suspicious zero dropped for energy counter '%s' "
                             "(prior cached value: %s kWh) — marking unavailable",
                             self.name, _name, _prior.value,
                         )
                         del fresh[_name]
+                        # Invalidate the cached entry as well; otherwise
+                        # cache.merge() would re-inject the stale prior value and
+                        # the sensor would show a flat value instead of going
+                        # unavailable (the honest-gap behaviour we want, matching
+                        # the timeout-path exclusion in step 9).
+                        self.cache.invalidate(_name)
 
         self.cache.update(fresh)
         merged_result = self.cache.merge(fresh, all_names)

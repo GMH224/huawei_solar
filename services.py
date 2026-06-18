@@ -253,8 +253,15 @@ MAXIMUM_FEED_GRID_POWER_PERCENTAGE_SCHEMA = {
 }
 
 
-HUAWEI_LUNA2000_TOU_PATTERN = r"([0-2]\d:\d\d-[0-2]\d:\d\d/[1-7]{0,7}/[+-]\n?){0,14}"
-LG_RESU_TOU_PATTERN = r"([0-2]\d:\d\d-[0-2]\d:\d\d/\d+\.?\d*\n?){0,14}"
+# Strict HH:MM sub-pattern: hours 00-23, minutes 00-59.  Rejects 24:00 and
+# malformed values like 29:99 that the old "[0-2]\d:\d\d" allowed.
+_TIME = r"(?:[01]\d|2[0-3]):[0-5]\d"
+
+# Period quantifier stays {0,N}: an empty string is a valid "clear all periods"
+# request.  The parsers below skip blank lines so empty input clears safely
+# instead of raising.  The day field requires at least one day ([1-7]{1,7}).
+HUAWEI_LUNA2000_TOU_PATTERN = rf"({_TIME}-{_TIME}/[1-7]{{1,7}}/[+-]\n?){{0,14}}"
+LG_RESU_TOU_PATTERN = rf"({_TIME}-{_TIME}/\d+\.?\d*\n?){{0,14}}"
 
 BATTERY_TOU_PERIODS_SCHEMA = BATTERY_DEVICE_SCHEMA.extend(
     {
@@ -275,7 +282,7 @@ EMMA_TOU_PERIODS_SCHEMA = EMMA_DEVICE_SCHEMA.extend(
 )
 
 CAPACITY_CONTROL_PERIODS_PATTERN = (
-    r"([0-2]\d:\d\d-[0-2]\d:\d\d/[1-7]{1,7}/\d+W\n?){0,14}"
+    rf"({_TIME}-{_TIME}/[1-7]{{1,7}}/\d+W\n?){{0,14}}"
 )
 
 CAPACITY_CONTROL_PERIODS_SCHEMA = BATTERY_DEVICE_SCHEMA.extend(
@@ -287,7 +294,7 @@ CAPACITY_CONTROL_PERIODS_SCHEMA = BATTERY_DEVICE_SCHEMA.extend(
     }
 )
 
-FIXED_CHARGE_PERIODS_PATTERN = r"([0-2]\d:\d\d-[0-2]\d:\d\d/\d+W\n?){0,10}"
+FIXED_CHARGE_PERIODS_PATTERN = rf"({_TIME}-{_TIME}/\d+W\n?){{0,10}}"
 
 FIXED_CHARGE_PERIODS_SCHEMA = BATTERY_DEVICE_SCHEMA.extend(
     {
@@ -312,11 +319,10 @@ def _parse_days_effective(
 def _parse_time(value: str) -> int:
     hours, minutes = value.split(":")
 
-    minutes_since_midnight = int(hours) * 60 + int(minutes)
-
-    if not 0 <= minutes_since_midnight <= 1440:
+    hours_i, minutes_i = int(hours), int(minutes)
+    if not (0 <= hours_i <= 23 and 0 <= minutes_i <= 59):
         raise ValueError(f"Invalid time '{value}': must be between 00:00 and 23:59")
-    return minutes_since_midnight
+    return hours_i * 60 + minutes_i
 
 
 async def _validate_power_value(
@@ -327,6 +333,12 @@ async def _validate_power_value(
 
     maximum_active_power = (await dd.device.get(max_value_key)).value
 
+    if maximum_active_power is None:
+        raise ValueError(
+            f"Could not read the maximum allowed power ({max_value_key}); "
+            "the inverter did not return a value. Try again shortly."
+        )
+
     if not power <= maximum_active_power:
         raise ValueError(f"Power cannot be more than {maximum_active_power}W")
 
@@ -336,6 +348,8 @@ async def _validate_power_value(
 def _parse_huawei_luna2000_periods(text: str) -> list[HUAWEI_LUNA2000_TimeOfUsePeriod]:
     result = []
     for line in text.split("\n"):
+        if not line.strip():
+            continue  # tolerate blank lines / empty input (clears all periods)
         start_end_time_str, days_effective_str, charge_flag_str = line.split("/")
         start_time_str, end_time_str = start_end_time_str.split("-")
 
@@ -354,6 +368,8 @@ def _parse_huawei_luna2000_periods(text: str) -> list[HUAWEI_LUNA2000_TimeOfUseP
 def _parse_lg_resu_periods(text: str) -> list[LG_RESU_TimeOfUsePeriod]:
     result = []
     for line in text.split("\n"):
+        if not line.strip():
+            continue  # tolerate blank lines / empty input (clears all periods)
         start_end_time_str, energy_price = line.split("/")
         start_time_str, end_time_str = start_end_time_str.split("-")
 
@@ -684,6 +700,8 @@ async def set_emma_tou_periods(
 def _parse_capacity_control_periods(text: str) -> list[PeakSettingPeriod]:
     result = []
     for line in text.split("\n"):
+        if not line.strip():
+            continue  # tolerate blank lines / empty input (clears all periods)
         start_end_time_str, days_str, wattage_str = line.split("/")
         start_time_str, end_time_str = start_end_time_str.split("-")
 
@@ -722,6 +740,8 @@ async def set_capacity_control_periods(service_call: ServiceCall) -> None:
 def _parse_fixed_charge_periods(text: str) -> list[ChargeDischargePeriod]:
     result = []
     for line in text.split("\n"):
+        if not line.strip():
+            continue  # tolerate blank lines / empty input (clears all periods)
         start_end_time_str, wattage_str = line.split("/")
         start_time_str, end_time_str = start_end_time_str.split("-")
 
@@ -868,36 +888,42 @@ async def async_setup_services(
                 schema=BATTERY_TOU_PERIODS_SCHEMA,
             )
 
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_FORCIBLE_CHARGE,
-            forcible_charge,
-            schema=DURATION_SCHEMA,
-        )
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_FORCIBLE_DISCHARGE,
-            forcible_discharge,
-            schema=DURATION_SCHEMA,
-        )
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_FORCIBLE_CHARGE_SOC,
-            forcible_charge_soc,
-            schema=SOC_SCHEMA,
-        )
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_FORCIBLE_DISCHARGE_SOC,
-            forcible_discharge_soc,
-            schema=SOC_SCHEMA,
-        )
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_STOP_FORCIBLE_CHARGE,
-            stop_forcible_charge,
-            schema=BATTERY_DEVICE_SCHEMA,
-        )
+        # Direct forcible charge/discharge control writes STORAGE_FORCIBLE_*
+        # registers straight to the inverter.  When an EMMA is present it is the
+        # sole battery manager, so exposing these would let a user issue a write
+        # that conflicts with EMMA's control.  Register them for non-EMMA setups
+        # only — consistent with the EMMA/else split for SET_TOU_PERIODS above.
+        if not has_emma:
+            hass.services.async_register(
+                DOMAIN,
+                SERVICE_FORCIBLE_CHARGE,
+                forcible_charge,
+                schema=DURATION_SCHEMA,
+            )
+            hass.services.async_register(
+                DOMAIN,
+                SERVICE_FORCIBLE_DISCHARGE,
+                forcible_discharge,
+                schema=DURATION_SCHEMA,
+            )
+            hass.services.async_register(
+                DOMAIN,
+                SERVICE_FORCIBLE_CHARGE_SOC,
+                forcible_charge_soc,
+                schema=SOC_SCHEMA,
+            )
+            hass.services.async_register(
+                DOMAIN,
+                SERVICE_FORCIBLE_DISCHARGE_SOC,
+                forcible_discharge_soc,
+                schema=SOC_SCHEMA,
+            )
+            hass.services.async_register(
+                DOMAIN,
+                SERVICE_STOP_FORCIBLE_CHARGE,
+                stop_forcible_charge,
+                schema=BATTERY_DEVICE_SCHEMA,
+            )
 
     if has_lg_battery:
         hass.services.async_register(

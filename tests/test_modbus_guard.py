@@ -265,3 +265,50 @@ class TestRegistry(unittest.TestCase):
         ModbusGuard.get_or_create("host:502")
         ModbusGuard.clear_registry()
         self.assertEqual(ModbusGuard._registry, {})
+
+
+class TestCancellationDoesNotDeadlock(unittest.TestCase):
+    """v1.1.3 regression: cancellation during the inter-request gap must not
+    leak the lock or the queue counter (former bug: `except Exception` did not
+    catch CancelledError, permanently deadlocking the bus)."""
+
+    def setUp(self):
+        ModbusGuard.clear_registry()
+
+    def test_cancel_during_gap_releases_lock_and_counter(self):
+        async def scenario():
+            g = ModbusGuard.get_or_create("10.0.0.9:502")
+            g.update_gap(0.5)  # long enough gap to be cancelled mid-sleep
+
+            async with g.request():  # first request sets _last_request_end
+                pass
+
+            async def second():
+                async with g.request():
+                    await asyncio.sleep(1)
+
+            t = asyncio.create_task(second())
+            await asyncio.sleep(0.1)  # let it acquire the lock and enter the gap sleep
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+
+            # The lock and the queue counter must both be released.
+            self.assertFalse(g.is_busy, "lock leaked -> bus deadlocked")
+            self.assertEqual(g.queue_depth, 0, "queue_depth leaked")
+
+            # And the bus must still be usable.
+            async with asyncio.timeout(1.0):
+                async with g.request():
+                    pass
+
+        _run(scenario())
+
+    def test_remove_is_targeted(self):
+        ModbusGuard.get_or_create("a:502")
+        ModbusGuard.get_or_create("b:502")
+        ModbusGuard.remove("a:502")
+        self.assertNotIn("a:502", ModbusGuard._registry)
+        self.assertIn("b:502", ModbusGuard._registry)

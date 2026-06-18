@@ -33,11 +33,23 @@ for _m in [
 ]:
     sys.modules.setdefault(_m, types.ModuleType(_m))
 
+# synchronized_power_coordinator imports `from homeassistant.core import
+# HomeAssistant`; provide the names on the core stub so the module loads
+# (previously missing — the whole test module skipped at import time).
+_core = sys.modules["homeassistant.core"]
+if not hasattr(_core, "HomeAssistant"):
+    _core.HomeAssistant = type("HomeAssistant", (), {})
+if not hasattr(_core, "callback"):
+    _core.callback = lambda f: f
+
 # DataUpdateCoordinator stub
 _duc = sys.modules["homeassistant.helpers.update_coordinator"]
 
 
 class _FakeDUC:
+    def __class_getitem__(cls, item):  # DataUpdateCoordinator[...] is generic
+        return cls
+
     def __init__(self, hass, logger, name, update_interval):
         self.hass = hass
         self.name = name
@@ -133,6 +145,9 @@ with patch.dict(
 
     # Inject stubs for relative imports
     sync_mod.__package__ = "huawei_solar"
+    # Register in sys.modules BEFORE exec: @dataclass(slots=True) resolves field
+    # annotations via sys.modules[cls.__module__], which is None otherwise.
+    sys.modules["sync_power"] = sync_mod
     with patch.dict(
         "sys.modules",
         {

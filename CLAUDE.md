@@ -1,7 +1,7 @@
 # CLAUDE.md — Huawei Solar Integration
 
 > **Maintained by Claude (Anthropic) on behalf of the community.**
-> Current version: **1.1.2** — see `manifest.json`.
+> Current version: **1.1.3** — see `manifest.json`.
 
 ---
 
@@ -307,6 +307,44 @@ fix that calls `_evict()` from `record_failure()` and `record_timeout()`.
 ---
 
 ## 8. Changelog
+
+### v1.1.3 (2026-06-19)
+**Independent industrial-grade audit — 12 bugs fixed (2 HIGH), test suite made runnable**
+
+Full static + dynamic audit. Every fix was verified by executing the production
+code. Two findings were treated as deployment blockers.
+
+#### Bugs fixed
+
+| ID | Sev | File | Root cause | Fix |
+|----|-----|------|------------|-----|
+| A1 | **HIGH** | `modbus_guard.py` | `__aenter__` cleanup used `except Exception`, which does not catch `asyncio.CancelledError`. A cancellation during the inter-request gap sleep (after the lock was acquired) leaked the lock **and** the queue counter, permanently deadlocking the whole Modbus bus until an HA restart. The gap runs on every request, so the window is present on every poll. | Catch `BaseException`; track `lock_acquired` and release the lock in the cleanup path before re-raising. Regression test cancels a task mid-gap and asserts the lock + counter are released and the bus is still usable. |
+| A2 | **HIGH** | `register_cache.py` ↔ `sensor.py` | `is_energy_counter()` matched a hand-maintained substring list that had drifted from the `TOTAL_INCREASING` energy sensors in `sensor.py`. **23 of 47** energy accumulators (incl. `STORAGE_TOTAL_CHARGE/DISCHARGE`, `TOTAL_DC_INPUT_POWER`, every `*_today` counter, `GRID_EXPORTED_ENERGY`) were unrecognised, so the stale-cache exclusion **and** the suspicious-zero guard silently did not protect them — re-introducing the sunrise/sunset Energy-dashboard corruption. | Added an authoritative `_ENERGY_COUNTER_NAMES` frozenset (source of truth). New `tests/test_energy_counter_coverage.py` re-derives the set from `sensor.py` via AST and fails if the two ever drift again. |
+| A3 | MED | `__init__.py` | `async_unload_entry` called the **global** `clear_registry()` on all four singleton registries, wiping instances owned by *other* still-loaded config entries → broken bus serialisation + leaked keep-alive tasks for the surviving entry. | Added targeted `remove()` to each registry; unload now removes only this entry's per-serial / per-endpoint instances. |
+| A4 | MED | `update_coordinator.py` | Suspicious-zero guard dropped the register from `fresh` but did not invalidate the cache entry, so `cache.merge()` re-injected the stale prior value — the sensor showed a flat value instead of going unavailable (contradicting the documented design and the timeout path). | Call `cache.invalidate(name)` when dropping, so `merge` skips it and the sensor goes unavailable. |
+| A5 | MED | `synchronized_power_coordinator.py` | `home_consumption` substituted `0` for a failed **battery** read on a battery system (off by the real battery power); `pv_power_total` silently dropped a failed INV2 — both reported a wrong number instead of unavailable. | Added `has_inv2` / `has_meter` / `has_battery` topology flags; derived properties return `None` when an *installed* input failed to read this tick. |
+| A6 | MED | `services.py` | Forcible charge/discharge/stop services were registered whenever a battery was present, even under an EMMA — contradicting the "no direct battery control with EMMA" design and allowing writes that conflict with EMMA. | Registered only when `not has_emma`, consistent with the TOU-period split. |
+| A7 | MED | `register_cache.py` | `TOTAL_DC_INPUT_POWER` (a kWh accumulator) was in `_FAST_SUBSTRINGS` → polled every cycle, TTL 0. | Added to `_SLOW_PRIORITY_SUBSTRINGS` (checked before FAST) and removed from FAST → classified `SLOW`. |
+| A8 | LOW | `services.py` | `_parse_time` accepted `24:00` and minutes `60–99`. | Strict HH:MM (`(?:[01]\d\|2[0-3]):[0-5]\d`) in all period regexes; `_parse_time` validates components (00:00–23:59). |
+| A9 | LOW | `services.py` | TOU/capacity/fixed-charge regexes accepted empty input that then crashed the parser with an unhandled `ValueError`; day field accepted zero days. | Parsers skip blank lines (empty input safely clears periods); day field requires `[1-7]{1,7}`. |
+| A10 | LOW | `services.py` | `_validate_power_value` raised `TypeError` if the max-power register read returned `None`. | Explicit `None` guard with a clear error. |
+| A11 | LOW | `update_coordinator.py` | Suspicious-zero guard `_prior.value > 0` could `TypeError` on a cached `None`. | Guard `_prior.value is not None` before comparing. |
+| A12 | LOW | `update_coordinator.py` | Back-off priority fallback `stale_names[:BATCH_CHUNK_SIZE]` could read SLOW/STATIC despite "deferred entirely". | Serve the cached snapshot when no priority registers are due. |
+
+#### Test suite — now runnable in a clean environment
+
+| File | Change |
+|---|---|
+| `tests/test_modbus_keepalive.py` | Registered the missing `huawei_solar.modbus_guard` stub — all 18 tests now run (were dead at import). |
+| `tests/test_synchronized_power_coordinator.py` | Provided `HomeAssistant`/`callback` on the core stub, registered the module in `sys.modules` before exec, made the coordinator stub generic — module now loads and collects all tests (was skipped at module level). |
+| `tests/test_modbus_guard.py` | +2 regression tests (cancellation deadlock, targeted `remove`). |
+| `tests/test_energy_counter_coverage.py` | **New** — asserts every `TOTAL_INCREASING` energy sensor is recognised by `is_energy_counter` (prevents A2 from recurring). |
+
+**Files changed:** `modbus_guard.py`, `register_cache.py`, `update_coordinator.py`,
+`synchronized_power_coordinator.py`, `services.py`, `modbus_telemetry.py`,
+`adaptive_modbus.py`, `modbus_keepalive.py`, `__init__.py`, `manifest.json`,
+plus tests. **No behavioural change for a single-entry, non-EMMA, healthy-bus
+install** beyond the energy-counter protection now working as documented.
 
 ### v1.1.2 (2026-06-05)
 **Energy dashboard negative-bar fix — state_class audit + suspicious-zero guard**

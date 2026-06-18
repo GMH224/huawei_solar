@@ -130,6 +130,15 @@ class ModbusKeepAlive:
         return cls._registry.get(serial_number)
 
     @classmethod
+    def remove(cls, serial_number: str) -> None:
+        """Remove a single entry from the registry (per-entry unload).
+
+        Unlike clear_registry(), this leaves singletons belonging to other
+        still-loaded config entries intact.
+        """
+        cls._registry.pop(serial_number, None)
+
+    @classmethod
     def clear_registry(cls) -> None:
         cls._registry.clear()
 
