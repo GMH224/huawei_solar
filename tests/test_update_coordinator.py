@@ -343,3 +343,39 @@ class TestVerifyWriteCacheCoherence(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRecordDispatchConsolidation(unittest.TestCase):
+    """v1.1.4: timeout/failure bookkeeping is consolidated into single-dispatch
+    helpers (_record_timeout / _record_failure) instead of being duplicated at
+    every except site. These assertions guard against re-duplication."""
+
+    def test_helper_methods_exist(self):
+        self.assertIn("def _record_timeout(self)", _SOURCE)
+        self.assertIn("def _record_failure(self)", _SOURCE)
+
+    def test_timeout_recording_defined_once(self):
+        # The adaptive timeout-record call must exist in exactly one place
+        # (the _record_timeout helper), not duplicated across except blocks.
+        self.assertEqual(
+            _SOURCE.count("self._adaptive.record_request(0.0, success=False, timeout=True)"),
+            1,
+            "timeout recording duplicated — should live only in _record_timeout()",
+        )
+
+    def test_failure_recording_defined_once(self):
+        self.assertEqual(
+            _SOURCE.count("self._adaptive.record_request(0.0, success=False, timeout=False)"),
+            1,
+            "failure recording duplicated — should live only in _record_failure()",
+        )
+
+    def test_poll_paths_call_helpers(self):
+        self.assertIn("self._record_timeout()", _SOURCE)
+        self.assertIn("self._record_failure()", _SOURCE)
+
+    def test_success_path_recording_not_consolidated(self):
+        # The success path is deliberately NOT folded into a helper (BUG-4/10:
+        # telemetry counts the request immediately; adaptive records later with
+        # the accumulated RTT). Ensure those calls still exist independently.
+        self.assertIn("success=True, timeout=False", _SOURCE)

@@ -46,7 +46,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DATA_DEVICE_DATAS, DATA_SYNC_POWER_COORDINATOR, DOMAIN
+from .const import DATA_DEVICE_DATAS, DATA_SYNC_POWER_COORDINATOR
 from .adaptive_modbus import AdaptiveModbusController, create_adaptive_entities
 from .modbus_telemetry import ModbusTelemetry, create_telemetry_entities
 from .synchronized_power_coordinator import SynchronizedPowerCoordinator, SynchronizedPowerData

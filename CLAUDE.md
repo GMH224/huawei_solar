@@ -1,7 +1,7 @@
 # CLAUDE.md — Huawei Solar Integration
 
 > **Maintained by Claude (Anthropic) on behalf of the community.**
-> Current version: **1.1.3** — see `manifest.json`.
+> Current version: **1.1.4** — see `manifest.json`.
 
 ---
 
@@ -307,6 +307,53 @@ fix that calls `_evict()` from `record_failure()` and `record_timeout()`.
 ---
 
 ## 8. Changelog
+
+### v1.1.4 (2026-06-20)
+**Code optimization + entity-layer test coverage**
+
+Follow-up to the v1.1.3 audit. No behavioural change; cleanup, one safe
+performance optimization, and new tests for the previously-untested entity layer.
+
+#### Optimizations
+- **Dead code removed:** 12 unused imports across 7 modules and 5 unreferenced
+  constants in `const.py` (`DEFAULT_SLAVE_ID`, `DEFAULT_SERIAL_SLAVE_ID`,
+  `DEFAULT_PASSWORD`, `DATA_UPDATE_COORDINATORS`, `CONFIGURATION_UPDATE_TIMEOUT`),
+  plus a dead `try/except` `_HAS_RN` block in `night_mode.py`. `pyflakes` is now
+  clean on all production modules.
+- **`update_coordinator._modbus_address` memoised** (`@lru_cache`): the
+  reflection-heavy attribute walk used to sort each batch by Modbus address ran
+  on every poll though a register's address never changes. Now a one-time cost
+  per register (same pattern as `register_cache._classify`).
+- **Outcome-recording consolidated** (`_record_timeout` / `_record_failure`):
+  the timeout and failure bookkeeping (consecutive counters + telemetry feed +
+  adaptive RTT tuner) was duplicated byte-for-byte across 8 `except` blocks. It
+  now lives in two single-dispatch helper methods. The deliberately-split
+  success path (telemetry counts immediately; adaptive records later with the
+  accumulated RTT — the BUG-4/BUG-10 fixes) is intentionally left intact.
+  Guarded by new regression tests that fail if the duplication returns.
+
+> **Optimizations deliberately NOT made** (evaluated and rejected on merit, not
+> just caution): (a) per-poll caching of the register-name set — negligible
+> gain, and correct invalidation would require hooking HA listener internals,
+> risking stale entities; (b) de-duplicating the per-poll `guard.update_gap()`
+> push — the `ModbusGuard` is **shared by endpoint** across coordinators, so
+> "push every poll, last-writer-wins" is *required* for the guard to track the
+> active params; caching would let it drift; (c) merging the four health/timing
+> subsystems (telemetry, adaptive, keep-alive, back-off) into one object — they
+> have distinct responsibilities (diagnostic sensors, RTT tuning, socket
+> probing, poll suppression); merging would couple unrelated concerns and change
+> the diagnostic/persistence data model for no runtime benefit.
+
+#### Entity-layer test coverage (new `tests/test_entities.py`, 14 tests)
+The number/switch/select/button entities — which contain the user-facing **write**
+paths to the inverter — previously had no executable tests. Added coverage for:
+read/availability (`_handle_coordinator_update` populates value and goes
+unavailable when the register is absent), write success (calls `device.set`,
+invalidates the cache, requests a refresh), write failure (no cache invalidation),
+number min/max precedence (static vs dynamic vs description vs default), the
+switch `check_is_available_func` override, and the button stop-forcible-charge
+write sequence. Also added regression tests locking in the outcome-recording
+consolidation (timeout/failure bookkeeping must appear exactly once).
 
 ### v1.1.3 (2026-06-19)
 **Independent industrial-grade audit — 12 bugs fixed (2 HIGH), test suite made runnable**

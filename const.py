@@ -4,16 +4,12 @@ from datetime import timedelta
 
 DOMAIN = "huawei_solar"
 DEFAULT_PORT = 502
-DEFAULT_SLAVE_ID = 0
-DEFAULT_SERIAL_SLAVE_ID = 1
 DEFAULT_USERNAME = "installer"
-DEFAULT_PASSWORD = "00000a"
 
 CONF_SLAVE_IDS = "slave_ids"
 CONF_ENABLE_PARAMETER_CONFIGURATION = "enable_parameter_configuration"
 
 DATA_DEVICE_DATAS = "device_datas"
-DATA_UPDATE_COORDINATORS = "update_coordinators"
 DATA_SYNC_POWER_COORDINATOR = "sync_power_coordinator"
 
 INVERTER_UPDATE_INTERVAL = timedelta(seconds=30)
@@ -29,7 +25,6 @@ UPDATE_TIMEOUT = timedelta(seconds=35)
 
 # configuration can only change when edited through FusionSolar web or app
 CONFIGURATION_UPDATE_INTERVAL = timedelta(minutes=15)
-CONFIGURATION_UPDATE_TIMEOUT = timedelta(minutes=1)
 
 # optimizer data is only refreshed every 5 minutes by the inverter.
 OPTIMIZER_UPDATE_INTERVAL = timedelta(minutes=5)

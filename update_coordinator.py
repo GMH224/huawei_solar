@@ -43,6 +43,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
+from functools import lru_cache
 from itertools import chain
 import logging
 import math
@@ -69,7 +70,6 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from .adaptive_modbus import AdaptiveModbusController
 from .const import (
-    BACKOFF_FAST_ALWAYS,
     BACKOFF_NORMAL_DIVISOR,
     BATCH_CHUNK_SIZE,
     BATCH_INTER_CHUNK_PAUSE,
@@ -106,26 +106,36 @@ def _backoff_seconds(consecutive: int) -> float:
     return max(0.0, delay + jitter)
 
 
+@lru_cache(maxsize=512)
+def _modbus_address(name: RegisterName) -> int:
+    """Resolve a register's Modbus address via the library's register metadata.
+
+    The result is constant for a given register name, so it is memoised: the
+    set of unique RegisterNames in a session is bounded (≤ ~200), turning the
+    reflection-heavy attribute walk into a one-time cost per register instead
+    of an every-poll cost during batch sorting.
+    """
+    for path in (
+        "register_definition.register",
+        "register_definition.address",
+        "address",
+        "value",
+    ):
+        try:
+            obj: Any = name
+            for part in path.split("."):
+                obj = getattr(obj, part)
+            if isinstance(obj, int):
+                return obj
+        except AttributeError:
+            continue
+    return 0
+
+
 def _sort_by_modbus_address(names: list[RegisterName]) -> list[RegisterName]:
     """Sort register names by Modbus address for contiguous PDU reads."""
-    def _addr(name: RegisterName) -> int:
-        for path in (
-            "register_definition.register",
-            "register_definition.address",
-            "address",
-            "value",
-        ):
-            try:
-                obj: Any = name
-                for part in path.split("."):
-                    obj = getattr(obj, part)
-                if isinstance(obj, int):
-                    return obj
-            except AttributeError:
-                continue
-        return 0
     try:
-        return sorted(names, key=_addr)
+        return sorted(names, key=_modbus_address)
     except Exception:  # noqa: BLE001
         return names
 
@@ -319,6 +329,27 @@ class HuaweiSolarUpdateCoordinator(
 
     # ── core batch executor with chunking + 0x06 retry (opts. 2, 4) ──────────
 
+    def _record_timeout(self) -> None:
+        """Record a Modbus timeout outcome to all observers (single dispatch).
+
+        Consolidates the previously-duplicated bookkeeping: the consecutive
+        counters, the telemetry diagnostic feed, and the adaptive RTT tuner.
+        """
+        self._consecutive_timeouts += 1
+        self._consecutive_failures += 1
+        if self.telemetry:
+            self.telemetry.record_timeout()
+        if self._adaptive:
+            self._adaptive.record_request(0.0, success=False, timeout=True)
+
+    def _record_failure(self) -> None:
+        """Record a non-timeout Modbus failure to all observers (single dispatch)."""
+        self._consecutive_failures += 1
+        if self.telemetry:
+            self.telemetry.record_failure()
+        if self._adaptive:
+            self._adaptive.record_request(0.0, success=False, timeout=False)
+
     async def _execute_batch(
         self,
         names: list[RegisterName],
@@ -467,12 +498,7 @@ class HuaweiSolarUpdateCoordinator(
                 self.telemetry.record_request(len(stale_names))
 
         except TimeoutError as err:
-            self._consecutive_timeouts += 1
-            self._consecutive_failures += 1
-            if self.telemetry:
-                self.telemetry.record_timeout()
-            if self._adaptive:
-                self._adaptive.record_request(0.0, success=False, timeout=True)
+            self._record_timeout()
 
             if self._consecutive_timeouts == 1:
                 _LOGGER.warning(
@@ -511,11 +537,7 @@ class HuaweiSolarUpdateCoordinator(
             ) from err
 
         except ReadException as err:
-            self._consecutive_failures += 1
-            if self.telemetry:
-                self.telemetry.record_failure()
-            if self._adaptive:
-                self._adaptive.record_request(0.0, success=False, timeout=False)
+            self._record_failure()
             if getattr(err, "modbus_exception_code", None) == _EXC_ILLEGAL_DATA_ADDRESS:
                 _LOGGER.error(
                     "%s: ILLEGAL_DATA_ADDRESS — disable sensors one-by-one "
@@ -527,11 +549,7 @@ class HuaweiSolarUpdateCoordinator(
             ) from err
 
         except ConnectionInterruptedException as err:
-            self._consecutive_failures += 1
-            if self.telemetry:
-                self.telemetry.record_failure()
-            if self._adaptive:
-                self._adaptive.record_request(0.0, success=False, timeout=False)
+            self._record_failure()
             _LOGGER.warning(
                 "%s: connection interrupted — another Modbus client may have connected.",
                 self.device.serial_number,
@@ -542,11 +560,7 @@ class HuaweiSolarUpdateCoordinator(
             ) from err
 
         except HuaweiSolarException as err:
-            self._consecutive_failures += 1
-            if self.telemetry:
-                self.telemetry.record_failure()
-            if self._adaptive:
-                self._adaptive.record_request(0.0, success=False, timeout=False)
+            self._record_failure()
             raise UpdateFailed(
                 f"Could not update {self.device.serial_number}: {err}"
             ) from err
@@ -677,12 +691,7 @@ class HuaweiSolarOptimizerUpdateCoordinator(
                 rtt_ms = (time.monotonic() - t0) * 1000
 
         except TimeoutError as err:
-            self._consecutive_timeouts += 1
-            self._consecutive_failures += 1
-            if self.telemetry:
-                self.telemetry.record_timeout()
-            if self._adaptive:
-                self._adaptive.record_request(0.0, success=False, timeout=True)
+            self._record_timeout()
             if self._consecutive_timeouts == 1:
                 _LOGGER.warning(
                     "Optimizer %s: Modbus timeout (attempt %d).",
@@ -695,11 +704,7 @@ class HuaweiSolarOptimizerUpdateCoordinator(
             ) from err
 
         except ConnectionInterruptedException as err:
-            self._consecutive_failures += 1
-            if self.telemetry:
-                self.telemetry.record_failure()
-            if self._adaptive:
-                self._adaptive.record_request(0.0, success=False, timeout=False)
+            self._record_failure()
             _LOGGER.warning("Optimizer %s: connection interrupted.", self.device.serial_number)
             raise UpdateFailed(
                 f"Connection to {self.device.serial_number} interrupted.",
@@ -707,22 +712,14 @@ class HuaweiSolarOptimizerUpdateCoordinator(
             ) from err
 
         except DecodeError as err:
-            self._consecutive_failures += 1
-            if self.telemetry:
-                self.telemetry.record_failure()
-            if self._adaptive:
-                self._adaptive.record_request(0.0, success=False, timeout=False)
+            self._record_failure()
             raise UpdateFailed(
                 f"Could not decode optimizer data from {self.device.serial_number}: {err}.",
                 retry_after=15 * 60,
             ) from err
 
         except HuaweiSolarException as err:
-            self._consecutive_failures += 1
-            if self.telemetry:
-                self.telemetry.record_failure()
-            if self._adaptive:
-                self._adaptive.record_request(0.0, success=False, timeout=False)
+            self._record_failure()
             raise UpdateFailed(
                 f"Could not update {self.device.serial_number} optimizers: {err}"
             ) from err

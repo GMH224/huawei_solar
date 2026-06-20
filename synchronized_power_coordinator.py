@@ -72,11 +72,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
-from huawei_solar import (
-    ConnectionInterruptedException,
-    HuaweiSolarException,
-    register_names as rn,
-)
+from huawei_solar import register_names as rn
 from huawei_solar.device.base import HuaweiSolarDevice
 
 from homeassistant.core import HomeAssistant

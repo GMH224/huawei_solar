@@ -31,15 +31,10 @@ import logging
 from collections.abc import Callable
 from datetime import timedelta
 from enum import Enum, auto
-from typing import Any, TYPE_CHECKING
+from typing import Any
 
 from huawei_solar import RegisterName
 
-try:
-    from huawei_solar import register_names as rn
-    _HAS_RN = True
-except ImportError:
-    _HAS_RN = False
 
 _LOGGER = logging.getLogger(__name__)
 

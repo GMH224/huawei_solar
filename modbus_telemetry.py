@@ -23,7 +23,6 @@ Integration wiring
 
 from __future__ import annotations
 
-import asyncio
 from collections import deque
 from datetime import datetime, timedelta
 import logging
@@ -31,16 +30,14 @@ import time
 from typing import Any
 
 from homeassistant.components.sensor import (
-    SensorDeviceClass,
     SensorEntity,
     SensorStateClass,
 )
-from homeassistant.const import EntityCategory, UnitOfTime
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.event import async_track_time_interval
 
-from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
