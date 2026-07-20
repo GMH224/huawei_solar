@@ -10,6 +10,7 @@ This integration exposes the information and functions made available by Huawei 
 ## Table of Contents
 
 - [Screenshots](#screenshots)
+- [Battery Health Index](#battery-health-index)
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
 - [Inverter polling frequency](#inverter-polling-frequency)
@@ -42,6 +43,17 @@ This integration exposes multiple services, allowing you to [actively control th
 ![services](images/services.png)
 
 To enable these advanced features, you need to select 'Elevate permissions' during the setup of this integration.
+
+## Battery Health Index
+
+Since **v1.1.5** this fork computes a local, read-only **Battery Health Index**
+for LUNA2000-S1 systems: capacity retention from harvested discharge segments
+(with Huawei SOH-calibration "golden" anchors), round-trip efficiency drift,
+pack balance, equivalent full cycles, warranty throughput tracking, and a
+measured-vs-model divergence early-warning sensor. No extra polling, no
+register writes. Tunables are exposed via the integration's *Configure*
+dialog. Full design rationale, formulas, and limitations:
+[BATTERY_HEALTH.md](BATTERY_HEALTH.md).
 
 ## Prerequisites
 

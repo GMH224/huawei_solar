@@ -50,6 +50,7 @@ from .const import (
     SYNC_POWER_UPDATE_INTERVAL,
 )
 from .adaptive_modbus import AdaptiveModbusController
+from .battery_health_manager import BatteryHealthManager
 from .modbus_guard import ModbusGuard
 from .modbus_keepalive import ModbusKeepAlive
 from .modbus_telemetry import ModbusTelemetry
@@ -223,6 +224,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
             DATA_DEVICE_DATAS: device_datas,
             DATA_SYNC_POWER_COORDINATOR: sync_coordinator,
         }
+
+        # ── Battery Health managers (v1.1.5) ─────────────────────────────────
+        # One read-only health engine per inverter with a connected battery.
+        # Persisted state is loaded inside async_initialize() BEFORE the
+        # listener attaches, so segment detection never restarts from a false
+        # "empty" state after a reboot (spec §8).
+        for device_data in device_datas:
+            if (
+                isinstance(device_data, HuaweiSolarInverterData)
+                and device_data.energy_storage_update_coordinator is not None
+                and device_data.connected_energy_storage is not None
+            ):
+                bh_manager = BatteryHealthManager.create(
+                    hass,
+                    device_data.device.serial_number,
+                    device_data.energy_storage_update_coordinator,
+                    device_data.connected_energy_storage,
+                    dict(entry.options),
+                )
+                await bh_manager.async_initialize()
     except ConnectionInterruptedException as err:
         if primary_device is not None:
             await primary_device.stop()
@@ -288,7 +309,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     await async_setup_services(hass, entry)
 
+    # Reload on options change (battery health tunables — spec §10). Raw
+    # persisted segment/sample logs stay valid; only aggregation changes.
+    entry.async_on_unload(entry.add_update_listener(_async_options_updated))
+
     return True
+
+
+async def _async_options_updated(
+    hass: HomeAssistant, entry: HuaweiSolarConfigEntry
+) -> None:
+    """Handle an options update by reloading the config entry."""
+    await hass.config_entries.async_reload(entry.entry_id)
 
 
 async def async_unload_entry(
@@ -323,6 +355,11 @@ async def async_unload_entry(
             if keepalive:
                 keepalive.stop()
             ModbusKeepAlive.remove(serial)
+
+            bh_manager = BatteryHealthManager.get(serial)
+            if bh_manager:
+                await bh_manager.async_unload()
+            BatteryHealthManager.remove(serial)
 
         # The ModbusGuard is keyed on the connection endpoint shared by all
         # sub-devices of this entry; remove just that endpoint's guard.

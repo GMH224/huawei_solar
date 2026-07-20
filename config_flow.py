@@ -42,6 +42,13 @@ from homeassistant.const import (
 import homeassistant.helpers.config_validation as cv
 
 from .const import (
+    CONF_BH_MIN_SEGMENT_DELTA_SOC,
+    CONF_BH_RATED_CAPACITY_KWH,
+    CONF_BH_WARRANTY_THROUGHPUT_KWH,
+    CONF_BH_WEIGHT_BALANCE,
+    CONF_BH_WEIGHT_CAPACITY,
+    CONF_BH_WEIGHT_EFFICIENCY,
+    CONF_BH_WINDOW_DAYS,
     CONF_ENABLE_PARAMETER_CONFIGURATION,
     CONF_SLAVE_IDS,
     DEFAULT_PORT,
@@ -471,6 +478,13 @@ def parse_unit_ids(unit_ids: str) -> list[int]:
 
 class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Huawei Solar."""
+
+    @staticmethod
+    def async_get_options_flow(
+        config_entry: config_entries.ConfigEntry,
+    ) -> "BatteryHealthOptionsFlowHandler":
+        """Return the options flow handler (battery health tunables)."""
+        return BatteryHealthOptionsFlowHandler()
 
     # Values entered by user in config flow
     _host: str | None = None
@@ -1405,3 +1419,58 @@ class DeviceException(Exception):
         """Initialize DeviceException."""
         super().__init__(message)
         self.unit_id = unit_id
+
+
+class BatteryHealthOptionsFlowHandler(config_entries.OptionsFlow):
+    """Options flow exposing the Battery Health Index tunable constants.
+
+    All values default to the BatteryHealthConfig defaults (battery_health.py)
+    so the integration works out-of-the-box without visiting this flow.
+    Changing options triggers a config-entry reload; persisted raw
+    segment/sample logs remain valid — only the aggregation formulas applied
+    to them change (spec §10).
+    """
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Manage battery health options."""
+        if user_input is not None:
+            # Auto-normalize weights on save (spec §10): they only need to be
+            # positive; normalized_weights() rescales them to sum to 1.0.
+            return self.async_create_entry(title="", data=user_input)
+
+        options = self.config_entry.options
+        schema = vol.Schema(
+            {
+                vol.Optional(
+                    CONF_BH_RATED_CAPACITY_KWH,
+                    default=options.get(CONF_BH_RATED_CAPACITY_KWH, 20.7),
+                ): vol.All(vol.Coerce(float), vol.Range(min=1.0, max=200.0)),
+                vol.Optional(
+                    CONF_BH_WARRANTY_THROUGHPUT_KWH,
+                    default=options.get(CONF_BH_WARRANTY_THROUGHPUT_KWH, 28840.0),
+                ): vol.All(vol.Coerce(float), vol.Range(min=1000.0, max=1_000_000.0)),
+                vol.Optional(
+                    CONF_BH_WEIGHT_CAPACITY,
+                    default=options.get(CONF_BH_WEIGHT_CAPACITY, 0.60),
+                ): vol.All(vol.Coerce(float), vol.Range(min=0.0, max=1.0)),
+                vol.Optional(
+                    CONF_BH_WEIGHT_EFFICIENCY,
+                    default=options.get(CONF_BH_WEIGHT_EFFICIENCY, 0.20),
+                ): vol.All(vol.Coerce(float), vol.Range(min=0.0, max=1.0)),
+                vol.Optional(
+                    CONF_BH_WEIGHT_BALANCE,
+                    default=options.get(CONF_BH_WEIGHT_BALANCE, 0.20),
+                ): vol.All(vol.Coerce(float), vol.Range(min=0.0, max=1.0)),
+                vol.Optional(
+                    CONF_BH_WINDOW_DAYS,
+                    default=options.get(CONF_BH_WINDOW_DAYS, 90),
+                ): vol.All(vol.Coerce(int), vol.Range(min=14, max=365)),
+                vol.Optional(
+                    CONF_BH_MIN_SEGMENT_DELTA_SOC,
+                    default=options.get(CONF_BH_MIN_SEGMENT_DELTA_SOC, 10.0),
+                ): vol.All(vol.Coerce(float), vol.Range(min=2.0, max=50.0)),
+            }
+        )
+        return self.async_show_form(step_id="init", data_schema=schema)

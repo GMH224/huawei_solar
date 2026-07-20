@@ -1,7 +1,7 @@
 # CLAUDE.md — Huawei Solar Integration
 
 > **Maintained by Claude (Anthropic) on behalf of the community.**
-> Current version: **1.1.4** — see `manifest.json`.
+> Current version: **1.1.6** — see `manifest.json`.
 
 ---
 
@@ -66,7 +66,11 @@ homeassistant/
         ├── register_cache.py                  # Tier-aware + adaptive TTL register cache
         ├── night_mode.py                      # PV-power-based night/day mode detector
         ├── update_coordinator.py              # Optimised DataUpdateCoordinator
-        ├── synchronized_power_coordinator.py  # ← NEW: coherent multi-inverter power snapshot
+        ├── synchronized_power_coordinator.py  # Coherent multi-inverter power snapshot
+        │
+        ├── battery_health.py                  # ← NEW (1.1.5): BHI v2 pure engine (no HA imports)
+        ├── battery_health_manager.py          # ← NEW (1.1.5): coordinator glue + Store persistence
+        ├── battery_health_entities.py         # ← NEW (1.1.5): push-based BHI sensor entities
         │
         ├── sensor.py        # SensorEntity (includes 4 fused power-flow sensors)
         ├── number.py        # NumberEntity (writable numeric registers)
@@ -86,7 +90,8 @@ homeassistant/
             ├── test_init_unload.py
             ├── test_const_services.py
             ├── test_update_coordinator.py
-            └── test_synchronized_power_coordinator.py   ← NEW
+            ├── test_synchronized_power_coordinator.py
+            └── test_battery_health.py                   ← NEW (1.1.5)
 ```
 
 ---
@@ -657,6 +662,95 @@ timestamp, eliminating arithmetic errors on the power-flow card.
   derived properties (all edge cases), happy path, partial failure, all-fail,
   consecutive failure counter, and telemetry recording.
 
+### v1.1.6 (2026-07-20)
+**Optimization pass over the v1.1.5 battery-health subsystem**
+
+Profiled three runtime costs and fixed all of them; behaviour/formulas
+unchanged (all v1.1.5 tests still pass unmodified except where noted):
+
+- **Data quality / Modbus (register_cache.py):** new exact-name
+  `_TIER_OVERRIDES` checked first in `_classify()`:
+  `storage_total_charge`/`storage_total_discharge` SLOW→**NORMAL** (5-min-stale
+  counter endpoints caused up to ±20% error on minimum-size 2 kWh segments;
+  addresses 37780–83 are PDU-contiguous with always-read registers ⇒ ≈ zero
+  added bus cost) and `storage_rated_capacity` STATIC→**SLOW** (the BMS
+  recalibration watch was blind in-session because STATIC is never re-read and
+  `invalidate_all()` skips it). Exact-name matching only — all other
+  `total_*`/`rated_capacity` registers keep their substring tiers (regression
+  test included).
+- **CPU (battery_health.py):** per-tick evaluation is now O(1) amortized —
+  `SegmentTracker` caches its trimmed-mean aggregation (invalidated on
+  append/prune/discard/restore; callers receive isolated attr copies),
+  `BalanceTracker` caches its median, `StressAccumulator` keeps running
+  Σstress·Δt / ΣΔt totals with a prune fast-path via oldest-bucket tracking
+  (totals zeroed when the window empties to stop float drift; recomputed on
+  restore). Segment prune has an oldest-first fast path. Benchmark: ~13 µs
+  per idle tick with a full 90-day window (60+ segments), ~75 k ticks/s.
+- **HA recorder churn (battery_health_manager.py / battery_health.py):**
+  `HealthReport.signature()` digests every sensor-facing value (stress index
+  quantized to integer steps — the rolling-window mixture otherwise creeps
+  ~0.01/tick and defeats change detection); the manager notifies entities only
+  when the signature (incl. watched rated capacity) changes. Ten sensors no
+  longer write identical states every 30 s. Baseline-reset forces a push.
+- **Cleanups:** `CounterMonitor.value` property replaces the `feed(None)` read
+  hack; `DischargeSegment.end_ts` is now set by `_close()` from the closing
+  sample (engine-side patching removed); redundant double `Result` unwrapping
+  in `_build_sample` removed.
+- **Tests:** +13 (T15 aggregation-cache invalidation & attr isolation & end_ts,
+  T16 stress running-total consistency vs. recompute after feed+prune +
+  persistence round-trip + empty-window reset, T17 signature
+  stability/segment/confidence transitions; 4 tier-override tests incl.
+  exact-name-only regression). Suite: **296 passed, 1 skipped**.
+
+### v1.1.5 (2026-07-20)
+**Battery Health Index (BHI) v2 — read-only local battery health estimation**
+
+- **New:** `battery_health.py` — pure computation engine (no HA imports):
+  discharge-segment harvesting with ΔSOC²·freshness weighting, SOC-correction
+  plausibility guard, Huawei SOH-calibration "golden" anchor boost (4×),
+  weighted trimmed-mean aggregation; round-trip efficiency drift (`SOH_eff`,
+  replaces invalid voltage-sag resistance under Module+ optimizers); pack
+  balance scoring; Q10×f(SOC) stress accumulator (hourly-bucketed, gap-aware);
+  √t calendar + throughput aging forecast with measured-vs-model divergence;
+  EFC + warranty-throughput bookkeeping; lifetime-counter reset detection;
+  versioned to_dict/restore persistence. Composite renormalizes over available
+  terms — missing terms never enter as implicit zeros.
+- **New:** `battery_health_manager.py` — per-serial singleton (ModbusTelemetry
+  registry pattern); subscribes to the energy-storage coordinator with a
+  `register_names` context (no extra poll loop); Store persistence
+  (`huawei_solar_battery_health_<serial>`, schema v1, debounced ≥5 min);
+  read-failure gap propagation; watches `storage_rated_capacity` (37758) for
+  post-calibration steps (logged, not yet used). **Writes no registers.**
+- **New:** `battery_health_entities.py` — 10 push-based sensors (BHI,
+  confidence, 3 SOH sub-scores, stress index*, predicted SOH*, divergence,
+  EFC, warranty %; * = disabled by default) + `Reset efficiency baseline`
+  button in `button.py` (registered before the parameter-configuration gate —
+  it performs no register writes).
+- **New:** Options flow (`BatteryHealthOptionsFlowHandler`): rated capacity,
+  warranty throughput, composite weights (auto-normalized), window days, min
+  segment ΔSOC. Options change triggers an entry reload
+  (`_async_options_updated` in `__init__.py`).
+- **New:** `BATTERY_HEALTH.md` — full design rationale (Huawei SOH
+  calibration registers 37920–37927, Module+ optimizer implications, LFP SOC
+  correction), formulas, register table, entities, limitations.
+- **New:** `tests/test_battery_health.py` — 40 tests (T1–T14 audit
+  traceability), full suite now 283 passed / 1 skipped.
+- **Fix (test infra):** modern pytest (≥8) imports the integration root
+  `__init__.py` as a Package during collection (repo root has `__init__.py`),
+  requiring a full HA runtime. Added scoped `tests/pytest.ini` so rootdir =
+  `tests/`; run the suite with `cd tests && pytest .`.
+- **Fix (pre-existing):** `test_synchronized_power_coordinator.py` asserted
+  pre-fail-safe semantics for `pv_power_total` with a failed INV2 —
+  contradicting the documented behaviour (None instead of a silently wrong
+  total). Test updated to the documented semantics.
+- **Fix (pre-existing):** `test_update_coordinator.py` used
+  `asyncio.get_event_loop().run_until_complete()` (order-dependent failure on
+  Python 3.12 after async tests close the loop) → `asyncio.run()`.
+- **Fix (test infra):** shared `huawei_solar` stub in `test_entities.py` now
+  provides `Result` (cross-module stub collision with `test_register_cache`);
+  stubs extended with `homeassistant.helpers.storage.Store` and the
+  `CONF_BH_*` constants.
+
 ### v1.0.0 (2026-05-24)
 **Bug fix release — 7 correctness issues resolved**
 
@@ -688,9 +782,11 @@ Timeout hardening, exponential back-off, battery entity improvements.
 ### Running the tests
 
 ```bash
-# From the integration directory — no HA environment required
+# From the tests/ directory — no HA environment required.
+# (Running from the repo root makes modern pytest import the integration's
+#  __init__.py as a Package, which needs a full HA runtime — see tests/pytest.ini.)
 pip install pytest pytest-asyncio
-pytest tests/ -v
+cd tests && pytest . -v
 ```
 
 All tests stub HA imports and the `huawei-solar` library.

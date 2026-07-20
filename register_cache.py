@@ -201,6 +201,35 @@ _SLOW_PRIORITY_SUBSTRINGS: tuple[str, ...] = (
 )
 
 
+# ── Exact-name tier overrides (checked FIRST — v1.1.6) ───────────────────────
+#
+# The battery-health engine (battery_health.py) computes segment energy and
+# round-trip efficiency from deltas of the lifetime counters, and watches the
+# reported rated capacity for BMS recalibration steps.  The generic substring
+# tiers are wrong for exactly these three names:
+#
+#   storage_total_charge / storage_total_discharge
+#       "total_" → SLOW (5 min TTL): counter endpoints read up to 5 min stale
+#       introduce up to ~0.2 kWh error per segment endpoint (±20% on a
+#       minimum-size 2 kWh segment).  NORMAL (30 s base) matches the storage
+#       coordinator cadence; the adaptive TTL still stretches to 5 min while
+#       the battery idles.  Bus cost ≈ 0: addresses 37780–37783 are contiguous
+#       with the SOC/power registers already read every poll (same PDU chunk).
+#
+#   storage_rated_capacity
+#       "rated_capacity" → STATIC (never re-read in-session, skipped by
+#       invalidate_all): the BMS-recalibration watch would be blind until an
+#       HA restart.  SLOW re-reads it every 5–30 min; address 37758 is
+#       likewise PDU-adjacent to always-read registers.
+#
+# Exact-name matching only — no substring side effects on other registers.
+_TIER_OVERRIDES: dict[str, "RegisterTier"] = {
+    "storage_total_charge": RegisterTier.NORMAL,
+    "storage_total_discharge": RegisterTier.NORMAL,
+    "storage_rated_capacity": RegisterTier.SLOW,
+}
+
+
 @lru_cache(maxsize=256)
 def _classify(name: RegisterName) -> RegisterTier:
     """Return the volatility tier for a register name.
@@ -217,6 +246,9 @@ def _classify(name: RegisterName) -> RegisterTier:
       5. NORMAL (default)
     """
     s = str(name).lower()
+    override = _TIER_OVERRIDES.get(s)
+    if override is not None:
+        return override
     for sub in _STATIC_SUBSTRINGS:
         if sub in s:
             return RegisterTier.STATIC

@@ -377,9 +377,12 @@ class TestSynchronizedPowerCoordinatorPartialFailure:
         assert result.grid_power == -500
         assert result.battery_power == 1000
         assert result.inv2_pv_power is None   # unavailable
-        # home_consumption still calculable without INV2
-        assert result.pv_power_total == 4000
-        assert result.home_consumption == pytest.approx(2500)  # 4000-500-1000
+        # Fail-safe semantics (see pv_power_total docstring): with a second
+        # inverter installed but unread, the total would silently omit INV2's
+        # contribution — so it must be None (entity unavailable), not a wrong
+        # number. home_consumption derives from it and must follow.
+        assert result.pv_power_total is None
+        assert result.home_consumption is None
 
     @pytest.mark.asyncio
     async def test_all_fail_raises_update_failed(self):

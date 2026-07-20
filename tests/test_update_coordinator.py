@@ -261,7 +261,7 @@ class TestVerifyWriteCacheCoherence(unittest.TestCase):
                     coord.cache.invalidate(name)
                     coord.cache.update({name: mock_result[name]})
 
-        asyncio.get_event_loop().run_until_complete(run())
+        asyncio.run(run())
 
         self.assertEqual(call_order, ["invalidate", "update"],
             "BUG-008: cache.invalidate must be called BEFORE cache.update in verify_write success path; "

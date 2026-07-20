@@ -48,6 +48,8 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DATA_DEVICE_DATAS, DATA_SYNC_POWER_COORDINATOR
 from .adaptive_modbus import AdaptiveModbusController, create_adaptive_entities
+from .battery_health_entities import create_battery_health_entities
+from .battery_health_manager import BatteryHealthManager
 from .modbus_telemetry import ModbusTelemetry, create_telemetry_entities
 from .synchronized_power_coordinator import SynchronizedPowerCoordinator, SynchronizedPowerData
 from .types import (
@@ -2251,6 +2253,18 @@ async def async_setup_entry(
             telemetry_entities.extend(create_telemetry_entities(telemetry))
     if telemetry_entities:
         async_add_entities(telemetry_entities)
+
+    # Register Battery Health Index sensors for each inverter with a battery
+    # (v1.1.5). Managers are created in __init__.async_setup_entry.
+    battery_health_entities = []
+    for ucs in device_datas:
+        bh_manager = BatteryHealthManager.get(ucs.device.serial_number)
+        if bh_manager:
+            battery_health_entities.extend(
+                create_battery_health_entities(bh_manager)
+            )
+    if battery_health_entities:
+        async_add_entities(battery_health_entities)
 
     # Register adaptive Modbus learning diagnostic sensors for each inverter
     adaptive_entities = []

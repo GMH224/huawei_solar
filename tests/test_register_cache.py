@@ -120,6 +120,26 @@ class TestClassify(unittest.TestCase):
     def test_bug3_reactive_power_fast(self):
         self.assertEqual(_classify("reactive_power"), RegisterTier.FAST)
 
+    # ── v1.1.6 exact-name tier overrides (battery-health data quality) ───────
+    def test_override_storage_total_charge_normal(self):
+        """BHI segment/efficiency energy needs 30 s counters, not 5-min SLOW."""
+        self.assertEqual(_classify("storage_total_charge"), RegisterTier.NORMAL)
+
+    def test_override_storage_total_discharge_normal(self):
+        self.assertEqual(_classify("storage_total_discharge"), RegisterTier.NORMAL)
+
+    def test_override_storage_rated_capacity_slow(self):
+        """Recalibration watch needs periodic re-reads; STATIC would be blind."""
+        self.assertEqual(_classify("storage_rated_capacity"), RegisterTier.SLOW)
+
+    def test_override_is_exact_name_only(self):
+        """Other total_*/rated_capacity names keep their substring tiers."""
+        self.assertEqual(_classify("total_energy_export"), RegisterTier.SLOW)
+        self.assertEqual(_classify("battery_1_rated_capacity"),
+                         RegisterTier.STATIC)
+        self.assertEqual(_classify("storage_unit_1_total_charge"),
+                         RegisterTier.SLOW)
+
 
 # ── Energy counter detection ──────────────────────────────────────────────────
 

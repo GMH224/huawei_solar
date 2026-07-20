@@ -98,6 +98,24 @@ def _install_ha_stubs() -> None:
         def available(self):
             return getattr(self.coordinator, "last_update_success", True)
     uc.CoordinatorEntity = CoordinatorEntity
+
+    st = mod("homeassistant.helpers.storage")
+
+    class Store:
+        def __init__(self, hass, version, key):
+            self.version = version
+            self.key = key
+            self.saved = None
+
+        async def async_load(self):
+            return None
+
+        async def async_save(self, data):
+            self.saved = data
+
+        def async_delay_save(self, data_fn, delay=0):
+            self.saved = data_fn()
+    st.Store = Store
     uc.DataUpdateCoordinator = type("DataUpdateCoordinator", (), {"__class_getitem__": classmethod(lambda c, i: c)})
     uc.UpdateFailed = type("UpdateFailed", (Exception,), {})
 
@@ -155,6 +173,11 @@ def _install_lib_stubs() -> None:
     hs = mod("huawei_solar")
     hs.__path__ = []
     hs.RegisterName = _RegisterName
+
+    class _HsResult:
+        def __init__(self, value):
+            self.value = value
+    hs.Result = _HsResult
     for n in ["HuaweiSolarDevice", "SUN2000Device", "EMMADevice"]:
         setattr(hs, n, type(n, (), {}))
 
@@ -184,6 +207,13 @@ def _install_lib_stubs() -> None:
     const = mod("huawei_solar.const")
     const.CONF_ENABLE_PARAMETER_CONFIGURATION = "enable_parameter_configuration"
     const.DATA_DEVICE_DATAS = "device_datas"
+    const.CONF_BH_RATED_CAPACITY_KWH = "bh_rated_capacity_kwh"
+    const.CONF_BH_WARRANTY_THROUGHPUT_KWH = "bh_warranty_throughput_kwh"
+    const.CONF_BH_WEIGHT_CAPACITY = "bh_weight_capacity"
+    const.CONF_BH_WEIGHT_EFFICIENCY = "bh_weight_efficiency"
+    const.CONF_BH_WEIGHT_BALANCE = "bh_weight_balance"
+    const.CONF_BH_WINDOW_DAYS = "bh_window_days"
+    const.CONF_BH_MIN_SEGMENT_DELTA_SOC = "bh_min_segment_delta_soc"
 
     # huawei_solar.types — real-shaped HuaweiSolarEntityDescription
     from homeassistant.helpers.entity import EntityDescription
@@ -220,6 +250,11 @@ def _load(modname: str):
     spec.loader.exec_module(m)
     return m
 
+
+BATTERY_HEALTH = _load("battery_health")
+sys.modules["huawei_solar.battery_health"] = BATTERY_HEALTH
+BATTERY_HEALTH_MANAGER = _load("battery_health_manager")
+sys.modules["huawei_solar.battery_health_manager"] = BATTERY_HEALTH_MANAGER
 
 NUMBER = _load("number")
 SWITCH = _load("switch")

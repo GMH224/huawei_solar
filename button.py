@@ -10,6 +10,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
+from .battery_health_manager import BatteryHealthManager
 from .const import CONF_ENABLE_PARAMETER_CONFIGURATION, DATA_DEVICE_DATAS
 from .types import (
     HuaweiSolarConfigEntry,
@@ -28,10 +29,20 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Huawei Solar Button entities Setup."""
+    device_datas: list[HuaweiSolarDeviceData] = entry.runtime_data[DATA_DEVICE_DATAS]
+
+    # Battery health baseline-reset buttons write NO inverter registers, so
+    # they are registered regardless of the parameter-configuration setting.
+    health_buttons: list[ButtonEntity] = []
+    for ucs in device_datas:
+        bh_manager = BatteryHealthManager.get(ucs.device.serial_number)
+        if bh_manager:
+            health_buttons.append(ResetEfficiencyBaselineButtonEntity(bh_manager))
+    if health_buttons:
+        async_add_entities(health_buttons)
+
     if not entry.data.get(CONF_ENABLE_PARAMETER_CONFIGURATION):
         return
-
-    device_datas: list[HuaweiSolarDeviceData] = entry.runtime_data[DATA_DEVICE_DATAS]
 
     entities_to_add: list[ButtonEntity] = []
     for ucs in device_datas:
@@ -88,3 +99,28 @@ class StopForcibleChargeButtonEntity(HuaweiSolarEntity, ButtonEntity):
 
         if self._configuration_update_coordinator:
             await self._configuration_update_coordinator.async_request_refresh()
+
+
+class ResetEfficiencyBaselineButtonEntity(HuaweiSolarEntity, ButtonEntity):
+    """Button to re-capture the battery health efficiency baseline.
+
+    Local-only action: clears the stored round-trip-efficiency baseline so it
+    is re-captured from the next qualifying full-charge windows.  Writes no
+    inverter/BMS registers.
+    """
+
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_name = "Reset battery health efficiency baseline"
+    _attr_icon = "mdi:backup-restore"
+
+    def __init__(self, manager: BatteryHealthManager) -> None:
+        """Initialize the button entity."""
+        self._manager = manager
+        self._attr_device_info = manager.device_info
+        self._attr_unique_id = (
+            f"{manager.serial_number}_battery_health_reset_efficiency_baseline"
+        )
+
+    async def async_press(self) -> None:
+        """Reset the efficiency baseline."""
+        await self._manager.async_reset_efficiency_baseline()

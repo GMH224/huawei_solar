@@ -1350,5 +1350,22 @@
       },
       "name": "Stop the forcible charge or discharge"
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Battery Health Index options",
+        "description": "Tunable constants for the Battery Health Index. Defaults work out-of-the-box for a LUNA2000-21-S1 under the CH/EEA warranty; retune only after real data accumulates. Weights are auto-normalized to sum to 1.0.",
+        "data": {
+          "bh_rated_capacity_kwh": "Rated usable capacity (kWh)",
+          "bh_warranty_throughput_kwh": "Warranty throughput (kWh)",
+          "bh_weight_capacity": "Weight: SOH capacity",
+          "bh_weight_efficiency": "Weight: SOH efficiency",
+          "bh_weight_balance": "Weight: SOH balance",
+          "bh_window_days": "Capacity rolling window (days)",
+          "bh_min_segment_delta_soc": "Min segment ΔSOC (%)"
+        }
+      }
+    }
   }
 }

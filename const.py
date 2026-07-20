@@ -193,3 +193,24 @@ WRITE_VERIFY_RETRIES: int = 2
 # (every Nth poll cycle); SLOW/STATIC are deferred entirely until recovery.
 BACKOFF_FAST_ALWAYS: bool = True
 BACKOFF_NORMAL_DIVISOR: int = 4   # read NORMAL registers every 4th back-off cycle
+
+# ── Battery Health Index (v1.1.5) ─────────────────────────────────────────────
+# Options-flow keys for the tunable constants (spec §10).  Defaults live in
+# battery_health.BatteryHealthConfig; these keys override them per entry.
+CONF_BH_RATED_CAPACITY_KWH = "bh_rated_capacity_kwh"
+CONF_BH_WARRANTY_THROUGHPUT_KWH = "bh_warranty_throughput_kwh"
+CONF_BH_WEIGHT_CAPACITY = "bh_weight_capacity"
+CONF_BH_WEIGHT_EFFICIENCY = "bh_weight_efficiency"
+CONF_BH_WEIGHT_BALANCE = "bh_weight_balance"
+CONF_BH_WINDOW_DAYS = "bh_window_days"
+CONF_BH_MIN_SEGMENT_DELTA_SOC = "bh_min_segment_delta_soc"
+
+BH_OPTION_KEYS = (
+    CONF_BH_RATED_CAPACITY_KWH,
+    CONF_BH_WARRANTY_THROUGHPUT_KWH,
+    CONF_BH_WEIGHT_CAPACITY,
+    CONF_BH_WEIGHT_EFFICIENCY,
+    CONF_BH_WEIGHT_BALANCE,
+    CONF_BH_WINDOW_DAYS,
+    CONF_BH_MIN_SEGMENT_DELTA_SOC,
+)
