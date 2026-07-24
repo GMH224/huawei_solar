@@ -1,137 +1,168 @@
-# Release Audit — huawei_solar v1.1.7 (bug fix: confidence entity)
+# Release Audit — huawei_solar v1.1.7
 
-**Date:** 2026-07-24 · **Auditor:** Claude (Anthropic) · **Trigger:** a user
-reported "Battery health confidence: no longer provided" and later supplied a
-Home Assistant log, which contained the actual root cause.
+**Date:** 2026-07-25 · **Auditor:** Claude (Anthropic)
+**Baseline:** the user-supplied v1.1.6 archive (verified intact: 37 Python
+files, 296 passed / 1 skipped before any modification).
+**Scope:** `battery_health_entities.py`, `__init__.py`, `sensor.py`,
+`button.py`, `const.py`, `config_flow.py`, `strings.json`,
+`translations/en.json`, `manifest.json`, `tests/`.
 
-This audit does something the two prior ones didn't have the chance to: trace
-a real field failure back through the code, rather than reviewing code in the
-abstract. That is a more valuable signal than another clean self-review, so
-it's recorded here in full.
+Both defects addressed here were found in **production logs from a real
+installation**, not in internal testing. That is itself an audit finding and
+is treated as one in §5.
 
-## 1. What the log showed
+---
 
-```
-2026-07-22 04:41:12 ERROR [homeassistant.components.sensor] Error adding
-  entity sensor.heating_batteries_battery_health_confidence for domain
-  sensor with platform huawei_solar
-ValueError: Sensor ... has device class 'None', state class 'None' unit
-  'None' and suggested precision '1' thus indicating it has a numeric
-  value; however, it has the non-numeric value: 'low' (<class 'str'>)
+## 1. Evidence base
 
-[repeats on every subsequent tick, from custom_components.huawei_solar.
- battery_health_manager: "listener failed", same ValueError]
-```
+Two Home Assistant logs from the reporting installation:
 
-Two Modbus-timeout patterns also appear in the same log (`HV2220098926`,
-`HV2220080950` update coordinators backing off after consecutive timeouts).
-Those are pre-existing, unrelated to the battery-health subsystem, and out of
-scope for this audit — they affect all registers on those coordinators, not
-something introduced by v1.1.5/1.1.6.
+| Symptom | Log evidence |
+|---|---|
+| `confidence` sensor `Unavailable`, 160 × `listener failed` | `Error adding entity sensor...battery_health_confidence` + `ValueError: ... indicating it has a numeric value; however, it has the non-numeric value: 'low'` |
+| All battery entities `Unknown`, both inverters affected | `Setup of config entry 'SUN2000-10KTL-M1' ... cancelled` → `entity_platform ... asyncio.exceptions.CancelledError` → `Config entry ... for huawei_solar.<platform> has already been setup!` (× 5 platforms) |
+| Underlying stressor (pre-existing, not introduced by this subsystem) | 156 × `Modbus timeout (no response in NN s)` across ~63 h, on `power_meter`, `config`, and `battery` coordinators alike |
 
-## 2. Root cause
+**Diff evidence.** v1.1.6 → the previously-shipped v1.1.7 differed **only** in
+`battery_health_entities.py`, `manifest.json`, `CLAUDE.md`, and one test file.
+The register set and all setup-path code were byte-identical. An earlier
+working hypothesis (that newly-required SOH-calibration registers were
+unsupported by the hardware and poisoning batched reads) is therefore
+**disproven** and was withdrawn. No Modbus exception for an illegal/unsupported
+address appears anywhere in the logs.
 
-`HuaweiSolarBatteryHealthSensorEntity` (battery_health_entities.py, all
-versions ≤ 1.1.6) declared:
+---
 
-```python
-class HuaweiSolarBatteryHealthSensorEntity(SensorEntity):
-    _attr_suggested_display_precision = 1     # class attribute — ALL instances
-```
+## 2. Finding 1 — HA API contract violation (confirmed defect)
 
-Home Assistant's `SensorEntity.state` property (see traceback) treats the
-mere *presence* of `suggested_display_precision` (or a unit, or a state
-class) as a declaration that the entity's value is numeric, and raises
-`ValueError` if the actual value is a non-numeric string. `confidence`'s
-native value is `"low"` / `"normal"` / `"stale"` — a string by design (it's
-a category, not a measurement) — so every write to that entity's state
-raised.
+**Severity:** High (entity permanently dead; error on every 30 s tick).
 
-**Failure sequence, exactly as the log shows:**
-1. On integration setup, HA tries to add the entity → raises → entity never
-   gets added → the entity registry is left with a stale/orphaned reference
-   from any earlier successful run → surfaces to the user as "no longer
-   provided."
-2. Every subsequent coordinator tick calls the manager's listener callback →
-   the entity's `_on_health_update` → `async_write_ha_state()` → the same
-   `ValueError`, caught by the manager's per-listener `except Exception`
-   guard (§4 of AUDIT_1.1.5.md) → logged as `listener failed`, execution
-   continues, **but this specific entity never recovers** — the guard
-   correctly protected the other nine sensors (which is why the rest of the
-   panel kept working), but had no way to fix or re-add the one that failed
-   at setup.
+`HuaweiSolarBatteryHealthSensorEntity` declared
+`_attr_suggested_display_precision = 1` at **class** scope. HA's
+`SensorEntity.state` raises `ValueError` when any numeric-implying hint is
+present alongside a non-numeric value. `confidence` returns
+`"low"`/`"normal"`/`"stale"`, so it violated the contract for every value it
+could ever hold.
 
-This explains every symptom reported in this conversation: the orphaned
-"no longer provided" message, the `Unavailable` confidence sensor, and the
-fact that waiting longer could never have helped — the entity was crashing
-on every update, not merely slow to accumulate data.
+The manager's per-listener exception guard behaved **correctly** here: it
+contained the fault to a single entity and kept the other nine plus the
+button working. The visible symptom (`Unavailable`, "no longer provided") was
+the entity failing to be added at startup.
 
-## 3. Why this wasn't caught before shipping
+**Fix:** `device_class: SensorDeviceClass.ENUM` + explicit `options`, and the
+precision hint applied per-instance and skipped for `_STRING_VALUED_KEYS`.
 
-The v1.1.5/1.1.6 test suites (283, then 296 tests) exercised the
-**engine** (`battery_health.py`) exhaustively — every formula, edge case,
-and persistence path. They did not instantiate the actual
-`SensorEntity` subclasses from `battery_health_entities.py` against HA's own
-state-validation contract. That was a real coverage gap: correct engine
-output does not guarantee a correct HA entity declaration. A dataclass field
-can be perfectly correct and still violate an API contract in the layer that
-displays it.
+**Verification (T18, 12 tests):** `tests/test_battery_health_entities.py`
+re-implements HA's real validation rule — including its error text — and runs
+every entity's resolved attributes through it for every plausible value
+(`None`, boundaries, typical). It also asserts engine-produced confidence
+values are a subset of the declared `options`, so the engine and entity cannot
+drift apart.
 
-## 4. The fix
+**Load-bearing proof:** the v1.1.6 defect was temporarily reintroduced; 4
+tests failed with the production error text, and passed again on revert.
 
-- `confidence` is now declared with `device_class: SensorDeviceClass.ENUM`
-  and an explicit `options` list — Home Assistant's documented, idiomatic way
-  to represent a fixed-set string sensor. This is a discoverability
-  improvement too: HA's UI can now render it as a proper enum/select in
-  places that support it, rather than a plain, untyped string.
-- `_attr_suggested_display_precision` moved from a class attribute to a
-  **per-instance** assignment in `__init__`, explicitly skipped for any
-  attr_key in a new `_STRING_VALUED_KEYS` frozenset. This closes the
-  mechanism, not just the one symptom — any future string-valued sensor
-  added to the table is protected by construction as long as its key is
-  added to that set (and the new test suite checks every table entry, not
-  just `confidence`, against HA's real rule).
+---
 
-## 5. Test evidence
+## 3. Finding 2 — architectural: additive subsystem on the critical path
 
-`tests/test_battery_health_entities.py` (new, 7 tests) re-implements HA's
-actual `SensorEntity.state` numeric-value rule from the traceback (not a
-mock of it) and runs every real entity's resolved attributes through it for
-every value it can plausibly report, including all three confidence strings
-and representative numeric values for the rest.
+**Severity:** High (blast radius = every entity in the integration).
 
-**This test was verified to actually catch the original bug**, not just to
-pass: the class-level `_attr_suggested_display_precision = 1` was temporarily
-reintroduced during this fix, the new test failed with the same shape of
-assertion the log's traceback represents, and passed again once reverted.
-That is stronger evidence than a clean pass alone.
+`await bh_manager.async_initialize()` — which performs Store disk I/O and
+attaches a coordinator listener — ran inline inside `async_setup_entry`.
+Whatever triggered the observed cancellation, an additive, read-only feature
+must not be able to add time to, or raise from, a path that Home Assistant
+cancels on timeout, because a cancelled platform setup takes down **all** of
+the integration's entities.
 
-Full suite: **303 passed, 1 skipped, 0 failed** (was 296/1), deterministic
-across repeated runs. All prior tests (T1–T17) pass unmodified — this was a
-pure entity-declaration fix; no engine formula or behavior changed.
+This audit does **not** claim the subsystem caused the reported cancellation;
+the evidence is insufficient to attribute it, and the same Modbus timeouts
+appear in logs predating it. The correct engineering response is to remove the
+possibility rather than argue about attribution.
 
-## 6. Scope check — anything else in the entity table at risk?
+**Isolation contract now enforced:**
 
-Reviewed every other `_BATTERY_HEALTH_SENSORS` entry against the same rule:
-`bhi`, `soh_capacity/efficiency/balance`, `efc`, `warranty_consumed_pct` are
-all genuinely numeric (percent or count) and correctly keep the precision
-hint. `stress_index`, `predicted_soh`, `health_divergence` are numeric.
-`confidence` was the only string-valued entity in the table, and is now
-covered by both the `_STRING_VALUED_KEYS` mechanism and the new test's
-blanket check over the whole table (`test_all_string_valued_keys_pass_ha_numeric_check`)
-so a future addition doesn't require remembering to update this audit.
+| # | Property | Mechanism |
+|---|---|---|
+| 1 | Setup never awaits battery-health work | `_async_setup_battery_health()` is synchronous; init runs via `entry.async_create_background_task` |
+| 2 | Manager creation failure contained | try/except + `BatteryHealthManager.remove()` cleanup; loop continues to next inverter |
+| 3 | Background init failure contained | coroutine has its own guard; cannot raise into the event loop |
+| 4 | Platform setup never aborted | `sensor.py` / `button.py` entity creation wrapped in try/except |
+| 5 | Entity callbacks never raise into HA's state machine | `async_added_to_hass` / `_on_health_update` guarded |
+| 6 | Unload never blocked | flush guarded, falls back to `stop()` |
+| 7 | User escape hatch | `bh_enabled` option (default True), evaluated **before** any manager work |
+| 8 | Modbus footprint cannot grow silently | golden register-set test |
 
-## 7. Note on the unrelated Modbus timeouts in the log
+**Verification (T19, 18 tests):** `tests/test_battery_health_isolation.py`
+asserts these **structurally, via AST inspection of the source**, because the
+property being protected is architectural ("no code path here can delay or
+fail entry setup") rather than behavioural. A future refactor that reintroduces
+an inline `await`, drops a guard, or moves the kill switch after manager
+creation fails the suite.
 
-`HV2220098926_battery_data_update_coordinator` and several sibling
-coordinators show frequent `Modbus timeout (no response in N s)` with
-backoff, on both inverters, throughout the log window. This predates and is
-independent of the battery-health subsystem — it affects the underlying
-coordinator all registers share, not something these changes introduced or
-can fix. Flagged for the user's own network/RTU-bridge investigation, out of
-scope here.
+**Load-bearing proof:** run against the pristine v1.1.6 tree, **13 of 18 fail**.
+The 5 that pass are the 3 golden-register-set tests and the 2 read-only tests —
+which is precisely the evidence that v1.1.7 changes **no** Modbus behaviour.
 
-**Verdict:** root cause identified and fixed at the mechanism level (not just
-patched for `confidence`), regression-tested against the real bug (proven to
-catch it), and the coverage gap that let it ship is closed for this file
-going forward.
+---
+
+## 4. Deliberately NOT changed
+
+- **The register set.** Byte-identical to v1.1.6, which the reporter confirms
+  operates correctly. Changing it while investigating an instability would
+  confound the variables. It is now pinned by test, capped at 25 registers,
+  and any future change must be a conscious edit to the golden list.
+- **All engine formulas and thresholds.** T1–T17 pass unmodified; BHI values
+  are computed identically to v1.1.6.
+- **Coordinator, cache, guard, and keepalive internals.** Out of scope; the
+  Modbus timeouts observed in the logs are an installation-side matter
+  (RS485 wiring, dongle, bus contention between the two inverters) and are
+  not addressed by a code change here.
+
+---
+
+## 5. Process finding (self-assessment)
+
+Both defects were invisible to the v1.1.5/v1.1.6 suites for structural
+reasons, and that is the more important finding than either bug:
+
+- **T18's class** — an API contract violated for certain *values* rather than
+  certain *code paths*. 296 tests exercised the engine exhaustively but never
+  instantiated a real `SensorEntity` against HA's own state validation.
+- **T19's class** — a property about *where in the lifecycle* code runs.
+  Nothing in the suite asserted anything about setup-path shape or blast
+  radius, so "additive feature cannot break existing entities" was an
+  assumption, never a test.
+
+Both classes are now covered by construction. Additionally, this release
+adopted **adversarial verification as a required step**: every new test file
+was run against a deliberately-broken tree to prove it fails, rather than
+trusting a green result on the fixed tree. Green tests that cannot fail are
+worse than no tests, and that check was missing from prior releases.
+
+---
+
+## 6. Evidence summary
+
+- Baseline (unmodified upload): **296 passed, 1 skipped** — archive verified
+  intact, no corruption.
+- Final: **326 passed, 1 skipped, 0 failed**, identical across 3 consecutive
+  runs (deterministic).
+- Static: 39 Python files parse clean (`ast.parse`); 22 JSON files valid
+  (manifest, hacs, icons, strings, 20 translations, en.json options mirrored).
+- `manifest.json` = **1.1.7**.
+- Adversarial: T18 4/12 fail on reintroduced defect; T19 13/18 fail on
+  pristine v1.1.6.
+
+**Verdict:** release-ready. Finding 1 is a confirmed defect with a verified
+fix. Finding 2 removes an architectural risk rather than a proven cause — the
+subsystem is now structurally incapable of delaying, cancelling, or failing
+config-entry setup, and ships with a user-accessible kill switch if it ever
+misbehaves again.
+
+**Residual risk (installation-side, unaddressed by this release):** the
+recurring Modbus timeouts. Until those are resolved, discharge segments will
+continue to be discarded by `mark_gap()` and `SOH capacity`/`efficiency` may
+remain `Unknown` regardless of the fixes here. That is correct conservative
+behaviour by the engine, not a defect, but it means this release should not be
+expected to make those two sensors populate on its own.

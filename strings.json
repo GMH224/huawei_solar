@@ -1361,6 +1361,7 @@
         "title": "Battery Health Index options",
         "description": "Tunable constants for the Battery Health Index. Defaults work out-of-the-box for a LUNA2000-21-S1 under the CH/EEA warranty; retune only after real data accumulates. Weights are auto-normalized to sum to 1.0.",
         "data": {
+          "bh_enabled": "Enable battery health monitoring",
           "bh_rated_capacity_kwh": "Rated usable capacity (kWh)",
           "bh_warranty_throughput_kwh": "Warranty throughput (kWh)",
           "bh_weight_capacity": "Weight: SOH capacity",

@@ -33,11 +33,21 @@ async def async_setup_entry(
 
     # Battery health baseline-reset buttons write NO inverter registers, so
     # they are registered regardless of the parameter-configuration setting.
+    # Fault isolation (v1.1.7): see sensor.py — additive entities must never
+    # abort the platform.
     health_buttons: list[ButtonEntity] = []
-    for ucs in device_datas:
-        bh_manager = BatteryHealthManager.get(ucs.device.serial_number)
-        if bh_manager:
-            health_buttons.append(ResetEfficiencyBaselineButtonEntity(bh_manager))
+    try:
+        for ucs in device_datas:
+            bh_manager = BatteryHealthManager.get(ucs.device.serial_number)
+            if bh_manager:
+                health_buttons.append(
+                    ResetEfficiencyBaselineButtonEntity(bh_manager)
+                )
+    except Exception:  # noqa: BLE001
+        _LOGGER.exception(
+            "Failed to build battery health buttons; continuing without them"
+        )
+        health_buttons = []
     if health_buttons:
         async_add_entities(health_buttons)
 

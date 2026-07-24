@@ -92,7 +92,8 @@ homeassistant/
             ├── test_update_coordinator.py
             ├── test_synchronized_power_coordinator.py
             ├── test_battery_health.py
-            └── test_battery_health_entities.py           ← NEW (1.1.7)
+            ├── test_battery_health_entities.py          ← NEW (1.1.7)
+            └── test_battery_health_isolation.py         ← NEW (1.1.7)
 ```
 
 ---
@@ -663,45 +664,77 @@ timestamp, eliminating arithmetic errors on the power-flow card.
   derived properties (all edge cases), happy path, partial failure, all-fail,
   consecutive failure counter, and telemetry recording.
 
-### v1.1.7 (2026-07-24)
-**Bug fix: `battery_health_confidence` entity crashed on every update**
+### v1.1.7 (2026-07-25)
+**Bug fix + fault isolation: `confidence` entity crash, and making the
+battery-health subsystem incapable of affecting anything else**
 
-A real production bug, found from a user-supplied HA log rather than in
-internal testing — see AUDIT_1.1.7.md for the full writeup.
+Both issues came from a user's production Home Assistant logs, not from
+internal testing. See AUDIT_1.1.7.md for the full writeup.
 
-- **Root cause:** `HuaweiSolarBatteryHealthSensorEntity` set
-  `_attr_suggested_display_precision = 1` as a **class attribute**, applying
-  it to every battery-health sensor including `confidence`, whose native
-  value is a string (`"low"`/`"normal"`/`"stale"`). Home Assistant's
-  `SensorEntity.state` property treats the presence of a display-precision
-  hint (or a unit, or a state class) as a promise that the value is numeric,
-  and raises `ValueError` for any non-numeric state. This is not a
-  hypothetical — a real log showed the entity failing to be added at
-  integration startup (`Error adding entity ...battery_health_confidence`)
-  and then the *same* `ValueError` on every subsequent coordinator tick
-  (`battery_health_manager: listener failed`), silently killing the
-  confidence sensor while the manager's per-listener exception guard (by
-  design) kept every other entity working normally. This is exactly what
-  produced the "no longer provided" / `Unavailable` symptom a user reported.
-- **Fix:** `confidence` is now declared with `device_class:
-  SensorDeviceClass.ENUM` and an explicit `options` list
-  (`["low", "normal", "stale"]`) — HA's idiomatic way to declare a
-  string-valued sensor — and the precision hint is applied **per-instance**
-  in `__init__`, skipped for any key in the new `_STRING_VALUED_KEYS`
-  frozenset, rather than inherited by every entity from the class body.
-- **Tests:** new `tests/test_battery_health_entities.py` (7 tests, T18) —
-  re-implements HA's actual `SensorEntity.state` numeric-value validation
-  rule (not a mock) and runs every real battery-health entity's resolved
-  attributes through it for every value it can plausibly report. Verified
-  to actually catch the original bug (temporarily reintroduced the class-level
-  hint during development; the new test failed exactly as the production log
-  did, then passed once reverted). Suite: **303 passed, 1 skipped** (was 296).
-- **Process note:** this class of bug — an HA API contract violation that
-  only crashes on certain *values*, not certain *code paths* — wasn't caught
-  by the v1.1.5/v1.1.6 test suites because they exercised the engine
-  extensively but never instantiated the actual `SensorEntity` subclasses
-  against HA's own state-validation rule. `test_battery_health_entities.py`
-  closes that gap going forward for this entity file.
+**Issue 1 — `battery_health_confidence` crashed on every update (real bug).**
+- *Root cause:* `HuaweiSolarBatteryHealthSensorEntity` set
+  `_attr_suggested_display_precision = 1` as a **class** attribute, so every
+  battery-health sensor inherited it — including `confidence`, whose native
+  value is the string `"low"`/`"normal"`/`"stale"`. HA's
+  `SensorEntity.state` treats any numeric-implying hint (unit, state_class,
+  device_class, or a precision hint) as a promise the value is numeric and
+  raises `ValueError` otherwise. Production effect: `Error adding entity
+  ...battery_health_confidence` at startup, then the same `ValueError` on
+  every coordinator tick (`battery_health_manager: listener failed`). The
+  manager's per-listener exception guard correctly kept all other entities
+  working, which is why only this one sensor showed `Unavailable`.
+- *Fix:* `confidence` is declared with `device_class: SensorDeviceClass.ENUM`
+  and an explicit `options` list — HA's idiomatic string-valued sensor — and
+  the precision hint is applied **per-instance**, skipped for keys in the new
+  `_STRING_VALUED_KEYS` frozenset.
+
+**Issue 2 — the subsystem sat on the config-entry setup critical path.**
+A user reported a whole-entry setup cancellation
+(`Setup of config entry ... cancelled` → `CancelledError` in
+`entity_platform` → `... has already been setup!` across all five platforms)
+while the Modbus link was timing out. A cancelled platform setup takes down
+**all** of the integration's entities. Regardless of the trigger, an additive
+read-only feature must not be able to contribute to that at all.
+- `async_setup_entry` no longer awaits any battery-health work. Manager
+  construction (pure object creation, no I/O) stays inline so the sensor and
+  button platforms can resolve `BatteryHealthManager.get`; `async_initialize()`
+  (Store load + coordinator listener attach) now runs as a **background task**
+  via `entry.async_create_background_task`.
+- New `_async_setup_battery_health()` helper contains **every** failure mode:
+  manager creation, task scheduling, and the background init coroutine are
+  each guarded, and a half-created manager is removed from the registry.
+- `sensor.py` and `button.py` wrap battery-health entity creation in
+  try/except so it can never abort a platform.
+- Entity `async_added_to_hass` and `_on_health_update` are guarded.
+- Unload is guarded so a failed state flush cannot block entry teardown.
+- **New kill switch:** `bh_enabled` option (default True, exposed in the
+  options flow) disables the whole subsystem from the UI without editing
+  files.
+- **Register set deliberately unchanged** from v1.1.6 (confirmed working on
+  the reporter's hardware) and now **pinned by a golden-list test**, so Modbus
+  load cannot grow silently.
+
+**Tests: 296 → 326 passed, 1 skipped.**
+- `tests/test_battery_health_entities.py` (12 tests, T18) re-implements HA's
+  *actual* `SensorEntity.state` validation rule (not a mock) and runs every
+  real entity through it for every value it can report — a value-domain test,
+  because this bug class manifests for certain *values*, not certain *code
+  paths*. Verified load-bearing: reintroducing the v1.1.6 defect made 4 tests
+  fail exactly as production did, and reverting made them pass.
+- `tests/test_battery_health_isolation.py` (18 tests, T19) enforces the
+  isolation contract structurally (AST-based), so it cannot regress in a
+  future refactor: no `await` on battery-health work in `async_setup_entry`,
+  guarded call sites in every platform file, background-task scheduling,
+  kill-switch ordering, the golden register set, and the read-only/no-writes
+  guarantee. Verified load-bearing: 13 of 18 fail against pristine v1.1.6.
+  The 5 that pass are the golden-register-set and read-only tests — which is
+  the evidence that v1.1.7 does **not** change the Modbus footprint.
+
+**Process note:** T18's bug class was invisible to T1–T17 because those tests
+exercised the engine thoroughly but never instantiated a real `SensorEntity`
+against HA's own validation. T19's bug class was invisible because no test
+asserted anything about *where* code runs in the setup lifecycle. Both gaps
+are now closed by construction.
 
 ### v1.1.6 (2026-07-20)
 **Optimization pass over the v1.1.5 battery-health subsystem**

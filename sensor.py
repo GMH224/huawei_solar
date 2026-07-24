@@ -2256,13 +2256,24 @@ async def async_setup_entry(
 
     # Register Battery Health Index sensors for each inverter with a battery
     # (v1.1.5). Managers are created in __init__.async_setup_entry.
+    # Fault isolation (v1.1.7): battery-health entities are additive and must
+    # never prevent the rest of the sensor platform from being set up.  A
+    # cancelled/failed platform setup takes down ALL of this integration's
+    # sensors, so any failure here is contained and logged instead.
     battery_health_entities = []
-    for ucs in device_datas:
-        bh_manager = BatteryHealthManager.get(ucs.device.serial_number)
-        if bh_manager:
-            battery_health_entities.extend(
-                create_battery_health_entities(bh_manager)
-            )
+    try:
+        for ucs in device_datas:
+            bh_manager = BatteryHealthManager.get(ucs.device.serial_number)
+            if bh_manager:
+                battery_health_entities.extend(
+                    create_battery_health_entities(bh_manager)
+                )
+    except Exception:  # noqa: BLE001
+        _LOGGER.exception(
+            "Failed to build battery health sensors; continuing without them. "
+            "All other sensors are unaffected"
+        )
+        battery_health_entities = []
     if battery_health_entities:
         async_add_entities(battery_health_entities)
 

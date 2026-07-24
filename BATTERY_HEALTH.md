@@ -177,7 +177,7 @@ do not write identical states into the HA recorder every 30 s.
 | Entity | Default | Notes |
 |---|---|---|
 | Battery health index | on | composite; rich attributes incl. sub-scores, spread, segment counts |
-| Battery health confidence | on | `low` / `normal` / `stale` |
+| Battery health confidence | on | `low` / `normal` / `stale` (declared as an HA ENUM sensor since v1.1.7) |
 | Battery SOH capacity / efficiency / balance | on (diagnostic) | sub-scores |
 | Battery health divergence | on (diagnostic) | measured − predicted; watch for sustained negative |
 | Battery equivalent full cycles | on | |
@@ -188,6 +188,26 @@ do not write identical states into the HA recorder every 30 s.
 
 `unknown` states are intentional: with no computable term the sensors report
 unknown, never a fake 0 or 100.
+
+## 4b. Fault isolation (v1.1.7)
+
+This subsystem is **additive**: it must never degrade the integration that
+existed before it. As of v1.1.7 that is enforced structurally, not by
+convention (see `tests/test_battery_health_isolation.py`):
+
+* Config-entry setup **never awaits** battery-health work. Manager objects are
+  constructed inline (no I/O); the Store load and coordinator-listener attach
+  run as a background task. A slow or failing init cannot contribute to Home
+  Assistant cancelling a platform setup — which would take down *all* of the
+  integration's entities, not just these.
+* Every failure mode is contained and logged: manager creation, background
+  init, entity creation in the sensor/button platforms, entity callbacks, and
+  unload. A battery-health failure costs you battery-health sensors and
+  nothing else.
+* **Kill switch:** set the *Enable battery health monitoring* option to off to
+  disable the whole subsystem from the UI, without editing files.
+* The polled register set is **pinned by a golden-list test** so Modbus load
+  cannot grow silently between releases.
 
 ## 5. Options (Settings → Integrations → Huawei Solar → Configure)
 

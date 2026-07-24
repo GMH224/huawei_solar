@@ -42,6 +42,7 @@ from homeassistant.const import (
 import homeassistant.helpers.config_validation as cv
 
 from .const import (
+    CONF_BH_ENABLED,
     CONF_BH_MIN_SEGMENT_DELTA_SOC,
     CONF_BH_RATED_CAPACITY_KWH,
     CONF_BH_WARRANTY_THROUGHPUT_KWH,
@@ -1443,6 +1444,12 @@ class BatteryHealthOptionsFlowHandler(config_entries.OptionsFlow):
         options = self.config_entry.options
         schema = vol.Schema(
             {
+                # Master kill switch first: if the subsystem ever misbehaves,
+                # a user can disable it here without editing files (v1.1.7).
+                vol.Optional(
+                    CONF_BH_ENABLED,
+                    default=options.get(CONF_BH_ENABLED, True),
+                ): bool,
                 vol.Optional(
                     CONF_BH_RATED_CAPACITY_KWH,
                     default=options.get(CONF_BH_RATED_CAPACITY_KWH, 20.7),

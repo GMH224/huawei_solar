@@ -25,16 +25,21 @@ from .battery_health_manager import BatteryHealthManager
 _LOGGER = logging.getLogger(__name__)
 
 
+#: Attribute keys whose native_value is a STRING, not a number.
+#: Home Assistant's SensorEntity.state property raises ValueError if a sensor
+#: carries any numeric-implying hint (unit, state_class, device_class, or a
+#: suggested_display_precision) while returning a non-numeric value.  Keys
+#: listed here therefore must never receive a precision hint, and are declared
+#: with device_class ENUM + an explicit options list instead.
+_STRING_VALUED_KEYS: frozenset[str] = frozenset({"confidence"})
+
+#: Valid states of the confidence sensor (must match BatteryHealthEngine).
+_CONFIDENCE_OPTIONS: list[str] = ["low", "normal", "stale"]
+
+
 def _round1(v: float | None) -> float | None:
     return None if v is None else round(v, 1)
 
-
-# Attribute keys whose native value is a string, not a number (v1.1.6 bug fix:
-# these must NEVER receive a numeric hint like suggested_display_precision —
-# HA's sensor base class treats that hint as a promise of numeric state and
-# raises ValueError on any non-numeric value, which silently killed entity
-# setup and every subsequent update. See CLAUDE.md changelog v1.1.7.)
-_STRING_VALUED_KEYS: frozenset[str] = frozenset({"confidence"})
 
 # (attr_key, name, unit, icon, extra_attrs, value_fn)
 _BATTERY_HEALTH_SENSORS: list[tuple[str, str, str | None, str, dict[str, Any]]] = [
@@ -51,9 +56,13 @@ _BATTERY_HEALTH_SENSORS: list[tuple[str, str, str | None, str, dict[str, Any]]] 
         None,
         "mdi:check-decagram-outline",
         {
-            "entity_category": EntityCategory.DIAGNOSTIC,
+            # ENUM is HA's idiomatic declaration for a string-valued sensor.
+            # Without it (v1.1.5/v1.1.6) the class-level precision hint made HA
+            # treat "low"/"normal"/"stale" as an invalid numeric state, so the
+            # entity failed to be added and every later update raised.
             "device_class": SensorDeviceClass.ENUM,
-            "options": ["low", "normal", "stale"],
+            "options": _CONFIDENCE_OPTIONS,
+            "entity_category": EntityCategory.DIAGNOSTIC,
         },
     ),
     (
@@ -153,13 +162,11 @@ class HuaweiSolarBatteryHealthSensorEntity(SensorEntity):
 
     _attr_has_entity_name = True
     _attr_should_poll = False
-    # NOTE (v1.1.7 bug fix): suggested_display_precision must NOT be a class
-    # attribute here. HA's sensor base class treats its mere presence as a
-    # promise that native_value is numeric and raises ValueError on any
-    # string state (e.g. "low"/"normal"/"stale" for `confidence`) — this
-    # silently prevented the confidence entity from ever being added and
-    # crashed every subsequent update. See CLAUDE.md changelog v1.1.7.
-    # It is set per-instance in __init__, only for numeric-valued sensors.
+    # NOTE (v1.1.7): suggested_display_precision must NOT be a class attribute.
+    # HA treats its presence as a promise that native_value is numeric and
+    # raises ValueError for any string state, which silently killed the
+    # `confidence` entity in v1.1.5/v1.1.6.  It is applied per-instance below,
+    # only for numeric-valued keys.
 
     def __init__(
         self,
@@ -190,9 +197,21 @@ class HuaweiSolarBatteryHealthSensorEntity(SensorEntity):
         self._cb = self._on_health_update
 
     async def async_added_to_hass(self) -> None:
-        """Register with the manager and populate from the last report."""
-        self._manager.add_listener(self._cb)
-        self._apply(self._manager.engine.report)
+        """Register with the manager and populate from the last report.
+
+        Fault isolation (v1.1.7): registration and the initial value read are
+        guarded so a manager in an unexpected state can never prevent this
+        entity — or the rest of the sensor platform — from being added.
+        """
+        try:
+            self._manager.add_listener(self._cb)
+            self._apply(self._manager.engine.report)
+        except Exception:  # noqa: BLE001 — never block platform setup
+            _LOGGER.exception(
+                "battery_health: failed to initialise entity %s; it will "
+                "report unknown until the next successful update",
+                self._attr_unique_id,
+            )
 
     async def async_will_remove_from_hass(self) -> None:
         """Deregister callback."""
@@ -200,7 +219,19 @@ class HuaweiSolarBatteryHealthSensorEntity(SensorEntity):
 
     @callback
     def _on_health_update(self, report: HealthReport) -> None:
-        self._apply(report)
+        """Apply a new report and write state.
+
+        Guarded (v1.1.7): the manager already isolates listener exceptions from
+        one another, but a failure here must additionally never leave the
+        entity holding a value HA cannot serialise.
+        """
+        try:
+            self._apply(report)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception(
+                "battery_health: failed to apply report to %s", self._attr_unique_id
+            )
+            return
         self.async_write_ha_state()
 
     def _apply(self, report: HealthReport) -> None:

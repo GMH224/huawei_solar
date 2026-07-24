@@ -37,6 +37,7 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.device_registry import DeviceInfo
 
 from .const import (
+    CONF_BH_ENABLED,
     CONF_ENABLE_PARAMETER_CONFIGURATION,
     CONF_SLAVE_IDS,
     CONFIGURATION_UPDATE_INTERVAL,
@@ -225,25 +226,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
             DATA_SYNC_POWER_COORDINATOR: sync_coordinator,
         }
 
-        # ── Battery Health managers (v1.1.5) ─────────────────────────────────
+        # ── Battery Health managers (v1.1.5; fault-isolated in v1.1.7) ──────
         # One read-only health engine per inverter with a connected battery.
-        # Persisted state is loaded inside async_initialize() BEFORE the
-        # listener attaches, so segment detection never restarts from a false
-        # "empty" state after a reboot (spec §8).
-        for device_data in device_datas:
-            if (
-                isinstance(device_data, HuaweiSolarInverterData)
-                and device_data.energy_storage_update_coordinator is not None
-                and device_data.connected_energy_storage is not None
-            ):
-                bh_manager = BatteryHealthManager.create(
-                    hass,
-                    device_data.device.serial_number,
-                    device_data.energy_storage_update_coordinator,
-                    device_data.connected_energy_storage,
-                    dict(entry.options),
-                )
-                await bh_manager.async_initialize()
+        #
+        # ISOLATION CONTRACT (v1.1.7): this subsystem is strictly additive and
+        # must never be able to delay, cancel, or fail config-entry setup.
+        # Nothing here is awaited on the setup critical path and every failure
+        # mode is swallowed and logged.  See _async_setup_battery_health().
+        _async_setup_battery_health(hass, entry, device_datas)
     except ConnectionInterruptedException as err:
         if primary_device is not None:
             await primary_device.stop()
@@ -323,6 +313,88 @@ async def _async_options_updated(
     await hass.config_entries.async_reload(entry.entry_id)
 
 
+def _async_setup_battery_health(
+    hass: HomeAssistant,
+    entry: HuaweiSolarConfigEntry,
+    device_datas: list[HuaweiSolarDeviceData],
+) -> None:
+    """Create battery-health managers without touching the setup critical path.
+
+    Fault-isolation rules (v1.1.7), in order of importance:
+
+    1. **Never awaited during setup.**  ``async_initialize()`` performs disk
+       I/O (Store load) and attaches a coordinator listener.  In v1.1.5/v1.1.6
+       it was awaited inline in ``async_setup_entry``; if it were slow while
+       the Modbus link was already struggling, it added time to a path Home
+       Assistant itself will cancel on timeout — and a cancelled platform
+       setup takes down *all* of the integration's entities, not just this
+       subsystem's.  It now runs as a background task.
+    2. **Every exception is contained.**  A failure creating or initialising a
+       manager leaves that inverter simply without health sensors; the rest of
+       the integration is unaffected.
+    3. **User-visible kill switch.**  Setting the ``bh_enabled`` option to
+       False skips the subsystem entirely.
+
+    Manager construction itself is pure object creation (no I/O), so it stays
+    synchronous — the sensor/button platforms need ``BatteryHealthManager.get``
+    to resolve while they set up.
+    """
+    if not entry.options.get(CONF_BH_ENABLED, True):
+        _LOGGER.info(
+            "Battery health subsystem disabled by configuration option; "
+            "skipping setup"
+        )
+        return
+
+    for device_data in device_datas:
+        if not (
+            isinstance(device_data, HuaweiSolarInverterData)
+            and device_data.energy_storage_update_coordinator is not None
+            and device_data.connected_energy_storage is not None
+        ):
+            continue
+
+        serial = device_data.device.serial_number
+        try:
+            bh_manager = BatteryHealthManager.create(
+                hass,
+                serial,
+                device_data.energy_storage_update_coordinator,
+                device_data.connected_energy_storage,
+                dict(entry.options),
+            )
+        except Exception:  # noqa: BLE001 — never break entry setup
+            _LOGGER.exception(
+                "battery_health[%s]: manager creation failed; battery health "
+                "sensors will be unavailable for this inverter. All other "
+                "entities are unaffected",
+                serial,
+            )
+            BatteryHealthManager.remove(serial)
+            continue
+
+        async def _initialize(manager: BatteryHealthManager = bh_manager) -> None:
+            try:
+                await manager.async_initialize()
+            except Exception:  # noqa: BLE001 — background task must not raise
+                _LOGGER.exception(
+                    "battery_health[%s]: initialisation failed; health sensors "
+                    "will report unknown. All other entities are unaffected",
+                    manager.serial_number,
+                )
+
+        try:
+            create_task = getattr(entry, "async_create_background_task", None)
+            if create_task is not None:
+                create_task(hass, _initialize(), f"battery_health_init_{serial}")
+            else:  # pragma: no cover — older HA cores
+                hass.async_create_task(_initialize())
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception(
+                "battery_health[%s]: could not schedule initialisation", serial
+            )
+
+
 async def async_unload_entry(
     hass: HomeAssistant, entry: HuaweiSolarConfigEntry
 ) -> bool:
@@ -356,9 +428,19 @@ async def async_unload_entry(
                 keepalive.stop()
             ModbusKeepAlive.remove(serial)
 
+            # Fault isolation (v1.1.7): a failed state flush must never
+            # prevent the rest of the entry from unloading cleanly — a stuck
+            # unload blocks reloads and config changes for the whole entry.
             bh_manager = BatteryHealthManager.get(serial)
             if bh_manager:
-                await bh_manager.async_unload()
+                try:
+                    await bh_manager.async_unload()
+                except Exception:  # noqa: BLE001
+                    _LOGGER.exception(
+                        "battery_health[%s]: unload failed; continuing with "
+                        "entry teardown", serial,
+                    )
+                    bh_manager.stop()
             BatteryHealthManager.remove(serial)
 
         # The ModbusGuard is keyed on the connection endpoint shared by all

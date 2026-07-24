@@ -197,6 +197,10 @@ BACKOFF_NORMAL_DIVISOR: int = 4   # read NORMAL registers every 4th back-off cyc
 # ── Battery Health Index (v1.1.5) ─────────────────────────────────────────────
 # Options-flow keys for the tunable constants (spec §10).  Defaults live in
 # battery_health.BatteryHealthConfig; these keys override them per entry.
+# Master kill switch (v1.1.7): lets a user disable the entire battery-health
+# subsystem from the UI without editing files, if it ever misbehaves.
+CONF_BH_ENABLED = "bh_enabled"
+
 CONF_BH_RATED_CAPACITY_KWH = "bh_rated_capacity_kwh"
 CONF_BH_WARRANTY_THROUGHPUT_KWH = "bh_warranty_throughput_kwh"
 CONF_BH_WEIGHT_CAPACITY = "bh_weight_capacity"
@@ -206,6 +210,7 @@ CONF_BH_WINDOW_DAYS = "bh_window_days"
 CONF_BH_MIN_SEGMENT_DELTA_SOC = "bh_min_segment_delta_soc"
 
 BH_OPTION_KEYS = (
+    CONF_BH_ENABLED,
     CONF_BH_RATED_CAPACITY_KWH,
     CONF_BH_WARRANTY_THROUGHPUT_KWH,
     CONF_BH_WEIGHT_CAPACITY,
