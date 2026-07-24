@@ -1,7 +1,7 @@
 # CLAUDE.md — Huawei Solar Integration
 
 > **Maintained by Claude (Anthropic) on behalf of the community.**
-> Current version: **1.1.6** — see `manifest.json`.
+> Current version: **1.1.7** — see `manifest.json`.
 
 ---
 
@@ -91,7 +91,8 @@ homeassistant/
             ├── test_const_services.py
             ├── test_update_coordinator.py
             ├── test_synchronized_power_coordinator.py
-            └── test_battery_health.py                   ← NEW (1.1.5)
+            ├── test_battery_health.py
+            └── test_battery_health_entities.py           ← NEW (1.1.7)
 ```
 
 ---
@@ -661,6 +662,46 @@ timestamp, eliminating arithmetic errors on the power-flow card.
 - **New:** `tests/test_synchronized_power_coordinator.py` — 22 tests covering
   derived properties (all edge cases), happy path, partial failure, all-fail,
   consecutive failure counter, and telemetry recording.
+
+### v1.1.7 (2026-07-24)
+**Bug fix: `battery_health_confidence` entity crashed on every update**
+
+A real production bug, found from a user-supplied HA log rather than in
+internal testing — see AUDIT_1.1.7.md for the full writeup.
+
+- **Root cause:** `HuaweiSolarBatteryHealthSensorEntity` set
+  `_attr_suggested_display_precision = 1` as a **class attribute**, applying
+  it to every battery-health sensor including `confidence`, whose native
+  value is a string (`"low"`/`"normal"`/`"stale"`). Home Assistant's
+  `SensorEntity.state` property treats the presence of a display-precision
+  hint (or a unit, or a state class) as a promise that the value is numeric,
+  and raises `ValueError` for any non-numeric state. This is not a
+  hypothetical — a real log showed the entity failing to be added at
+  integration startup (`Error adding entity ...battery_health_confidence`)
+  and then the *same* `ValueError` on every subsequent coordinator tick
+  (`battery_health_manager: listener failed`), silently killing the
+  confidence sensor while the manager's per-listener exception guard (by
+  design) kept every other entity working normally. This is exactly what
+  produced the "no longer provided" / `Unavailable` symptom a user reported.
+- **Fix:** `confidence` is now declared with `device_class:
+  SensorDeviceClass.ENUM` and an explicit `options` list
+  (`["low", "normal", "stale"]`) — HA's idiomatic way to declare a
+  string-valued sensor — and the precision hint is applied **per-instance**
+  in `__init__`, skipped for any key in the new `_STRING_VALUED_KEYS`
+  frozenset, rather than inherited by every entity from the class body.
+- **Tests:** new `tests/test_battery_health_entities.py` (7 tests, T18) —
+  re-implements HA's actual `SensorEntity.state` numeric-value validation
+  rule (not a mock) and runs every real battery-health entity's resolved
+  attributes through it for every value it can plausibly report. Verified
+  to actually catch the original bug (temporarily reintroduced the class-level
+  hint during development; the new test failed exactly as the production log
+  did, then passed once reverted). Suite: **303 passed, 1 skipped** (was 296).
+- **Process note:** this class of bug — an HA API contract violation that
+  only crashes on certain *values*, not certain *code paths* — wasn't caught
+  by the v1.1.5/v1.1.6 test suites because they exercised the engine
+  extensively but never instantiated the actual `SensorEntity` subclasses
+  against HA's own state-validation rule. `test_battery_health_entities.py`
+  closes that gap going forward for this entity file.
 
 ### v1.1.6 (2026-07-20)
 **Optimization pass over the v1.1.5 battery-health subsystem**

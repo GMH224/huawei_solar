@@ -11,7 +11,11 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from homeassistant.components.sensor import SensorEntity, SensorStateClass
+from homeassistant.components.sensor import (
+    SensorDeviceClass,
+    SensorEntity,
+    SensorStateClass,
+)
 from homeassistant.const import PERCENTAGE, EntityCategory
 from homeassistant.core import callback
 
@@ -24,6 +28,13 @@ _LOGGER = logging.getLogger(__name__)
 def _round1(v: float | None) -> float | None:
     return None if v is None else round(v, 1)
 
+
+# Attribute keys whose native value is a string, not a number (v1.1.6 bug fix:
+# these must NEVER receive a numeric hint like suggested_display_precision —
+# HA's sensor base class treats that hint as a promise of numeric state and
+# raises ValueError on any non-numeric value, which silently killed entity
+# setup and every subsequent update. See CLAUDE.md changelog v1.1.7.)
+_STRING_VALUED_KEYS: frozenset[str] = frozenset({"confidence"})
 
 # (attr_key, name, unit, icon, extra_attrs, value_fn)
 _BATTERY_HEALTH_SENSORS: list[tuple[str, str, str | None, str, dict[str, Any]]] = [
@@ -39,7 +50,11 @@ _BATTERY_HEALTH_SENSORS: list[tuple[str, str, str | None, str, dict[str, Any]]] 
         "Battery health confidence",
         None,
         "mdi:check-decagram-outline",
-        {"entity_category": EntityCategory.DIAGNOSTIC},
+        {
+            "entity_category": EntityCategory.DIAGNOSTIC,
+            "device_class": SensorDeviceClass.ENUM,
+            "options": ["low", "normal", "stale"],
+        },
     ),
     (
         "soh_capacity",
@@ -138,7 +153,13 @@ class HuaweiSolarBatteryHealthSensorEntity(SensorEntity):
 
     _attr_has_entity_name = True
     _attr_should_poll = False
-    _attr_suggested_display_precision = 1
+    # NOTE (v1.1.7 bug fix): suggested_display_precision must NOT be a class
+    # attribute here. HA's sensor base class treats its mere presence as a
+    # promise that native_value is numeric and raises ValueError on any
+    # string state (e.g. "low"/"normal"/"stale" for `confidence`) — this
+    # silently prevented the confidence entity from ever being added and
+    # crashed every subsequent update. See CLAUDE.md changelog v1.1.7.
+    # It is set per-instance in __init__, only for numeric-valued sensors.
 
     def __init__(
         self,
@@ -153,6 +174,8 @@ class HuaweiSolarBatteryHealthSensorEntity(SensorEntity):
         self._attr_key = attr_key
         self._attr_name = name
         self._attr_native_unit_of_measurement = unit
+        if attr_key not in _STRING_VALUED_KEYS:
+            self._attr_suggested_display_precision = 1
         self._attr_icon = icon
         self._attr_device_info = manager.device_info
         self._attr_unique_id = (
