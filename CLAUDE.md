@@ -1,7 +1,7 @@
 # CLAUDE.md — Huawei Solar Integration
 
 > **Maintained by Claude (Anthropic) on behalf of the community.**
-> Current version: **1.1.7** — see `manifest.json`.
+> Current version: **1.1.8** — see `manifest.json`.
 
 ---
 
@@ -663,6 +663,78 @@ timestamp, eliminating arithmetic errors on the power-flow card.
 - **New:** `tests/test_synchronized_power_coordinator.py` — 22 tests covering
   derived properties (all edge cases), happy path, partial failure, all-fail,
   consecutive failure counter, and telemetry recording.
+
+### v1.1.8 (2026-07-25)
+**Design correction: data gaps are bridged, not discarded**
+
+Field-diagnosed from a reporting installation. Capacity and efficiency sat at
+`Unknown` indefinitely while balance worked. Attributes told the story:
+
+    segment_count: 0        discarded_segment_count: 11
+    efficiency_window_count: 0    balance_sample_count: 20
+
+Balance is a *point-in-time* measurement (one instant at rest) and worked.
+Capacity and efficiency are *interval* measurements, and every interval was
+being destroyed before it could complete.
+
+**Root cause — a design error in the v1.1.5 spec, not an environmental issue.**
+`SegmentTracker.mark_gap()` discarded the in-progress segment on any
+coordinator read failure, and `EfficiencyTracker.invalidate_anchor()` dropped
+the open efficiency window on the same trigger. The stated justification ("we
+cannot know what happened during the outage") does not hold: SOC is an
+*absolute* state reading and `storage_total_discharge` is a *cumulative*
+counter, so ΔSOC and Δenergy across a gap remain exact without the intervening
+samples. If something unobserved did occur, the implied-capacity plausibility
+band already rejects the segment on close — that guard exists for exactly this
+case, and the discard rule was redundant over-engineering on top of it.
+
+The consequence was structural, not marginal: on a link with intermittent
+Modbus timeouts (~1 per 25 min in the field), a slow overnight discharge
+(~3 SOC points/hour) could accumulate only 1-2 SOC points before being killed,
+making the 10-point minimum **mathematically unreachable**. No amount of
+waiting would ever have produced a capacity reading.
+
+**Changes:**
+- `SegmentTracker.mark_gap()` now marks the gap *pending*; the next good
+  sample bridges it and the segment continues. Gaps beyond `max_gap_bridge_s`
+  (new config, default 3600 s) still discard — bounded trust rather than
+  unbounded stitching.
+- New `SegmentTracker.discard_active()` for events that genuinely invalidate
+  interval arithmetic. Only a **lifetime-counter reset** uses it (energy of
+  unknown magnitude may have flowed before the counter restarted).
+- `EfficiencyTracker` anchors survive data gaps; `invalidate_anchor()` is now
+  called only on counter reset. On reset the anchor restarts from the
+  post-reset sample in the same tick, so no window spans a reset and
+  measurement resumes immediately rather than stalling.
+- `BatteryHealthEngine.mark_gap()` no longer touches the efficiency tracker.
+  The stress accumulator still excludes gap time (it integrates over *time*,
+  where an outage genuinely is not a calm period).
+- `DischargeSegment.gap_bridged` records bridges per segment;
+  `gap_bridged_count` is exposed in the Battery health index attributes and
+  persisted. `from_dict` tolerates pre-1.1.8 persisted segments.
+
+**Tests: 326 -> 337 passed, 1 skipped.**
+- `TestGapHandling` rewritten. Two tests previously asserted "any gap
+  discards" — they encoded the design error and were replaced, not weakened:
+  the suite now asserts short gaps are bridged, over-limit gaps still discard,
+  a fresh segment starts after an over-limit gap, and counter resets still
+  hard-discard.
+- `test_field_report_scenario_timeouts_no_longer_prevent_measurement`
+  reproduces the reported failure directly: 8 h of slow discharge with a
+  timeout every 25 min must now yield one qualifying segment and an accurate
+  capacity estimate (20.7 kWh +/- 0.3).
+- `TestEfficiencyGapTolerance` (3) and `TestGapBridgingDiagnostics` (3) cover
+  baseline capture on a flaky link, reset semantics, attribute exposure,
+  persistence round-trip, and pre-1.1.8 backward compatibility.
+- **Adversarial verification:** the new tests were run against the pristine
+  v1.1.7 tree — **10 fail**, including the field-scenario test. All v1.1.7
+  fault-isolation and entity-contract tests (30) still pass unchanged.
+
+**Note on `CounterMonitor` carry-forward:** on a failed read the lifetime
+counters carry the last value forward (so EFC/warranty stay populated), so the
+segment tracker never sees `None` for them. Only segment endpoints enter the
+capacity arithmetic, so a flat counter mid-segment is harmless — covered by
+`test_counter_carry_forward_does_not_corrupt_segment_energy`.
 
 ### v1.1.7 (2026-07-25)
 **Bug fix + fault isolation: `confidence` entity crash, and making the

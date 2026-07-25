@@ -101,6 +101,7 @@ missing field, implied capacity within [8, 35] kWh.
 ```
 implied_capacity_i = ΔkWh_i / (ΔSOC_i / 100)
 weight_i           = ΔSOC_i² × exp(−throughput_since_full/τ) × (4 if golden)
+(segments may span bridged data gaps; see §7)
 SOH_cap            = clip( trimmed_weighted_mean(implied) / C_rated × 100 )
 ```
 Aggregation over a 90-day rolling window uses a **weighted trimmed mean**
@@ -228,12 +229,57 @@ open segments are never resumed across a restart; the rolling windows are.
 ## 7. Failure handling (spec §9 heritage)
 
 - Implausible values are **discarded per-field, never clipped**.
-- A coordinator read failure discards the active segment and excludes the gap
-  from stress time-weighting (outages must not look like calm periods).
+- **Data gaps are bridged, not discarded (v1.1.8).** A coordinator read
+  failure no longer destroys an in-progress discharge segment or the open
+  efficiency window. SOC is an absolute state reading and the lifetime
+  counters are cumulative, so ΔSOC and Δenergy across a gap stay exact without
+  the samples in between; anything anomalous is caught by the implied-capacity
+  band and the η plausibility band on close. Gaps longer than
+  `max_gap_bridge_s` (default 1 h) still terminate the segment.
+
+  *Why this matters:* the previous discard-on-gap rule made capacity and
+  efficiency measurement **structurally impossible** on a link with
+  intermittent Modbus timeouts — a slow overnight discharge could never
+  accumulate the minimum ΔSOC between failures. Balance was unaffected
+  because it is a point-in-time measurement, which is exactly the fingerprint
+  the field report showed (balance populated, capacity/efficiency stuck at
+  `Unknown` with `discarded_segment_count` climbing).
+- The stress accumulator still **excludes** gap time, because it integrates
+  over *time* — an outage genuinely is not a calm period.
 - Lifetime-counter decreases > 1 kWh are treated as **reset events** (offset
-  carried forward, efficiency window invalidated, WARNING logged) — never as
-  negative energy.
+  carried forward, active segment hard-discarded, efficiency anchor restarted
+  from the post-reset sample, WARNING logged) — never as negative energy. A
+  reset is the one event that genuinely invalidates interval arithmetic, so
+  unlike a data gap it is not bridged.
 - One misbehaving entity listener cannot break the others.
+
+## 7b. Diagnosing "why is SOH capacity still Unknown?"
+
+Open the **Battery health index** entity's attributes (Developer Tools →
+States, or the entity detail dialog) and read these counters:
+
+| Attribute | Meaning |
+|---|---|
+| `segment_count` | qualifying segments currently in the 90-day window |
+| `discarded_segment_count` | segments started and thrown away |
+| `gap_bridged_count` | data gaps spanned mid-segment (v1.1.8+) |
+| `efficiency_window_count` | completed full-charge-to-full-charge windows |
+| `balance_sample_count` | rest-at-high-SOC samples collected |
+
+Interpretation:
+
+* `segment_count: 0` **and** `discarded_segment_count` climbing → segments are
+  being started but destroyed. Before v1.1.8 this meant Modbus gaps; from
+  v1.1.8 the remaining causes are over-limit gaps (> 1 h), counter resets, or
+  implied capacity outside the plausibility band.
+* `segment_count: 0` **and** `discarded_segment_count: 0` → no segment ever
+  qualified. Usually the discharge is fragmented into runs shallower than
+  `min_segment_delta_soc`.
+* `gap_bridged_count` rising while segments complete → bridging is doing its
+  job on an imperfect link.
+* Balance populated while capacity/efficiency are `Unknown` → interval
+  measurements are failing while the point-in-time one succeeds; check the
+  first two rows.
 
 ## 8. Known limitations
 
@@ -246,7 +292,9 @@ open segments are never resumed across a restart; the rolling windows are.
 3. Only **storage unit 1** (up to 3 packs) is currently processed.
 4. Options changes require the automatic entry reload to take effect.
 5. If PV/load patterns never produce ΔSOC ≥ 10 discharge segments, confidence
-   stays `low`/`stale` — by design. Trigger a manual Huawei health check to
+   stays `low`/`stale` — by design. (Note: 10 is a segment *depth*, not an
+   absolute SOC floor: a 100% → 77% overnight run is a 23-point segment and
+   qualifies comfortably.) Trigger a manual Huawei health check to
    feed the estimator a golden cycle.
 
 ## 9. Byproduct: one actionable aging lever

@@ -167,26 +167,149 @@ class TestFreshnessAndGolden(unittest.TestCase):  # T5
         self.assertAlmostEqual(seg.weight(cfg), 20.0 ** 2 * 4.0, places=1)
 
 
-class TestGapHandling(unittest.TestCase):  # T6
-    def test_gap_mid_segment_discards(self):
-        eng = bh.BatteryHealthEngine(_cfg())
-        for i, soc in enumerate([90, 80, 70]):
+class TestGapHandling(unittest.TestCase):  # T6 (contract corrected in v1.1.8)
+    """Gap handling.
+
+    NOTE ON THE v1.1.8 CHANGE: two tests here previously asserted that ANY
+    data gap discards the in-progress segment. That encoded a design error,
+    not a requirement — SOC is an absolute reading and lifetime discharge is a
+    cumulative counter, so ΔSOC and Δenergy across a gap are still exact, and
+    the implied-capacity band already rejects intervals where something
+    unobserved happened. The old rule made capacity measurement structurally
+    impossible on a link with intermittent Modbus timeouts (observed in the
+    field: 11 segments started, 11 discarded, 0 completed).
+
+    They are replaced below with the corrected contract: short gaps are
+    bridged, over-limit gaps are still discarded.
+    """
+
+    def test_short_gap_mid_segment_is_bridged(self):
+        eng = bh.BatteryHealthEngine(_cfg(freshness_tau_kwh=1e12))
+        for i, soc in enumerate([90, 85, 80]):
             eng.update(_sample(i * 60, soc=float(soc), power=-3000.0,
-                               chg=0.0, dis=float(i * 2)))
-        eng.mark_gap()  # coordinator failure
-        # Discharge "ends" after the gap — must NOT produce a segment
-        eng.update(_sample(600, soc=55.0, power=0.0, chg=0.0, dis=7.0))
+                               chg=0.0, dis=float(i)))
+        eng.mark_gap()                       # coordinator failure
+        # Resume 5 min later, still discharging, then close normally.
+        eng.update(_sample(480, soc=72.0, power=-3000.0, chg=0.0, dis=3.7))
+        eng.update(_sample(540, soc=72.0, power=0.0, chg=0.0, dis=3.7))
+        self.assertEqual(len(eng.segments.segments), 1)
+        seg = eng.segments.segments[0]
+        self.assertEqual(seg.soc_start, 90.0)
+        self.assertEqual(seg.soc_end, 72.0)
+        self.assertEqual(seg.gap_bridged, 1)
+        self.assertEqual(eng.segments.gap_bridged_count, 1)
+
+    def test_missing_field_mid_segment_is_bridged(self):
+        """A register missing from coordinator data mid-segment.
+
+        Note: the lifetime counters are NOT a valid probe here — CounterMonitor
+        deliberately carries the last value forward on a failed read so EFC and
+        warranty stay populated, so the tracker never sees None for them (only
+        the segment's start/end endpoints matter, and those are real readings).
+        SOC has no such carry-forward, so it is the genuine None path.
+        """
+        eng = bh.BatteryHealthEngine(_cfg(freshness_tau_kwh=1e12))
+        for i, soc in enumerate([90, 85, 80]):
+            eng.update(_sample(i * 60, soc=float(soc), power=-3000.0,
+                               chg=0.0, dis=float(i)))
+        eng.update(_sample(300, soc=None, power=-3000.0, chg=0.0, dis=2.5))
+        eng.update(_sample(360, soc=72.0, power=-3000.0, chg=0.0, dis=3.7))
+        eng.update(_sample(420, soc=72.0, power=0.0, chg=0.0, dis=3.7))
+        self.assertEqual(len(eng.segments.segments), 1)
+        self.assertEqual(eng.segments.segments[0].gap_bridged, 1)
+
+    def test_counter_carry_forward_does_not_corrupt_segment_energy(self):
+        """Stale carried-forward counter values mid-segment are harmless.
+
+        Only the segment endpoints enter the capacity arithmetic, so a flat
+        counter during an outage cannot distort the result as long as the
+        closing sample is a real reading.
+        """
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        eng = bh.BatteryHealthEngine(cfg)
+        eng.update(_sample(0, soc=100.0, power=-2000.0, chg=0.0, dis=0.0))
+        # Mid-segment reads fail: counter carried forward (flat) while SOC drops
+        for i, soc in enumerate([90.0, 85.0, 80.0], start=1):
+            eng.update(_sample(i * 60, soc=soc, power=-2000.0, chg=0.0, dis=None))
+        # Real closing reading
+        eng.update(_sample(300, soc=75.0, power=-2000.0, chg=0.0, dis=5.175))
+        eng.update(_sample(360, soc=75.0, power=0.0, chg=0.0, dis=5.175))
+        self.assertEqual(len(eng.segments.segments), 1)
+        seg = eng.segments.segments[0]
+        self.assertAlmostEqual(seg.implied_capacity_kwh, 20.7, delta=0.1)
+
+    def test_gap_beyond_bridge_limit_still_discards(self):
+        cfg = _cfg(max_gap_bridge_s=3600.0)
+        eng = bh.BatteryHealthEngine(cfg)
+        for i, soc in enumerate([90, 85, 80]):
+            eng.update(_sample(i * 60, soc=float(soc), power=-3000.0,
+                               chg=0.0, dis=float(i)))
+        eng.mark_gap()
+        # Resume 3 hours later — beyond the trust horizon.
+        eng.update(_sample(3 * 3600, soc=60.0, power=0.0, chg=0.0, dis=8.0))
         self.assertEqual(len(eng.segments.segments), 0)
         self.assertGreaterEqual(eng.segments.discarded_segments, 1)
+        self.assertEqual(eng.segments.gap_bridged_count, 0)
 
-    def test_missing_field_mid_segment_discards(self):
+    def test_over_limit_gap_starts_a_fresh_segment_if_still_discharging(self):
+        cfg = _cfg(max_gap_bridge_s=3600.0, freshness_tau_kwh=1e12)
+        eng = bh.BatteryHealthEngine(cfg)
+        eng.update(_sample(0, soc=90.0, power=-3000.0, chg=0.0, dis=0.0))
+        eng.mark_gap()
+        eng.update(_sample(3 * 3600, soc=60.0, power=-3000.0, chg=0.0, dis=8.0))
+        # Old segment gone, but a new one must be open from this sample.
+        eng.update(_sample(3 * 3600 + 3600, soc=45.0, power=-3000.0,
+                           chg=0.0, dis=11.1))
+        eng.update(_sample(3 * 3600 + 3660, soc=45.0, power=0.0,
+                           chg=0.0, dis=11.1))
+        self.assertEqual(len(eng.segments.segments), 1)
+        seg = eng.segments.segments[0]
+        self.assertEqual(seg.soc_start, 60.0)
+        self.assertEqual(seg.soc_end, 45.0)
+
+    def test_counter_reset_still_discards_and_is_not_bridged(self):
+        """A reset is NOT a gap: unknown energy may have flowed."""
         eng = bh.BatteryHealthEngine(_cfg())
-        for i, soc in enumerate([90, 80, 70]):
+        for i, soc in enumerate([90, 85, 80]):
             eng.update(_sample(i * 60, soc=float(soc), power=-3000.0,
-                               chg=0.0, dis=float(i * 2)))
-        eng.update(_sample(300, soc=None, power=-3000.0, chg=0.0, dis=6.0))
-        eng.update(_sample(360, soc=55.0, power=0.0, chg=0.0, dis=7.0))
+                               chg=50.0, dis=100.0 + i))
+        eng.update(_sample(300, soc=75.0, power=-3000.0, chg=50.0, dis=1.0))
+        eng.update(_sample(360, soc=70.0, power=0.0, chg=50.0, dis=2.0))
         self.assertEqual(len(eng.segments.segments), 0)
+        self.assertEqual(eng.segments.gap_bridged_count, 0)
+
+    def test_field_report_scenario_timeouts_no_longer_prevent_measurement(self):
+        """Regression test reproducing the reported failure.
+
+        Slow overnight discharge (~3 SOC points/hour) on a link timing out
+        roughly every 25 minutes. Under the v1.1.7 rule this could never
+        produce a segment; it must now complete one.
+        """
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        eng = bh.BatteryHealthEngine(cfg)
+        soc, dis, t = 100.0, 0.0, 0.0
+        tick = 30.0
+        # 8 hours of discharge at ~3 SOC points/hour => ~24 points total
+        for i in range(int(8 * 3600 / tick)):
+            t = i * tick
+            soc = 100.0 - (t / 3600.0) * 3.0
+            dis = (100.0 - soc) / 100.0 * 20.7
+            if i % 50 == 0 and i > 0:          # a timeout every 25 min
+                eng.mark_gap()
+                eng.update(_sample(t, soc=soc, power=-700.0, chg=0.0, dis=None))
+                continue
+            eng.update(_sample(t, soc=soc, power=-700.0, chg=0.0, dis=dis))
+        eng.update(_sample(t + tick, soc=soc, power=0.0, chg=0.0, dis=dis))
+
+        self.assertEqual(len(eng.segments.segments), 1,
+                         "a qualifying segment must survive intermittent timeouts")
+        seg = eng.segments.segments[0]
+        self.assertGreater(seg.delta_soc, 20.0)
+        self.assertGreater(seg.gap_bridged, 10)
+        # And the capacity estimate must be accurate despite the gaps.
+        soh, attrs = eng.segments.soh_capacity()
+        self.assertAlmostEqual(attrs["estimated_capacity_kwh"], 20.7, delta=0.3)
+        self.assertAlmostEqual(soh, 100.0, delta=1.5)
 
 
 class TestCounterReset(unittest.TestCase):  # T7
@@ -600,3 +723,121 @@ class TestReportSignature(unittest.TestCase):  # T17
                            dis=188.0, temp=20.0))
         self.assertNotEqual(sig_normal, eng.report.signature())
         self.assertEqual(eng.report.confidence, "stale")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# v1.1.8 — gap bridging for the efficiency tracker
+# ═════════════════════════════════════════════════════════════════════════════
+class TestEfficiencyGapTolerance(unittest.TestCase):  # T20
+    """Round-trip efficiency must survive intermittent read failures.
+
+    Field symptom under v1.1.7: efficiency_window_count stuck at 0 forever,
+    because every coordinator failure invalidated the open anchor.
+    """
+
+    def _anchor(self, eng, ts, chg, dis):
+        eng.efficiency.feed(_sample(ts, soc=99.0, power=0.0, chg=chg, dis=dis))
+
+    def test_gap_does_not_invalidate_open_anchor(self):
+        cfg = _cfg(eff_baseline_windows=1, eff_rolling_windows=1)
+        eng = bh.BatteryHealthEngine(cfg)
+        self._anchor(eng, 0.0, 0.0, 0.0)
+        eng.mark_gap()                      # coordinator failure
+        eng.mark_gap()                      # and another
+        self._anchor(eng, DAY, 40.0, 38.4)  # η = 0.96
+        self.assertEqual(len(eng.efficiency.windows), 1)
+        self.assertAlmostEqual(eng.efficiency.baseline, 0.96, places=3)
+
+    def test_counter_reset_restarts_the_anchor(self):
+        """A reset drops the open window; measurement restarts cleanly.
+
+        The anchor is re-established from the post-reset state in the same
+        tick, so no window ever spans the reset, but measurement resumes
+        immediately rather than stalling.
+        """
+        cfg = _cfg(eff_baseline_windows=1)
+        eng = bh.BatteryHealthEngine(cfg)
+        eng.update(_sample(0.0, soc=99.0, power=0.0, chg=100.0, dis=95.0,
+                           temp=20.0))
+        self.assertEqual(eng.efficiency._anchor[0], 0.0)
+
+        eng.update(_sample(60.0, soc=99.0, power=0.0, chg=1.0, dis=1.0,
+                           temp=20.0))
+        # No window may be recorded across the reset ...
+        self.assertEqual(len(eng.efficiency.windows), 0)
+        # ... and the anchor must have restarted at the reset sample.
+        self.assertEqual(eng.efficiency._anchor[0], 60.0)
+
+        # A window measured entirely after the reset is valid.
+        eng.update(_sample(DAY, soc=99.0, power=0.0, chg=41.0, dis=39.4,
+                           temp=20.0))
+        self.assertEqual(len(eng.efficiency.windows), 1)
+        self.assertAlmostEqual(eng.efficiency.windows[0], 0.96, places=3)
+
+    def test_baseline_captured_despite_frequent_gaps(self):
+        """End-to-end: baseline must form on a flaky link."""
+        cfg = _cfg(eff_baseline_windows=3, eff_rolling_windows=3)
+        eng = bh.BatteryHealthEngine(cfg)
+        chg = dis = 0.0
+        self._anchor(eng, 0.0, chg, dis)
+        for i in range(1, 6):
+            eng.mark_gap()                  # a failure between every anchor
+            chg += 40.0
+            dis += 40.0 * 0.96
+            self._anchor(eng, i * DAY, chg, dis)
+        self.assertIsNotNone(eng.efficiency.baseline)
+        soh, _ = eng.efficiency.soh_efficiency()
+        self.assertAlmostEqual(soh, 100.0, delta=0.5)
+
+
+class TestGapBridgingDiagnostics(unittest.TestCase):  # T20
+    def test_gap_bridged_count_exposed_in_attributes(self):
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        eng = bh.BatteryHealthEngine(cfg)
+        eng.update(_sample(0, soc=95.0, power=-3000.0, chg=0.0, dis=0.0))
+        eng.mark_gap()
+        eng.update(_sample(300, soc=80.0, power=-3000.0, chg=0.0, dis=3.1))
+        eng.update(_sample(360, soc=80.0, power=0.0, chg=0.0, dis=3.1))
+        _, attrs = eng.segments.soh_capacity()
+        self.assertIn("gap_bridged_count", attrs)
+        self.assertEqual(attrs["gap_bridged_count"], 1)
+
+    def test_gap_counter_survives_persistence(self):
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        eng = bh.BatteryHealthEngine(cfg)
+        eng.update(_sample(0, soc=95.0, power=-3000.0, chg=0.0, dis=0.0))
+        eng.mark_gap()
+        eng.update(_sample(300, soc=80.0, power=-3000.0, chg=0.0, dis=3.1))
+        eng.update(_sample(360, soc=80.0, power=0.0, chg=0.0, dis=3.1))
+        data = eng.to_dict()
+        import json
+        json.dumps(data)
+        eng2 = bh.BatteryHealthEngine(cfg)
+        eng2.restore(data)
+        self.assertEqual(eng2.segments.gap_bridged_count, 1)
+        self.assertEqual(eng2.segments.segments[0].gap_bridged, 1)
+
+    def test_pre_1_1_8_persisted_segments_still_load(self):
+        """Backward compatibility: segments saved before the field existed."""
+        cfg = _cfg()
+        eng = bh.BatteryHealthEngine(cfg)
+        legacy = {
+            "schema_version": bh.SCHEMA_VERSION,
+            "first_seen_ts": 0.0,
+            "segments": {
+                "segments": [{
+                    "start_ts": 0.0, "end_ts": 100.0, "soc_start": 95.0,
+                    "soc_end": 75.0, "energy_kwh": 4.14,
+                    "implied_capacity_kwh": 20.7, "freshness": 1.0,
+                    "golden": False,
+                }],
+                "throughput_since_full": 0.0, "last_discharge": 4.14,
+                "last_segment_ts": 0.0, "discarded": 3,
+            },
+            "efficiency": {}, "balance": {}, "stress": {},
+            "charge_counter": {}, "discharge_counter": {},
+        }
+        eng.restore(legacy)
+        self.assertEqual(len(eng.segments.segments), 1)
+        self.assertEqual(eng.segments.segments[0].gap_bridged, 0)
+        self.assertEqual(eng.segments.discarded_segments, 3)

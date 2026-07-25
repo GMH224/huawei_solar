@@ -106,6 +106,13 @@ class BatteryHealthConfig:
     stress_soc_max_factor: float = 2.5
     stress_window_days: float = 90.0
     stress_max_gap_s: float = 900.0           # gaps > this excluded from Δt
+    #: v1.1.8 — a data gap no longer destroys an in-progress discharge
+    #: segment.  SOC is an absolute state reading and storage_total_discharge
+    #: is a cumulative counter, so ΔSOC and Δenergy across a gap remain valid
+    #: without the samples in between; the implied-capacity plausibility band
+    #: already rejects any interval where something unobserved happened.
+    #: Gaps longer than this are still treated as untrustworthy.
+    max_gap_bridge_s: float = 3600.0          # 1 h
 
     # Aging forecast (heuristic model — documented as such)
     forecast_calendar_pct_per_sqrt_year: float = 2.5   # at stress_ratio = 1.0
@@ -273,6 +280,7 @@ class DischargeSegment:
     implied_capacity_kwh: float
     freshness: float          # exp(-throughput_since_full/τ) at segment start
     golden: bool              # Huawei SOH calibration ran during this segment
+    gap_bridged: int = 0      # v1.1.8: data gaps spanned by this segment
 
     @property
     def delta_soc(self) -> float:
@@ -289,10 +297,13 @@ class DischargeSegment:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> DischargeSegment:
-        return cls(**{k: d[k] for k in (
+        kwargs = {k: d[k] for k in (
             "start_ts", "end_ts", "soc_start", "soc_end", "energy_kwh",
             "implied_capacity_kwh", "freshness", "golden",
-        )})
+        )}
+        # Tolerate pre-1.1.8 persisted segments (field added in 1.1.8).
+        kwargs["gap_bridged"] = int(d.get("gap_bridged", 0))
+        return cls(**kwargs)
 
 
 class SegmentTracker:
@@ -328,6 +339,11 @@ class SegmentTracker:
         # v1.1.6: aggregation cache — soh_capacity() is O(n log n); recompute
         # only when the segment set changes, not on every 30 s tick.
         self._agg_cache: tuple[float | None, dict[str, Any]] | None = None
+        # v1.1.8 gap bridging
+        self._gap_pending = False
+        self._last_good_ts: float | None = None
+        self._bridges_in_segment = 0
+        self.gap_bridged_count = 0
 
     # ── feed ────────────────────────────────────────────────────────────────
     def feed(self, s: HealthSample) -> DischargeSegment | None:
@@ -347,11 +363,28 @@ class SegmentTracker:
             self._throughput_since_full_kwh = 0.0
 
         if soc is None or power is None or discharge is None:
-            # Missing critical field: per spec §9 do not guess — discard any
-            # in-progress segment and skip this tick for segment detection.
+            # v1.1.8: a read failure NO LONGER destroys an in-progress segment.
+            #
+            # Rationale (corrects a v1.1.5 design error): the previous rule
+            # discarded the segment "because we cannot know what happened during
+            # the outage".  But nothing needs to be known: SOC is an absolute
+            # state reading and lifetime discharge is a cumulative counter, so
+            # ΔSOC and Δenergy across the gap are both still exact without the
+            # intervening samples.  If something unobserved DID occur, the
+            # implied-capacity plausibility band rejects the segment on close —
+            # that guard exists precisely for this.
+            #
+            # The old rule made measurement structurally impossible on a link
+            # with intermittent Modbus timeouts: register_cache correctly
+            # refuses to serve energy counters from a stale cache after a
+            # timeout, so every timeout produced a None here and killed the
+            # segment long before it could reach the minimum ΔSOC.
             if self._active:
-                self._discard("missing field / read failure mid-segment")
+                self._gap_pending = True
             return None
+
+        prev_good_ts = self._last_good_ts
+        self._last_good_ts = s.timestamp
 
         discharging = power < -cfg.segment_rest_power_w
 
@@ -361,6 +394,28 @@ class SegmentTracker:
             return None
 
         # Active segment ------------------------------------------------------
+        # Resolve a pending gap first: bridge it if short enough, otherwise
+        # give up on this segment (bounded trust — v1.1.8).
+        if self._gap_pending:
+            elapsed = (
+                s.timestamp - prev_good_ts if prev_good_ts is not None else 0.0
+            )
+            if elapsed > cfg.max_gap_bridge_s:
+                self._discard(
+                    f"data gap of {elapsed / 60.0:.0f} min exceeds the "
+                    f"{cfg.max_gap_bridge_s / 60.0:.0f} min bridge limit"
+                )
+                if discharging:
+                    self._begin(s, soc, discharge)
+                return None
+            self._gap_pending = False
+            self._bridges_in_segment += 1
+            self.gap_bridged_count += 1
+            self._agg_cache = None
+            _LOGGER.debug(
+                "battery_health: bridged a %.0f s data gap mid-segment", elapsed
+            )
+
         if s.soh_calibration_active:
             self._seg_calibration_seen = True
 
@@ -374,9 +429,25 @@ class SegmentTracker:
         return None
 
     def mark_gap(self) -> None:
-        """A data gap occurred (coordinator failure): discard active segment."""
+        """A data gap occurred (coordinator read failure).
+
+        v1.1.8: this marks the gap *pending* rather than destroying the
+        segment.  It is bridged on the next good sample if it falls within
+        ``max_gap_bridge_s``, and discarded otherwise.
+        """
         if self._active:
-            self._discard("data gap")
+            self._gap_pending = True
+
+    def discard_active(self, reason: str) -> None:
+        """Destroy the in-progress segment outright.
+
+        Reserved for events that genuinely invalidate the interval arithmetic
+        — currently only a lifetime-counter reset, where energy of unknown
+        magnitude may have flowed before the counter restarted.  A plain data
+        gap is NOT such an event (see feed()).
+        """
+        if self._active:
+            self._discard(reason)
 
     # ── internals ───────────────────────────────────────────────────────────
     def _begin(self, s: HealthSample, soc: float, discharge: float) -> None:
@@ -385,6 +456,8 @@ class SegmentTracker:
         self._start_soc = soc
         self._last_soc = soc
         self._start_discharge_kwh = discharge
+        self._gap_pending = False
+        self._bridges_in_segment = 0
         self._seg_calibration_seen = bool(s.soh_calibration_active)
         self._seg_freshness = math.exp(
             -self._throughput_since_full_kwh / self._cfg.freshness_tau_kwh
@@ -428,6 +501,7 @@ class SegmentTracker:
             implied_capacity_kwh=implied,
             freshness=self._seg_freshness,
             golden=self._seg_calibration_seen,
+            gap_bridged=self._bridges_in_segment,
         )
         self.segments.append(seg)
         self.last_segment_ts = self._start_ts
@@ -460,6 +534,7 @@ class SegmentTracker:
             "segment_count": len(segs),
             "golden_segment_count": sum(1 for s in segs if s.golden),
             "discarded_segment_count": self.discarded_segments,
+            "gap_bridged_count": self.gap_bridged_count,
         }
         if not segs:
             self._agg_cache = (None, dict(attrs))
@@ -514,6 +589,7 @@ class SegmentTracker:
             "last_discharge": self._last_discharge_kwh,
             "last_segment_ts": self.last_segment_ts,
             "discarded": self.discarded_segments,
+            "gap_bridged": self.gap_bridged_count,
         }
 
     def restore(self, data: dict[str, Any]) -> None:
@@ -524,6 +600,10 @@ class SegmentTracker:
         self._last_discharge_kwh = data.get("last_discharge")
         self.last_segment_ts = data.get("last_segment_ts")
         self.discarded_segments = int(data.get("discarded", 0))
+        self.gap_bridged_count = int(data.get("gap_bridged", 0))
+        self._gap_pending = False
+        self._last_good_ts = None
+        self._bridges_in_segment = 0
         self._agg_cache = None
         # Never resume a half-open segment across a restart (spec §8).
         self._active = False
@@ -589,7 +669,16 @@ class EfficiencyTracker:
                 )
 
     def invalidate_anchor(self) -> None:
-        """Counter reset / data gap: current window can't be trusted."""
+        """Discard the open efficiency window.
+
+        v1.1.8: called ONLY on a lifetime-counter reset.  A plain data gap no
+        longer invalidates the anchor: both endpoints are cumulative counter
+        readings, so η over the window is unaffected by missing samples in
+        between, and the η plausibility band (0.50-1.05) rejects anything
+        anomalous.  Under the old rule this tracker could never capture a
+        baseline on a link with intermittent timeouts — the observed symptom
+        was efficiency_window_count stuck at 0.
+        """
         self._anchor = None
 
     def reset_baseline(self) -> None:
@@ -890,7 +979,10 @@ class BatteryHealthEngine:
             self._charge_counter.reset_count + self._discharge_counter.reset_count
         )
         if post_resets != pre_resets:
-            self.segments.mark_gap()
+            # A counter reset genuinely invalidates interval arithmetic:
+            # energy of unknown magnitude may have flowed before the counter
+            # restarted. This is a hard discard, unlike a data gap (v1.1.8).
+            self.segments.discard_active("lifetime counter reset")
             self.efficiency.invalidate_anchor()
             self.dirty = True
 
@@ -907,10 +999,16 @@ class BatteryHealthEngine:
         return self._last_report
 
     def mark_gap(self) -> None:
-        """Coordinator update failed: propagate per spec §9."""
+        """Coordinator update failed.
+
+        v1.1.8: the segment tracker marks the gap pending (bridged on resume
+        if short enough) and the efficiency anchor is left intact — both
+        measurements are built from absolute/cumulative readings and survive
+        missing samples. Only the stress accumulator must exclude the gap,
+        since it integrates over *time* and an outage is not a calm period.
+        """
         self.segments.mark_gap()
         self.stress.mark_gap()
-        self.efficiency.invalidate_anchor()
 
     @property
     def report(self) -> HealthReport:
