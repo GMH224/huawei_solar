@@ -98,6 +98,13 @@ def _make_ctrl() -> AdaptiveModbusController:
     ctrl._save_task = None
     ctrl._listeners = []
     ctrl._unsub_push = None
+    # v1.2.2 learning gate — open by default so existing tests exercise the
+    # learning path unchanged.
+    ctrl.learning_enabled = True
+    ctrl._suppressed_until = None
+    ctrl._suppress_reason = ""
+    ctrl.suppressed_observations = 0
+    ctrl.settling_events = 0
     return ctrl
 
 
@@ -678,3 +685,119 @@ class TestDebounceDirtyFlag(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v1.2.2 — learning gate
+# ══════════════════════════════════════════════════════════════════════════════
+class TestLearningGate(unittest.TestCase):
+    """record_request() cannot tell WHY a request was slow or failed.
+
+    HA event-loop congestion and an unreachable inverter are recorded
+    identically, so the controller must not learn while either is suspected.
+    """
+
+    def test_observations_discarded_while_disabled(self):
+        ctrl = _make_ctrl()
+        ctrl.set_learning_enabled(False)
+        for _ in range(20):
+            ctrl.record_request(100.0, success=False, timeout=True)
+        slot = ctrl._slots[ctrl._current_slot_index()]
+        self.assertEqual(slot.n, 0.0)
+        self.assertEqual(ctrl.suppressed_observations, 20)
+
+    def test_observations_recorded_when_enabled(self):
+        ctrl = _make_ctrl()
+        for _ in range(10):
+            ctrl.record_request(100.0, success=True, timeout=False)
+        slot = ctrl._slots[ctrl._current_slot_index()]
+        self.assertEqual(slot.n, 10.0)
+        self.assertEqual(ctrl.suppressed_observations, 0)
+
+    def test_settling_blocks_then_expires(self):
+        ctrl = _make_ctrl()
+        ctrl.mark_recovery("test")
+        self.assertFalse(ctrl.learning_active())
+        ctrl.record_request(100.0, success=False, timeout=True)
+        self.assertEqual(ctrl._slots[ctrl._current_slot_index()].n, 0.0)
+        # Simulate the settling window elapsing.
+        ctrl._suppressed_until = time.time() - 1
+        self.assertTrue(ctrl.learning_active())
+        ctrl.record_request(100.0, success=True, timeout=False)
+        self.assertEqual(ctrl._slots[ctrl._current_slot_index()].n, 1.0)
+
+    def test_indefinite_suppression_never_expires(self):
+        ctrl = _make_ctrl()
+        ctrl.suppress_indefinitely("home assistant stopping")
+        self.assertFalse(ctrl.learning_active())
+        ctrl._suppressed_until = ctrl._suppressed_until  # unchanged by time
+        self.assertFalse(ctrl.learning_active())
+
+    def test_reenable_triggers_settling(self):
+        ctrl = _make_ctrl()
+        ctrl.set_learning_enabled(False)
+        ctrl.set_learning_enabled(True)
+        self.assertTrue(ctrl.learning_enabled)
+        self.assertFalse(ctrl.learning_active())
+
+    def test_firmware_update_scenario_leaves_slot_untouched(self):
+        """The exposure that motivated the gate.
+
+        A ~1 h Huawei firmware update is ~120 consecutive failed requests
+        across four 15-minute slots. On a mature slot that lifts the failure
+        rate from ~3% to ~12%, mapping to a poll interval near 137 s rather
+        than 20-30 s. Daily decay does NOT undo it: decay scales failures and
+        sample count equally, so the RATIO survives - only new successful
+        observations dilute it, and those accrue far more slowly because
+        polling has slowed.
+        """
+        ctrl = _make_ctrl()
+        idx = ctrl._current_slot_index()
+        # Mature, healthy slot: 300 observations at a ~3% failure rate.
+        for i in range(300):
+            ctrl.record_request(200.0, success=(i % 33 != 0), timeout=(i % 33 == 0))
+        healthy_rate = ctrl._slots[idx].failure_rate
+        self.assertLess(healthy_rate, 0.05)
+
+        # Operator disables learning before the firmware update.
+        ctrl.set_learning_enabled(False)
+        for _ in range(120):
+            ctrl.record_request(60000.0, success=False, timeout=True)
+
+        self.assertAlmostEqual(ctrl._slots[idx].failure_rate, healthy_rate,
+                               places=6)
+        self.assertEqual(ctrl.suppressed_observations, 120)
+
+    def test_unguarded_firmware_update_would_have_poisoned_the_slot(self):
+        """Control case: proves the guard is load-bearing, not decorative."""
+        ctrl = _make_ctrl()
+        idx = ctrl._current_slot_index()
+        for i in range(300):
+            ctrl.record_request(200.0, success=(i % 33 != 0), timeout=(i % 33 == 0))
+        healthy_rate = ctrl._slots[idx].failure_rate
+        for _ in range(120):          # learning left ENABLED
+            ctrl.record_request(60000.0, success=False, timeout=True)
+        poisoned = ctrl._slots[idx].failure_rate
+        self.assertGreater(poisoned, healthy_rate * 3)
+        self.assertGreater(poisoned, 0.10)
+
+    def test_decay_does_not_repair_a_poisoned_failure_rate(self):
+        """Decay lowers confidence, not the failure RATE - the key asymmetry."""
+        ctrl = _make_ctrl()
+        idx = ctrl._current_slot_index()
+        for i in range(300):
+            ctrl.record_request(200.0, success=(i % 33 != 0), timeout=(i % 33 == 0))
+        for _ in range(120):
+            ctrl.record_request(60000.0, success=False, timeout=True)
+        before = ctrl._slots[idx].failure_rate
+        for _ in range(14):           # a fortnight of decay
+            ctrl._slots[idx].apply_decay(ADAPTIVE_DECAY_FACTOR)
+        self.assertAlmostEqual(ctrl._slots[idx].failure_rate, before, places=6)
+
+    def test_gate_state_persisted(self):
+        ctrl = _make_ctrl()
+        ctrl.set_learning_enabled(False)
+        ctrl.suppressed_observations = 42
+        raw = ctrl._serialize()
+        self.assertFalse(raw["learning_enabled"])
+        self.assertEqual(raw["suppressed_observations"], 42)

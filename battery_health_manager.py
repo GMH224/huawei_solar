@@ -229,6 +229,10 @@ class BatteryHealthManager:
             )
             data = None
         self.engine.restore(data)
+        # v1.2.1: after any (re)start, registers may briefly report stale or
+        # default values.  Measurement resumes immediately; irreversible
+        # learning waits out the settling period.
+        self.engine.mark_recovery("integration start")
         self._unsub = self.coordinator.async_add_listener(
             self._handle_coordinator_update,
             context={"register_names": list(REQUIRED_REGISTER_NAMES)},
@@ -279,6 +283,11 @@ class BatteryHealthManager:
             await self._flush_and_notify()
         return applied
 
+    async def async_set_learning_enabled(self, enabled: bool) -> None:
+        """Maintenance inhibit for the learning phase (v1.2.1)."""
+        self.engine.set_learning_enabled(enabled)
+        await self._flush_and_notify()
+
     async def _flush_and_notify(self) -> None:
         await self._store.async_save(self.engine.to_dict())
         self._last_signature = None     # force the next tick to notify
@@ -295,6 +304,10 @@ class BatteryHealthManager:
                 self.engine.mark_gap()
             self._last_update_success = False
             return
+        if not self._last_update_success:
+            # Coordinator just came back: settle before trusting the data for
+            # anything irreversible (v1.2.1).
+            self.engine.mark_recovery("coordinator recovered")
         self._last_update_success = True
 
         data = coordinator.data or {}

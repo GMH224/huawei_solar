@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 import logging
+import time
 from typing import Any, TypeVar
 
 from huawei_solar import HuaweiSolarDevice, register_names as rn, register_values as rv
@@ -17,6 +18,8 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
+from .adaptive_modbus import AdaptiveModbusController
+from .battery_health_manager import BatteryHealthManager
 from .const import CONF_ENABLE_PARAMETER_CONFIGURATION, DATA_DEVICE_DATAS
 from .types import (
     HuaweiSolarConfigEntry,
@@ -106,11 +109,31 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Huawei Solar Switch Entities Setup."""
+    device_data: list[HuaweiSolarDeviceData] = entry.runtime_data[DATA_DEVICE_DATAS]
+
+    # The battery-health learning switch writes NO inverter registers, so it
+    # is registered regardless of the parameter-configuration setting (that
+    # gate exists to guard register-writing entities).  Fault-isolated: a
+    # failure here must never abort the switch platform (v1.1.7 contract).
+    try:
+        learning_switches: list[SwitchEntity] = []
+        for ucs in device_data:
+            bh_manager = BatteryHealthManager.get(ucs.device.serial_number)
+            if bh_manager:
+                learning_switches.append(
+                    AdaptiveLearningSwitchEntity(bh_manager)
+                )
+        if learning_switches:
+            async_add_entities(learning_switches)
+    except Exception:  # noqa: BLE001
+        _LOGGER.exception(
+            "Failed to build adaptive learning switch; continuing "
+            "without it. All other switches are unaffected"
+        )
+
     if not entry.data.get(CONF_ENABLE_PARAMETER_CONFIGURATION, False):
         _LOGGER.info("Skipping switch setup, as parameter configuration is not enabled")
         return
-
-    device_data: list[HuaweiSolarDeviceData] = entry.runtime_data[DATA_DEVICE_DATAS]
 
     entities_to_add: list[SwitchEntity] = []
     for ucs in device_data:
@@ -345,3 +368,90 @@ class HuaweiSolarOnOffSwitchEntity(
                     break
 
         await self.coordinator.async_request_refresh()
+
+
+class AdaptiveLearningSwitchEntity(SwitchEntity):
+    """Maintenance inhibit for ALL adaptive learning on this inverter.
+
+    Governs two independent learners (v1.2.2 - one control, one concept):
+
+      * the battery-health engine (segments, capacity/balance/efficiency
+        baselines, charge-ceiling epochs), and
+      * the adaptive Modbus controller (circadian poll interval, gap, timeout).
+
+    Turn OFF before planned work.  A Huawei firmware update takes about an
+    hour, and the vendor does not document which registers stay meaningful
+    during the cycle.  Turn back ON once the system is stable.
+
+    Why this matters most for the Modbus learner: an hour of unreachable
+    inverter is ~120 consecutive failed requests spread over four 15-minute
+    circadian slots.  On a mature slot that lifts the failure rate from ~3% to
+    ~12%, which maps to a poll interval near 137 s instead of 20-30 s.  Daily
+    decay does NOT undo it - decay scales failures and sample count equally, so
+    it lowers confidence but leaves the ratio intact.  Only new successful
+    observations dilute it, and those accrue 4-5x more slowly precisely because
+    polling has slowed.  One maintenance window can therefore cost weeks of
+    degraded polling.
+
+    While off, everything keeps RUNNING and every sensor keeps updating - only
+    learning is frozen.  A day without learning costs nothing.
+
+    Unplanned disturbances cannot be prepared for, so both subsystems also
+    self-suspend for a settling period after Home Assistant starts.  This
+    switch is the planned-work counterpart.
+
+    Writes no inverter registers.
+    """
+
+    _attr_has_entity_name = True
+    _attr_should_poll = False
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_name = "Adaptive learning"
+    _attr_icon = "mdi:school-outline"
+
+    def __init__(self, manager: BatteryHealthManager) -> None:
+        """Initialize the learning switch."""
+        self._manager = manager
+        self._attr_device_info = manager.device_info
+        # unique_id retained from the battery-health-only switch so existing
+        # entity registry entries and any automations survive the rename.
+        self._attr_unique_id = f"{manager.serial_number}_battery_health_learning"
+
+    @property
+    def is_on(self) -> bool:
+        """Return True when learning is enabled."""
+        return self._manager.engine.learning_enabled
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Expose the state of both learners."""
+        engine = self._manager.engine
+        attrs: dict[str, Any] = {
+            "battery_health_learning_active": engine.learning_active(time.time()),
+            "battery_health_settling_events": engine.settling_events,
+            "settling_period_s": engine.cfg.settling_period_s,
+        }
+        controller = AdaptiveModbusController.get(self._manager.serial_number)
+        if controller is not None:
+            attrs.update({
+                "modbus_learning_active": controller.learning_active(),
+                "modbus_suppressed_observations": controller.suppressed_observations,
+                "modbus_settling_events": controller.settling_events,
+            })
+        return attrs
+
+    async def _apply(self, enabled: bool) -> None:
+        await self._manager.async_set_learning_enabled(enabled)
+        controller = AdaptiveModbusController.get(self._manager.serial_number)
+        if controller is not None:
+            controller.set_learning_enabled(enabled)
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        """Enable learning (a settling period still applies)."""
+        await self._apply(True)
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        """Freeze all learning for planned maintenance."""
+        await self._apply(False)
+        self.async_write_ha_state()

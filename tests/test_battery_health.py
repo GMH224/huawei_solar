@@ -22,6 +22,7 @@ import importlib.util
 import math
 import pathlib
 import sys
+import time
 import unittest
 
 # ── Import battery_health directly (avoid package-level HA imports) ──────────
@@ -849,10 +850,18 @@ class TestEfficiencyGapTolerance(unittest.TestCase):  # T20
                            temp=20.0))
         # No window may be recorded across the reset ...
         self.assertEqual(len(eng.efficiency.windows), 0)
-        # ... and the anchor must have restarted at the reset sample.
-        self.assertEqual(eng.efficiency._anchor[0], 60.0)
+        # ... and (v1.2.1) a reset is treated as a recovery, so learning is
+        # suspended for the settling period rather than re-anchoring
+        # immediately on data that may still be stale.
+        self.assertFalse(eng.learning_active(60.0))
+        self.assertIsNone(eng.efficiency._anchor)
 
-        # A window measured entirely after the reset is valid.
+        # After settling, measurement resumes and re-anchors normally.
+        eng.update(_sample(60.0 + 400.0, soc=99.0, power=0.0, chg=1.0, dis=1.0,
+                           temp=20.0))
+        self.assertTrue(eng.learning_active(60.0 + 400.0))
+        self.assertIsNotNone(eng.efficiency._anchor)
+
         eng.update(_sample(DAY, soc=99.0, power=0.0, chg=41.0, dis=39.4,
                            temp=20.0))
         self.assertEqual(len(eng.efficiency.windows), 1)
@@ -1249,21 +1258,190 @@ class TestThermalRise(unittest.TestCase):  # T27 / optional ambient input
         self.assertIsNotNone(attrs["balance_raw_dt"])   # everything else works
 
     def test_rise_deviation_detects_uniform_ageing(self):
-        """All packs hotter by the same amount: spread unchanged, rise up."""
-        cfg = _cfg(balance_baseline_min_samples=5)
+        """All packs hotter by the same amount: spread unchanged, rise up.
+
+        Samples are spread over days because the thermal-rise baseline
+        requires a multi-day span (v1.2.1): pack cooling runs ~-0.4 C/h, so
+        consecutive samples carry one afternoon's load history, not a norm.
+        """
+        cfg = _cfg(balance_baseline_min_samples=5,
+                   thermal_rise_baseline_min_span_days=3.0)
         eng = bh.BatteryHealthEngine(cfg)
         for i in range(10):
-            s = _sample(i * 60, soc=98.0, power=0.0,
+            s = _sample(i * DAY, soc=98.0, power=0.0,
                         packs=self._packs([25.9, 28.5, 27.2]))
             s.ambient_temp_c = 23.3
             eng.balance.feed(s)
         _, base = eng.balance.soh_balance()
         self.assertAlmostEqual(base["thermal_rise_deviation"], 0.0, places=1)
         for i in range(5):
-            s = _sample(20_000 + i * 60, soc=98.0, power=0.0,
+            s = _sample((11 + i) * DAY, soc=98.0, power=0.0,
                         packs=self._packs([27.9, 30.5, 29.2]))
             s.ambient_temp_c = 23.3
             eng.balance.feed(s)
         _, later = eng.balance.soh_balance()
         self.assertAlmostEqual(later["balance_dt_deviation"], 0.0, places=1)
         self.assertAlmostEqual(later["thermal_rise_deviation"], 2.0, places=1)
+
+    def test_thermal_rise_baseline_deferred_until_span_reached(self):
+        """20 samples from one afternoon must NOT anchor the rise baseline."""
+        cfg = _cfg(balance_baseline_min_samples=5,
+                   thermal_rise_baseline_min_span_days=3.0)
+        eng = bh.BatteryHealthEngine(cfg)
+        for i in range(10):
+            s = _sample(i * 60, soc=98.0, power=0.0,
+                        packs=self._packs([25.9, 28.5, 27.2]))
+            s.ambient_temp_c = 23.3
+            eng.balance.feed(s)
+        _, attrs = eng.balance.soh_balance()
+        self.assertIsNotNone(attrs["thermal_rise_max"])      # still measured
+        self.assertIsNone(attrs["thermal_rise_baseline_max"])  # not anchored
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# v1.2.1 — maintenance inhibit, settling, ceiling validation
+# ═════════════════════════════════════════════════════════════════════════════
+class TestCeilingValidation(unittest.TestCase):  # T28
+    """Register 47081 must not be able to destroy baselines during a reboot.
+
+    A ceiling change restarts the efficiency AND balance baseline epochs, so a
+    spurious change is expensive.  Firmware cycles take ~1 h and the vendor
+    does not document which registers stay meaningful throughout.
+    """
+
+    def test_implausible_ceiling_rejected(self):
+        cfg = _cfg()
+        mon = bh.CeilingMonitor(cfg)
+        self.assertEqual(mon.feed(100.0), 100.0)
+        # Reboot artefact: register reads 0.
+        self.assertEqual(mon.feed(0.0), 100.0)
+        self.assertEqual(mon.feed(0.0), 100.0)
+        self.assertEqual(mon.rejected_count, 2)
+
+    def test_transient_change_debounced(self):
+        cfg = _cfg(ceiling_debounce_samples=3)
+        mon = bh.CeilingMonitor(cfg)
+        mon.feed(100.0)
+        # A single odd-but-plausible reading must not be accepted.
+        self.assertEqual(mon.feed(50.0), 100.0)
+        self.assertEqual(mon.feed(100.0), 100.0)
+        self.assertEqual(mon.debounced_count, 0)
+
+    def test_genuine_change_accepted_after_debounce(self):
+        cfg = _cfg(ceiling_debounce_samples=3)
+        mon = bh.CeilingMonitor(cfg)
+        mon.feed(100.0)
+        for _ in range(3):
+            mon.feed(93.0)
+        self.assertEqual(mon.value, 93.0)
+        self.assertEqual(mon.debounced_count, 1)
+
+    def test_reboot_glitch_does_not_wipe_baselines(self):
+        """End-to-end: the failure mode this guard exists for."""
+        cfg = _cfg(eff_baseline_windows=1, ceiling_debounce_samples=3)
+        eng = bh.BatteryHealthEngine(cfg)
+        eng.update(_sample(0, soc=100.0, power=0.0, chg=0.0, dis=0.0,
+                           temp=20.0, ceiling=100.0))
+        eng.update(_sample(600, soc=100.0, power=0.0, chg=20.0, dis=19.8,
+                           temp=20.0, ceiling=100.0))
+        self.assertIsNotNone(eng.efficiency.baseline)
+        baseline = eng.efficiency.baseline
+        # Firmware cycle: register returns 0 for a few polls.
+        for i in range(5):
+            eng.update(_sample(700 + i * 30, soc=100.0, power=0.0, chg=20.0,
+                               dis=19.8, temp=20.0, ceiling=0.0))
+        self.assertEqual(eng.efficiency.baseline, baseline,
+                         "a glitched ceiling must not restart the epoch")
+        self.assertGreater(eng.report.attributes["ceiling_rejected_readings"], 0)
+
+
+class TestLearningInhibit(unittest.TestCase):  # T29
+    """Maintenance inhibit: freeze learning, keep measuring."""
+
+    def test_disabled_learning_records_no_segments(self):
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        eng = bh.BatteryHealthEngine(cfg)
+        eng.set_learning_enabled(False)
+        _run_discharge(eng, 0.0, 100.0, 77.0, 0.0, 5.24)
+        self.assertEqual(len(eng.segments.segments), 0)
+
+    def test_disabled_learning_still_updates_counters(self):
+        """Sensors must keep displaying during maintenance."""
+        eng = bh.BatteryHealthEngine(_cfg())
+        eng.set_learning_enabled(False)
+        eng.update(_sample(0, soc=50.0, power=0.0, chg=3300.0, dis=3105.0,
+                           temp=20.0))
+        self.assertAlmostEqual(eng.report.efc, 150.0, places=1)
+        self.assertFalse(eng.report.attributes["learning_enabled"])
+
+    def test_disabled_learning_blocks_ceiling_epoch(self):
+        """The whole point: maintenance cannot poison baselines."""
+        cfg = _cfg(eff_baseline_windows=1)
+        eng = bh.BatteryHealthEngine(cfg)
+        eng.update(_sample(0, soc=100.0, power=0.0, chg=0.0, dis=0.0,
+                           temp=20.0, ceiling=100.0))
+        eng.update(_sample(600, soc=100.0, power=0.0, chg=20.0, dis=19.8,
+                           temp=20.0, ceiling=100.0))
+        baseline = eng.efficiency.baseline
+        self.assertIsNotNone(baseline)
+        eng.set_learning_enabled(False)
+        for i in range(5):
+            eng.update(_sample(700 + i * 30, soc=100.0, power=0.0, chg=20.0,
+                               dis=19.8, temp=20.0, ceiling=50.0))
+        self.assertEqual(eng.efficiency.baseline, baseline)
+
+    def test_state_survives_persistence(self):
+        eng = bh.BatteryHealthEngine(_cfg())
+        eng.set_learning_enabled(False)
+        import json
+        data = json.loads(json.dumps(eng.to_dict()))
+        eng2 = bh.BatteryHealthEngine(_cfg())
+        eng2.restore(data)
+        self.assertFalse(eng2.learning_enabled)
+
+    def test_reenable_triggers_settling(self):
+        eng = bh.BatteryHealthEngine(_cfg(settling_period_s=300.0))
+        eng.set_learning_enabled(False)
+        eng.set_learning_enabled(True)
+        now = time.time()
+        self.assertTrue(eng.learning_enabled)
+        self.assertFalse(eng.learning_active(now))
+        self.assertTrue(eng.learning_active(now + 400.0))
+
+
+class TestSettlingPeriod(unittest.TestCase):  # T30
+    """Unplanned recoveries cannot be prepared for, so settle automatically."""
+
+    def test_no_learning_during_settling(self):
+        """A discharge occurring entirely inside the settling window is not
+        recorded.  (The window is deliberately long here: the default 300 s is
+        shorter than a realistic discharge, so learning correctly resumes
+        part-way through one - see test_learning_resumes_after_settling.)"""
+        cfg = _cfg(freshness_tau_kwh=1e12, settling_period_s=7200.0)
+        eng = bh.BatteryHealthEngine(cfg)
+        eng.mark_recovery("test restart", now=0.0)
+        _run_discharge(eng, 60.0, 100.0, 77.0, 0.0, 5.24)
+        self.assertEqual(len(eng.segments.segments), 0)
+        self.assertFalse(eng.learning_active(1200.0))
+
+    def test_learning_resumes_after_settling(self):
+        cfg = _cfg(freshness_tau_kwh=1e12, settling_period_s=300.0)
+        eng = bh.BatteryHealthEngine(cfg)
+        eng.mark_recovery("test restart", now=0.0)
+        _run_discharge(eng, 400.0, 100.0, 77.0, 0.0, 5.24)
+        self.assertEqual(len(eng.segments.segments), 1)
+
+    def test_counter_reset_triggers_settling(self):
+        eng = bh.BatteryHealthEngine(_cfg(settling_period_s=300.0))
+        eng.update(_sample(0, soc=50.0, power=0.0, chg=100.0, dis=95.0, temp=20.0))
+        eng.update(_sample(60, soc=50.0, power=0.0, chg=1.0, dis=1.0, temp=20.0))
+        self.assertFalse(eng.learning_active(60.0))
+        self.assertGreaterEqual(eng.report.attributes["settling_events"], 1)
+
+    def test_settling_does_not_stop_measurement(self):
+        eng = bh.BatteryHealthEngine(_cfg(settling_period_s=300.0))
+        eng.mark_recovery("test", now=0.0)
+        eng.update(_sample(60, soc=50.0, power=0.0, chg=3300.0, dis=3105.0,
+                           temp=20.0))
+        self.assertAlmostEqual(eng.report.efc, 150.0, places=1)
+        self.assertFalse(eng.report.attributes["learning_active"])

@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time as time_module
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from typing import Any
@@ -165,6 +166,24 @@ class BatteryHealthConfig:
     # Confidence
     confidence_min_segments: int = 5
     stale_after_days: float = 60.0
+    #: v1.2.1 - after ANY recovery (HA restart, coordinator returning from an
+    #: outage, counter reset) registers may briefly report stale or default
+    #: values. Measurement resumes immediately, but IRREVERSIBLE operations
+    #: (baseline capture, epoch changes) wait for this settling period.
+    settling_period_s: float = 300.0          # 5 minutes
+    #: A firmware update or reboot can leave register 47081 returning a
+    #: default value for the duration of the cycle. Accepting it as a real
+    #: setting change would fire a ceiling epoch and destroy the efficiency
+    #: and balance baselines - four times a year, on a residential system
+    #: whose reboot behaviour the vendor does not document.
+    ceiling_min_plausible: float = 20.0
+    ceiling_debounce_samples: int = 3
+    #: Pack cooling runs at roughly -0.4 C/hour (measured over 48 undisturbed
+    #: rest windows), so thermal rise carries HOURS of load history. Twenty
+    #: consecutive samples from one afternoon are not a norm; the baseline
+    #: must span days to average across diurnal cycles.
+    thermal_rise_baseline_min_span_days: float = 3.0
+
     #: v1.2.0 - term availability is seasonal (balance/efficiency need a high
     #: SOC that winter may not reach).  Hold the last good sub-score rather
     #: than dropping it, so the renormalised composite does not step at the
@@ -332,6 +351,78 @@ class CounterMonitor:
         self._last = data.get("last")
         self._offset = float(data.get("offset", 0.0))
         self.reset_count = int(data.get("resets", 0))
+
+
+class CeilingMonitor:
+    """Validate and debounce the configured end-of-charge SOC (register 47081).
+
+    A ceiling change is a *destructive* signal here: it restarts the efficiency
+    and balance baseline epochs, because the ceiling shifts eta and the SOC
+    operating band systematically. That makes a spurious change expensive, and
+    firmware-update / reboot windows are exactly when a register is most likely
+    to report a default or stale value.
+
+    Two guards, deliberately simple:
+      * a plausibility floor - nobody configures a ceiling below ~20%, so a
+        lower reading is a glitch by definition, not a setting;
+      * a debounce - a genuine setting change persists across consecutive
+        polls; a transient does not.
+    """
+
+    def __init__(self, cfg: BatteryHealthConfig) -> None:
+        self._cfg = cfg
+        self.value: float | None = None
+        self._candidate: float | None = None
+        self._streak = 0
+        self.rejected_count = 0
+        self.debounced_count = 0
+
+    def feed(self, raw: float | None) -> float | None:
+        """Return the accepted ceiling, ignoring implausible/transient values."""
+        cfg = self._cfg
+        if raw is None:
+            return self.value
+        if raw < cfg.ceiling_min_plausible:
+            self.rejected_count += 1
+            _LOGGER.warning(
+                "battery_health: implausible end-of-charge SOC %.0f%% ignored "
+                "(below the %.0f%% floor) - likely a reboot/firmware artefact; "
+                "keeping %s",
+                raw, cfg.ceiling_min_plausible,
+                "unset" if self.value is None else f"{self.value:.0f}%",
+            )
+            return self.value
+        if self.value is None:
+            self.value = raw
+            return self.value
+        if abs(raw - self.value) < 1.0:
+            self._candidate = None
+            self._streak = 0
+            return self.value
+        if self._candidate is not None and abs(raw - self._candidate) < 1.0:
+            self._streak += 1
+        else:
+            self._candidate = raw
+            self._streak = 1
+        if self._streak >= cfg.ceiling_debounce_samples:
+            _LOGGER.info(
+                "battery_health: end-of-charge SOC change confirmed %.0f%% -> "
+                "%.0f%% after %d consistent readings",
+                self.value, self._candidate, self._streak)
+            self.value = self._candidate
+            self._candidate = None
+            self._streak = 0
+            self.debounced_count += 1
+        return self.value
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"value": self.value, "rejected": self.rejected_count,
+                "debounced": self.debounced_count}
+
+    def restore(self, data: dict[str, Any]) -> None:
+        self.value = data.get("value")
+        self.rejected_count = int(data.get("rejected", 0))
+        self.debounced_count = int(data.get("debounced", 0))
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -846,17 +937,26 @@ class EfficiencyTracker:
             return 2
         return 0
 
-    def feed(self, s: HealthSample) -> None:
+    def feed(self, s: HealthSample, learn: bool = True) -> None:
         cfg = self._cfg
         # Finding O: a ceiling change invalidates cross-epoch comparison, and
         # must be detected even on ticks where the counters failed to read.
+        # Suppressed while learning is paused: a reboot-time register artefact
+        # must never be able to destroy a baseline (v1.2.1).
         ceiling = s.charge_ceiling_soc
         if ceiling is not None:
-            if self.last_ceiling is not None and abs(ceiling - self.last_ceiling) >= 1.0:
+            if (
+                learn
+                and self.last_ceiling is not None
+                and abs(ceiling - self.last_ceiling) >= 1.0
+            ):
                 self.new_epoch(
                     f"charge ceiling changed {self.last_ceiling:.0f}% -> "
                     f"{ceiling:.0f}%", ts=s.timestamp)
-            self.last_ceiling = ceiling
+            if learn or self.last_ceiling is None:
+                self.last_ceiling = ceiling
+        if not learn:
+            return
         if s.lifetime_charge_kwh is None or s.lifetime_discharge_kwh is None:
             return
 
@@ -1033,7 +1133,10 @@ class BalanceTracker:
         self.raw_dt_min: deque[float] = deque(maxlen=cfg.balance_sample_count)
         #: Per-pack rise above ambient (max sensors), when an ambient sensor
         #: is configured. Empty otherwise - the feature degrades silently.
-        self.thermal_rise: deque[list[float]] = deque(maxlen=cfg.balance_sample_count)
+        #: (timestamp, [rise per pack]) - timestamps retained so the baseline
+        #: can require a multi-day span (pack cooling constant is ~hours).
+        self.thermal_rise: deque[tuple[float, list[float]]] = deque(
+            maxlen=cfg.balance_sample_count)
         self.baseline_rise: list[float] | None = None
         self.sample_soc: deque[float] = deque(maxlen=cfg.balance_sample_count)
         self.last_included: list[int] = []
@@ -1055,18 +1158,31 @@ class BalanceTracker:
             return cfg.balance_min_soc
         return max(cfg.balance_min_soc_floor, ceiling - cfg.balance_ceiling_margin)
 
-    def feed(self, s: HealthSample) -> None:
+    def feed(self, s: HealthSample, learn: bool = True) -> None:
+        """Process a sample.
+
+        When *learn* is False (learning switch off, or still settling after a
+        recovery) raw dV/dT are still recorded so the sensors keep displaying
+        live values, but no score is accumulated, no baseline is captured and
+        no epoch is started - nothing irreversible happens on data that may be
+        untrustworthy.
+        """
         cfg = self._cfg
         if s.soc is None or s.power_w is None:
             return
 
         ceiling = s.charge_ceiling_soc
         if ceiling is not None:
-            if self.last_ceiling is not None and abs(ceiling - self.last_ceiling) >= 1.0:
+            if (
+                learn
+                and self.last_ceiling is not None
+                and abs(ceiling - self.last_ceiling) >= 1.0
+            ):
                 self.new_epoch(
                     f"charge ceiling changed {self.last_ceiling:.0f}% -> "
                     f"{ceiling:.0f}%", ts=s.timestamp)
-            self.last_ceiling = ceiling
+            if learn or self.last_ceiling is None:
+                self.last_ceiling = ceiling
 
         if s.soc < self._gate_soc(s) or abs(s.power_w) > cfg.balance_rest_power_w:
             return
@@ -1093,8 +1209,12 @@ class BalanceTracker:
         if len(temps_min) >= 2:
             self.raw_dt_min.append(max(temps_min) - min(temps_min))
         if s.ambient_temp_c is not None:
-            self.thermal_rise.append([t - s.ambient_temp_c for t in temps])
+            self.thermal_rise.append(
+                (s.timestamp, [t - s.ambient_temp_c for t in temps]))
         self.sample_soc.append(s.soc)
+
+        if not learn:
+            return          # raw values recorded above; nothing irreversible
 
         if cfg.balance_use_baseline and self.baseline_dv is None:
             self._pool_dv.append(dv)
@@ -1131,12 +1251,24 @@ class BalanceTracker:
             {"ts": ts, "dv": round(dv, 3), "dt": round(dt, 2), "reason": reason,
              "previous_dv": prev[0], "previous_dt": prev[1]})
         self.baseline_dv, self.baseline_dt = dv, dt
+        # Only anchor thermal rise once the samples SPAN days. Pack cooling
+        # runs ~-0.4 C/h, so consecutive samples from a single afternoon carry
+        # that afternoon's load history, not the installation's norm.
         if self.thermal_rise:
-            n = len(self.thermal_rise[-1])
-            self.baseline_rise = [
-                _median([r[i] for r in self.thermal_rise if len(r) > i])
-                for i in range(n)
-            ]
+            span_days = (
+                self.thermal_rise[-1][0] - self.thermal_rise[0][0]
+            ) / SECONDS_PER_DAY
+            if span_days >= self._cfg.thermal_rise_baseline_min_span_days:
+                n = len(self.thermal_rise[-1][1])
+                self.baseline_rise = [
+                    _median([r[1][i] for r in self.thermal_rise if len(r[1]) > i])
+                    for i in range(n)
+                ]
+            else:
+                _LOGGER.debug(
+                    "battery_health: thermal-rise baseline deferred - samples "
+                    "span %.1f of %.1f required days",
+                    span_days, self._cfg.thermal_rise_baseline_min_span_days)
         self.baseline_captured_ts = ts
         self._pool_dv.clear()
         self._pool_dt.clear()
@@ -1181,14 +1313,15 @@ class BalanceTracker:
                 round(self.raw_dt[-1] - self.baseline_dt, 2)
                 if self.raw_dt and self.baseline_dt is not None else None),
             "thermal_rise_above_ambient": (
-                [round(v, 2) for v in self.thermal_rise[-1]]
+                [round(v, 2) for v in self.thermal_rise[-1][1]]
                 if self.thermal_rise else None),
             "thermal_rise_max": (
-                round(max(self.thermal_rise[-1]), 2) if self.thermal_rise else None),
+                round(max(self.thermal_rise[-1][1]), 2)
+                if self.thermal_rise else None),
             "thermal_rise_baseline_max": (
                 round(max(self.baseline_rise), 2) if self.baseline_rise else None),
             "thermal_rise_deviation": (
-                round(max(self.thermal_rise[-1]) - max(self.baseline_rise), 2)
+                round(max(self.thermal_rise[-1][1]) - max(self.baseline_rise), 2)
                 if self.thermal_rise and self.baseline_rise else None),
             "balance_channel_disagreement": (
                 round(abs(self.raw_dt[-1] - self.raw_dt_min[-1]), 2)
@@ -1213,7 +1346,7 @@ class BalanceTracker:
             "raw_dv": list(self.raw_dv),
             "raw_dt": list(self.raw_dt),
             "raw_dt_min": list(self.raw_dt_min),
-            "thermal_rise": [list(r) for r in self.thermal_rise],
+            "thermal_rise": [[r[0], list(r[1])] for r in self.thermal_rise],
             "baseline_rise": self.baseline_rise,
             "sample_soc": list(self.sample_soc),
             "included": self.last_included,
@@ -1234,7 +1367,9 @@ class BalanceTracker:
         self.raw_dt = deque(data.get("raw_dt", []), maxlen=n)
         self.raw_dt_min = deque(data.get("raw_dt_min", []), maxlen=n)
         self.thermal_rise = deque(
-            [list(r) for r in data.get("thermal_rise", [])], maxlen=n)
+            [(float(r[0]), list(r[1])) for r in data.get("thermal_rise", [])
+             if isinstance(r, (list, tuple)) and len(r) == 2],
+            maxlen=n)
         self.baseline_rise = data.get("baseline_rise")
         self.sample_soc = deque(data.get("sample_soc", []), maxlen=n)
         self.last_included = list(data.get("included", []))
@@ -1389,6 +1524,8 @@ class HealthReport:
             self.attributes.get("discarded_segment_count"),
             self.attributes.get("counter_resets"),
             tuple(self.attributes.get("contributing_terms", ())),
+            self.attributes.get("learning_enabled"),
+            self.attributes.get("learning_active"),
         )
 
 
@@ -1408,6 +1545,16 @@ class BatteryHealthEngine:
         #: Held (not dropped) while a term is seasonally unavailable, so the
         #: renormalised composite does not step when a term disappears.
         self._held: dict[str, tuple[float, float]] = {}
+        self.ceiling = CeilingMonitor(self.cfg)
+        #: v1.2.1 maintenance inhibit. Disable before planned work (firmware
+        #: updates), re-enable once the system is stable, so a maintenance
+        #: window cannot poison the learned baselines.
+        self.learning_enabled = True
+        #: Automatic counterpart: unplanned reboots and coordinator recoveries
+        #: cannot be prepared for, so learning is suspended for a settling
+        #: period after any of them.
+        self._settling_until: float | None = None
+        self.settling_events = 0
         self.dirty = False                     # persistence hint for manager
         self._last_report = HealthReport()
 
@@ -1435,19 +1582,30 @@ class BatteryHealthEngine:
             # restarted. This is a hard discard, unlike a data gap (v1.1.8).
             self.segments.discard_active("lifetime counter reset")
             self.efficiency.invalidate_anchor()
+            # A counter reset means the system restarted underneath us.
+            self.mark_recovery("lifetime counter reset", now=s.timestamp)
             self.dirty = True
 
+        # v1.2.1: sanity-check and debounce the configured ceiling BEFORE any
+        # tracker sees it, so a reboot artefact cannot fire a baseline epoch.
+        s.charge_ceiling_soc = self.ceiling.feed(s.charge_ceiling_soc)
+
+        learning = self.learning_active(s.timestamp)
         counter_stale = self._discharge_counter.is_stale
         seg_before = (len(self.segments.segments), self.segments.discarded_segments,
                       self.segments.gap_bridged_count)
-        closed = self.segments.feed(s, counter_stale=counter_stale)
-        if closed is not None:
-            self.dirty = True
+        if learning:
+            closed = self.segments.feed(s, counter_stale=counter_stale)
+            if closed is not None:
+                self.dirty = True
+        else:
+            closed = None
+            self.segments.mark_gap()
         eff_base_before = self.efficiency.baseline
         bal_base_before = self.balance.baseline_dv
         bal_n_before = len(self.balance.scores)
-        self.efficiency.feed(s)
-        self.balance.feed(s)
+        self.efficiency.feed(s, learn=learning)
+        self.balance.feed(s, learn=learning)
         # Finding E: persist on every material state change, not only on a
         # closed segment.  The efficiency baseline in particular is a
         # once-in-a-lifetime reference that was previously lost on an
@@ -1467,6 +1625,47 @@ class BatteryHealthEngine:
 
         self._last_report = self._evaluate(s.timestamp)
         return self._last_report
+
+    def set_learning_enabled(self, enabled: bool) -> None:
+        """Maintenance inhibit (v1.2.1).
+
+        Measurement and display continue; only irreversible learning stops -
+        segment recording, baseline capture and epoch changes.
+        """
+        if enabled == self.learning_enabled:
+            return
+        self.learning_enabled = enabled
+        self.dirty = True
+        if enabled:
+            # Treat the resumption as a recovery: settle before trusting data.
+            self.mark_recovery("learning re-enabled")
+        else:
+            self.segments.mark_gap()
+            _LOGGER.warning(
+                "battery_health: learning DISABLED - baselines and segments "
+                "are frozen. Sensors continue to display. Re-enable once the "
+                "system is stable.")
+
+    def mark_recovery(self, reason: str, now: float | None = None) -> None:
+        """Suspend learning for the settling period after a recovery."""
+        base = now if now is not None else time_module.time()
+        self._settling_until = base + self.cfg.settling_period_s
+        self.settling_events += 1
+        self.segments.mark_gap()
+        _LOGGER.info(
+            "battery_health: settling for %.0f s after %s - measurement "
+            "continues, learning paused",
+            self.cfg.settling_period_s, reason)
+
+    def learning_active(self, now: float) -> bool:
+        """True when it is safe to perform irreversible learning."""
+        if not self.learning_enabled:
+            return False
+        if self._settling_until is not None:
+            if now < self._settling_until:
+                return False
+            self._settling_until = None
+        return True
 
     def mark_gap(self) -> None:
         """Coordinator update failed.
@@ -1623,6 +1822,11 @@ class BatteryHealthEngine:
         else:
             r.confidence = "normal"
 
+        r.attributes["learning_enabled"] = self.learning_enabled
+        r.attributes["learning_active"] = self.learning_active(now)
+        r.attributes["settling_events"] = self.settling_events
+        r.attributes["ceiling_rejected_readings"] = self.ceiling.rejected_count
+        r.attributes["ceiling_confirmed_changes"] = self.ceiling.debounced_count
         r.attributes["counter_resets"] = (
             self._charge_counter.reset_count + self._discharge_counter.reset_count
         )
@@ -1634,6 +1838,9 @@ class BatteryHealthEngine:
             "schema_version": SCHEMA_VERSION,
             "first_seen_ts": self.first_seen_ts,
             "held_subscores": {k: list(v) for k, v in self._held.items()},
+            "learning_enabled": self.learning_enabled,
+            "settling_events": self.settling_events,
+            "ceiling": self.ceiling.to_dict(),
             "segments": self.segments.to_dict(),
             "efficiency": self.efficiency.to_dict(),
             "balance": self.balance.to_dict(),
@@ -1657,6 +1864,9 @@ class BatteryHealthEngine:
             for k, v in (data.get("held_subscores") or {}).items()
             if isinstance(v, (list, tuple)) and len(v) == 2
         }
+        self.learning_enabled = bool(data.get("learning_enabled", True))
+        self.settling_events = int(data.get("settling_events", 0))
+        self.ceiling.restore(data.get("ceiling", {}))
         self.segments.restore(data.get("segments", {}))
         self.efficiency.restore(data.get("efficiency", {}))
         self.balance.restore(data.get("balance", {}))

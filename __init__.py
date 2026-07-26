@@ -31,7 +31,8 @@ from homeassistant.const import (
     CONF_USERNAME,
     Platform,
 )
-from homeassistant.core import HomeAssistant
+from homeassistant.const import EVENT_HOMEASSISTANT_STARTED, EVENT_HOMEASSISTANT_STOP
+from homeassistant.core import CoreState, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.device_registry import DeviceInfo
@@ -234,6 +235,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
         # Nothing here is awaited on the setup critical path and every failure
         # mode is swallowed and logged.  See _async_setup_battery_health().
         _async_setup_battery_health(hass, entry, device_datas)
+        # v1.2.2: gate BOTH learners across HA start-up and shutdown.
+        try:
+            _async_register_learning_gates(
+                hass, entry, [d.device.serial_number for d in device_datas]
+            )
+        except Exception:  # noqa: BLE001 — must never break entry setup
+            _LOGGER.exception(
+                "Failed to register learning gates; learning will proceed "
+                "without start-up suppression"
+            )
     except ConnectionInterruptedException as err:
         if primary_device is not None:
             await primary_device.stop()
@@ -311,6 +322,69 @@ async def _async_options_updated(
 ) -> None:
     """Handle an options update by reloading the config entry."""
     await hass.config_entries.async_reload(entry.entry_id)
+
+
+def _async_register_learning_gates(
+    hass: HomeAssistant,
+    entry: HuaweiSolarConfigEntry,
+    serials: list[str],
+) -> None:
+    """Suspend both learners across Home Assistant start-up and shutdown.
+
+    Keyed on Home Assistant's OWN lifecycle events rather than on integration
+    setup time.  Integration setup routinely completes while HA is still
+    grinding through recorder migration and other integrations, so a window
+    measured from setup could expire before the congestion does - defeating
+    the purpose.
+
+    During those windows Modbus round-trip times and timeouts reflect Home
+    Assistant, not the inverter.  The adaptive controller cannot distinguish
+    the two, and restarts are not uniformly distributed across the day
+    (scheduled updates, evening maintenance), so the same circadian slots
+    would be poisoned repeatedly.
+
+    Nothing stops POLLING here - only learning from what is observed.
+    """
+
+    def _settle(reason: str) -> None:
+        for serial in serials:
+            controller = AdaptiveModbusController.get(serial)
+            if controller is not None:
+                controller.mark_recovery(reason)
+            manager = BatteryHealthManager.get(serial)
+            if manager is not None:
+                manager.engine.mark_recovery(reason)
+
+    def _suppress(reason: str) -> None:
+        for serial in serials:
+            controller = AdaptiveModbusController.get(serial)
+            if controller is not None:
+                controller.suppress_indefinitely(reason)
+
+    if hass.state is not CoreState.running:
+        # Set up during HA start-up: hold learning until HA reports ready,
+        # then settle from THAT point.
+        _suppress("home assistant still starting")
+
+        @callback
+        def _on_started(_event) -> None:
+            _settle("home assistant started")
+
+        entry.async_on_unload(
+            hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _on_started)
+        )
+    else:
+        _settle("integration (re)loaded")
+
+    @callback
+    def _on_stop(_event) -> None:
+        # Components unload in order and Modbus can fail while the loop winds
+        # down; those failures are artefacts, not inverter behaviour.
+        _suppress("home assistant stopping")
+
+    entry.async_on_unload(
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _on_stop)
+    )
 
 
 def _async_setup_battery_health(

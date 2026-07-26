@@ -121,6 +121,29 @@ def _install_ha_stubs() -> None:
 
     comps = mod("homeassistant.components")
     # number
+    ev = mod("homeassistant.helpers.event")
+    ev.async_track_time_interval = lambda *a, **k: (lambda: None)
+    ev.async_call_later = lambda *a, **k: (lambda: None)
+
+    sen = mod("homeassistant.components.sensor")
+
+    class SensorEntity:
+        _attr_native_value = None
+
+        @property
+        def native_value(self):
+            return self._attr_native_value
+
+    class SensorStateClass:
+        MEASUREMENT = "measurement"
+        TOTAL_INCREASING = "total_increasing"
+
+    class SensorDeviceClass:
+        ENUM = "enum"
+    sen.SensorEntity = SensorEntity
+    sen.SensorStateClass = SensorStateClass
+    sen.SensorDeviceClass = SensorDeviceClass
+
     num = mod("homeassistant.components.number")
 
     @dataclass(frozen=True)
@@ -204,7 +227,14 @@ def _install_lib_stubs() -> None:
     base.HuaweiSolarDevice = hs.HuaweiSolarDevice
 
     # ── Sibling integration modules (kept light so we don't load the coordinator)
-    const = mod("huawei_solar.const")
+    # Use the REAL const module: adaptive_modbus imports many ADAPTIVE_*
+    # constants and a hand-maintained stub list would drift out of sync.
+    import importlib.util as _ilu
+    _cspec = _ilu.spec_from_file_location(
+        "huawei_solar.const", str(_ROOT / "const.py"))
+    const = _ilu.module_from_spec(_cspec)
+    sys.modules["huawei_solar.const"] = const
+    _cspec.loader.exec_module(const)
     const.CONF_ENABLE_PARAMETER_CONFIGURATION = "enable_parameter_configuration"
     const.DATA_DEVICE_DATAS = "device_datas"
     const.CONF_BH_RATED_CAPACITY_KWH = "bh_rated_capacity_kwh"
@@ -253,6 +283,11 @@ def _load(modname: str):
     spec.loader.exec_module(m)
     return m
 
+
+# v1.2.2: switch.py imports the adaptive controller for the shared learning
+# switch, so it must resolve as a package submodule too.
+ADAPTIVE = _load("adaptive_modbus")
+sys.modules["huawei_solar.adaptive_modbus"] = ADAPTIVE
 
 BATTERY_HEALTH = _load("battery_health")
 sys.modules["huawei_solar.battery_health"] = BATTERY_HEALTH

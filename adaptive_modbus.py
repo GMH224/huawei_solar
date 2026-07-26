@@ -85,6 +85,7 @@ from homeassistant.helpers.storage import Store
 
 from .const import (
     ADAPTIVE_DECAY_FACTOR,
+    LEARNING_SETTLING_PERIOD_S,
     ADAPTIVE_FAILURE_RATE_HIGH,
     ADAPTIVE_FAILURE_RATE_LOW,
     ADAPTIVE_FULL_CONFIDENCE_N,
@@ -243,6 +244,37 @@ class AdaptiveModbusController:
 
     _registry: dict[str, "AdaptiveModbusController"] = {}
 
+    #: v1.2.2 - LEARNING GATE.
+    #:
+    #: record_request() cannot tell WHY a request was slow or failed. An RTT
+    #: inflated by Home Assistant's own event-loop congestion is recorded
+    #: identically to a genuinely slow inverter, which violates this module's
+    #: founding premise that failure patterns reflect INVERTER state.
+    #:
+    #: Two exposures motivated the gate:
+    #:
+    #: 1. HA startup/shutdown. Congestion produces spurious failures. Restarts
+    #:    are not uniformly distributed in time (scheduled updates, evening
+    #:    tinkering), so the same circadian slots are poisoned repeatedly.
+    #:
+    #: 2. Planned inverter maintenance - the larger exposure. A Huawei firmware
+    #:    update makes the inverter unreachable for ~1 h: ~120 consecutive
+    #:    failures spread across four 15-minute slots. Applied to a mature slot
+    #:    that lifts the failure rate from ~3% to ~12%, which maps to a poll
+    #:    interval of ~137 s instead of 20-30 s.
+    #:
+    #: Recovery is slow and asymmetric. Daily decay multiplies n AND failures
+    #: by the same factor, so it lowers CONFIDENCE but NOT the failure rate -
+    #: only new successful observations dilute that, and those now accrue 4-5x
+    #: more slowly because polling just slowed down. A single maintenance
+    #: window therefore costs weeks of degraded polling.
+    #:
+    #: Note the deliberate asymmetry with the battery-health engine: that one
+    #: also settles after a COORDINATOR recovery, because stale register values
+    #: would corrupt it. This controller does NOT, because Modbus timing is
+    #: precisely what it exists to measure - a recovering link is genuine
+    #: signal, not noise.
+
     # ── class helpers ─────────────────────────────────────────────────────────
 
     @classmethod
@@ -301,6 +333,12 @@ class AdaptiveModbusController:
             f"{DOMAIN}.adaptive.{serial_number}",
         )
         self._last_decay_date: date | None = None
+        # Learning gate (v1.2.2)
+        self.learning_enabled = True
+        self._suppressed_until: float | None = None
+        self._suppress_reason: str = ""
+        self.suppressed_observations = 0
+        self.settling_events = 0
         self._first_data_date: date | None = None
         self._dirty: bool = False
         self._save_task: asyncio.Task | None = None
@@ -382,10 +420,65 @@ class AdaptiveModbusController:
         slot = self._slots[slot_idx]
         return self._derive_params(slot, slot_idx, self._in_transition)
 
+    def learning_active(self) -> bool:
+        """True when it is safe to learn from observations."""
+        if not self.learning_enabled:
+            return False
+        if self._suppressed_until is not None:
+            if time.time() < self._suppressed_until:
+                return False
+            self._suppressed_until = None
+            self._suppress_reason = ""
+        return True
+
+    def set_learning_enabled(self, enabled: bool) -> None:
+        """Maintenance inhibit shared with the battery-health engine."""
+        if enabled == self.learning_enabled:
+            return
+        self.learning_enabled = enabled
+        self._dirty = True
+        if enabled:
+            self.mark_recovery("learning re-enabled")
+        else:
+            _LOGGER.warning(
+                "AdaptiveModbus[%s]: learning DISABLED - observations are "
+                "discarded and learned parameters frozen. Polling continues "
+                "using the current parameters.",
+                self.serial_number,
+            )
+
+    def mark_recovery(self, reason: str) -> None:
+        """Suppress learning for the settling period after a disturbance."""
+        self._suppressed_until = time.time() + LEARNING_SETTLING_PERIOD_S
+        self._suppress_reason = reason
+        self.settling_events += 1
+        _LOGGER.info(
+            "AdaptiveModbus[%s]: not learning for %.0f s after %s - polling "
+            "continues with current parameters",
+            self.serial_number, LEARNING_SETTLING_PERIOD_S, reason,
+        )
+
+    def suppress_indefinitely(self, reason: str) -> None:
+        """Suppress learning until explicitly resumed (e.g. HA shutting down)."""
+        self._suppressed_until = float("inf")
+        self._suppress_reason = reason
+        _LOGGER.debug(
+            "AdaptiveModbus[%s]: learning suppressed (%s)",
+            self.serial_number, reason,
+        )
+
     def record_request(
         self, rtt_ms: float, success: bool, timeout: bool
     ) -> None:
-        """Record one completed Modbus request into the current time slot."""
+        """Record one completed Modbus request into the current time slot.
+
+        Discarded outright while the learning gate is closed. Suppression is
+        preferred over down-weighting: a weight would be another unvalidated
+        constant, whereas "recorded or not" is directly verifiable.
+        """
+        if not self.learning_active():
+            self.suppressed_observations += 1
+            return
         slot_idx = self._current_slot_index()
         self._slots[slot_idx].record(
             rtt_ms, success, timeout, ADAPTIVE_RTT_SAMPLE_SIZE
@@ -460,6 +553,12 @@ class AdaptiveModbusController:
             "days_of_data": self.days_of_data,
             "current_slot": self._slot_label(params.slot_index),
             "slot_requests": round(slot.n, 1),
+            # v1.2.2 learning gate visibility
+            "learning_enabled": self.learning_enabled,
+            "learning_active": self.learning_active(),
+            "suppressed_observations": self.suppressed_observations,
+            "settling_events": self.settling_events,
+            "suppress_reason": self._suppress_reason or None,
         }
 
     # ── properties ────────────────────────────────────────────────────────────
@@ -627,6 +726,9 @@ class AdaptiveModbusController:
             "version": _STORAGE_VERSION,
             "serial": self.serial_number,
             "last_decay_date": (self._last_decay_date or date.today()).isoformat(),
+            "learning_enabled": self.learning_enabled,
+            "suppressed_observations": self.suppressed_observations,
+            "settling_events": self.settling_events,
             "first_data_date": (self._first_data_date or date.today()).isoformat(),
             "slots": {
                 str(i): s.to_dict()
@@ -645,6 +747,9 @@ class AdaptiveModbusController:
                     self._slots[idx] = TimeSlotStats.from_dict(slot_dict, slot_index=idx)
             except (ValueError, KeyError):
                 pass
+        self.learning_enabled = bool(raw.get("learning_enabled", True))
+        self.suppressed_observations = int(raw.get("suppressed_observations", 0))
+        self.settling_events = int(raw.get("settling_events", 0))
         last_str = raw.get("last_decay_date")
         self._last_decay_date = date.fromisoformat(last_str) if last_str else None
         first_str = raw.get("first_data_date")

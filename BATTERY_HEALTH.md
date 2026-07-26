@@ -318,6 +318,42 @@ inter-pack spread cannot see when all packs age together — a genuinely
 independent degradation channel. It is optional, configurable (so replacing
 the sensor needs no code change), and degrades silently when unavailable.
 
+## 7e. Maintenance and reboots (v1.2.1)
+
+Learned baselines take weeks to build, so anything that could corrupt them
+during maintenance matters more than it first appears.
+
+**Before planned work** (e.g. a Huawei firmware update, which takes about an
+hour): turn **off** the *Adaptive learning* switch. Since v1.2.2 this single
+switch governs **both** learners — the battery-health engine and the adaptive
+Modbus controller. Sensors keep
+displaying and raw values keep updating; only irreversible learning freezes -
+no segments recorded, no baselines captured, no charge-ceiling epoch. Turn it
+back on once the system is stable. A day without learning costs nothing.
+
+**Unplanned reboots** cannot be prepared for, so the engine suspends learning
+automatically for a settling period (default 5 minutes) after any integration
+start, coordinator recovery, or lifetime-counter reset.
+
+**Charge-ceiling guard:** because a ceiling change restarts baseline epochs, a
+reading below 20% is rejected as a reboot artefact, and any change must
+persist across several consecutive polls before it is accepted.
+
+**Why the Modbus learner matters most here.** An hour of unreachable inverter
+is roughly 120 consecutive failed requests spread over four 15-minute
+circadian slots. On a mature slot that lifts the failure rate from ~3% to
+~12%, which maps to a poll interval near 137 s instead of 20–30 s. Daily decay
+does **not** undo this: decay scales failures and sample count equally, so it
+lowers confidence but leaves the ratio intact. Only new successful
+observations dilute it — and those accrue 4–5× more slowly precisely because
+polling has slowed. A single unguarded maintenance window can cost weeks of
+degraded polling, with nothing to tell you it happened.
+
+Check `learning_enabled`, `learning_active`, `settling_events` and
+`ceiling_rejected_readings` in the Battery health index attributes, and
+`suppressed_observations` on the adaptive diagnostic sensors, to confirm what
+happened across a maintenance window.
+
 ## 8. Known limitations
 
 1. **Circularity:** SOH_cap depends on BMS SOC. Freshness weighting and the
@@ -332,6 +368,9 @@ the sensor needs no code change), and degrades silently when unavailable.
    ceiling-relative sampling gate is designed by analogy to the efficiency
    anchors, but the reference dataset covered only 6 summer weeks of pack
    voltage/temperature at a single charge ceiling.
+4d. **Thermal-rise baselines need days, not samples.** Pack cooling runs at
+   roughly −0.4 °C/hour, so rise carries hours of load history; the baseline
+   defers until samples span several days.
 4c. **η temperature compensation was attempted and abandoned** — the available
    BMS temperature range spanned only 3.2 °C, giving r = +0.18 and a 2% noise
    reduction. Worth revisiting with a full winter of data.

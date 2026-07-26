@@ -83,6 +83,13 @@ SERVICES = (
 # Parameters below define the learning model and parameter bounds.
 
 # Slot granularity: 96 slots × 15 min = 24 hours
+#: v1.2.2 - shared settling period for BOTH learning subsystems (battery
+#: health and adaptive Modbus). During HA startup the event loop is congested
+#: by other integrations, recorder migration and database work; Modbus RTT and
+#: timeouts observed then reflect HOME ASSISTANT, not the inverter. The
+#: adaptive learner cannot distinguish the two, so it must not learn from them.
+LEARNING_SETTLING_PERIOD_S: float = 300.0
+
 ADAPTIVE_SLOT_MINUTES: int = 15
 ADAPTIVE_SLOT_COUNT: int = 96          # 24 * 60 // ADAPTIVE_SLOT_MINUTES
 

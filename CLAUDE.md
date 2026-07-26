@@ -1,7 +1,7 @@
 # CLAUDE.md — Huawei Solar Integration
 
 > **Maintained by Claude (Anthropic) on behalf of the community.**
-> Current version: **1.2.0** — see `manifest.json`.
+> Current version: **1.2.2** — see `manifest.json`.
 
 ---
 
@@ -663,6 +663,123 @@ timestamp, eliminating arithmetic errors on the power-flow card.
 - **New:** `tests/test_synchronized_power_coordinator.py` — 22 tests covering
   derived properties (all edge cases), happy path, partial failure, all-fail,
   consecutive failure counter, and telemetry recording.
+
+### v1.2.2 (2026-07-26)
+**Learning gate extended to the adaptive Modbus controller.** Raised by the
+operator: the Modbus layer also learns, and Home Assistant's own start-up
+behaviour is not trustworthy enough to learn from.
+
+**Why this matters more than the battery-health case.** `record_request()`
+records `(rtt_ms, success, timeout)` with no notion of CAUSE. An RTT inflated
+by HA's event-loop congestion is indistinguishable from a slow inverter, which
+violates the module's founding premise that failure patterns reflect INVERTER
+state. Three properties make the consequences worse than a wrong dashboard
+number:
+
+1. **Blast radius.** Poisoned parameters change real polling behaviour
+   (interval 20-180 s, timeout 15-60 s, gap 150-500 ms), degrading the data
+   collection everything else depends on - including battery-health segment
+   resolution.
+2. **A ratchet.** Failures push toward SLOWER polling, which yields fewer
+   observations per slot per day, which makes recovery slower still. Descent
+   is fast; recovery is slow.
+3. **Restarts are not uniformly distributed in time.** Scheduled updates and
+   evening maintenance cluster in the same circadian slots, so the same slots
+   are poisoned repeatedly - faster than decay removes it.
+
+**The larger exposure is planned maintenance, not restarts.** A Huawei
+firmware update leaves the inverter unreachable for ~1 h: at 30 s polling that
+is ~120 consecutive failures across four 15-minute slots. Applied to a mature
+slot (n~300, ~3% failures) it lifts the failure rate to ~12%, mapping to a
+poll interval near 137 s instead of 20-30 s.
+
+**And daily decay does not repair it.** Decay multiplies `n` and `failures` by
+the SAME factor, so it lowers confidence but leaves the RATIO intact. Only new
+successful observations dilute a poisoned failure rate, and those accrue 4-5x
+more slowly precisely because polling has slowed. One maintenance window can
+cost weeks of degraded polling, with no visible signal that it happened.
+`test_decay_does_not_repair_a_poisoned_failure_rate` pins this.
+
+**Changes:**
+- `AdaptiveModbusController` gains the same learning gate as the battery-health
+  engine: `learning_enabled`, `mark_recovery()`, `suppress_indefinitely()`,
+  `learning_active()`. Blocked observations are counted
+  (`suppressed_observations`) and surfaced on the diagnostic sensors.
+  Suppression is total rather than down-weighted - a weight would be another
+  unvalidated constant, whereas "recorded or not" is directly verifiable.
+- **Switch renamed** `Battery health learning` -> **`Adaptive learning`**, and
+  it now governs BOTH learners. `unique_id` is deliberately unchanged so
+  existing registry entries and automations survive the rename.
+- **Gates keyed on Home Assistant's own lifecycle events**
+  (`EVENT_HOMEASSISTANT_STARTED` / `EVENT_HOMEASSISTANT_STOP`), not on
+  integration setup time: setup routinely completes while HA is still working
+  through recorder migration and other integrations, so a window measured from
+  setup could expire before the congestion does.
+- **Deliberate asymmetry, documented in code:** the battery-health engine also
+  settles after a COORDINATOR recovery (stale register values would corrupt
+  it); the Modbus controller does NOT, because Modbus timing is precisely what
+  it measures - a recovering link is genuine signal, not noise. One control for
+  the operator; different automatic reflexes underneath.
+- Gate state is persisted, so an inhibit set before maintenance survives the
+  restart that maintenance usually involves.
+
+**Tests: 382 -> 391 passed, 1 skipped.** New `TestLearningGate` covers
+suppression, settling expiry, indefinite suppression, persistence, and the
+firmware-update scenario end to end - including a **control case**
+(`test_unguarded_firmware_update_would_have_poisoned_the_slot`) proving the
+guard is load-bearing rather than decorative. Adversarial verification: 6 fail
+against pristine v1.2.1. Replay against the 6-month field dataset is unchanged
+(162 segments, reference 22.59 kWh, BHI 100.4) - this release alters
+robustness, not measurement.
+
+**Test-harness change:** `test_entities.py` now loads the REAL `const.py`
+rather than a hand-maintained constant stub, which had begun to drift as
+`adaptive_modbus` imported more constants.
+
+### v1.2.1 (2026-07-26)
+**Maintenance robustness.** Raised by the operator: Huawei firmware updates
+take about an hour, four times a year, and the vendor does not document which
+registers stay meaningful *during* the cycle. Empirically the hardware is
+never harmed and values are correct once the cycle completes - but not every
+sensor makes sense mid-flight. Unplanned reboots are more frequent and cannot
+be prepared for at all.
+
+**The vulnerability this closed.** A charge-ceiling change is a *destructive*
+signal: it restarts the efficiency and balance baseline epochs (v1.2.0,
+Finding O). Register 47081 was validated only as 0-100%, so a reboot returning
+**0** was accepted as a legitimate setting change - and would have wiped
+baselines that take weeks to rebuild, up to four times a year.
+
+- **Ceiling plausibility floor + debounce** (`CeilingMonitor`): readings below
+  `ceiling_min_plausible` (20%) are rejected as artefacts - nobody configures
+  a ceiling that low - and a change must persist for
+  `ceiling_debounce_samples` (3) consecutive polls before it is accepted. A
+  genuine setting change persists; a transient does not.
+- **Maintenance inhibit** (`switch.<device>_battery_health_learning`, default
+  on, persisted): turn it off before planned work. Sensors keep displaying and
+  raw values keep updating, but nothing irreversible happens - no segments
+  recorded, no baselines captured, no epoch can fire. Writes no registers, and
+  registered outside the parameter-configuration gate for that reason.
+- **Automatic settling period** (`settling_period_s`, default 300 s): after
+  ANY recovery - integration start, coordinator returning from an outage, or a
+  lifetime-counter reset - measurement resumes immediately but irreversible
+  learning waits. This covers the unplanned reboots a manual switch cannot.
+
+**Thermal-rise baseline now requires a multi-day span.** The operator's first
+v1.2.0 deployment produced `thermal_rise_baseline_max: 7.47` against a current
+5.09. Analysis of 48 undisturbed rest windows showed pack cooling runs at
+roughly **-0.4 C/hour**, so thermal rise carries *hours* of load history:
+twenty consecutive samples from one afternoon are that afternoon, not a norm.
+A short settling period would NOT have fixed this - the constant is hours, not
+minutes - so the fix is `thermal_rise_baseline_min_span_days` (3), the same
+lesson as Finding J applied at a shorter timescale. Rise is still *measured*
+immediately; only the baseline defers.
+
+**Tests: 368 -> 382 passed, 1 skipped.** New: T28 ceiling validation
+(including an end-to-end reboot-glitch scenario asserting baselines survive),
+T29 learning inhibit, T30 settling period. Adversarial verification: 15 fail
+against pristine v1.2.0. Replay against the 6-month field dataset produces
+results identical to v1.2.0 - no measurement regression.
 
 ### v1.2.0 (2026-07-26)
 **Field-calibrated measurement release.** Every change below was derived from
