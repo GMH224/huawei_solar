@@ -1,7 +1,7 @@
 # CLAUDE.md — Huawei Solar Integration
 
 > **Maintained by Claude (Anthropic) on behalf of the community.**
-> Current version: **1.1.8** — see `manifest.json`.
+> Current version: **1.2.0** — see `manifest.json`.
 
 ---
 
@@ -663,6 +663,115 @@ timestamp, eliminating arithmetic errors on the power-flow card.
 - **New:** `tests/test_synchronized_power_coordinator.py` — 22 tests covering
   derived properties (all edge cases), happy path, partial failure, all-fail,
   consecutive failure counter, and telemetry recording.
+
+### v1.2.0 (2026-07-26)
+**Field-calibrated measurement release.** Every change below was derived from
+6 months of real operating data from a production installation, replayed
+through the engine offline. The data itself is NOT redistributed (see
+"Validation data" below).
+
+**Finding H - SOH capacity was anchored to the wrong number.**
+The nameplate (20.7 kWh) did not match measured capacity (~22.75 kWh,
+162 segments, spread 0.31). SOH_cap was therefore pinned at the 100% clip and
+the first ~10% of any real degradation would have been invisible. Capacity is
+now anchored to a MEASURED beginning-of-life reference, auto-captured once
+enough segments span enough time, persisted, re-anchorable via a button, and
+clipped at 110 rather than 100 so headroom is not hidden.
+
+**Finding J - the operating band shifts the measurement.**
+Implied capacity varies ~2% with where in the SOC range a segment sat
+(22.98 kWh at midpoint 85-100% vs 23.49 at 50-65%). Usage is seasonal, so
+that shift would read as degradation. Segments now record `soc_midpoint` and
+the prevailing charge ceiling, and the reference capture requires a minimum
+TIME SPAN (not just a segment count) so it averages across conditions - the
+first attempt anchored to 21.9 kWh from winter-only segments and left SOH
+reading 103.8%.
+
+**Findings L + O - efficiency anchors were the dominant noise source.**
+eta is only meaningful between states of EQUAL stored energy; "SOC >= 97"
+admitted up to 3 SOC points of mismatch, worth ~4.5% on a window. Measured:
+stdev 0.0101 at SOC>=97 vs 0.0018 at SOC>=100 - 5.6x quieter, zero windows
+lost. But an absolute gate is unusable in winter (122 consecutive days below
+100% in the field), so anchors are now defined relative to the CONFIGURED
+end-of-charge SOC in two tiers: tier 1 at a BMS recalibration point, tier 2
+matched pairs at the prevailing ceiling (time-capped, flagged). Window
+threshold 30 -> 15 kWh: baseline in 24 days instead of 47, and quieter.
+Changing the charge ceiling shifts eta systematically (0.9801 at a 93% cap vs
+0.9883 at 100% = 6.5 SOH points), so a ceiling change now starts a new
+baseline epoch automatically.
+
+**Findings A1 + A2 - balance scoring measured the wrong things.**
+A 2.4 C inter-pack spread was present at idle (2.33 C) as much as under >1 kW
+charge (2.52 C), so it is not battery-generated heat; it scored a healthy pack
+set at ~81/100. Separately, pack voltage has 0.1 V resolution against a
+0.05-0.50 V band, making one LSB worth 11 score points - the observed 90.5 /
+84.9 / 79.4 "swings" were pure quantisation. Balance is now scored as
+deviation from a learned per-installation baseline, with raw dV/dT always
+exposed and never re-zeroed. Sampling is gated relative to the charge ceiling
+(the absolute SOC>=95 gate was unreachable for 78 consecutive days).
+
+**Finding N - seasonal term availability stepped the composite.**
+Capacity is the only term available year-round, so the renormalised composite
+would jump at the seasonal boundary with no health change. Sub-scores are now
+HELD at their last good value for up to 90 days and reported in `held_terms`.
+
+**Finding F - idle was ending discharge segments.**
+Capacity arithmetic is dkWh/dSOC, unaffected by the battery resting. A single
+near-zero power reading (15 such blips in 8 days, median 130 s) split a
+10-hour discharge into marginal halves. Only genuine charging now ends a
+segment; 6 h of continuous rest still does. Measured on real power data:
+43 fragmented runs -> 23, of which 8 are clean full-night segments.
+
+**Finding C - segments could start on stale counter values.**
+`CounterMonitor` carries the last value forward on a failed read, so a segment
+opening on such a tick got a stale energy endpoint. It now exposes `is_stale`
+and segments refuse to open on carried-forward values.
+
+**Finding D - forecast age used the wrong origin.**
+`first_seen_ts` records when the integration started observing, not battery
+age. New `bh_install_date` option; falls back to first-seen and reports which
+via `battery_age_source`.
+
+**Finding E - persistence was under-triggered.**
+`dirty` was set on only four events, none of which occur before the first
+segment closes, so the once-in-a-lifetime efficiency baseline could be lost on
+an unclean restart. Now set on baseline capture, balance samples, bridges and
+discards (the existing 5-minute debounce still prevents write churn).
+
+**New diagnostics.**
+- Independent MIN-temperature-sensor spread channel. Field data shows max and
+  min channels agree (2.61 vs 2.73 C, same ordering) - which is what proved
+  the offset is a real thermal gradient, not miscalibration. Divergence
+  between channels therefore indicates a SENSOR fault.
+- Deviations exposed in physical units (V, C) alongside the 0-100 scores.
+- OPTIONAL ambient temperature input (`bh_ambient_entity`, configurable so the
+  sensor can be replaced): pack rise above ambient measures heat GENERATION,
+  which inter-pack spread cannot see when all packs age together. Degrades
+  silently when absent or unavailable.
+
+**New entities.** Buttons: recalibrate pack-balance baseline; re-anchor
+capacity reference (disabled by default - it redefines what 100% means).
+All baseline operations append epochs, never overwrite, and log at WARNING.
+
+**Register set:** +1 (`storage_charging_cutoff_capacity`, 47081), deliberate
+and justified in the golden-list test.
+
+**Tests: 337 -> 368 passed, 1 skipped.** New: T21 capacity reference, T22
+stale endpoints, T23 install date, T24 sub-score hold, T25 efficiency anchor
+tiers, T26 balance diagnostic channels, T27 thermal rise. Balance and gap
+tests that asserted superseded designs were replaced, not weakened - the
+number of assertions in both areas increased.
+
+**Adversarial verification:** the new suite was run against the pristine
+v1.1.8 tree - 80 tests fail. Two real bugs were caught by the new tests during
+development: a falsy-zero install timestamp, and the winter-biased reference
+capture described under Finding J.
+
+**Validation data.** All findings were derived by replaying a real 6-month
+dataset offline. That data is confidential and is NOT included in this
+repository. `tests/FIELD_VALIDATION.md` documents which sensors were used, how
+the analysis was performed, and the numeric results, so the work is
+reproducible by anyone with their own equivalent export.
 
 ### v1.1.8 (2026-07-25)
 **Design correction: data gaps are bridged, not discarded**

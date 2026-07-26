@@ -42,7 +42,9 @@ from homeassistant.const import (
 import homeassistant.helpers.config_validation as cv
 
 from .const import (
+    CONF_BH_AMBIENT_ENTITY,
     CONF_BH_ENABLED,
+    CONF_BH_INSTALL_DATE,
     CONF_BH_MIN_SEGMENT_DELTA_SOC,
     CONF_BH_RATED_CAPACITY_KWH,
     CONF_BH_WARRANTY_THROUGHPUT_KWH,
@@ -1450,6 +1452,14 @@ class BatteryHealthOptionsFlowHandler(config_entries.OptionsFlow):
                     CONF_BH_ENABLED,
                     default=options.get(CONF_BH_ENABLED, True),
                 ): bool,
+                vol.Optional(
+                    CONF_BH_AMBIENT_ENTITY,
+                    default=options.get(CONF_BH_AMBIENT_ENTITY, ""),
+                ): str,
+                vol.Optional(
+                    CONF_BH_INSTALL_DATE,
+                    default=options.get(CONF_BH_INSTALL_DATE, ""),
+                ): str,
                 vol.Optional(
                     CONF_BH_RATED_CAPACITY_KWH,
                     default=options.get(CONF_BH_RATED_CAPACITY_KWH, 20.7),

@@ -45,12 +45,17 @@ def _cfg(**overrides) -> "bh.BatteryHealthConfig":
 
 
 def _sample(ts, soc=None, power=None, temp=None, chg=None, dis=None,
-            packs=None, calib=False) -> "bh.HealthSample":
+            packs=None, calib=False, ceiling=100.0) -> "bh.HealthSample":
     return bh.HealthSample(
         timestamp=ts, soc=soc, power_w=power, battery_temp_c=temp,
         lifetime_charge_kwh=chg, lifetime_discharge_kwh=dis,
         packs=packs or [], soh_calibration_active=calib,
+        charge_ceiling_soc=ceiling,
     )
+
+
+#: v1.2.0 - idle no longer ends a segment (Finding F); only charging does.
+CLOSE_POWER = 1500.0
 
 
 def _run_discharge(engine, t0, soc0, soc1, dis0, dis1, steps=20, power=-2500.0,
@@ -62,8 +67,8 @@ def _run_discharge(engine, t0, soc0, soc1, dis0, dis1, steps=20, power=-2500.0,
             t0 + i * 60, soc=soc0 + (soc1 - soc0) * frac, power=power,
             temp=temp, chg=chg, dis=dis0 + (dis1 - dis0) * frac, calib=calib,
         ))
-    # Close: idle tick
-    engine.update(_sample(t0 + (steps + 1) * 60, soc=soc1, power=0.0,
+    # Close with a CHARGING tick (v1.2.0: idle no longer closes a segment)
+    engine.update(_sample(t0 + (steps + 1) * 60, soc=soc1, power=CLOSE_POWER,
                           temp=temp, chg=chg, dis=dis1, calib=calib))
     return t0 + (steps + 1) * 60
 
@@ -140,7 +145,7 @@ class TestSocCorrectionGuard(unittest.TestCase):  # T4
                                         (55, 1.5), (50, 2.0)]):
             eng.update(_sample(t + i * 60, soc=float(soc), power=-3000.0,
                                chg=0.0, dis=dis))
-        eng.update(_sample(t + 5 * 60, soc=50.0, power=0.0, chg=0.0, dis=2.0))
+        eng.update(_sample(t + 5 * 60, soc=50.0, power=1500.0, chg=0.0, dis=2.0))
         self.assertEqual(len(eng.segments.segments), 0)
         self.assertGreaterEqual(eng.segments.discarded_segments, 1)
 
@@ -191,7 +196,7 @@ class TestGapHandling(unittest.TestCase):  # T6 (contract corrected in v1.1.8)
         eng.mark_gap()                       # coordinator failure
         # Resume 5 min later, still discharging, then close normally.
         eng.update(_sample(480, soc=72.0, power=-3000.0, chg=0.0, dis=3.7))
-        eng.update(_sample(540, soc=72.0, power=0.0, chg=0.0, dis=3.7))
+        eng.update(_sample(540, soc=72.0, power=1500.0, chg=0.0, dis=3.7))
         self.assertEqual(len(eng.segments.segments), 1)
         seg = eng.segments.segments[0]
         self.assertEqual(seg.soc_start, 90.0)
@@ -214,7 +219,7 @@ class TestGapHandling(unittest.TestCase):  # T6 (contract corrected in v1.1.8)
                                chg=0.0, dis=float(i)))
         eng.update(_sample(300, soc=None, power=-3000.0, chg=0.0, dis=2.5))
         eng.update(_sample(360, soc=72.0, power=-3000.0, chg=0.0, dis=3.7))
-        eng.update(_sample(420, soc=72.0, power=0.0, chg=0.0, dis=3.7))
+        eng.update(_sample(420, soc=72.0, power=1500.0, chg=0.0, dis=3.7))
         self.assertEqual(len(eng.segments.segments), 1)
         self.assertEqual(eng.segments.segments[0].gap_bridged, 1)
 
@@ -233,7 +238,7 @@ class TestGapHandling(unittest.TestCase):  # T6 (contract corrected in v1.1.8)
             eng.update(_sample(i * 60, soc=soc, power=-2000.0, chg=0.0, dis=None))
         # Real closing reading
         eng.update(_sample(300, soc=75.0, power=-2000.0, chg=0.0, dis=5.175))
-        eng.update(_sample(360, soc=75.0, power=0.0, chg=0.0, dis=5.175))
+        eng.update(_sample(360, soc=75.0, power=1500.0, chg=0.0, dis=5.175))
         self.assertEqual(len(eng.segments.segments), 1)
         seg = eng.segments.segments[0]
         self.assertAlmostEqual(seg.implied_capacity_kwh, 20.7, delta=0.1)
@@ -246,7 +251,7 @@ class TestGapHandling(unittest.TestCase):  # T6 (contract corrected in v1.1.8)
                                chg=0.0, dis=float(i)))
         eng.mark_gap()
         # Resume 3 hours later — beyond the trust horizon.
-        eng.update(_sample(3 * 3600, soc=60.0, power=0.0, chg=0.0, dis=8.0))
+        eng.update(_sample(3 * 3600, soc=60.0, power=1500.0, chg=0.0, dis=8.0))
         self.assertEqual(len(eng.segments.segments), 0)
         self.assertGreaterEqual(eng.segments.discarded_segments, 1)
         self.assertEqual(eng.segments.gap_bridged_count, 0)
@@ -260,7 +265,7 @@ class TestGapHandling(unittest.TestCase):  # T6 (contract corrected in v1.1.8)
         # Old segment gone, but a new one must be open from this sample.
         eng.update(_sample(3 * 3600 + 3600, soc=45.0, power=-3000.0,
                            chg=0.0, dis=11.1))
-        eng.update(_sample(3 * 3600 + 3660, soc=45.0, power=0.0,
+        eng.update(_sample(3 * 3600 + 3660, soc=45.0, power=1500.0,
                            chg=0.0, dis=11.1))
         self.assertEqual(len(eng.segments.segments), 1)
         seg = eng.segments.segments[0]
@@ -274,7 +279,7 @@ class TestGapHandling(unittest.TestCase):  # T6 (contract corrected in v1.1.8)
             eng.update(_sample(i * 60, soc=float(soc), power=-3000.0,
                                chg=50.0, dis=100.0 + i))
         eng.update(_sample(300, soc=75.0, power=-3000.0, chg=50.0, dis=1.0))
-        eng.update(_sample(360, soc=70.0, power=0.0, chg=50.0, dis=2.0))
+        eng.update(_sample(360, soc=70.0, power=1500.0, chg=50.0, dis=2.0))
         self.assertEqual(len(eng.segments.segments), 0)
         self.assertEqual(eng.segments.gap_bridged_count, 0)
 
@@ -299,7 +304,7 @@ class TestGapHandling(unittest.TestCase):  # T6 (contract corrected in v1.1.8)
                 eng.update(_sample(t, soc=soc, power=-700.0, chg=0.0, dis=None))
                 continue
             eng.update(_sample(t, soc=soc, power=-700.0, chg=0.0, dis=dis))
-        eng.update(_sample(t + tick, soc=soc, power=0.0, chg=0.0, dis=dis))
+        eng.update(_sample(t + tick, soc=soc, power=1500.0, chg=0.0, dis=dis))
 
         self.assertEqual(len(eng.segments.segments), 1,
                          "a qualifying segment must survive intermittent timeouts")
@@ -334,7 +339,7 @@ class TestCounterReset(unittest.TestCase):  # T7
                                chg=50.0, dis=100.0 + i * 2))
         # Counter reset mid-segment
         eng.update(_sample(300, soc=60.0, power=-3000.0, chg=50.0, dis=1.0))
-        eng.update(_sample(360, soc=55.0, power=0.0, chg=50.0, dis=2.0))
+        eng.update(_sample(360, soc=55.0, power=1500.0, chg=50.0, dis=2.0))
         self.assertEqual(len(eng.segments.segments), 0)
         self.assertEqual(eng.report.attributes["counter_resets"], 1)
 
@@ -390,30 +395,108 @@ class TestEfficiency(unittest.TestCase):  # T8
         self.assertIsNone(eng.efficiency.baseline)
 
 
-class TestBalance(unittest.TestCase):  # T9
+class TestBalance(unittest.TestCase):  # T9 (contract replaced in v1.2.0)
+    """Pack balance, now scored against a learned baseline.
+
+    NOTE ON THE v1.2.0 CHANGE: the previous tests asserted absolute dV/dT
+    thresholds (e.g. dT=2.7 C -> 87.9). Field data showed that design was
+    unusable: a fixed 2.4 C inter-pack offset - present at idle (2.33 C) just
+    as much as under >1 kW charge (2.52 C), so demonstrably not
+    battery-generated heat - scored a healthy pack set at ~81/100, and the
+    0.1 V voltage register resolution made one LSB worth 11 score points.
+    Those tests encoded the flawed design; they are replaced, not weakened.
+    """
+
     def _packs(self, volts, temps, online=(True, True, True)):
         return [bh.PackSample(voltage=v, temp_max=t, temp_min=t - 1.0, online=o)
                 for v, t, o in zip(volts, temps, online)]
 
-    def test_spec_vector(self):
-        """Spec §11: ΔV=0 → 100; ΔT=2.7 → 75.7; SOH_bal = 87.9."""
-        eng = bh.BatteryHealthEngine(_cfg())
-        eng.balance.feed(_sample(0, soc=98.0, power=0.0,
-                                 packs=self._packs([26.4, 26.4, 26.4],
-                                                   [26.2, 28.9, 27.5])))
-        soh, _ = eng.balance.soh_balance()
-        self.assertAlmostEqual(soh, 87.9, delta=0.15)
+    def _feed(self, eng, n, volts, temps, soc=98.0, ceiling=100.0, t0=0.0):
+        for i in range(n):
+            eng.balance.feed(_sample(t0 + i * 60, soc=soc, power=0.0,
+                                     packs=self._packs(volts, temps),
+                                     ceiling=ceiling))
+
+    def test_no_score_until_baseline_captured(self):
+        cfg = _cfg(balance_baseline_min_samples=20)
+        eng = bh.BatteryHealthEngine(cfg)
+        self._feed(eng, 19, [26.4, 26.4, 26.5], [26.0, 28.4, 27.2])
+        soh, attrs = eng.balance.soh_balance()
+        self.assertIsNone(soh)
+        self.assertIsNone(attrs["balance_baseline_dv"])
+
+    def test_fixed_offset_cancels_after_baseline(self):
+        """THE key property: a constant offset must score ~100, not ~81."""
+        cfg = _cfg(balance_baseline_min_samples=20)
+        eng = bh.BatteryHealthEngine(cfg)
+        # 2.4 C fixed spread + 0.1 V quantisation step, exactly as measured.
+        self._feed(eng, 25, [26.4, 26.4, 26.5], [26.0, 28.4, 27.2])
+        soh, attrs = eng.balance.soh_balance()
+        self.assertIsNotNone(soh)
+        self.assertGreaterEqual(soh, 99.0)
+        self.assertAlmostEqual(attrs["balance_baseline_dt"], 2.4, places=2)
+        self.assertAlmostEqual(attrs["balance_baseline_dv"], 0.1, places=3)
+
+    def test_drift_away_from_baseline_lowers_score(self):
+        cfg = _cfg(balance_baseline_min_samples=20)
+        eng = bh.BatteryHealthEngine(cfg)
+        self._feed(eng, 25, [26.4, 26.4, 26.5], [26.0, 28.4, 27.2])
+        base, _ = eng.balance.soh_balance()
+        # One pack now runs 4 C hotter than its established norm.
+        self._feed(eng, 25, [26.4, 26.4, 26.5], [26.0, 32.4, 27.2], t0=10_000.0)
+        drifted, _ = eng.balance.soh_balance()
+        self.assertLess(drifted, base - 20.0)
+
+    def test_raw_values_always_exposed(self):
+        """Ground truth survives any recalibration."""
+        cfg = _cfg(balance_baseline_min_samples=5)
+        eng = bh.BatteryHealthEngine(cfg)
+        self._feed(eng, 10, [26.4, 26.4, 26.5], [26.0, 28.4, 27.2])
+        _, attrs = eng.balance.soh_balance()
+        self.assertAlmostEqual(attrs["balance_raw_dt"], 2.4, places=2)
+        eng.reset_balance_baseline()
+        _, attrs2 = eng.balance.soh_balance()
+        self.assertAlmostEqual(attrs2["balance_raw_dt"], 2.4, places=2)
+        self.assertIsNone(attrs2["balance_baseline_dt"])
+        self.assertGreaterEqual(attrs2["balance_baseline_epochs"], 1)
+
+    def test_adaptive_gate_samples_below_95_when_ceiling_is_lower(self):
+        """Field: a 93% configured cap meant SOC>=95 was unreachable for 78 days."""
+        cfg = _cfg(balance_baseline_min_samples=5)
+        eng = bh.BatteryHealthEngine(cfg)
+        self._feed(eng, 10, [26.4, 26.4, 26.5], [26.0, 28.4, 27.2],
+                   soc=92.5, ceiling=93.0)
+        self.assertIsNotNone(eng.balance.baseline_dt)
+
+    def test_hard_floor_rejects_mid_range_samples(self):
+        """LFP's flat mid-range OCV makes dV uninformative low down."""
+        cfg = _cfg(balance_baseline_min_samples=5)
+        eng = bh.BatteryHealthEngine(cfg)
+        self._feed(eng, 10, [26.4, 26.4, 26.5], [26.0, 28.4, 27.2],
+                   soc=45.0, ceiling=50.0)
+        self.assertIsNone(eng.balance.baseline_dt)
+
+    def test_ceiling_change_starts_new_epoch(self):
+        cfg = _cfg(balance_baseline_min_samples=5)
+        eng = bh.BatteryHealthEngine(cfg)
+        self._feed(eng, 10, [26.4, 26.4, 26.5], [26.0, 28.4, 27.2], ceiling=95.0)
+        self.assertIsNotNone(eng.balance.baseline_dt)
+        self._feed(eng, 1, [26.4, 26.4, 26.5], [26.0, 28.4, 27.2],
+                   ceiling=100.0, t0=50_000.0)
+        self.assertIsNone(eng.balance.baseline_dt)
+        self.assertGreaterEqual(len(eng.balance.baseline_epochs), 2)
 
     def test_offline_pack_excluded(self):
-        eng = bh.BatteryHealthEngine(_cfg())
-        eng.balance.feed(_sample(0, soc=98.0, power=0.0,
-                                 packs=self._packs([26.4, 0.0, 26.5],
-                                                   [26.0, 0.0, 26.5],
-                                                   online=(True, False, True))))
-        soh, attrs = eng.balance.soh_balance()
+        cfg = _cfg(balance_baseline_min_samples=5)
+        eng = bh.BatteryHealthEngine(cfg)
+        for i in range(10):
+            eng.balance.feed(_sample(i * 60, soc=98.0, power=0.0,
+                                     packs=self._packs([26.4, 0.0, 26.5],
+                                                       [26.0, 0.0, 26.5],
+                                                       online=(True, False, True))))
+        _, attrs = eng.balance.soh_balance()
         self.assertEqual(attrs["packs_included"], [1, 3])
         self.assertEqual(attrs["packs_excluded"], [2])
-        self.assertIsNotNone(soh)
 
     def test_fewer_than_two_online_packs_no_sample(self):
         eng = bh.BatteryHealthEngine(_cfg())
@@ -421,14 +504,13 @@ class TestBalance(unittest.TestCase):  # T9
                                  packs=self._packs([26.4, 0.0, 0.0],
                                                    [26.0, 0.0, 0.0],
                                                    online=(True, False, False))))
-        soh, _ = eng.balance.soh_balance()
-        self.assertIsNone(soh)
+        self.assertIsNone(eng.balance.soh_balance()[0])
 
     def test_gating_rejects_loaded_or_low_soc(self):
         eng = bh.BatteryHealthEngine(_cfg())
         packs = self._packs([26.4, 26.4, 26.4], [26.0, 26.0, 26.0])
-        eng.balance.feed(_sample(0, soc=98.0, power=3000.0, packs=packs))  # loaded
-        eng.balance.feed(_sample(0, soc=50.0, power=0.0, packs=packs))     # low SOC
+        eng.balance.feed(_sample(0, soc=98.0, power=3000.0, packs=packs))
+        eng.balance.feed(_sample(0, soc=20.0, power=0.0, packs=packs))
         self.assertEqual(len(eng.balance.scores), 0)
 
 
@@ -494,12 +576,14 @@ class TestComposite(unittest.TestCase):  # T11
         # efficiency: baseline @ η=0.96 then current identical → 100
         eng.efficiency.feed(_sample(t + 100, soc=99.0, power=0.0, chg=200.0, dis=150.0))
         eng.efficiency.feed(_sample(t + DAY, soc=99.0, power=0.0, chg=240.0, dis=188.4))
-        # balance: perfect packs → 100
-        eng.balance.feed(_sample(t + DAY, soc=99.0, power=0.0, packs=[
-            bh.PackSample(voltage=26.4, temp_max=25.0, temp_min=24.0, online=True),
-            bh.PackSample(voltage=26.4, temp_max=25.0, temp_min=24.0, online=True),
-            bh.PackSample(voltage=26.4, temp_max=25.5, temp_min=24.0, online=True),
-        ]))
+        # balance: baseline-relative, so feed enough samples to establish it
+        # and then score at the same (stable) spread -> ~100
+        for i in range(cfg.balance_baseline_min_samples + 5):
+            eng.balance.feed(_sample(t + DAY + i, soc=99.0, power=0.0, packs=[
+                bh.PackSample(voltage=26.4, temp_max=25.0, temp_min=24.0, online=True),
+                bh.PackSample(voltage=26.4, temp_max=25.0, temp_min=24.0, online=True),
+                bh.PackSample(voltage=26.4, temp_max=25.5, temp_min=24.0, online=True),
+            ]))
         eng.update(_sample(t + DAY + 60, soc=99.0, power=0.0, chg=240.0,
                            dis=188.4, temp=20.0))
         r = eng.report
@@ -797,7 +881,7 @@ class TestGapBridgingDiagnostics(unittest.TestCase):  # T20
         eng.update(_sample(0, soc=95.0, power=-3000.0, chg=0.0, dis=0.0))
         eng.mark_gap()
         eng.update(_sample(300, soc=80.0, power=-3000.0, chg=0.0, dis=3.1))
-        eng.update(_sample(360, soc=80.0, power=0.0, chg=0.0, dis=3.1))
+        eng.update(_sample(360, soc=80.0, power=1500.0, chg=0.0, dis=3.1))
         _, attrs = eng.segments.soh_capacity()
         self.assertIn("gap_bridged_count", attrs)
         self.assertEqual(attrs["gap_bridged_count"], 1)
@@ -808,7 +892,7 @@ class TestGapBridgingDiagnostics(unittest.TestCase):  # T20
         eng.update(_sample(0, soc=95.0, power=-3000.0, chg=0.0, dis=0.0))
         eng.mark_gap()
         eng.update(_sample(300, soc=80.0, power=-3000.0, chg=0.0, dis=3.1))
-        eng.update(_sample(360, soc=80.0, power=0.0, chg=0.0, dis=3.1))
+        eng.update(_sample(360, soc=80.0, power=1500.0, chg=0.0, dis=3.1))
         data = eng.to_dict()
         import json
         json.dumps(data)
@@ -841,3 +925,345 @@ class TestGapBridgingDiagnostics(unittest.TestCase):  # T20
         self.assertEqual(len(eng.segments.segments), 1)
         self.assertEqual(eng.segments.segments[0].gap_bridged, 0)
         self.assertEqual(eng.segments.discarded_segments, 3)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# v1.2.0 — findings H, C, D, N, L/O
+# ═════════════════════════════════════════════════════════════════════════════
+class TestCapacityReference(unittest.TestCase):  # T21 / Finding H
+    """SOH_cap must be anchored to MEASURED capacity, not the nameplate.
+
+    Field evidence: a pack rated 20.7 kWh measured a consistent ~22.8 kWh
+    across 162 segments over 6 months (spread 0.31). Anchoring to the
+    nameplate pinned SOH_cap at the 100% clip, so the first ~10% of any real
+    degradation would have been invisible.
+    """
+
+    def _fill(self, eng, n, cap_kwh=22.8, t0=0.0, spacing=None):
+        """Run n daily-ish segments. Spacing matters: the reference capture
+        requires the segments to SPAN time, not merely to exist."""
+        t = t0
+        step = spacing if spacing is not None else DAY
+        for i in range(n):
+            energy = cap_kwh * 0.23
+            t = _run_discharge(eng, t0 + i * step, 100.0, 77.0,
+                               i * energy, (i + 1) * energy)
+        return t0 + n * step
+
+    def test_reference_auto_captured_from_measurement(self):
+        cfg = _cfg(freshness_tau_kwh=1e12, capacity_reference_min_segments=10,
+                   capacity_reference_min_span_days=5.0)
+        eng = bh.BatteryHealthEngine(cfg)
+        self._fill(eng, 12)
+        soh, attrs = eng.segments.soh_capacity()
+        self.assertTrue(attrs["capacity_reference_is_measured"])
+        self.assertAlmostEqual(attrs["capacity_reference_kwh"], 22.8, delta=0.3)
+        self.assertAlmostEqual(soh, 100.0, delta=1.0)
+
+    def test_nameplate_mismatch_no_longer_hides_degradation(self):
+        """With a 20.7 nameplate and 22.8 real capacity, a 5% fade must show."""
+        cfg = _cfg(freshness_tau_kwh=1e12, capacity_reference_min_segments=10,
+                   capacity_reference_min_span_days=5.0)
+        eng = bh.BatteryHealthEngine(cfg)
+        self._fill(eng, 12, cap_kwh=22.8)
+        healthy, _ = eng.segments.soh_capacity()
+        # Now the same battery delivers 5% less per SOC point.
+        eng2 = bh.BatteryHealthEngine(cfg)
+        eng2.segments.set_reference(22.8, reason="test")
+        self._fill(eng2, 12, cap_kwh=22.8 * 0.95)
+        faded, _ = eng2.segments.soh_capacity()
+        self.assertAlmostEqual(healthy, 100.0, delta=1.0)
+        self.assertAlmostEqual(faded, 95.0, delta=1.5)
+        self.assertLess(faded, 97.0, "a 5% fade must be visible, not clipped")
+
+    def test_clip_allows_headroom_above_100(self):
+        cfg = _cfg(freshness_tau_kwh=1e12, capacity_reference_min_segments=100)
+        eng = bh.BatteryHealthEngine(cfg)
+        eng.segments.set_reference(20.7, reason="nameplate")
+        self._fill(eng, 3, cap_kwh=22.8)
+        soh, _ = eng.segments.soh_capacity()
+        self.assertGreater(soh, 100.0)
+        self.assertLessEqual(soh, cfg.soh_capacity_clip_max)
+
+    def test_reanchor_appends_epoch_and_refuses_on_thin_data(self):
+        cfg = _cfg(freshness_tau_kwh=1e12, capacity_reference_min_segments=10,
+                   capacity_reference_min_span_days=5.0)
+        eng = bh.BatteryHealthEngine(cfg)
+        self._fill(eng, 3)
+        self.assertFalse(eng.reanchor_capacity_reference())   # too few segments
+        # Enough segments, but crammed into a single day -> still refused,
+        # because a reference must average out seasonal operating-range
+        # effects (Finding J).
+        eng2 = bh.BatteryHealthEngine(cfg)
+        eng2.cfg.capacity_window_days = 400.0
+        self._fill(eng2, 12, spacing=600.0)
+        self.assertFalse(eng2.reanchor_capacity_reference())
+        self._fill(eng, 12, t0=10 * DAY)
+        self.assertTrue(eng.reanchor_capacity_reference())
+        self.assertGreaterEqual(len(eng.segments.reference_epochs), 1)
+        self.assertIsNotNone(eng.segments.reference_epochs[-1]["reason"])
+
+    def test_reference_survives_persistence(self):
+        cfg = _cfg(freshness_tau_kwh=1e12, capacity_reference_min_segments=10)
+        eng = bh.BatteryHealthEngine(cfg)
+        self._fill(eng, 12)
+        import json
+        data = json.loads(json.dumps(eng.to_dict()))
+        eng2 = bh.BatteryHealthEngine(cfg)
+        eng2.restore(data)
+        self.assertAlmostEqual(eng2.segments.reference_capacity_kwh,
+                               eng.segments.reference_capacity_kwh, places=6)
+
+    def test_segment_records_soc_midpoint_and_ceiling(self):
+        """Finding J: the operating band must be recorded alongside capacity."""
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        eng = bh.BatteryHealthEngine(cfg)
+        _run_discharge(eng, 0.0, 100.0, 77.0, 0.0, 5.24)
+        seg = eng.segments.segments[0]
+        self.assertAlmostEqual(seg.soc_midpoint, 88.5, places=1)
+        self.assertEqual(seg.charge_ceiling, 100.0)
+        _, attrs = eng.segments.soh_capacity()
+        self.assertAlmostEqual(attrs["segment_soc_midpoint_mean"], 88.5, places=1)
+
+
+class TestStaleCounterEndpoints(unittest.TestCase):  # T22 / Finding C
+    def test_segment_does_not_open_on_carried_forward_counter(self):
+        eng = bh.BatteryHealthEngine(_cfg())
+        # Establish counters, then a failed read carries the value forward.
+        eng.update(_sample(0, soc=95.0, power=0.0, chg=10.0, dis=10.0, temp=20.0))
+        eng.update(_sample(60, soc=94.0, power=-3000.0, chg=None, dis=None,
+                           temp=20.0))
+        self.assertEqual(len(eng.segments.segments), 0)
+        self.assertGreaterEqual(eng.segments.stale_endpoint_skips, 1)
+
+    def test_segment_opens_normally_on_fresh_counter(self):
+        eng = bh.BatteryHealthEngine(_cfg())
+        eng.update(_sample(0, soc=95.0, power=0.0, chg=10.0, dis=10.0, temp=20.0))
+        eng.update(_sample(60, soc=94.0, power=-3000.0, chg=10.0, dis=10.1,
+                           temp=20.0))
+        self.assertTrue(eng.segments._active)
+
+
+class TestInstallDate(unittest.TestCase):  # T23 / Finding D
+    def test_install_date_drives_forecast_age(self):
+        year = 365.25 * DAY
+        cfg = _cfg(battery_install_ts=0.0)
+        eng = bh.BatteryHealthEngine(cfg)
+        # Integration only starts observing one year after installation.
+        eng.update(_sample(year, soc=50.0, power=0.0, chg=0.0, dis=0.0, temp=25.0))
+        r = eng.report
+        self.assertEqual(r.attributes["battery_age_source"], "install_date")
+        self.assertAlmostEqual(r.attributes["battery_age_days"], 365, delta=2)
+        self.assertAlmostEqual(r.predicted_soh, 100.0 - 2.5, delta=0.4)
+
+    def test_falls_back_to_first_seen(self):
+        eng = bh.BatteryHealthEngine(_cfg())
+        eng.update(_sample(0.0, soc=50.0, power=0.0, chg=0.0, dis=0.0, temp=25.0))
+        self.assertEqual(eng.report.attributes["battery_age_source"], "first_seen")
+
+
+class TestSubscoreHold(unittest.TestCase):  # T24 / Finding N
+    """Seasonal term availability must not step the composite."""
+
+    def test_balance_held_when_seasonally_unavailable(self):
+        cfg = _cfg(freshness_tau_kwh=1e12, balance_baseline_min_samples=5,
+                   subscore_hold_days=90.0)
+        eng = bh.BatteryHealthEngine(cfg)
+        t = _run_discharge(eng, 0.0, 100.0, 77.0, 0.0, 5.24)
+        packs = [bh.PackSample(voltage=26.4, temp_max=25.0, temp_min=24.0, online=True)
+                 for _ in range(3)]
+        for i in range(10):
+            eng.balance.feed(_sample(t + i, soc=99.0, power=0.0, packs=packs))
+        eng.update(_sample(t + 100, soc=80.0, power=0.0, chg=6.0, dis=5.24, temp=20.0))
+        with_bal = eng.report
+        self.assertIn("balance", with_bal.attributes["contributing_terms"])
+
+        # Winter: no more balance samples for 30 days. Term must be HELD.
+        eng.balance.scores.clear()
+        eng.balance._median_cache = None
+        eng.update(_sample(t + 30 * DAY, soc=60.0, power=0.0, chg=6.0,
+                           dis=5.24, temp=20.0))
+        held = eng.report
+        self.assertIn("balance", held.attributes["contributing_terms"])
+        self.assertIn("balance", held.attributes["held_terms"])
+        self.assertAlmostEqual(held.bhi, with_bal.bhi, delta=0.2)
+
+    def test_hold_expires_after_configured_window(self):
+        cfg = _cfg(freshness_tau_kwh=1e12, balance_baseline_min_samples=5,
+                   subscore_hold_days=10.0)
+        eng = bh.BatteryHealthEngine(cfg)
+        t = _run_discharge(eng, 0.0, 100.0, 77.0, 0.0, 5.24)
+        packs = [bh.PackSample(voltage=26.4, temp_max=25.0, temp_min=24.0, online=True)
+                 for _ in range(3)]
+        for i in range(10):
+            eng.balance.feed(_sample(t + i, soc=99.0, power=0.0, packs=packs))
+        eng.update(_sample(t + 100, soc=80.0, power=0.0, chg=6.0, dis=5.24, temp=20.0))
+        eng.balance.scores.clear()
+        eng.balance._median_cache = None
+        eng.update(_sample(t + 40 * DAY, soc=60.0, power=0.0, chg=6.0,
+                           dis=5.24, temp=20.0))
+        self.assertNotIn("balance", eng.report.attributes["contributing_terms"])
+
+
+class TestEfficiencyAnchorTiers(unittest.TestCase):  # T25 / Findings L, O
+    """Anchors must sit at EQUAL stored energy, with a winter fallback."""
+
+    def _anchor(self, eng, ts, chg, dis, soc=100.0, ceiling=100.0):
+        eng.efficiency.feed(_sample(ts, soc=soc, power=0.0, chg=chg, dis=dis,
+                                    ceiling=ceiling))
+
+    def test_tier1_anchors_at_recalibration_point(self):
+        cfg = _cfg(eff_baseline_windows=1)
+        eng = bh.BatteryHealthEngine(cfg)
+        self._anchor(eng, 0.0, 0.0, 0.0)
+        self._anchor(eng, DAY, 20.0, 19.8)
+        self.assertEqual(len(eng.efficiency.windows), 1)
+        self.assertEqual(eng.efficiency.window_tiers[-1], 1)
+
+    def test_tier2_requires_matched_soc(self):
+        """A 93% ceiling still yields anchors, but only matched pairs."""
+        cfg = _cfg(eff_baseline_windows=1)
+        eng = bh.BatteryHealthEngine(cfg)
+        self._anchor(eng, 0.0, 0.0, 0.0, soc=93.0, ceiling=93.0)
+        # Mismatched partner (91 vs 93) must NOT produce a window.
+        self._anchor(eng, DAY, 20.0, 19.8, soc=91.0, ceiling=93.0)
+        self.assertEqual(len(eng.efficiency.windows), 0)
+
+    def test_tier2_matched_pair_produces_window(self):
+        cfg = _cfg(eff_baseline_windows=1)
+        eng = bh.BatteryHealthEngine(cfg)
+        self._anchor(eng, 0.0, 0.0, 0.0, soc=93.0, ceiling=93.0)
+        self._anchor(eng, DAY, 20.0, 19.8, soc=93.0, ceiling=93.0)
+        self.assertEqual(len(eng.efficiency.windows), 1)
+        self.assertEqual(eng.efficiency.window_tiers[-1], 2)
+
+    def test_no_anchor_below_min_ceiling(self):
+        cfg = _cfg(eff_baseline_windows=1)
+        eng = bh.BatteryHealthEngine(cfg)
+        self._anchor(eng, 0.0, 0.0, 0.0, soc=45.0, ceiling=50.0)
+        self._anchor(eng, DAY, 20.0, 19.8, soc=45.0, ceiling=50.0)
+        self.assertEqual(len(eng.efficiency.windows), 0)
+
+    def test_tier2_window_is_time_capped(self):
+        cfg = _cfg(eff_baseline_windows=1, eff_tier2_max_window_days=5.0)
+        eng = bh.BatteryHealthEngine(cfg)
+        self._anchor(eng, 0.0, 0.0, 0.0, soc=93.0, ceiling=93.0)
+        self._anchor(eng, 10 * DAY, 20.0, 19.8, soc=93.0, ceiling=93.0)
+        self.assertEqual(len(eng.efficiency.windows), 0)
+
+    def test_ceiling_change_starts_new_epoch(self):
+        """Field: eta 0.9801 at a 93% cap vs 0.9883 at 100% = 6.5 SOH points."""
+        cfg = _cfg(eff_baseline_windows=1)
+        eng = bh.BatteryHealthEngine(cfg)
+        self._anchor(eng, 0.0, 0.0, 0.0, soc=93.0, ceiling=93.0)
+        self._anchor(eng, DAY, 20.0, 19.6, soc=93.0, ceiling=93.0)
+        self.assertIsNotNone(eng.efficiency.baseline)
+        # User raises the cap to 100%: the old baseline must not carry over.
+        self._anchor(eng, 2 * DAY, 21.0, 20.6, soc=100.0, ceiling=100.0)
+        self.assertIsNone(eng.efficiency.baseline)
+        self.assertGreaterEqual(len(eng.efficiency.baseline_epochs), 2)
+        self.assertEqual(len(eng.efficiency.windows), 0)
+
+    def test_lower_threshold_still_requires_min_charge(self):
+        cfg = _cfg(eff_baseline_windows=1, eff_min_window_charge_kwh=15.0)
+        eng = bh.BatteryHealthEngine(cfg)
+        self._anchor(eng, 0.0, 0.0, 0.0)
+        self._anchor(eng, DAY, 10.0, 9.9)      # below threshold
+        self.assertEqual(len(eng.efficiency.windows), 0)
+        self._anchor(eng, 2 * DAY, 16.0, 15.8)
+        self.assertEqual(len(eng.efficiency.windows), 1)
+
+
+class TestBalanceDiagnosticChannels(unittest.TestCase):  # T26
+    """Independent MIN-sensor channel and physical-unit deviations."""
+
+    def _feed(self, eng, n, tmax, tmin, volts=(26.4, 26.4, 26.5)):
+        for i in range(n):
+            packs = [bh.PackSample(voltage=v, temp_max=a, temp_min=b, online=True)
+                     for v, a, b in zip(volts, tmax, tmin)]
+            eng.balance.feed(_sample(i * 60, soc=98.0, power=0.0, packs=packs))
+
+    def test_min_sensor_spread_tracked_independently(self):
+        cfg = _cfg(balance_baseline_min_samples=5)
+        eng = bh.BatteryHealthEngine(cfg)
+        # Field-like: max spread 2.6, min spread 2.7, same ordering.
+        self._feed(eng, 10, (25.9, 28.5, 27.2), (23.6, 26.2, 25.1))
+        _, attrs = eng.balance.soh_balance()
+        self.assertAlmostEqual(attrs["balance_raw_dt"], 2.6, places=1)
+        self.assertAlmostEqual(attrs["balance_raw_dt_min_sensors"], 2.6, places=1)
+        self.assertLess(attrs["balance_channel_disagreement"], 0.3)
+
+    def test_channel_disagreement_flags_sensor_fault(self):
+        """Max and min channels diverging points at a sensor, not a thermal, issue."""
+        cfg = _cfg(balance_baseline_min_samples=5)
+        eng = bh.BatteryHealthEngine(cfg)
+        self._feed(eng, 10, (25.9, 33.0, 27.2), (23.6, 26.2, 25.1))
+        _, attrs = eng.balance.soh_balance()
+        self.assertGreater(attrs["balance_channel_disagreement"], 3.0)
+
+    def test_deviation_exposed_in_physical_units(self):
+        cfg = _cfg(balance_baseline_min_samples=5)
+        eng = bh.BatteryHealthEngine(cfg)
+        self._feed(eng, 10, (25.9, 28.5, 27.2), (23.6, 26.2, 25.1))
+        _, base = eng.balance.soh_balance()
+        self.assertAlmostEqual(base["balance_dt_deviation"], 0.0, places=1)
+        self._feed(eng, 5, (25.9, 30.5, 27.2), (23.6, 26.2, 25.1))
+        _, drift = eng.balance.soh_balance()
+        self.assertAlmostEqual(drift["balance_dt_deviation"], 2.0, places=1)
+
+
+class TestThermalRise(unittest.TestCase):  # T27 / optional ambient input
+    """Rise above ambient measures heat GENERATION.
+
+    Inter-pack spread is blind to all packs ageing together; rise above
+    ambient is not.  Field baseline (max sensors): +2.6 / +5.2 / +3.9 C.
+    """
+
+    def _packs(self, temps):
+        return [bh.PackSample(voltage=26.4, temp_max=t, temp_min=t - 2.3,
+                              online=True) for t in temps]
+
+    def test_thermal_rise_computed_when_ambient_present(self):
+        cfg = _cfg(balance_baseline_min_samples=5)
+        eng = bh.BatteryHealthEngine(cfg)
+        for i in range(10):
+            s = _sample(i * 60, soc=98.0, power=0.0,
+                        packs=self._packs([25.9, 28.5, 27.2]))
+            s.ambient_temp_c = 23.3
+            eng.balance.feed(s)
+        _, attrs = eng.balance.soh_balance()
+        rise = attrs["thermal_rise_above_ambient"]
+        self.assertEqual(len(rise), 3)
+        self.assertAlmostEqual(rise[0], 2.6, places=1)
+        self.assertAlmostEqual(rise[1], 5.2, places=1)
+        self.assertAlmostEqual(attrs["thermal_rise_max"], 5.2, places=1)
+
+    def test_absent_ambient_degrades_silently(self):
+        cfg = _cfg(balance_baseline_min_samples=5)
+        eng = bh.BatteryHealthEngine(cfg)
+        for i in range(10):
+            eng.balance.feed(_sample(i * 60, soc=98.0, power=0.0,
+                                     packs=self._packs([25.9, 28.5, 27.2])))
+        _, attrs = eng.balance.soh_balance()
+        self.assertIsNone(attrs["thermal_rise_above_ambient"])
+        self.assertIsNotNone(attrs["balance_raw_dt"])   # everything else works
+
+    def test_rise_deviation_detects_uniform_ageing(self):
+        """All packs hotter by the same amount: spread unchanged, rise up."""
+        cfg = _cfg(balance_baseline_min_samples=5)
+        eng = bh.BatteryHealthEngine(cfg)
+        for i in range(10):
+            s = _sample(i * 60, soc=98.0, power=0.0,
+                        packs=self._packs([25.9, 28.5, 27.2]))
+            s.ambient_temp_c = 23.3
+            eng.balance.feed(s)
+        _, base = eng.balance.soh_balance()
+        self.assertAlmostEqual(base["thermal_rise_deviation"], 0.0, places=1)
+        for i in range(5):
+            s = _sample(20_000 + i * 60, soc=98.0, power=0.0,
+                        packs=self._packs([27.9, 30.5, 29.2]))
+            s.ambient_temp_c = 23.3
+            eng.balance.feed(s)
+        _, later = eng.balance.soh_balance()
+        self.assertAlmostEqual(later["balance_dt_deviation"], 0.0, places=1)
+        self.assertAlmostEqual(later["thermal_rise_deviation"], 2.0, places=1)

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable
 
 from homeassistant.core import HomeAssistant, callback
@@ -39,6 +40,8 @@ from .battery_health import (
     SCHEMA_VERSION,
 )
 from .const import (
+    CONF_BH_AMBIENT_ENTITY,
+    CONF_BH_INSTALL_DATE,
     CONF_BH_MIN_SEGMENT_DELTA_SOC,
     CONF_BH_RATED_CAPACITY_KWH,
     CONF_BH_WARRANTY_THROUGHPUT_KWH,
@@ -69,6 +72,11 @@ _RN_TOTAL_CHARGE = "storage_total_charge"                   # 37780, /100 kWh
 _RN_TOTAL_DISCHARGE = "storage_total_discharge"             # 37782, /100 kWh
 _RN_RATED_CAPACITY = "storage_rated_capacity"               # 37758, Wh (logged)
 _RN_UNIT_CALIBRATION = "storage_unit_soh_calibration_status"  # 37926
+#: v1.2.0 - "full" is defined relative to the CONFIGURED end-of-charge SOC,
+#: not an absolute 100%. A user running a 93% summer cap still reaches their
+#: ceiling daily; an absolute gate produced no anchors for 122 days in the
+#: field. Read-only here; the integration exposes a separate writable entity.
+_RN_END_OF_CHARGE_SOC = "storage_charging_cutoff_capacity"    # 47081, %
 
 _RN_PACK_VOLTAGE = [
     f"storage_unit_1_battery_pack_{i}_voltage" for i in range(1, PACK_COUNT + 1)
@@ -98,6 +106,7 @@ REQUIRED_REGISTER_NAMES: list[str] = [
     _RN_TOTAL_DISCHARGE,
     _RN_RATED_CAPACITY,
     _RN_UNIT_CALIBRATION,
+    _RN_END_OF_CHARGE_SOC,
     *_RN_PACK_VOLTAGE,
     *_RN_PACK_TMAX,
     *_RN_PACK_TMIN,
@@ -126,6 +135,19 @@ def config_from_options(options: dict[str, Any] | None) -> BatteryHealthConfig:
     cfg.min_segment_delta_soc = float(
         options.get(CONF_BH_MIN_SEGMENT_DELTA_SOC, cfg.min_segment_delta_soc)
     )
+    # Finding D: the calendar-aging forecast needs the true install date;
+    # otherwise an already-aged battery is modelled as new from the moment
+    # this integration first ran.
+    install = options.get(CONF_BH_INSTALL_DATE)
+    if install:
+        try:
+            cfg.battery_install_ts = datetime.fromisoformat(
+                str(install)
+            ).replace(tzinfo=timezone.utc).timestamp()
+        except (TypeError, ValueError):
+            _LOGGER.warning(
+                "battery_health: could not parse battery install date %r; "
+                "falling back to first-observed date", install)
     return cfg
 
 
@@ -165,6 +187,12 @@ class BatteryHealthManager:
         self.last_rated_capacity_wh: float | None = None
         # v1.1.6: entity-notification change detection — see _notify().
         self._last_signature: tuple | None = None
+        #: Optional entity_id of an ambient temperature sensor (Finding: pack
+        #: rise above ambient tracks heat generation). Read defensively every
+        #: tick so replacing the sensor only needs an options change.
+        self._ambient_entity: str | None = (options or {}).get(
+            CONF_BH_AMBIENT_ENTITY) or None
+        self._ambient_warned = False
 
     # ── registry (ModbusTelemetry pattern) ──────────────────────────────────
     @classmethod
@@ -237,8 +265,23 @@ class BatteryHealthManager:
     async def async_reset_efficiency_baseline(self) -> None:
         """Manual efficiency-baseline re-capture (button)."""
         self.engine.reset_efficiency_baseline()
+        await self._flush_and_notify()
+
+    async def async_reset_balance_baseline(self) -> None:
+        """Re-anchor pack-balance scoring. Raw dV/dT are NOT affected."""
+        self.engine.reset_balance_baseline()
+        await self._flush_and_notify()
+
+    async def async_reanchor_capacity_reference(self) -> bool:
+        """Re-anchor SOH capacity to the current measured estimate."""
+        applied = self.engine.reanchor_capacity_reference()
+        if applied:
+            await self._flush_and_notify()
+        return applied
+
+    async def _flush_and_notify(self) -> None:
         await self._store.async_save(self.engine.to_dict())
-        self._last_signature = None     # force next tick to notify
+        self._last_signature = None     # force the next tick to notify
         self._notify(self.engine.report)
 
     # ── coordinator callback ────────────────────────────────────────────────
@@ -331,7 +374,34 @@ class BatteryHealthManager:
             lifetime_discharge_kwh=_value(data, _RN_TOTAL_DISCHARGE),
             packs=packs,
             soh_calibration_active=calibration_active,
+            charge_ceiling_soc=_value(data, _RN_END_OF_CHARGE_SOC),
+            ambient_temp_c=self._read_ambient(),
         )
+
+    def _read_ambient(self) -> float | None:
+        """Read the optional ambient temperature sensor, if configured.
+
+        Never raises and never blocks: a missing, renamed, or unavailable
+        entity simply disables the thermal-rise attributes.
+        """
+        if not self._ambient_entity:
+            return None
+        state = self.hass.states.get(self._ambient_entity)
+        if state is None or state.state in ("unknown", "unavailable"):
+            if not self._ambient_warned:
+                self._ambient_warned = True
+                _LOGGER.warning(
+                    "battery_health[%s]: ambient temperature entity %s is "
+                    "unavailable; thermal-rise diagnostics are disabled until "
+                    "it returns (change it under the integration options)",
+                    self.serial_number, self._ambient_entity)
+            return None
+        try:
+            value = float(state.state)
+        except (TypeError, ValueError):
+            return None
+        self._ambient_warned = False
+        return value
 
     def _notify(self, report: HealthReport) -> None:
         for cb in list(self._listeners):

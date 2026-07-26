@@ -1364,7 +1364,9 @@
           "bh_weight_efficiency": "Weight: SOH efficiency",
           "bh_weight_balance": "Weight: SOH balance",
           "bh_window_days": "Capacity rolling window (days)",
-          "bh_min_segment_delta_soc": "Min segment ΔSOC (%)"
+          "bh_min_segment_delta_soc": "Min segment ΔSOC (%)",
+          "bh_install_date": "Battery install date (YYYY-MM-DD)",
+          "bh_ambient_entity": "Ambient temperature sensor entity (optional)"
         }
       }
     }

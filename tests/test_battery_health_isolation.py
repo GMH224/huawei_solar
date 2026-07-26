@@ -6,7 +6,7 @@ The battery-health subsystem is *additive*: it must never be able to degrade
 the integration that existed before it.  A user running v1.1.6 hit a
 whole-config-entry setup cancellation while the Modbus link was struggling:
 
-    Setup of config entry 'SUN2000-10KTL-M1' ... cancelled
+    Setup of config entry '<inverter>' ... cancelled
       -> entity_platform ... asyncio.exceptions.CancelledError
     Config entry ... for huawei_solar.<platform> has already been setup!  (x5)
 
@@ -128,7 +128,15 @@ class TestGoldenRegisterSet(unittest.TestCase):  # T19.1
     a shared RS485 bus and must be justified and re-validated, not slipped in.
     """
 
+    #: v1.2.0 CHANGE (deliberate, +1 register): storage_charging_cutoff_capacity
+    #: (47081) was added because "full" must be defined relative to the
+    #: CONFIGURED end-of-charge SOC, not an absolute 100%.  Field evidence: a
+    #: 93%/95% configured cap meant an absolute gate produced ZERO efficiency
+    #: anchors for 122 consecutive days and zero balance samples for 78.
+    #: Cost: one U16 register, adjacent to the storage control block already
+    #: polled by the integration's own end-of-charge SOC entity.
     GOLDEN = sorted([
+        "storage_charging_cutoff_capacity",
         "storage_state_of_capacity",
         "storage_charge_discharge_power",
         "storage_unit_1_battery_temperature",

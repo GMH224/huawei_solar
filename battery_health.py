@@ -61,7 +61,23 @@ class BatteryHealthConfig:
     """All tunable constants.  Values are starting points, not fitted truths."""
 
     # System reference
-    rated_capacity_kwh: float = 20.7          # LUNA2000-21-S1 usable (BOL)
+    rated_capacity_kwh: float = 20.7          # nameplate fallback only
+    #: v1.2.0 - SOH_cap is anchored to a MEASURED beginning-of-life capacity,
+    #: not the nameplate.  Field evidence: a LUNA2000-21-S1 rated 20.7 kWh
+    #: measured a consistent ~22.8 kWh across 162 segments spanning 6 months
+    #: (spread 0.31 kWh).  Anchoring to the nameplate pinned SOH_cap at the
+    #: 100% clip, hiding the first ~10% of any real degradation.
+    capacity_reference_kwh: float | None = None      # learned, persisted
+    capacity_reference_min_segments: int = 20
+    #: The reference must also SPAN time.  Implied capacity depends ~2% on
+    #: where in the SOC range a segment sat (Finding J), and usage is
+    #: seasonal, so anchoring to the first N segments alone captures whatever
+    #: conditions happened to come first.  On the field dataset that biased
+    #: the reference to 21.9 kWh against a true ~22.75 kWh and left SOH
+    #: capacity reading 103.8% indefinitely.
+    capacity_reference_min_span_days: float = 45.0
+    soh_capacity_clip_max: float = 110.0      # do not hide headroom at 100
+    battery_install_ts: float | None = None   # for calendar-age forecast
     warranty_throughput_kwh: float = 28_840.0  # CH/EEA: 28.84 MWh to 60%
 
     # Composite weights (auto-normalized; measured health terms only)
@@ -78,25 +94,53 @@ class BatteryHealthConfig:
     implied_capacity_max_kwh: float = 35.0    #   SOC-correction / glitch guard
     full_charge_soc: float = 97.0             # "full" for freshness/anchors
     freshness_tau_kwh: float = 40.0           # coulomb-drift decay constant
+    segment_max_idle_s: float = 21600.0       # 6 h at rest ends a segment
     golden_weight_boost: float = 4.0          # Huawei SOH-calibration segments
     trim_fraction: float = 0.10               # weighted trimmed mean
 
     # SOH_eff — round-trip efficiency drift
-    eff_min_window_charge_kwh: float = 30.0   # min charge between anchors
+    #: v1.2.0 - anchors must sit at EQUAL stored energy, not merely "high
+    #: SOC". Relaxing to SOC>=97 admitted up to 3 SOC points of mismatch,
+    #: worth ~4.5% of a 15 kWh window. Field data (187 days, 23 windows):
+    #: eta stdev 0.0101 at SOC>=97 vs 0.0018 at SOC>=100 - 5.6x quieter with
+    #: zero windows lost.
+    eff_min_window_charge_kwh: float = 15.0   # was 30: 2x faster AND quieter
     eff_anchor_rest_power_w: float = 100.0
+    eff_anchor_tier1_soc: float = 99.0        # at/near a BMS recalibration point
+    eff_anchor_soc_match: float = 0.5         # tier 2: anchors matched to +-this
+    eff_anchor_ceiling_margin: float = 0.5    # tier 2 gate: ceiling - this
+    eff_anchor_min_ceiling: float = 60.0      # below this, do not anchor at all
+    eff_tier2_max_window_days: float = 21.0   # bound coulomb drift in tier 2
     eff_valid_min: float = 0.50               # plausibility band for η
     eff_valid_max: float = 1.05
     eff_baseline_windows: int = 3             # first N windows → baseline
     eff_rolling_windows: int = 6              # last N windows → current
     eff_pts_per_pct_loss: float = 8.0         # SOH_eff slope
 
-    # SOH_bal — pack balance
-    balance_min_soc: float = 95.0
+    # SOH_bal — pack balance (v1.2.0: baseline-relative)
+    #: Absolute thresholds proved unusable on real hardware: a rock-stable
+    #: 2.4 C inter-pack offset (present at idle AND under load, so NOT
+    #: battery-generated heat) scored ~81/100 on a healthy pack set, and the
+    #: 0.1 V voltage register resolution made one LSB worth 11 score points.
+    #: The score is now deviation from a learned per-installation baseline.
+    balance_use_baseline: bool = True
+    balance_baseline_min_samples: int = 20
+    balance_dv_dev_full_score: float = 0.15   # deviation >= 1 LSB tolerated
+    balance_dv_dev_zero_score: float = 0.40
+    balance_dt_dev_full_score: float = 1.0
+    balance_dt_dev_zero_score: float = 6.0
+    #: Sampling is gated relative to the prevailing charge ceiling: a
+    #: configured cap or winter PV may keep the pack below 95% for months
+    #: (field: 78 consecutive days).  The floor still applies because LFP's
+    #: flat mid-range OCV makes dV uninformative low down.
+    balance_ceiling_margin: float = 10.0
+    balance_min_soc_floor: float = 60.0
+    balance_min_soc: float = 95.0             # fallback when ceiling unknown
     balance_rest_power_w: float = 50.0
-    balance_dv_full_score: float = 0.05       # ΔV ≤ this → 100
-    balance_dv_zero_score: float = 0.50       # ΔV ≥ this → 0
-    balance_dt_full_score: float = 1.0        # ΔT ≤ this → 100
-    balance_dt_zero_score: float = 8.0        # ΔT ≥ this → 0
+    balance_dv_full_score: float = 0.05       # legacy absolute mode
+    balance_dv_zero_score: float = 0.50
+    balance_dt_full_score: float = 1.0
+    balance_dt_zero_score: float = 8.0
     balance_sample_count: int = 20            # median over last N samples
 
     # Stress accumulator (model input — NOT part of BHI)
@@ -121,6 +165,11 @@ class BatteryHealthConfig:
     # Confidence
     confidence_min_segments: int = 5
     stale_after_days: float = 60.0
+    #: v1.2.0 - term availability is seasonal (balance/efficiency need a high
+    #: SOC that winter may not reach).  Hold the last good sub-score rather
+    #: than dropping it, so the renormalised composite does not step at the
+    #: seasonal boundary with no underlying health change.
+    subscore_hold_days: float = 90.0
 
     def normalized_weights(self) -> tuple[float, float, float]:
         """Return (w_cap, w_eff, w_bal) normalized to sum to 1.0."""
@@ -165,6 +214,16 @@ class HealthSample:
     lifetime_discharge_kwh: float | None = None
     packs: list[PackSample] = field(default_factory=list)
     soh_calibration_active: bool = False
+    #: Configured end-of-charge SOC (register 47081). "Full" is defined
+    #: relative to this, not to an absolute 100% - a user running a 93%
+    #: summer cap still reaches their ceiling daily (v1.2.0).
+    charge_ceiling_soc: float | None = None
+    #: Optional ambient temperature of the battery room. Field evidence shows
+    #: every pack sits a characteristic amount above ambient (max sensors
+    #: +2.6/+5.2/+3.9 C, min sensors +0.5/+3.3/+2.1 C). That RISE tracks heat
+    #: generation, so it can reveal all packs ageing together - something
+    #: inter-pack spread is blind to by construction.
+    ambient_temp_c: float | None = None
 
 
 def _valid_or_none(
@@ -200,6 +259,10 @@ def validate_sample(raw: HealthSample) -> HealthSample:
         raw.lifetime_discharge_kwh, 0.0, 1e9, "lifetime_discharge"
     )
     out.soh_calibration_active = bool(raw.soh_calibration_active)
+    out.charge_ceiling_soc = _valid_or_none(
+        raw.charge_ceiling_soc, 0.0, 100.0, "charge_ceiling")
+    out.ambient_temp_c = _valid_or_none(
+        raw.ambient_temp_c, TEMP_MIN_C, TEMP_MAX_C, "ambient_temp")
     for pack in raw.packs:
         out.packs.append(
             PackSample(
@@ -230,6 +293,10 @@ class CounterMonitor:
         self._last: float | None = None
         self._offset = 0.0
         self.reset_count = 0
+        #: True when the most recent feed() had no fresh reading and the
+        #: previous value was carried forward.  Segment endpoints must not be
+        #: taken from a carried-forward value (Finding C, v1.2.0).
+        self.is_stale = False
 
     @property
     def last_raw(self) -> float | None:
@@ -243,7 +310,9 @@ class CounterMonitor:
     def feed(self, raw: float | None) -> float | None:
         """Return the continuous (offset-corrected) counter value, or None."""
         if raw is None:
+            self.is_stale = True
             return None if self._last is None else self._last + self._offset
+        self.is_stale = False
         if self._last is not None and raw < self._last - COUNTER_RESET_TOLERANCE_KWH:
             # Counter reset — carry forward the old total as an offset.
             self._offset += self._last
@@ -281,6 +350,12 @@ class DischargeSegment:
     freshness: float          # exp(-throughput_since_full/τ) at segment start
     golden: bool              # Huawei SOH calibration ran during this segment
     gap_bridged: int = 0      # v1.1.8: data gaps spanned by this segment
+    #: v1.2.0 (Finding J): implied capacity depends ~2% on where in the SOC
+    #: range the segment sat (field: 22.98 kWh at midpoint 85-100% vs
+    #: 23.49 kWh at 50-65%).  Seasonal usage shifts therefore look like
+    #: capacity change unless the operating band is recorded alongside it.
+    soc_midpoint: float = 0.0
+    charge_ceiling: float | None = None
 
     @property
     def delta_soc(self) -> float:
@@ -303,6 +378,10 @@ class DischargeSegment:
         )}
         # Tolerate pre-1.1.8 persisted segments (field added in 1.1.8).
         kwargs["gap_bridged"] = int(d.get("gap_bridged", 0))
+        # Pre-1.2.0 segments predate these fields.
+        kwargs["soc_midpoint"] = float(
+            d.get("soc_midpoint", (d["soc_start"] + d["soc_end"]) / 2.0))
+        kwargs["charge_ceiling"] = d.get("charge_ceiling")
         return cls(**kwargs)
 
 
@@ -341,12 +420,22 @@ class SegmentTracker:
         self._agg_cache: tuple[float | None, dict[str, Any]] | None = None
         # v1.1.8 gap bridging
         self._gap_pending = False
+        self._idle_since: float | None = None
         self._last_good_ts: float | None = None
         self._bridges_in_segment = 0
         self.gap_bridged_count = 0
+        self._seg_ceiling: float | None = None
+        #: Measured beginning-of-life capacity (Finding H). Captured once from
+        #: the first N segments, persisted, and re-anchorable via a button.
+        self.reference_capacity_kwh: float | None = None
+        self.reference_captured_ts: float | None = None
+        self.reference_epochs: list[dict[str, Any]] = []
+        self.stale_endpoint_skips = 0
 
     # ── feed ────────────────────────────────────────────────────────────────
-    def feed(self, s: HealthSample) -> DischargeSegment | None:
+    def feed(
+        self, s: HealthSample, counter_stale: bool = False
+    ) -> DischargeSegment | None:
         """Process one sample; return a completed segment if one just closed."""
         cfg = self._cfg
         soc, power = s.soc, s.power_w
@@ -389,8 +478,13 @@ class SegmentTracker:
         discharging = power < -cfg.segment_rest_power_w
 
         if not self._active:
-            if discharging:
+            # Finding C (v1.2.0): never open a segment on a carried-forward
+            # counter value - the start endpoint would be stale by however
+            # long the read had been failing.
+            if discharging and not counter_stale:
                 self._begin(s, soc, discharge)
+            elif discharging:
+                self.stale_endpoint_skips += 1
             return None
 
         # Active segment ------------------------------------------------------
@@ -424,8 +518,25 @@ class SegmentTracker:
             return self._close(self._last_soc, discharge, s.timestamp)
         self._last_soc = min(self._last_soc, soc)
 
-        if not discharging:
+        # Finding F (v1.2.0): resting does NOT end a segment.
+        #
+        # Capacity arithmetic is dkWh / dSOC - a ratio unaffected by the
+        # battery pausing partway through.  The previous rule closed on any
+        # tick above the rest threshold, so a single near-zero power reading
+        # (field: 15 such blips in 8 days, median duration 130 s) split a
+        # 10-hour overnight discharge into two ~5 h halves, each marginal
+        # against the minimum dSOC.  Only genuine CHARGING ends a segment;
+        # prolonged rest still does, to bound SOC drift.
+        charging = power > cfg.segment_rest_power_w
+        if charging:
             return self._close(soc, discharge, s.timestamp)
+        if not discharging:
+            if self._idle_since is None:
+                self._idle_since = s.timestamp
+            elif s.timestamp - self._idle_since > cfg.segment_max_idle_s:
+                return self._close(soc, discharge, s.timestamp)
+            return None
+        self._idle_since = None
         return None
 
     def mark_gap(self) -> None:
@@ -457,7 +568,9 @@ class SegmentTracker:
         self._last_soc = soc
         self._start_discharge_kwh = discharge
         self._gap_pending = False
+        self._idle_since = None
         self._bridges_in_segment = 0
+        self._seg_ceiling = s.charge_ceiling_soc
         self._seg_calibration_seen = bool(s.soh_calibration_active)
         self._seg_freshness = math.exp(
             -self._throughput_since_full_kwh / self._cfg.freshness_tau_kwh
@@ -502,6 +615,8 @@ class SegmentTracker:
             freshness=self._seg_freshness,
             golden=self._seg_calibration_seen,
             gap_bridged=self._bridges_in_segment,
+            soc_midpoint=(self._start_soc + end_soc) / 2.0,
+            charge_ceiling=self._seg_ceiling,
         )
         self.segments.append(seg)
         self.last_segment_ts = self._start_ts
@@ -535,6 +650,7 @@ class SegmentTracker:
             "golden_segment_count": sum(1 for s in segs if s.golden),
             "discarded_segment_count": self.discarded_segments,
             "gap_bridged_count": self.gap_bridged_count,
+            "stale_endpoint_skips": self.stale_endpoint_skips,
         }
         if not segs:
             self._agg_cache = (None, dict(attrs))
@@ -577,9 +693,61 @@ class SegmentTracker:
         var = sum(w * (c - mean_cap) ** 2 for c, w in weighted) / total_w
         attrs["estimated_capacity_kwh"] = round(mean_cap, 2)
         attrs["capacity_spread_kwh"] = round(math.sqrt(var), 2)
-        soh = clip(mean_cap / cfg.rated_capacity_kwh * 100.0, 0.0, 100.0)
+        # Finding J: record the SOC band these segments came from, so a
+        # seasonal shift in operating range is not mistaken for capacity fade.
+        mids = [s.soc_midpoint for s in segs]
+        attrs["segment_soc_midpoint_mean"] = round(sum(mids) / len(mids), 1)
+        ceils = [s.charge_ceiling for s in segs if s.charge_ceiling is not None]
+        if ceils:
+            attrs["segment_charge_ceiling_mean"] = round(sum(ceils) / len(ceils), 1)
+
+        # Finding H: capture a measured beginning-of-life reference once.
+        if (
+            self.reference_capacity_kwh is None
+            and len(segs) >= cfg.capacity_reference_min_segments
+        ):
+            span_days = (
+                max(s.end_ts for s in segs) - min(s.start_ts for s in segs)
+            ) / SECONDS_PER_DAY
+            if span_days >= cfg.capacity_reference_min_span_days:
+                self.set_reference(
+                    _median(sorted(s.implied_capacity_kwh for s in segs)),
+                    reason="auto: %d segments spanning %.0f days"
+                           % (len(segs), span_days),
+                    ts=max(s.end_ts for s in segs),
+                )
+
+        reference = self.reference_capacity_kwh or cfg.rated_capacity_kwh
+        attrs["capacity_reference_kwh"] = round(reference, 2)
+        attrs["capacity_reference_is_measured"] = self.reference_capacity_kwh is not None
+        attrs["capacity_reference_captured"] = self.reference_captured_ts
+        attrs["capacity_reference_epochs"] = len(self.reference_epochs)
+        soh = clip(mean_cap / reference * 100.0, 0.0, cfg.soh_capacity_clip_max)
         self._agg_cache = (soh, dict(attrs))
         return soh, attrs
+
+    def set_reference(
+        self, value: float, reason: str, ts: float | None = None
+    ) -> None:
+        """Anchor SOH_cap to a measured capacity, appending a new epoch.
+
+        Epochs are appended, never overwritten: the raw estimate and every
+        prior reference remain reconstructible, so re-anchoring can never
+        destroy the long-term record (only re-zero a derived view).
+        """
+        prev = self.reference_capacity_kwh
+        self.reference_epochs.append(
+            {"ts": ts, "value": round(value, 3), "reason": reason,
+             "previous": None if prev is None else round(prev, 3)}
+        )
+        self.reference_capacity_kwh = value
+        self.reference_captured_ts = ts
+        self._agg_cache = None
+        _LOGGER.warning(
+            "battery_health: capacity reference set to %.2f kWh (was %s) - %s. "
+            "SOH capacity is measured against this value from now on.",
+            value, "unset" if prev is None else f"{prev:.2f} kWh", reason,
+        )
 
     # ── persistence ─────────────────────────────────────────────────────────
     def to_dict(self) -> dict[str, Any]:
@@ -590,6 +758,10 @@ class SegmentTracker:
             "last_segment_ts": self.last_segment_ts,
             "discarded": self.discarded_segments,
             "gap_bridged": self.gap_bridged_count,
+            "reference_capacity": self.reference_capacity_kwh,
+            "reference_captured_ts": self.reference_captured_ts,
+            "reference_epochs": self.reference_epochs,
+            "stale_endpoint_skips": self.stale_endpoint_skips,
         }
 
     def restore(self, data: dict[str, Any]) -> None:
@@ -601,7 +773,12 @@ class SegmentTracker:
         self.last_segment_ts = data.get("last_segment_ts")
         self.discarded_segments = int(data.get("discarded", 0))
         self.gap_bridged_count = int(data.get("gap_bridged", 0))
+        self.reference_capacity_kwh = data.get("reference_capacity")
+        self.reference_captured_ts = data.get("reference_captured_ts")
+        self.reference_epochs = list(data.get("reference_epochs", []))
+        self.stale_endpoint_skips = int(data.get("stale_endpoint_skips", 0))
         self._gap_pending = False
+        self._idle_since = None
         self._last_good_ts = None
         self._bridges_in_segment = 0
         self._agg_cache = None
@@ -613,90 +790,172 @@ class SegmentTracker:
 # SOH_eff — round-trip efficiency drift between full-charge anchors
 # ═════════════════════════════════════════════════════════════════════════════
 class EfficiencyTracker:
-    """Round-trip efficiency between successive full-charge anchor states.
+    """Round-trip efficiency between successive equal-energy anchor states.
 
-    η = Δ(lifetime discharge) / Δ(lifetime charge) between two ticks at which
-    the battery is full and at rest.  Rising I²R losses (growing internal
-    resistance) show up as declining η — the physics SOH_res tried to reach,
-    measured through counters the Module+ optimizers cannot distort.
+    v1.2.0 - the anchor rule is the whole ballgame.  eta = dDischarge/dCharge
+    is only meaningful between two states holding the SAME stored energy.
+    "SOC >= 97" was a poor proxy: it admitted up to 3 SOC points of mismatch,
+    worth ~4.5% on a 15 kWh window.  Field data (187 days, 23 windows):
+
+        anchor rule            eta stdev   jitter at slope 8
+        SOC >= 97 (v1.1.x)      0.0101         +-8.1 pts
+        SOC >= 100              0.0018         +-1.5 pts   <- 5.6x quieter
+
+    ...with ZERO windows lost.  But an absolute 100% gate is unusable in
+    winter, when a configured charge ceiling (or weak PV) may keep the pack
+    below it for months - field: 122 consecutive days below 100%.  So anchors
+    are defined RELATIVE to the prevailing ceiling, in two tiers:
+
+      tier 1  SOC >= eff_anchor_tier1_soc, i.e. at a BMS recalibration point.
+              Highest quality; SOC is freshly re-referenced.
+      tier 2  Matched pairs (+- eff_anchor_soc_match) at the prevailing
+              ceiling.  Usable year-round, flagged lower confidence, and
+              time-capped because coulomb drift grows between recalibrations.
+
+    Changing the configured ceiling shifts eta systematically (field: 0.9801
+    at a 93% cap vs 0.9883 at 100% - 6.5 SOH points, comparable to a whole
+    lifetime of real degradation), so a ceiling change starts a new baseline
+    epoch rather than contaminating the existing one.
     """
 
     def __init__(self, cfg: BatteryHealthConfig) -> None:
         self._cfg = cfg
-        self._anchor: tuple[float, float, float] | None = None  # ts, chg, dis
-        self.windows: deque[float] = deque(maxlen=64)           # η history
+        self._anchor: tuple[float, float, float, float, int] | None = None
+        self.windows: deque[float] = deque(maxlen=64)
+        self.window_tiers: deque[int] = deque(maxlen=64)
         self.baseline: float | None = None
+        self.baseline_tier: int | None = None
         self._baseline_pool: list[float] = []
+        self.baseline_epochs: list[dict[str, Any]] = []
+        self.last_ceiling: float | None = None
+
+    # ── anchor qualification ────────────────────────────────────────────────
+    def _anchor_tier(self, s: HealthSample) -> int:
+        """Return 1 or 2 for a qualifying anchor, else 0."""
+        cfg = self._cfg
+        if s.soc is None or s.power_w is None:
+            return 0
+        if abs(s.power_w) > cfg.eff_anchor_rest_power_w:
+            return 0
+        if s.soc >= cfg.eff_anchor_tier1_soc:
+            return 1
+        ceiling = s.charge_ceiling_soc
+        if ceiling is None or ceiling < cfg.eff_anchor_min_ceiling:
+            return 0
+        if s.soc >= ceiling - cfg.eff_anchor_ceiling_margin:
+            return 2
+        return 0
 
     def feed(self, s: HealthSample) -> None:
         cfg = self._cfg
-        if (
-            s.soc is None
-            or s.power_w is None
-            or s.lifetime_charge_kwh is None
-            or s.lifetime_discharge_kwh is None
-        ):
-            return
-        if s.soc < cfg.full_charge_soc or abs(s.power_w) > cfg.eff_anchor_rest_power_w:
+        # Finding O: a ceiling change invalidates cross-epoch comparison, and
+        # must be detected even on ticks where the counters failed to read.
+        ceiling = s.charge_ceiling_soc
+        if ceiling is not None:
+            if self.last_ceiling is not None and abs(ceiling - self.last_ceiling) >= 1.0:
+                self.new_epoch(
+                    f"charge ceiling changed {self.last_ceiling:.0f}% -> "
+                    f"{ceiling:.0f}%", ts=s.timestamp)
+            self.last_ceiling = ceiling
+        if s.lifetime_charge_kwh is None or s.lifetime_discharge_kwh is None:
             return
 
-        # Battery is full & at rest → candidate anchor.
+        tier = self._anchor_tier(s)
+        if tier == 0:
+            return
+
         if self._anchor is None:
-            self._anchor = (s.timestamp, s.lifetime_charge_kwh, s.lifetime_discharge_kwh)
+            self._anchor = (s.timestamp, s.lifetime_charge_kwh,
+                            s.lifetime_discharge_kwh, s.soc, tier)
             return
 
-        _, chg0, dis0 = self._anchor
+        t0, chg0, dis0, soc0, tier0 = self._anchor
         d_charge = s.lifetime_charge_kwh - chg0
-        d_discharge = s.lifetime_discharge_kwh - dis0
         if d_charge < cfg.eff_min_window_charge_kwh:
-            # Same full-dwell period (or too little throughput): slide anchor.
-            self._anchor = (s.timestamp, chg0, dis0)
+            # Same dwell (or too little throughput): slide the anchor forward.
+            self._anchor = (s.timestamp, chg0, dis0, soc0, tier0)
             return
 
-        eta = d_discharge / d_charge
-        self._anchor = (s.timestamp, s.lifetime_charge_kwh, s.lifetime_discharge_kwh)
+        window_tier = max(tier, tier0)
+        # Tier 2 requires the two anchors to sit at the same SOC, and bounds
+        # how long the window may span (coulomb drift between recalibrations).
+        if window_tier == 2:
+            if abs(s.soc - soc0) > cfg.eff_anchor_soc_match:
+                self._anchor = (s.timestamp, s.lifetime_charge_kwh,
+                                s.lifetime_discharge_kwh, s.soc, tier)
+                return
+            if (s.timestamp - t0) > cfg.eff_tier2_max_window_days * SECONDS_PER_DAY:
+                self._anchor = (s.timestamp, s.lifetime_charge_kwh,
+                                s.lifetime_discharge_kwh, s.soc, tier)
+                return
+
+        eta = (s.lifetime_discharge_kwh - dis0) / d_charge
+        self._anchor = (s.timestamp, s.lifetime_charge_kwh,
+                        s.lifetime_discharge_kwh, s.soc, tier)
         if not (cfg.eff_valid_min <= eta <= cfg.eff_valid_max):
-            _LOGGER.debug("battery_health: discarding implausible η=%.3f", eta)
+            _LOGGER.debug("battery_health: discarding implausible eta=%.3f", eta)
             return
         self.windows.append(eta)
+        self.window_tiers.append(window_tier)
         if self.baseline is None:
             self._baseline_pool.append(eta)
             if len(self._baseline_pool) >= cfg.eff_baseline_windows:
                 self.baseline = _median(self._baseline_pool)
+                self.baseline_tier = window_tier
+                self.baseline_epochs.append(
+                    {"ts": s.timestamp, "value": round(self.baseline, 5),
+                     "tier": window_tier, "reason": "auto: first %d windows"
+                     % len(self._baseline_pool)})
                 _LOGGER.info(
-                    "battery_health: efficiency baseline captured: η=%.3f "
-                    "(median of %d windows)", self.baseline, len(self._baseline_pool),
-                )
+                    "battery_health: efficiency baseline captured: eta=%.4f "
+                    "(median of %d tier-%d windows)",
+                    self.baseline, len(self._baseline_pool), window_tier)
 
     def invalidate_anchor(self) -> None:
-        """Discard the open efficiency window.
+        """Discard the open window. Called ONLY on a lifetime-counter reset.
 
-        v1.1.8: called ONLY on a lifetime-counter reset.  A plain data gap no
-        longer invalidates the anchor: both endpoints are cumulative counter
-        readings, so η over the window is unaffected by missing samples in
-        between, and the η plausibility band (0.50-1.05) rejects anything
-        anomalous.  Under the old rule this tracker could never capture a
-        baseline on a link with intermittent timeouts — the observed symptom
-        was efficiency_window_count stuck at 0.
+        A plain data gap does not invalidate it: both endpoints are cumulative
+        counter readings, so eta over the window survives missing samples
+        in between (v1.1.8).
         """
         self._anchor = None
 
-    def reset_baseline(self) -> None:
-        """Manual baseline re-capture (button/service)."""
+    def new_epoch(self, reason: str, ts: float | None = None) -> None:
+        """Start a fresh baseline epoch, retaining the previous one."""
+        prev = self.baseline
+        self.baseline_epochs.append(
+            {"ts": ts, "value": None, "reason": reason,
+             "previous": None if prev is None else round(prev, 5)})
         self.baseline = None
+        self.baseline_tier = None
         self._baseline_pool.clear()
+        self._anchor = None
+        self.windows.clear()
+        self.window_tiers.clear()
+        _LOGGER.warning(
+            "battery_health: efficiency baseline epoch restarted (%s). "
+            "Previous baseline %s retained in history.",
+            reason, "unset" if prev is None else f"eta={prev:.4f}")
+
+    def reset_baseline(self) -> None:
+        self.new_epoch("manual reset")
 
     def soh_efficiency(self) -> tuple[float | None, dict[str, Any]]:
         cfg = self._cfg
         attrs: dict[str, Any] = {
             "efficiency_baseline": self.baseline,
             "efficiency_window_count": len(self.windows),
+            "efficiency_baseline_tier": self.baseline_tier,
+            "efficiency_baseline_epochs": len(self.baseline_epochs),
+            "efficiency_charge_ceiling": self.last_ceiling,
         }
         if self.baseline is None or not self.windows:
             return None, attrs
         recent = list(self.windows)[-cfg.eff_rolling_windows:]
         current = _median(recent)
         attrs["efficiency_current"] = round(current, 4)
+        tiers = list(self.window_tiers)[-cfg.eff_rolling_windows:]
+        attrs["efficiency_current_tier"] = max(tiers) if tiers else None
         loss_pct_points = max(0.0, (self.baseline - current) * 100.0)
         soh = clip(100.0 - loss_pct_points * cfg.eff_pts_per_pct_loss, 0.0, 100.0)
         return soh, attrs
@@ -705,16 +964,24 @@ class EfficiencyTracker:
         return {
             "anchor": list(self._anchor) if self._anchor else None,
             "windows": list(self.windows),
+            "window_tiers": list(self.window_tiers),
             "baseline": self.baseline,
+            "baseline_tier": self.baseline_tier,
             "baseline_pool": list(self._baseline_pool),
+            "baseline_epochs": self.baseline_epochs,
+            "last_ceiling": self.last_ceiling,
         }
 
     def restore(self, data: dict[str, Any]) -> None:
         anchor = data.get("anchor")
         self._anchor = tuple(anchor) if anchor else None
         self.windows = deque(data.get("windows", []), maxlen=64)
+        self.window_tiers = deque(data.get("window_tiers", []), maxlen=64)
         self.baseline = data.get("baseline")
+        self.baseline_tier = data.get("baseline_tier")
         self._baseline_pool = list(data.get("baseline_pool", []))
+        self.baseline_epochs = list(data.get("baseline_epochs", []))
+        self.last_ceiling = data.get("last_ceiling")
 
 
 def _median(values: list[float]) -> float:
@@ -728,57 +995,211 @@ def _median(values: list[float]) -> float:
 # SOH_bal — pack balance at rest near full SOC
 # ═════════════════════════════════════════════════════════════════════════════
 class BalanceTracker:
-    """ΔV / ΔT spread across online packs, sampled at rest & high SOC."""
+    """Pack balance from dV / dT spread at rest, scored against a baseline.
+
+    v1.2.0 - absolute thresholds proved unusable on real hardware:
+
+    * A pack-temperature spread of 2.40 C (stdev 0.19 over 1056 samples) was
+      present at idle (2.33 C) just as much as under >1 kW charge (2.52 C).
+      Battery-generated heat would collapse at rest; this does not.  It is a
+      fixed sensor/positional offset, not degradation - yet it scored ~81/100.
+    * Pack voltage has 0.1 V resolution.  Against the old 0.05-0.50 V band one
+      least-significant bit moved the score 11 points, so the metric mostly
+      reported quantisation noise (observed plateaus at 90.5 / 84.9 / 79.4).
+
+    So the score is now deviation from a learned per-installation baseline:
+    fixed offsets cancel, and only a pack drifting away from its own
+    established norm registers.  Raw dV/dT are always exposed and never
+    re-zeroed, so re-baselining can only reset a derived view - the underlying
+    record survives.
+
+    Sampling is gated relative to the prevailing charge ceiling rather than an
+    absolute SOC, because a configured cap (or winter PV) may keep the pack
+    below 95% for months - field: 78 consecutive days.  LFP's flat mid-range
+    OCV still makes dV uninformative low down, hence the hard floor.
+    """
 
     def __init__(self, cfg: BatteryHealthConfig) -> None:
         self._cfg = cfg
         self.scores: deque[float] = deque(maxlen=cfg.balance_sample_count)
+        self.raw_dv: deque[float] = deque(maxlen=cfg.balance_sample_count)
+        self.raw_dt: deque[float] = deque(maxlen=cfg.balance_sample_count)
+        #: Spread across the pack MIN-temperature sensors - a physically
+        #: independent channel from the max sensors.  Field data shows the two
+        #: agree closely (2.61 C vs 2.73 C) with identical pack ordering, which
+        #: is what confirmed the inter-pack offset is a real thermal gradient
+        #: rather than sensor miscalibration.  Divergence between the two
+        #: channels therefore indicates a SENSOR fault, not a thermal one.
+        self.raw_dt_min: deque[float] = deque(maxlen=cfg.balance_sample_count)
+        #: Per-pack rise above ambient (max sensors), when an ambient sensor
+        #: is configured. Empty otherwise - the feature degrades silently.
+        self.thermal_rise: deque[list[float]] = deque(maxlen=cfg.balance_sample_count)
+        self.baseline_rise: list[float] | None = None
+        self.sample_soc: deque[float] = deque(maxlen=cfg.balance_sample_count)
         self.last_included: list[int] = []
         self.last_excluded: list[int] = []
-        self._median_cache: float | None = None     # v1.1.6
+        self.baseline_dv: float | None = None
+        self.baseline_dt: float | None = None
+        self.baseline_captured_ts: float | None = None
+        self.baseline_epochs: list[dict[str, Any]] = []
+        self._pool_dv: list[float] = []
+        self._pool_dt: list[float] = []
+        self._median_cache: float | None = None
+        self.last_ceiling: float | None = None
+
+    def _gate_soc(self, s: HealthSample) -> float:
+        """Minimum SOC for a balance sample, relative to the charge ceiling."""
+        cfg = self._cfg
+        ceiling = s.charge_ceiling_soc
+        if ceiling is None:
+            return cfg.balance_min_soc
+        return max(cfg.balance_min_soc_floor, ceiling - cfg.balance_ceiling_margin)
 
     def feed(self, s: HealthSample) -> None:
         cfg = self._cfg
         if s.soc is None or s.power_w is None:
             return
-        if s.soc < cfg.balance_min_soc or abs(s.power_w) > cfg.balance_rest_power_w:
+
+        ceiling = s.charge_ceiling_soc
+        if ceiling is not None:
+            if self.last_ceiling is not None and abs(ceiling - self.last_ceiling) >= 1.0:
+                self.new_epoch(
+                    f"charge ceiling changed {self.last_ceiling:.0f}% -> "
+                    f"{ceiling:.0f}%", ts=s.timestamp)
+            self.last_ceiling = ceiling
+
+        if s.soc < self._gate_soc(s) or abs(s.power_w) > cfg.balance_rest_power_w:
             return
 
-        included, excluded = [], []
-        volts, temps = [], []
+        included, excluded, volts, temps = [], [], [], []
+        temps_min: list[float] = []
         for idx, pack in enumerate(s.packs, start=1):
             if pack.online and pack.voltage is not None and pack.temp_max is not None:
                 included.append(idx)
                 volts.append(pack.voltage)
                 temps.append(pack.temp_max)
+                if pack.temp_min is not None:
+                    temps_min.append(pack.temp_min)
             else:
                 excluded.append(idx)
-        # A pack offline mid-poll is excluded rather than compared against a
-        # stale/zero reading (spec §9).
         if len(included) < 2:
             return
         self.last_included, self.last_excluded = included, excluded
 
         dv = max(volts) - min(volts)
         dt = max(temps) - min(temps)
+        self.raw_dv.append(dv)
+        self.raw_dt.append(dt)
+        if len(temps_min) >= 2:
+            self.raw_dt_min.append(max(temps_min) - min(temps_min))
+        if s.ambient_temp_c is not None:
+            self.thermal_rise.append([t - s.ambient_temp_c for t in temps])
+        self.sample_soc.append(s.soc)
+
+        if cfg.balance_use_baseline and self.baseline_dv is None:
+            self._pool_dv.append(dv)
+            self._pool_dt.append(dt)
+            if len(self._pool_dv) >= cfg.balance_baseline_min_samples:
+                self.set_baseline(
+                    _median(self._pool_dv), _median(self._pool_dt),
+                    reason="auto: first %d samples" % len(self._pool_dv),
+                    ts=s.timestamp)
+            return   # no score until a baseline exists
+
+        base_dv = self.baseline_dv if cfg.balance_use_baseline else 0.0
+        base_dt = self.baseline_dt if cfg.balance_use_baseline else 0.0
+        if base_dv is None or base_dt is None:
+            return
+        dev_v = max(0.0, dv - base_dv)
+        dev_t = max(0.0, dt - base_dt)
         score_v = 100.0 - clip(
-            (dv - cfg.balance_dv_full_score)
-            / (cfg.balance_dv_zero_score - cfg.balance_dv_full_score) * 100.0,
-            0.0, 100.0,
-        )
+            (dev_v - cfg.balance_dv_dev_full_score)
+            / (cfg.balance_dv_dev_zero_score - cfg.balance_dv_dev_full_score) * 100.0,
+            0.0, 100.0)
         score_t = 100.0 - clip(
-            (dt - cfg.balance_dt_full_score)
-            / (cfg.balance_dt_zero_score - cfg.balance_dt_full_score) * 100.0,
-            0.0, 100.0,
-        )
+            (dev_t - cfg.balance_dt_dev_full_score)
+            / (cfg.balance_dt_dev_zero_score - cfg.balance_dt_dev_full_score) * 100.0,
+            0.0, 100.0)
         self.scores.append((score_v + score_t) / 2.0)
         self._median_cache = None
 
+    def set_baseline(self, dv: float, dt: float, reason: str,
+                     ts: float | None = None) -> None:
+        """Anchor balance scoring to a measured resting spread (new epoch)."""
+        prev = (self.baseline_dv, self.baseline_dt)
+        self.baseline_epochs.append(
+            {"ts": ts, "dv": round(dv, 3), "dt": round(dt, 2), "reason": reason,
+             "previous_dv": prev[0], "previous_dt": prev[1]})
+        self.baseline_dv, self.baseline_dt = dv, dt
+        if self.thermal_rise:
+            n = len(self.thermal_rise[-1])
+            self.baseline_rise = [
+                _median([r[i] for r in self.thermal_rise if len(r) > i])
+                for i in range(n)
+            ]
+        self.baseline_captured_ts = ts
+        self._pool_dv.clear()
+        self._pool_dt.clear()
+        self._median_cache = None
+        _LOGGER.warning(
+            "battery_health: pack-balance baseline set to dV=%.3f V dT=%.2f C "
+            "- %s. Raw dV/dT remain exposed and are unaffected.", dv, dt, reason)
+
+    def new_epoch(self, reason: str, ts: float | None = None) -> None:
+        prev = (self.baseline_dv, self.baseline_dt)
+        self.baseline_epochs.append(
+            {"ts": ts, "dv": None, "dt": None, "reason": reason,
+             "previous_dv": prev[0], "previous_dt": prev[1]})
+        self.baseline_dv = self.baseline_dt = None
+        self.baseline_rise = None
+        self.baseline_captured_ts = None
+        self._pool_dv.clear()
+        self._pool_dt.clear()
+        self.scores.clear()
+        self._median_cache = None
+        _LOGGER.warning("battery_health: pack-balance baseline epoch restarted (%s)", reason)
+
+    def reset_baseline(self) -> None:
+        self.new_epoch("manual reset")
+
     def soh_balance(self) -> tuple[float | None, dict[str, Any]]:
-        attrs = {
+        attrs: dict[str, Any] = {
             "balance_sample_count": len(self.scores),
             "packs_included": self.last_included,
             "packs_excluded": self.last_excluded,
+            # Ground truth - never re-zeroed by any recalibration.
+            "balance_raw_dv": round(self.raw_dv[-1], 3) if self.raw_dv else None,
+            "balance_raw_dt": round(self.raw_dt[-1], 2) if self.raw_dt else None,
+            "balance_raw_dt_min_sensors": (
+                round(self.raw_dt_min[-1], 2) if self.raw_dt_min else None),
+            # Deviation from the learned norm, in physical units - more
+            # interpretable than the 0-100 score it feeds.
+            "balance_dv_deviation": (
+                round(self.raw_dv[-1] - self.baseline_dv, 3)
+                if self.raw_dv and self.baseline_dv is not None else None),
+            "balance_dt_deviation": (
+                round(self.raw_dt[-1] - self.baseline_dt, 2)
+                if self.raw_dt and self.baseline_dt is not None else None),
+            "thermal_rise_above_ambient": (
+                [round(v, 2) for v in self.thermal_rise[-1]]
+                if self.thermal_rise else None),
+            "thermal_rise_max": (
+                round(max(self.thermal_rise[-1]), 2) if self.thermal_rise else None),
+            "thermal_rise_baseline_max": (
+                round(max(self.baseline_rise), 2) if self.baseline_rise else None),
+            "thermal_rise_deviation": (
+                round(max(self.thermal_rise[-1]) - max(self.baseline_rise), 2)
+                if self.thermal_rise and self.baseline_rise else None),
+            "balance_channel_disagreement": (
+                round(abs(self.raw_dt[-1] - self.raw_dt_min[-1]), 2)
+                if self.raw_dt and self.raw_dt_min else None),
+            "balance_baseline_dv": self.baseline_dv,
+            "balance_baseline_dt": self.baseline_dt,
+            "balance_baseline_captured": self.baseline_captured_ts,
+            "balance_baseline_epochs": len(self.baseline_epochs),
+            "balance_sample_soc_mean": (
+                round(sum(self.sample_soc) / len(self.sample_soc), 1)
+                if self.sample_soc else None),
         }
         if not self.scores:
             return None, attrs
@@ -789,17 +1210,43 @@ class BalanceTracker:
     def to_dict(self) -> dict[str, Any]:
         return {
             "scores": list(self.scores),
+            "raw_dv": list(self.raw_dv),
+            "raw_dt": list(self.raw_dt),
+            "raw_dt_min": list(self.raw_dt_min),
+            "thermal_rise": [list(r) for r in self.thermal_rise],
+            "baseline_rise": self.baseline_rise,
+            "sample_soc": list(self.sample_soc),
             "included": self.last_included,
             "excluded": self.last_excluded,
+            "baseline_dv": self.baseline_dv,
+            "baseline_dt": self.baseline_dt,
+            "baseline_captured_ts": self.baseline_captured_ts,
+            "baseline_epochs": self.baseline_epochs,
+            "pool_dv": self._pool_dv,
+            "pool_dt": self._pool_dt,
+            "last_ceiling": self.last_ceiling,
         }
 
     def restore(self, data: dict[str, Any]) -> None:
-        self.scores = deque(
-            data.get("scores", []), maxlen=self._cfg.balance_sample_count
-        )
-        self._median_cache = None
+        n = self._cfg.balance_sample_count
+        self.scores = deque(data.get("scores", []), maxlen=n)
+        self.raw_dv = deque(data.get("raw_dv", []), maxlen=n)
+        self.raw_dt = deque(data.get("raw_dt", []), maxlen=n)
+        self.raw_dt_min = deque(data.get("raw_dt_min", []), maxlen=n)
+        self.thermal_rise = deque(
+            [list(r) for r in data.get("thermal_rise", [])], maxlen=n)
+        self.baseline_rise = data.get("baseline_rise")
+        self.sample_soc = deque(data.get("sample_soc", []), maxlen=n)
         self.last_included = list(data.get("included", []))
         self.last_excluded = list(data.get("excluded", []))
+        self.baseline_dv = data.get("baseline_dv")
+        self.baseline_dt = data.get("baseline_dt")
+        self.baseline_captured_ts = data.get("baseline_captured_ts")
+        self.baseline_epochs = list(data.get("baseline_epochs", []))
+        self._pool_dv = list(data.get("pool_dv", []))
+        self._pool_dt = list(data.get("pool_dt", []))
+        self.last_ceiling = data.get("last_ceiling")
+        self._median_cache = None
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -957,6 +1404,10 @@ class BatteryHealthEngine:
         self._charge_counter = CounterMonitor("lifetime_charge")
         self._discharge_counter = CounterMonitor("lifetime_discharge")
         self.first_seen_ts: float | None = None
+        #: Finding N: last good value of each sub-score, with its timestamp.
+        #: Held (not dropped) while a term is seasonally unavailable, so the
+        #: renormalised composite does not step when a term disappears.
+        self._held: dict[str, tuple[float, float]] = {}
         self.dirty = False                     # persistence hint for manager
         self._last_report = HealthReport()
 
@@ -986,11 +1437,30 @@ class BatteryHealthEngine:
             self.efficiency.invalidate_anchor()
             self.dirty = True
 
-        closed = self.segments.feed(s)
+        counter_stale = self._discharge_counter.is_stale
+        seg_before = (len(self.segments.segments), self.segments.discarded_segments,
+                      self.segments.gap_bridged_count)
+        closed = self.segments.feed(s, counter_stale=counter_stale)
         if closed is not None:
             self.dirty = True
+        eff_base_before = self.efficiency.baseline
+        bal_base_before = self.balance.baseline_dv
+        bal_n_before = len(self.balance.scores)
         self.efficiency.feed(s)
         self.balance.feed(s)
+        # Finding E: persist on every material state change, not only on a
+        # closed segment.  The efficiency baseline in particular is a
+        # once-in-a-lifetime reference that was previously lost on an
+        # unclean restart.
+        if (
+            eff_base_before is None and self.efficiency.baseline is not None
+        ) or (
+            bal_base_before is None and self.balance.baseline_dv is not None
+        ) or len(self.balance.scores) != bal_n_before or seg_before != (
+            len(self.segments.segments), self.segments.discarded_segments,
+            self.segments.gap_bridged_count
+        ):
+            self.dirty = True
         self.stress.feed(s)
         self.segments.prune(s.timestamp)
         self.stress.prune(s.timestamp)
@@ -1018,6 +1488,40 @@ class BatteryHealthEngine:
         self.efficiency.reset_baseline()
         self.dirty = True
 
+    def reset_balance_baseline(self) -> None:
+        """Re-anchor pack-balance scoring (raw dV/dT are unaffected)."""
+        self.balance.reset_baseline()
+        self.dirty = True
+
+    def reanchor_capacity_reference(self) -> bool:
+        """Re-anchor SOH capacity to the current measured estimate.
+
+        Refuses when there is not enough data to anchor on, so a reference
+        cannot be captured from noise. Returns True if applied.
+        """
+        segs = self.segments.segments
+        if len(segs) < self.cfg.capacity_reference_min_segments:
+            _LOGGER.warning(
+                "battery_health: refusing to re-anchor capacity reference - "
+                "%d of %d required segments available",
+                len(segs), self.cfg.capacity_reference_min_segments)
+            return False
+        span_days = (
+            max(s.end_ts for s in segs) - min(s.start_ts for s in segs)
+        ) / SECONDS_PER_DAY
+        if span_days < self.cfg.capacity_reference_min_span_days:
+            _LOGGER.warning(
+                "battery_health: refusing to re-anchor capacity reference - "
+                "segments span only %.0f of the %.0f days required to average "
+                "out seasonal operating-range effects",
+                span_days, self.cfg.capacity_reference_min_span_days)
+            return False
+        self.segments.set_reference(
+            _median(sorted(s.implied_capacity_kwh for s in segs)),
+            reason="manual re-anchor", ts=max(s.end_ts for s in segs))
+        self.dirty = True
+        return True
+
     # ── evaluation ──────────────────────────────────────────────────────────
     def _evaluate(self, now: float) -> HealthReport:
         cfg = self.cfg
@@ -1033,13 +1537,36 @@ class BatteryHealthEngine:
         # Composite over available measured terms only (renormalized weights;
         # a missing term must never crater the composite as an implicit 0).
         w_cap, w_eff, w_bal = cfg.normalized_weights()
+
+        # Finding N: a sub-score that is seasonally unavailable is HELD at its
+        # last good value (up to subscore_hold_days) rather than dropped.
+        # Otherwise the renormalised composite steps at the seasonal boundary
+        # purely because a term appeared or vanished - a change with no
+        # underlying health meaning.
+        live = {"capacity": r.soh_capacity, "efficiency": r.soh_efficiency,
+                "balance": r.soh_balance}
+        held_terms: list[str] = []
+        for name, value in live.items():
+            if value is not None:
+                self._held[name] = (value, now)
+            else:
+                prev = self._held.get(name)
+                if prev is not None and (now - prev[1]) <= (
+                    cfg.subscore_hold_days * SECONDS_PER_DAY
+                ):
+                    live[name] = prev[0]
+                    held_terms.append(name)
+                elif prev is not None:
+                    self._held.pop(name, None)
+
         terms = [
-            ("capacity", r.soh_capacity, w_cap),
-            ("efficiency", r.soh_efficiency, w_eff),
-            ("balance", r.soh_balance, w_bal),
+            ("capacity", live["capacity"], w_cap),
+            ("efficiency", live["efficiency"], w_eff),
+            ("balance", live["balance"], w_bal),
         ]
         available = [(n, v, w) for n, v, w in terms if v is not None]
         r.attributes["contributing_terms"] = [n for n, _, _ in available]
+        r.attributes["held_terms"] = held_terms
         if available:
             total_w = sum(w for _, _, w in available)
             r.bhi = round(sum(v * w for _, v, w in available) / total_w, 1)
@@ -1060,8 +1587,20 @@ class BatteryHealthEngine:
 
         # Aging forecast: predicted SOH = 100 − A·stress·√years − B·EFC.
         # Heuristic model for divergence detection, not a lab prediction.
-        if self.first_seen_ts is not None:
-            age_years = max(0.0, (now - self.first_seen_ts) / (365.25 * SECONDS_PER_DAY))
+        # Finding D: prefer the true battery install date; first_seen_ts only
+        # records when this integration started observing, which understates
+        # calendar aging for an already-installed battery.
+        age_origin = (
+            cfg.battery_install_ts
+            if cfg.battery_install_ts is not None
+            else self.first_seen_ts
+        )
+        if age_origin is not None:
+            age_years = max(0.0, (now - age_origin) / (365.25 * SECONDS_PER_DAY))
+            r.attributes["battery_age_days"] = round((now - age_origin) / SECONDS_PER_DAY)
+            r.attributes["battery_age_source"] = (
+                "install_date" if cfg.battery_install_ts is not None
+                else "first_seen")
             stress = r.stress_ratio if r.stress_ratio is not None else 1.0
             calendar_loss = (
                 cfg.forecast_calendar_pct_per_sqrt_year * stress * math.sqrt(age_years)
@@ -1094,6 +1633,7 @@ class BatteryHealthEngine:
         return {
             "schema_version": SCHEMA_VERSION,
             "first_seen_ts": self.first_seen_ts,
+            "held_subscores": {k: list(v) for k, v in self._held.items()},
             "segments": self.segments.to_dict(),
             "efficiency": self.efficiency.to_dict(),
             "balance": self.balance.to_dict(),
@@ -1112,6 +1652,11 @@ class BatteryHealthEngine:
             )
             return
         self.first_seen_ts = data.get("first_seen_ts")
+        self._held = {
+            k: (float(v[0]), float(v[1]))
+            for k, v in (data.get("held_subscores") or {}).items()
+            if isinstance(v, (list, tuple)) and len(v) == 2
+        }
         self.segments.restore(data.get("segments", {}))
         self.efficiency.restore(data.get("efficiency", {}))
         self.balance.restore(data.get("balance", {}))

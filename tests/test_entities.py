@@ -214,6 +214,9 @@ def _install_lib_stubs() -> None:
     const.CONF_BH_WEIGHT_BALANCE = "bh_weight_balance"
     const.CONF_BH_WINDOW_DAYS = "bh_window_days"
     const.CONF_BH_MIN_SEGMENT_DELTA_SOC = "bh_min_segment_delta_soc"
+    const.CONF_BH_ENABLED = "bh_enabled"
+    const.CONF_BH_INSTALL_DATE = "bh_install_date"
+    const.CONF_BH_AMBIENT_ENTITY = "bh_ambient_entity"
 
     # huawei_solar.types — real-shaped HuaweiSolarEntityDescription
     from homeassistant.helpers.entity import EntityDescription

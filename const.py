@@ -202,6 +202,17 @@ BACKOFF_NORMAL_DIVISOR: int = 4   # read NORMAL registers every 4th back-off cyc
 CONF_BH_ENABLED = "bh_enabled"
 
 CONF_BH_RATED_CAPACITY_KWH = "bh_rated_capacity_kwh"
+#: Finding D: true battery install/commissioning date (ISO yyyy-mm-dd).
+#: Without it the calendar-aging forecast treats an already-aged battery as
+#: new from the moment this integration first ran.
+CONF_BH_INSTALL_DATE = "bh_install_date"
+#: OPTIONAL entity_id of an ambient temperature sensor in the battery room.
+#: Enables thermal-rise diagnostics (pack temperature above ambient), which
+#: measure heat GENERATION directly - unlike inter-pack spread, which cannot
+#: see all packs ageing together. Configurable rather than hardcoded so the
+#: sensor can be replaced without code changes; absent or unavailable simply
+#: disables the derived attributes.
+CONF_BH_AMBIENT_ENTITY = "bh_ambient_entity"
 CONF_BH_WARRANTY_THROUGHPUT_KWH = "bh_warranty_throughput_kwh"
 CONF_BH_WEIGHT_CAPACITY = "bh_weight_capacity"
 CONF_BH_WEIGHT_EFFICIENCY = "bh_weight_efficiency"
@@ -212,6 +223,8 @@ CONF_BH_MIN_SEGMENT_DELTA_SOC = "bh_min_segment_delta_soc"
 BH_OPTION_KEYS = (
     CONF_BH_ENABLED,
     CONF_BH_RATED_CAPACITY_KWH,
+    CONF_BH_INSTALL_DATE,
+    CONF_BH_AMBIENT_ENTITY,
     CONF_BH_WARRANTY_THROUGHPUT_KWH,
     CONF_BH_WEIGHT_CAPACITY,
     CONF_BH_WEIGHT_EFFICIENCY,

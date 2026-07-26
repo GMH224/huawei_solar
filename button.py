@@ -43,6 +43,12 @@ async def async_setup_entry(
                 health_buttons.append(
                     ResetEfficiencyBaselineButtonEntity(bh_manager)
                 )
+                health_buttons.append(
+                    RecalibrateBalanceBaselineButtonEntity(bh_manager)
+                )
+                health_buttons.append(
+                    ReanchorCapacityReferenceButtonEntity(bh_manager)
+                )
     except Exception:  # noqa: BLE001
         _LOGGER.exception(
             "Failed to build battery health buttons; continuing without them"
@@ -134,3 +140,62 @@ class ResetEfficiencyBaselineButtonEntity(HuaweiSolarEntity, ButtonEntity):
     async def async_press(self) -> None:
         """Reset the efficiency baseline."""
         await self._manager.async_reset_efficiency_baseline()
+
+
+class RecalibrateBalanceBaselineButtonEntity(HuaweiSolarEntity, ButtonEntity):
+    """Re-anchor pack-balance scoring to the current resting spread.
+
+    Balance is scored as deviation from a learned baseline, so a fixed sensor
+    or rack-position offset cancels out.  Press this after hardware changes
+    (pack replacement, sensor swap, firmware update that shifts calibration).
+
+    This appends a new baseline *epoch*; it does not overwrite history, and
+    the raw dV/dT attributes are never re-zeroed — so the long-term record
+    stays reconstructible.  Note that re-anchoring AFTER real degradation has
+    occurred will hide that degradation in the score; the raw series and the
+    epoch list are the audit trail.  Writes no inverter registers.
+    """
+
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_name = "Recalibrate battery pack balance baseline"
+    _attr_icon = "mdi:scale-balance"
+
+    def __init__(self, manager: BatteryHealthManager) -> None:
+        """Initialize the button entity."""
+        self._manager = manager
+        self._attr_device_info = manager.device_info
+        self._attr_unique_id = (
+            f"{manager.serial_number}_battery_health_recalibrate_balance_baseline"
+        )
+
+    async def async_press(self) -> None:
+        """Start a new pack-balance baseline epoch."""
+        await self._manager.async_reset_balance_baseline()
+
+
+class ReanchorCapacityReferenceButtonEntity(HuaweiSolarEntity, ButtonEntity):
+    """Re-anchor SOH capacity to the currently measured capacity.
+
+    Disabled by default: this redefines what 100% health means.  It is the
+    right action after a battery or module replacement, and wrong as routine
+    maintenance — pressing it after genuine fade would silently reset the
+    baseline to the degraded value.  Refuses when too few segments exist to
+    anchor on.  Writes no inverter registers.
+    """
+
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_entity_registry_enabled_default = False
+    _attr_name = "Re-anchor battery capacity reference"
+    _attr_icon = "mdi:target-variant"
+
+    def __init__(self, manager: BatteryHealthManager) -> None:
+        """Initialize the button entity."""
+        self._manager = manager
+        self._attr_device_info = manager.device_info
+        self._attr_unique_id = (
+            f"{manager.serial_number}_battery_health_reanchor_capacity_reference"
+        )
+
+    async def async_press(self) -> None:
+        """Re-anchor the capacity reference to the measured value."""
+        await self._manager.async_reanchor_capacity_reference()

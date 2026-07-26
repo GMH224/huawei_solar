@@ -20,7 +20,7 @@ Two Home Assistant logs from the reporting installation:
 | Symptom | Log evidence |
 |---|---|
 | `confidence` sensor `Unavailable`, 160 × `listener failed` | `Error adding entity sensor...battery_health_confidence` + `ValueError: ... indicating it has a numeric value; however, it has the non-numeric value: 'low'` |
-| All battery entities `Unknown`, both inverters affected | `Setup of config entry 'SUN2000-10KTL-M1' ... cancelled` → `entity_platform ... asyncio.exceptions.CancelledError` → `Config entry ... for huawei_solar.<platform> has already been setup!` (× 5 platforms) |
+| All battery entities `Unknown`, both inverters affected | `Setup of config entry '<inverter>' ... cancelled` → `entity_platform ... asyncio.exceptions.CancelledError` → `Config entry ... for huawei_solar.<platform> has already been setup!` (× 5 platforms) |
 | Underlying stressor (pre-existing, not introduced by this subsystem) | 156 × `Modbus timeout (no response in NN s)` across ~63 h, on `power_meter`, `config`, and `battery` coordinators alike |
 
 **Diff evidence.** v1.1.6 → the previously-shipped v1.1.7 differed **only** in

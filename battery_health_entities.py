@@ -250,6 +250,8 @@ class HuaweiSolarBatteryHealthSensorEntity(SensorEntity):
                 "note": (
                     "Self-referential trend proxy, not a validated diagnostic. "
                     "Track change over time, not the absolute number. "
+                    "Sub-scores are measured against learned per-installation "
+                    "baselines; raw values are exposed alongside them. "
                     "See BATTERY_HEALTH.md."
                 ),
             }
@@ -273,6 +275,45 @@ class HuaweiSolarBatteryHealthSensorEntity(SensorEntity):
         elif self._attr_key == "confidence":
             self._attr_extra_state_attributes = {
                 "contributing_terms": report.attributes.get("contributing_terms", []),
+                "held_terms": report.attributes.get("held_terms", []),
                 "segment_count": report.attributes.get("segment_count"),
                 "golden_segment_count": report.attributes.get("golden_segment_count"),
+                "discarded_segment_count": report.attributes.get(
+                    "discarded_segment_count"),
+                "gap_bridged_count": report.attributes.get("gap_bridged_count"),
+                "stale_endpoint_skips": report.attributes.get("stale_endpoint_skips"),
+                "efficiency_window_count": report.attributes.get(
+                    "efficiency_window_count"),
+                "balance_sample_count": report.attributes.get("balance_sample_count"),
+            }
+        elif self._attr_key == "soh_capacity":
+            self._attr_extra_state_attributes = {
+                k: report.attributes.get(k) for k in (
+                    "estimated_capacity_kwh", "capacity_spread_kwh",
+                    "capacity_reference_kwh", "capacity_reference_is_measured",
+                    "capacity_reference_captured", "capacity_reference_epochs",
+                    "segment_soc_midpoint_mean", "segment_charge_ceiling_mean",
+                    "segment_count",
+                )
+            }
+        elif self._attr_key == "soh_balance":
+            # Raw dV/dT are ground truth and are never re-zeroed by any
+            # recalibration - the baseline only re-zeroes the derived score.
+            self._attr_extra_state_attributes = {
+                k: report.attributes.get(k) for k in (
+                    "balance_raw_dv", "balance_raw_dt",
+                    "balance_baseline_dv", "balance_baseline_dt",
+                    "balance_baseline_captured", "balance_baseline_epochs",
+                    "balance_sample_soc_mean", "balance_sample_count",
+                    "packs_included", "packs_excluded",
+                )
+            }
+        elif self._attr_key == "soh_efficiency":
+            self._attr_extra_state_attributes = {
+                k: report.attributes.get(k) for k in (
+                    "efficiency_baseline", "efficiency_current",
+                    "efficiency_baseline_tier", "efficiency_current_tier",
+                    "efficiency_window_count", "efficiency_baseline_epochs",
+                    "efficiency_charge_ceiling",
+                )
             }

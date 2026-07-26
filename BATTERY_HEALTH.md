@@ -281,6 +281,43 @@ Interpretation:
   measurements are failing while the point-in-time one succeeds; check the
   first two rows.
 
+## 7c. Baselines and recalibration (v1.2.0)
+
+Three sub-scores are measured against **learned per-installation baselines**
+rather than absolute constants, because field data showed absolute thresholds
+measure the installation, not the battery:
+
+| Baseline | What it anchors | Captured |
+|---|---|---|
+| Capacity reference | what 100% SOH capacity means | automatically, once ≥20 segments span ≥45 days |
+| Pack-balance baseline | the normal resting ΔV/ΔT spread | automatically, after 20 resting samples |
+| Efficiency baseline | the normal round-trip η | automatically, after 3 valid windows |
+
+Rules that make this safe:
+
+* **Raw values are never re-zeroed.** `balance_raw_dv`, `balance_raw_dt`,
+  `estimated_capacity_kwh` and the thermal-rise figures are ground truth and
+  survive every recalibration — only the *derived* score is re-anchored.
+* **Recalibration appends an epoch**, retaining previous values and dates, and
+  logs at WARNING. Nothing is silently overwritten.
+* **Automatic epochs** start when the configured end-of-charge SOC changes,
+  because that shifts both η and the SOC operating band systematically.
+* Capacity re-anchoring **refuses** unless enough segments span enough time.
+
+⚠️ Re-anchoring *after* real degradation has occurred will hide that
+degradation in the score. That is why the raw series and the epoch history
+exist — they remain the record. Recalibrate after hardware changes, not as
+routine maintenance.
+
+## 7d. Optional: ambient temperature
+
+If you configure an ambient temperature sensor for the battery room
+(*Ambient temperature sensor entity* in the options), the integration derives
+each pack's **rise above ambient**. This measures heat *generation*, which
+inter-pack spread cannot see when all packs age together — a genuinely
+independent degradation channel. It is optional, configurable (so replacing
+the sensor needs no code change), and degrades silently when unavailable.
+
 ## 8. Known limitations
 
 1. **Circularity:** SOH_cap depends on BMS SOC. Freshness weighting and the
@@ -291,6 +328,13 @@ Interpretation:
    computable, not to predict warranty outcomes.
 3. Only **storage unit 1** (up to 3 packs) is currently processed.
 4. Options changes require the automatic entry reload to take effect.
+4b. **Balance winter behaviour is not yet field-validated.** The
+   ceiling-relative sampling gate is designed by analogy to the efficiency
+   anchors, but the reference dataset covered only 6 summer weeks of pack
+   voltage/temperature at a single charge ceiling.
+4c. **η temperature compensation was attempted and abandoned** — the available
+   BMS temperature range spanned only 3.2 °C, giving r = +0.18 and a 2% noise
+   reduction. Worth revisiting with a full winter of data.
 5. If PV/load patterns never produce ΔSOC ≥ 10 discharge segments, confidence
    stays `low`/`stale` — by design. (Note: 10 is a segment *depth*, not an
    absolute SOC floor: a 100% → 77% overnight run is a 23-point segment and
