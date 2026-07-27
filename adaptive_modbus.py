@@ -107,15 +107,28 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 # HA storage version — increment when the on-disk schema changes
-#: v2 (v1.2.3) — the RTT scale changed. Before the Defect A fix, rtt_samples
-#: held BATCH-summed values (sum of every chunk in a poll); afterwards they
-#: hold a single chunk's round trip. Mixing the two in one P95 list would keep
-#: the old inflated values dominant for weeks and make the fix look ineffective,
+#: Home Assistant Store schema version.
+#:
+#: DO NOT BUMP without also supplying a migration callable to Store(). HA's
+#: Store calls ``_async_migrate_func`` whenever the persisted version is lower
+#: than the requested one, and the default implementation raises
+#: NotImplementedError — which propagates out of ``async_load()`` and aborts
+#: config-entry setup for the entire integration. v1.2.3 bumped this to 2 and
+#: did exactly that; v1.2.4 reverts it. See _DATA_SCHEMA_VERSION below for how
+#: internal payload migrations are handled instead.
+_STORAGE_VERSION = 1
+
+#: Our OWN payload schema version, stored inside the data dict and therefore
+#: entirely under our control — changing it can never trip HA's migration
+#: machinery.
+#:
+#: v2 (v1.2.3): the RTT scale changed. Before the Defect A fix, rtt_samples
+#: held BATCH-summed values (the sum of every chunk in a poll); afterwards they
+#: hold a single chunk's round trip. Mixing the two in one P95 list keeps the
+#: old inflated values dominant for weeks and makes the fix look ineffective,
 #: so v1 RTT data is discarded on upgrade. Failure/timeout counts, slot
-#: identities and decay dates are scale-independent and are KEPT — only the
-#: RTT-derived state is reset, so gap/timeout recover quickly while the
-#: hard-won failure-rate history survives.
-_STORAGE_VERSION = 2
+#: identities and decay dates are scale-independent and are KEPT.
+_DATA_SCHEMA_VERSION = 2
 # How often the controller pushes updates to its HA sensor entities
 _SENSOR_PUSH_INTERVAL = timedelta(seconds=60)
 # Minimum interval between storage writes (debounce)
@@ -364,12 +377,28 @@ class AdaptiveModbusController:
 
     async def async_load(self) -> None:
         """Load persisted statistics from HA storage and apply daily decay."""
-        raw = await self._store.async_load()
+        # v1.2.4: the store load itself must never be able to abort
+        # config-entry setup. Adaptive learning is an OPTIONAL optimisation;
+        # losing it costs tuned poll parameters, whereas an exception here
+        # costs the user every entity in the integration. (v1.2.3 shipped a
+        # Store version bump with no migration callable, and the resulting
+        # NotImplementedError did exactly that.)
+        try:
+            raw = await self._store.async_load()
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception(
+                "AdaptiveModbus[%s]: could not read stored learning data — "
+                "continuing with defaults. Poll/gap/timeout will re-learn; no "
+                "other functionality is affected.",
+                self.serial_number,
+            )
+            raw = None
         if raw:
             try:
                 self._deserialize(raw)
-                stored_version = int(raw.get("version", 1))
-                if stored_version < 2:
+                # Payload-level migration (NOT HA's Store version — see
+                # _STORAGE_VERSION). Absent marker == pre-v1.2.3 data.
+                if int(raw.get("data_schema", 1)) < _DATA_SCHEMA_VERSION:
                     self._migrate_v1_rtt_scale()
                 _LOGGER.info(
                     "AdaptiveModbus[%s]: loaded %d days of learning data",
@@ -773,6 +802,7 @@ class AdaptiveModbusController:
     def _serialize(self) -> dict[str, Any]:
         return {
             "version": _STORAGE_VERSION,
+            "data_schema": _DATA_SCHEMA_VERSION,
             "serial": self.serial_number,
             "last_decay_date": (self._last_decay_date or date.today()).isoformat(),
             "learning_enabled": self.learning_enabled,

@@ -737,6 +737,21 @@ class HuaweiSolarOptimizerUpdateCoordinator(
     def attach_adaptive(self, controller: AdaptiveModbusController) -> None:
         self._adaptive = controller
 
+    def _record_failure(self) -> None:
+        """Record a non-timeout Modbus failure.
+
+        Defined here because HuaweiSolarOptimizerUpdateCoordinator is a SIBLING
+        of HuaweiSolarUpdateCoordinator, not a subclass — it cannot use that
+        class's helpers. Before v1.2.4 these call sites raised AttributeError
+        instead of recording the failure, masking the real error behind a
+        confusing traceback whenever an optimizer read failed.
+        """
+        self._consecutive_failures += 1
+        if self.telemetry:
+            self.telemetry.record_failure()
+        if self._adaptive:
+            self._adaptive.record_request(0.0, success=False, timeout=False)
+
     async def _async_update_data(self) -> dict[int, OptimizerRealTimeData]:
         if self._consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS:
             wait = _backoff_seconds(
@@ -762,12 +777,22 @@ class HuaweiSolarOptimizerUpdateCoordinator(
                 rtt_ms = (time.monotonic() - t0) * 1000
 
         except TimeoutError as err:
-            # Defect D: see BatchUpdateCoordinator._record_shed().
-            if isinstance(err, ModbusQueueShed):
-                self._record_shed()
-            else:
-                self._record_timeout()
-            if not isinstance(err, ModbusQueueShed) and self._consecutive_timeouts == 1:
+            # Defect D. NOTE: HuaweiSolarOptimizerUpdateCoordinator is a
+            # SIBLING of HuaweiSolarUpdateCoordinator, not a subclass, so the
+            # _record_* helpers defined there are NOT available here. The
+            # bookkeeping is therefore done inline (v1.2.4).
+            is_shed = isinstance(err, ModbusQueueShed)
+            self._consecutive_timeouts += 1
+            self._consecutive_failures += 1
+            if self.telemetry:
+                self.telemetry.record_timeout()
+            if self._adaptive:
+                if is_shed:
+                    # Internal contention — diagnostics only, never learning.
+                    self._adaptive.note_shed()
+                else:
+                    self._adaptive.record_request(0.0, success=False, timeout=True)
+            if not is_shed and self._consecutive_timeouts == 1:
                 _LOGGER.warning(
                     "Optimizer %s: Modbus timeout (attempt %d).",
                     self.device.serial_number, self._consecutive_timeouts,

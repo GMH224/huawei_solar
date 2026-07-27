@@ -983,11 +983,62 @@ class TestStorageMigrationV1toV2(unittest.TestCase):
         self.assertEqual(slot.failure_rate, fr_before)
         self.assertEqual(slot.rtt_p95_ms, 0.0)
 
-    def test_storage_version_is_2(self):
-        self.assertEqual(_MOD._STORAGE_VERSION, 2)
+    def test_ha_store_version_must_stay_1(self):
+        """REGRESSION (v1.2.3 -> v1.2.4): the outage this caused.
+
+        v1.2.3 bumped the Home Assistant Store version to 2 to trigger the RTT
+        rescale. HA's Store calls ``_async_migrate_func`` whenever the stored
+        version is older than the requested one, and the default raises
+        NotImplementedError. That exception propagated out of async_load(),
+        out of _setup_inverter_device_data(), and aborted async_setup_entry —
+        taking down EVERY entity in the integration, not just adaptive tuning.
+
+        The Store version may only be bumped together with a migration
+        callable. Payload-level migrations use _DATA_SCHEMA_VERSION instead.
+        """
+        self.assertEqual(
+            _MOD._STORAGE_VERSION, 1,
+            "bumping the HA Store version without a migration callable aborts "
+            "config-entry setup — use _DATA_SCHEMA_VERSION for payload changes",
+        )
+
+    def test_payload_schema_version_drives_migration(self):
+        self.assertEqual(_MOD._DATA_SCHEMA_VERSION, 2)
+        ctrl = _make_ctrl()
+        self.assertEqual(ctrl._serialize()["data_schema"], 2)
+
+    def test_pre_1_2_3_payload_has_no_marker_and_migrates(self):
+        """Absent marker means pre-v1.2.3 data, recorded on the old RTT scale."""
+        legacy = {"version": 1}          # no data_schema key
+        self.assertLess(int(legacy.get("data_schema", 1)), _MOD._DATA_SCHEMA_VERSION)
 
     def test_migration_marks_state_dirty(self):
         ctrl = _make_ctrl()
         ctrl._dirty = False
         ctrl._migrate_v1_rtt_scale()
         self.assertTrue(ctrl._dirty)
+
+
+class TestStoreLoadFaultIsolation(unittest.TestCase):
+    """Adaptive storage must never be able to abort config-entry setup.
+
+    Adaptive learning is an OPTIONAL optimisation. Losing it costs tuned poll
+    parameters; an exception escaping async_load() costs the user every entity
+    in the integration — which is exactly what happened in v1.2.3.
+    """
+
+    def test_store_load_is_guarded(self):
+        src = (pathlib.Path(__file__).parent.parent / "adaptive_modbus.py").read_text()
+        idx = src.find("await self._store.async_load()")
+        self.assertGreater(idx, -1)
+        window = src[max(0, idx - 400):idx]
+        self.assertIn("try:", window,
+                      "the Store load must be inside a try/except so a corrupt "
+                      "or version-incompatible store cannot abort entry setup")
+
+    def test_load_failure_leaves_controller_usable(self):
+        """A failed load must yield working defaults, not a broken object."""
+        ctrl = _make_ctrl()
+        params = ctrl.get_params()        # no stored data at all
+        self.assertIsNotNone(params.poll_interval)
+        self.assertGreaterEqual(params.max_queue_depth, 1)

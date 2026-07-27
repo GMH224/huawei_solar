@@ -379,20 +379,43 @@ class TestRecordDispatchConsolidation(unittest.TestCase):
         self.assertIn("def _record_timeout(self)", _SOURCE)
         self.assertIn("def _record_failure(self)", _SOURCE)
 
-    def test_timeout_recording_defined_once(self):
+    def test_timeout_recording_sites_are_accounted_for(self):
+        """Two sites, both deliberate (v1.2.4).
+
+        1. HuaweiSolarUpdateCoordinator._record_timeout() — the consolidated
+           helper for the batch coordinator.
+        2. HuaweiSolarOptimizerUpdateCoordinator's inline handler — that class
+           is a SIBLING, not a subclass, so it cannot call the helper, and it
+           must additionally discriminate a queue shed from a real timeout
+           (Defect D). Folding it into a shared helper would require the shed
+           check in both places anyway.
+        """
         # The adaptive timeout-record call must exist in exactly one place
         # (the _record_timeout helper), not duplicated across except blocks.
         self.assertEqual(
             _SOURCE.count("self._adaptive.record_request(0.0, success=False, timeout=True)"),
-            1,
-            "timeout recording duplicated — should live only in _record_timeout()",
+            2,
+            "timeout recording must appear exactly twice: once in "
+            "_record_timeout() and once inline in the optimizer coordinator "
+            "(a sibling class that cannot use that helper)",
         )
 
-    def test_failure_recording_defined_once(self):
+    def test_failure_recording_lives_only_in_record_failure_helpers(self):
+        """One occurrence per COORDINATOR CLASS, not one per file (v1.2.4).
+
+        HuaweiSolarOptimizerUpdateCoordinator is a sibling of
+        HuaweiSolarUpdateCoordinator, not a subclass, so it cannot share the
+        other's helper. Before v1.2.4 it called `self._record_failure()`
+        without defining it — an AttributeError on every optimizer error path.
+        Each class therefore now owns one definition, and the assertion counts
+        definitions rather than raw occurrences.
+        """
+        self.assertEqual(_SOURCE.count("def _record_failure(self)"), 2)
         self.assertEqual(
             _SOURCE.count("self._adaptive.record_request(0.0, success=False, timeout=False)"),
-            1,
-            "failure recording duplicated — should live only in _record_failure()",
+            2,
+            "failure recording must appear exactly once inside each class's "
+            "_record_failure() helper and nowhere else",
         )
 
     def test_poll_paths_call_helpers(self):

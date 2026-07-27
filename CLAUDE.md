@@ -1,7 +1,7 @@
 # CLAUDE.md — Huawei Solar Integration
 
 > **Maintained by Claude (Anthropic) on behalf of the community.**
-> Current version: **1.2.3** — see `manifest.json`.
+> Current version: **1.2.4** — see `manifest.json`.
 
 ---
 
@@ -663,6 +663,81 @@ timestamp, eliminating arithmetic errors on the power-flow card.
 - **New:** `tests/test_synchronized_power_coordinator.py` — 22 tests covering
   derived properties (all edge cases), happy path, partial failure, all-fail,
   consecutive failure counter, and telemetry recording.
+
+### v1.2.4 (2026-07-27)
+**HOTFIX — v1.2.3 could not load. Upgrade immediately from v1.2.3.**
+
+v1.2.3 aborted config-entry setup on any installation with existing adaptive
+learning data, taking down **every entity in the integration**, not just
+adaptive tuning:
+
+    File "adaptive_modbus.py", line 367, in async_load
+        raw = await self._store.async_load()
+    File "homeassistant/helpers/storage.py", line 622, in _async_migrate_func
+        raise NotImplementedError
+
+**Root cause.** v1.2.3 bumped `_STORAGE_VERSION` 1 -> 2 to trigger the RTT
+rescale migration. Home Assistant's `Store` calls `_async_migrate_func`
+whenever the persisted version is older than the requested one, and the base
+implementation raises `NotImplementedError`. No migration callable was
+supplied, so `async_load()` raised before returning any data — meaning the
+`_migrate_v1_rtt_scale()` routine never even ran. The call also sat OUTSIDE
+the existing `try/except` (which wrapped only `_deserialize`), so the
+exception propagated through `_setup_inverter_device_data()` and out of
+`async_setup_entry()`.
+
+**Fixes:**
+- `_STORAGE_VERSION` reverted to **1**. Payload migrations are now driven by
+  `_DATA_SCHEMA_VERSION`, stored *inside* our own data dict and therefore
+  incapable of tripping HA's migration machinery. An absent marker means
+  pre-v1.2.3 data. The RTT rescale behaviour is unchanged.
+- **The Store load is now fault-isolated.** Adaptive learning is an optional
+  optimisation: losing it costs tuned poll parameters, whereas an exception
+  costs the user every entity. A corrupt or version-incompatible store now
+  logs and continues with defaults. This isolation existed for the
+  battery-health subsystem since v1.1.7 but had never been applied to the
+  adaptive controller.
+
+**Also fixed — method ownership across sibling coordinator classes.**
+`HuaweiSolarOptimizerUpdateCoordinator` is a SIBLING of
+`HuaweiSolarUpdateCoordinator`, not a subclass, so helpers defined on one are
+not available on the other:
+- v1.2.3 regression: it called `self._record_shed()`, which does not exist
+  there. Now handled inline, including the shed/timeout discrimination.
+- **Pre-existing latent defect** (present well before v1.2.3): the same class
+  called `self._record_failure()` on three error paths without defining it —
+  an `AttributeError` masking the real error on every optimizer read failure.
+  It now owns a `_record_failure()`.
+
+**Tests: 412 -> 419 passed, 1 skipped.**
+
+New `tests/test_module_imports.py` closes the two gaps that let this ship:
+1. **Modules are now actually imported**, not merely parsed or string-matched.
+   `test_update_coordinator.py` validates that file by searching its source
+   text — it never imports it, constructs a coordinator, or executes a path,
+   so an import-time or attribute-level defect passes untouched.
+2. **AST-based method-ownership check**: every class must define (or inherit)
+   the `_record_*` helpers it calls. These run only on error paths, so a
+   missing definition stays invisible until something is already going wrong.
+
+`TestStorageMigrationV1toV2` now pins `_STORAGE_VERSION == 1` with the outage
+recorded in the docstring, and `TestStoreLoadFaultIsolation` asserts the load
+is guarded.
+
+**Adversarial verification:** the new tests were run against the broken
+v1.2.3 tree — **5 fail**, including the ownership check and all three storage
+assertions.
+
+**Test-harness fix:** stub installation in `test_module_imports.py` runs in
+`setUp`, not at import time. Other test modules install their own
+`huawei_solar` stub during collection and collection order is not fixed, so
+import-time setup made the file's behaviour order-dependent.
+
+**Process note.** Three defects in this release class (the v1.1.5 confidence
+sensor, and both faults here) share one shape: tests asserting the *shape* of
+code rather than its *behaviour*. Source-string assertions are useful for
+pinning structural invariants but cannot substitute for importing and running
+the module.
 
 ### v1.2.3 (2026-07-27)
 **Adaptive Modbus measurement correctness.** Origin: an operator bug report
