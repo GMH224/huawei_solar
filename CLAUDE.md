@@ -1,7 +1,7 @@
 # CLAUDE.md — Huawei Solar Integration
 
 > **Maintained by Claude (Anthropic) on behalf of the community.**
-> Current version: **1.2.2** — see `manifest.json`.
+> Current version: **1.2.3** — see `manifest.json`.
 
 ---
 
@@ -663,6 +663,106 @@ timestamp, eliminating arithmetic errors on the power-flow card.
 - **New:** `tests/test_synchronized_power_coordinator.py` — 22 tests covering
   derived properties (all edge cases), happy path, partial failure, all-fail,
   consecutive failure counter, and telemetry recording.
+
+### v1.2.3 (2026-07-27)
+**Adaptive Modbus measurement correctness.** Origin: an operator bug report
+backed by two months of adaptive-sensor history. Staged release — Defect C
+(multi-inverter shared-bus race) and the §9 optimizations are deliberately
+NOT included; see "Deferred" below.
+
+**Defect A — batch total consumed as a per-request RTT.**
+`_execute_batch()` summed every chunk's round trip into `total_rtt_ms` and
+passed it to `record_request()`, where `_derive_params()` treats it as ONE
+Modbus exchange (`gap = rtt x 0.4`, `timeout = rtt / 1000 x 5`). Both
+parameters were therefore inflated by the chunk count.
+
+Field evidence (2 months, one inverter, 11,113 aligned samples):
+
+| | value |
+|---|---|
+| Gap at 500 ms ceiling (time-weighted) | **84%** (87.7% at full confidence) |
+| Timeout at 60 s ceiling | **42%** |
+| Timeout >= poll interval | **11.3%** |
+| "poll at 20 s floor" AND "gap >= 480 ms", at 100% confidence | **1,071 samples** |
+
+Gap saturates at rtt >= 1250 ms and timeout at rtt >= 12000 ms, so the stored
+`rtt_p95_ms` exceeded **twelve seconds** for nearly half the window — not a
+physically possible single Modbus round trip.
+
+*Note on the original report's figures:* it quoted 28% gap-ceiling and 2.3%
+timeout>=poll from event counts. Those understate the problem, because a
+pinned value stops emitting state changes. Time-weighting the same data gives
+84% and 11.3%.
+
+- `_execute_batch()` now returns `max_chunk_rtt_ms` and tracks `total_batch_ms`
+  separately. **MAX, not mean**: `effective_timeout` is applied per chunk, so
+  the driving value must cover the slowest chunk, not the average.
+- **The observation unit stays one poll.** An earlier proposal to call
+  `record_request()` per chunk was rejected: successes would then be counted
+  per chunk while failures remained per poll, deflating `failure_rate` by the
+  chunk count and making the controller *most* aggressive when the bus is
+  sickest. Only the RTT value is rescaled; `n`, `failures`, confidence and the
+  0.85/day decay keep their tuned per-poll semantics.
+- **Storage v1 -> v2 migration.** `rtt_samples` is FIFO-trimmed, not
+  time-windowed, so pre-fix batch-summed values would have dominated the P95
+  for weeks and made the fix look ineffective. v1 RTT state is discarded;
+  failure/timeout counts, slot occupancy and decay dates are scale-independent
+  and are KEPT.
+
+**Defect D (new, found during review) — shed requests recorded as inverter
+timeouts.** `ModbusGuard` raised a bare `asyncio.TimeoutError` when shedding,
+which reached the learner as `record_request(success=False, timeout=True)`.
+Internal contention between our own sub-coordinators was thus taught to the
+circadian model as inverter misbehaviour.
+
+This closed a positive feedback loop: shed -> recorded failure -> higher
+failure rate -> lower queue depth -> more shedding. **Defect B would have
+triggered it**, which is why B could not ship alone.
+- New `ModbusQueueShed(asyncio.TimeoutError)`. Subclassing preserves every
+  existing `except asyncio.TimeoutError` path (back-off, stale-cache fallback,
+  entity availability); only the adaptive bookkeeping differs. Discrimination
+  happens *inside* the existing handler so no downstream logic is duplicated.
+- Sheds still reach telemetry and still advance the consecutive-failure
+  counters; they no longer reach the learner.
+
+**Defect B — queue depth had no cold-start blending.** It was the only one of
+the four outputs without it, and `failure_rate` returns 0.0 for an unseen slot
+(n < 1), so a zero-observation slot fell through to the MOST permissive value
+(3) — the exact case the blending exists to protect.
+- Same `confidence x derived + (1 - confidence) x baseline` blend as the other
+  three, with `ADAPTIVE_QUEUE_DEPTH_COLD_START = 2`.
+- **Baseline 2, not the report's 1.** Queue depth creates no concurrency (the
+  guard holds a single lock); it only bounds how many callers may wait. With
+  up to five sub-coordinators per inverter on a shared bus, 1 sheds
+  aggressively on precisely the unproven slots being protected.
+
+**Instrumentation.** `rtt_p95_ms`, `last_batch_ms`, `last_chunk_count` and
+`shed_count` are exposed on the adaptive diagnostic sensor. During this
+investigation `rtt_p95_ms` had to be back-solved from saturation thresholds;
+the next export can verify the fix directly, and `last_chunk_count` gives the
+true inflation factor, which analysis could only bound.
+
+**Tests: 391 -> 412 passed, 1 skipped.** Adversarial verification against
+pristine v1.2.2: 9 failures in the two collectable modules, and
+`test_adaptive_modbus.py` cannot even collect (the new constant does not
+exist there) — a stronger signal than a failure.
+
+Four tests that **encoded the defect** were replaced, not weakened —
+`test_returns_total_rtt_ms` asserted `return merged, total_rtt_ms`, pinning
+the bug in place. Each new assertion is paired with a **control case**
+(`test_batch_scale_rtt_would_saturate_both`) proving the healthy-case
+assertion could actually fail.
+
+**Deferred (by agreement):** Defect C (shared-bus last-writer-wins on
+`update_gap`/`update_max_queue_depth`) needs both inverters' sensor history to
+validate. §9 optimizations follow in v1.3.0, led by 9.4 (unifying the two
+independent RTT measurement paths — the structural reason Defect A went
+undetected).
+
+**Expected after deployment:** gap should fall toward its 150 ms floor and
+timeout toward 15 s during healthy, high-confidence slots. This roughly
+triples the request rate on a shared bus, so `slot_failure_rate` is the metric
+to watch before Defect C ships.
 
 ### v1.2.2 (2026-07-26)
 **Learning gate extended to the adaptive Modbus controller.** Raised by the

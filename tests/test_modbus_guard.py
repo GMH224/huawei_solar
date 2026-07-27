@@ -50,6 +50,7 @@ def _fresh_guard(endpoint: str = "192.168.1.1:502") -> ModbusGuard:
     g._queue_depth = 0
     g._effective_gap = MIN_INTER_REQUEST_GAP.total_seconds()
     g._max_queue_depth = MAX_QUEUE_DEPTH
+    g.shed_count = 0                    # v1.2.3 diagnostic counter
     return g
 
 
@@ -312,3 +313,35 @@ class TestCancellationDoesNotDeadlock(unittest.TestCase):
         ModbusGuard.remove("a:502")
         self.assertNotIn("a:502", ModbusGuard._registry)
         self.assertIn("b:502", ModbusGuard._registry)
+
+
+class TestShedExceptionType(unittest.TestCase):
+    """Defect D (v1.2.3): shedding must be distinguishable from a timeout.
+
+    A shed request is internal contention between our own sub-coordinators;
+    an inverter timeout is the inverter failing to answer. Recording the first
+    as the second taught the adaptive circadian model that our own contention
+    was inverter misbehaviour.
+    """
+
+    def test_shed_raises_dedicated_subclass(self):
+        self.assertTrue(issubclass(_MOD.ModbusQueueShed, asyncio.TimeoutError))
+
+    def test_existing_timeout_handlers_still_catch_it(self):
+        """Subclassing preserves every `except asyncio.TimeoutError` path."""
+        try:
+            raise _MOD.ModbusQueueShed("queue full")
+        except asyncio.TimeoutError:
+            caught = True
+        self.assertTrue(caught)
+
+    def test_shed_increments_counter(self):
+        async def run():
+            g = _fresh_guard()
+            g._max_queue_depth = 1
+            g._queue_depth = 1
+            with self.assertRaises(_MOD.ModbusQueueShed):
+                async with g.request():
+                    pass
+            return g.shed_count
+        self.assertEqual(asyncio.run(run()), 1)

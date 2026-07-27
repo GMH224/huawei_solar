@@ -84,7 +84,7 @@ from .const import (
     WRITE_VERIFY_DELAY,
     WRITE_VERIFY_RETRIES,
 )
-from .modbus_guard import ModbusGuard
+from .modbus_guard import ModbusGuard, ModbusQueueShed
 from .modbus_telemetry import ModbusTelemetry
 from .night_mode import InverterMode, NightModeDetector
 from .register_cache import RegisterCache, RegisterTier, is_energy_counter
@@ -215,6 +215,15 @@ class HuaweiSolarUpdateCoordinator(
 
         self._consecutive_timeouts: int = 0
         self._consecutive_failures: int = 0
+        #: Requests shed by the shared bus guard (v1.2.3, Defect D). Counted
+        #: separately from inverter failures because they measure OUR
+        #: contention, not the inverter's health.
+        self._shed_count: int = 0
+        #: Diagnostics for the Defect A fix — the batch total and how many
+        #: chunks produced it, so the inflation factor is directly observable
+        #: instead of having to be back-solved from saturated parameters.
+        self._last_batch_ms: float = 0.0
+        self._last_chunk_count: int = 0
 
     # ── wiring ────────────────────────────────────────────────────────────────
 
@@ -342,6 +351,25 @@ class HuaweiSolarUpdateCoordinator(
         if self._adaptive:
             self._adaptive.record_request(0.0, success=False, timeout=True)
 
+    def _record_shed(self) -> None:
+        """Record a queue-shed request — NOT as inverter misbehaviour.
+
+        DEFECT D (v1.2.3): shedding happens when our own sub-coordinators
+        contend for the shared bus lock.  It says nothing about the inverter,
+        so it must not enter the adaptive circadian model that drives poll
+        interval, gap and timeout.  Telemetry still sees it (a shed request is
+        genuinely interesting operationally), and the consecutive-failure
+        counters still advance so back-off and entity availability behave
+        exactly as before.
+        """
+        self._consecutive_timeouts += 1
+        self._consecutive_failures += 1
+        self._shed_count += 1
+        if self.telemetry:
+            self.telemetry.record_timeout()
+        if self._adaptive:
+            self._adaptive.note_shed()   # diagnostics only, NOT a failure
+
     def _record_failure(self) -> None:
         """Record a non-timeout Modbus failure to all observers (single dispatch)."""
         self._consecutive_failures += 1
@@ -368,7 +396,26 @@ class HuaweiSolarUpdateCoordinator(
         sorted_names = _sort_by_modbus_address(names)
         chunks = _chunk(sorted_names, BATCH_CHUNK_SIZE)
         merged: dict[RegisterName, Result[Any]] = {}
-        total_rtt_ms: float = 0.0  # BUG-10: accumulated across all chunks
+        # DEFECT A (v1.2.3) — two DIFFERENT quantities, previously conflated.
+        #
+        # ``total_batch_ms`` is how long the whole poll cycle spent talking to
+        # the inverter.  ``max_chunk_rtt_ms`` is how long ONE Modbus exchange
+        # took.  Until v1.2.3 the sum was returned and fed to
+        # AdaptiveModbusController.record_request() as if it were a single
+        # round trip, so rtt_p95_ms was inflated by the chunk count.
+        #
+        # Field evidence (2 months, one inverter): gap sat at its 500 ms
+        # ceiling 84% of the time (time-weighted) and the request timeout at
+        # its 60 s ceiling 42%, implying a stored rtt_p95_ms above 12 SECONDS
+        # for nearly half the window — not physically possible for one Modbus
+        # TCP exchange.
+        #
+        # MAX, not mean: ``effective_timeout`` is applied per chunk (see the
+        # asyncio.timeout below), so the value that drives it must cover the
+        # slowest chunk in the cycle, not the average one.
+        total_batch_ms: float = 0.0
+        max_chunk_rtt_ms: float = 0.0
+        chunk_count: int = 0
 
         for chunk_idx, chunk in enumerate(chunks):
             if chunk_idx > 0:
@@ -384,7 +431,10 @@ class HuaweiSolarUpdateCoordinator(
                         async with asyncio.timeout(effective_timeout.total_seconds()):
                             chunk_result = await self.device.batch_update(chunk)
                     merged.update(chunk_result)
-                    total_rtt_ms += (time.monotonic() - t0) * 1000
+                    chunk_ms = (time.monotonic() - t0) * 1000
+                    total_batch_ms += chunk_ms
+                    max_chunk_rtt_ms = max(max_chunk_rtt_ms, chunk_ms)
+                    chunk_count += 1
                     break  # chunk succeeded
 
                 except ReadException as exc:
@@ -410,7 +460,11 @@ class HuaweiSolarUpdateCoordinator(
                     # BUG-4 FIX: do NOT record failure here; outer handlers do it.
                     raise
 
-        return merged, total_rtt_ms  # BUG-10 FIX: return rtt to caller
+        self._last_batch_ms = total_batch_ms
+        self._last_chunk_count = chunk_count
+        # Return the PER-REQUEST figure: this is what the adaptive controller
+        # consumes. The batch total is retained for diagnostics only.
+        return merged, max_chunk_rtt_ms
 
     # ── poll logic ────────────────────────────────────────────────────────────
 
@@ -493,14 +547,27 @@ class HuaweiSolarUpdateCoordinator(
         # ── 6–8. Execute chunked batch with 0x06 retry ────────────────────────
         try:
             # BUG-10 FIX: record_request after batch so count is accurate
-            fresh, total_rtt_ms = await self._execute_batch(stale_names, effective_timeout)
+            fresh, chunk_rtt_ms = await self._execute_batch(stale_names, effective_timeout)
             if self.telemetry:
                 self.telemetry.record_request(len(stale_names))
 
         except TimeoutError as err:
-            self._record_timeout()
+            # Defect D (v1.2.3): a queue shed is OUR contention, not the
+            # inverter's fault. Everything downstream (back-off, stale-cache
+            # fallback, entity availability) is deliberately shared with the
+            # real-timeout path — only the adaptive-learning bookkeeping
+            # differs, so the circadian model is never taught that internal
+            # contention is inverter misbehaviour.
+            if isinstance(err, ModbusQueueShed):
+                self._record_shed()
+                _LOGGER.debug(
+                    "%s: request shed by bus guard (%s); not recorded as an "
+                    "inverter failure", self.name, err,
+                )
+            else:
+                self._record_timeout()
 
-            if self._consecutive_timeouts == 1:
+            if not isinstance(err, ModbusQueueShed) and self._consecutive_timeouts == 1:
                 _LOGGER.warning(
                     "%s: Modbus timeout (no response in %.0f s). "
                     "Back-off after %d consecutive timeouts.",
@@ -579,7 +646,11 @@ class HuaweiSolarUpdateCoordinator(
 
         # BUG-4 FIX: record_request called exactly once here (not in _execute_batch)
         if self._adaptive:
-            self._adaptive.record_request(total_rtt_ms, success=True, timeout=False)
+            # One observation per POLL (unchanged): n, failures, confidence and
+            # the daily decay factor are all tuned against a per-poll rate.
+            # Only the RTT *value* is corrected to per-request scale.
+            self._adaptive.note_batch(self._last_batch_ms, self._last_chunk_count)
+            self._adaptive.record_request(chunk_rtt_ms, success=True, timeout=False)
 
         # ── 11. Suspicious-zero guard for energy counters ─────────────────────
         # A live Modbus read can return 0 for kWh accumulators during inverter
@@ -691,8 +762,12 @@ class HuaweiSolarOptimizerUpdateCoordinator(
                 rtt_ms = (time.monotonic() - t0) * 1000
 
         except TimeoutError as err:
-            self._record_timeout()
-            if self._consecutive_timeouts == 1:
+            # Defect D: see BatchUpdateCoordinator._record_shed().
+            if isinstance(err, ModbusQueueShed):
+                self._record_shed()
+            else:
+                self._record_timeout()
+            if not isinstance(err, ModbusQueueShed) and self._consecutive_timeouts == 1:
                 _LOGGER.warning(
                     "Optimizer %s: Modbus timeout (attempt %d).",
                     self.device.serial_number, self._consecutive_timeouts,

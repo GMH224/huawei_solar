@@ -41,6 +41,30 @@ _LOGGER = logging.getLogger(__name__)
 
 MIN_INTER_REQUEST_GAP = timedelta(milliseconds=150)
 QUEUE_WAIT_TIMEOUT = timedelta(seconds=10)
+
+
+class ModbusQueueShed(asyncio.TimeoutError):
+    """Raised when a request is shed because the guard's queue is full.
+
+    DEFECT D (v1.2.3) — this used to be a bare ``asyncio.TimeoutError``, which
+    the coordinator's error handling could not distinguish from an inverter
+    that failed to answer.  A shed request therefore reached the adaptive
+    learner as ``record_request(success=False, timeout=True)`` — i.e. purely
+    internal contention between our own sub-coordinators was recorded as
+    *inverter* misbehaviour, in the same circadian slot model that drives poll
+    interval, gap and timeout.
+
+    Why that mattered more than it looks: shedding gets *more* likely as
+    ``max_queue_depth`` drops, and ``max_queue_depth`` drops as the failure
+    rate rises.  Recording sheds as failures therefore closed a positive
+    feedback loop — shed → recorded failure → higher failure rate → lower
+    queue depth → more shedding — which would have been triggered by the very
+    cold-start blending introduced to make unproven slots *safer*.
+
+    Subclassing ``asyncio.TimeoutError`` preserves every existing
+    ``except asyncio.TimeoutError`` path (back-off, cache fallback, entity
+    availability); only the adaptive-learning bookkeeping treats it specially.
+    """
 MAX_QUEUE_DEPTH = 3
 
 
@@ -96,6 +120,10 @@ class ModbusGuard:
         self._queue_depth: int = 0
         self._effective_gap: float = MIN_INTER_REQUEST_GAP.total_seconds()
         self._max_queue_depth: int = MAX_QUEUE_DEPTH
+        #: Diagnostic counter (v1.2.3): how many requests this guard has shed.
+        #: Exposed so internal contention is observable rather than silently
+        #: mixed into the inverter's failure statistics.
+        self.shed_count: int = 0
 
     # ── adaptive parameter setters ────────────────────────────────────────────
 
@@ -130,7 +158,8 @@ class ModbusGuard:
                     "ModbusGuard[%s]: queue full (%d/%d) — shedding request",
                     guard.endpoint, guard._queue_depth, guard._max_queue_depth,
                 )
-                raise asyncio.TimeoutError(
+                guard.shed_count += 1
+                raise ModbusQueueShed(
                     f"ModbusGuard[{guard.endpoint}] queue full "
                     f"({guard._queue_depth}/{guard._max_queue_depth})"
                 )

@@ -85,6 +85,7 @@ from homeassistant.helpers.storage import Store
 
 from .const import (
     ADAPTIVE_DECAY_FACTOR,
+    ADAPTIVE_QUEUE_DEPTH_COLD_START,
     LEARNING_SETTLING_PERIOD_S,
     ADAPTIVE_FAILURE_RATE_HIGH,
     ADAPTIVE_FAILURE_RATE_LOW,
@@ -106,7 +107,15 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 # HA storage version — increment when the on-disk schema changes
-_STORAGE_VERSION = 1
+#: v2 (v1.2.3) — the RTT scale changed. Before the Defect A fix, rtt_samples
+#: held BATCH-summed values (sum of every chunk in a poll); afterwards they
+#: hold a single chunk's round trip. Mixing the two in one P95 list would keep
+#: the old inflated values dominant for weeks and make the fix look ineffective,
+#: so v1 RTT data is discarded on upgrade. Failure/timeout counts, slot
+#: identities and decay dates are scale-independent and are KEPT — only the
+#: RTT-derived state is reset, so gap/timeout recover quickly while the
+#: hard-won failure-rate history survives.
+_STORAGE_VERSION = 2
 # How often the controller pushes updates to its HA sensor entities
 _SENSOR_PUSH_INTERVAL = timedelta(seconds=60)
 # Minimum interval between storage writes (debounce)
@@ -339,6 +348,10 @@ class AdaptiveModbusController:
         self._suppress_reason: str = ""
         self.suppressed_observations = 0
         self.settling_events = 0
+        #: Reported by the coordinator each poll (v1.2.3 instrumentation).
+        self.last_batch_ms: float = 0.0
+        self.last_chunk_count: int = 0
+        self.shed_count: int = 0
         self._first_data_date: date | None = None
         self._dirty: bool = False
         self._save_task: asyncio.Task | None = None
@@ -355,6 +368,9 @@ class AdaptiveModbusController:
         if raw:
             try:
                 self._deserialize(raw)
+                stored_version = int(raw.get("version", 1))
+                if stored_version < 2:
+                    self._migrate_v1_rtt_scale()
                 _LOGGER.info(
                     "AdaptiveModbus[%s]: loaded %d days of learning data",
                     self.serial_number,
@@ -467,6 +483,20 @@ class AdaptiveModbusController:
             self.serial_number, reason,
         )
 
+    def note_batch(self, batch_ms: float, chunk_count: int) -> None:
+        """Diagnostics only — never feeds the circadian model.
+
+        Records how long a whole poll took and how many chunks it needed, so
+        the ratio between the batch total and the per-request RTT is visible
+        in a sensor export rather than having to be inferred.
+        """
+        self.last_batch_ms = batch_ms
+        self.last_chunk_count = chunk_count
+
+    def note_shed(self) -> None:
+        """Diagnostics only — a request shed by the shared bus guard."""
+        self.shed_count += 1
+
     def record_request(
         self, rtt_ms: float, success: bool, timeout: bool
     ) -> None:
@@ -553,6 +583,14 @@ class AdaptiveModbusController:
             "days_of_data": self.days_of_data,
             "current_slot": self._slot_label(params.slot_index),
             "slot_requests": round(slot.n, 1),
+            # v1.2.3 instrumentation. rtt_p95_ms previously had to be
+            # back-solved from saturated gap/timeout values during incident
+            # analysis; exposing it (and the chunk count that inflated it)
+            # makes the Defect A fix directly verifiable from a sensor export.
+            "rtt_p95_ms": round(slot.rtt_p95_ms, 1),
+            "last_batch_ms": round(self.last_batch_ms, 1),
+            "last_chunk_count": self.last_chunk_count,
+            "shed_count": self.shed_count,
             # v1.2.2 learning gate visibility
             "learning_enabled": self.learning_enabled,
             "learning_active": self.learning_active(),
@@ -661,12 +699,23 @@ class AdaptiveModbusController:
         request_timeout = timedelta(seconds=round(timeout_s))
 
         # ── Queue depth: 3 → 1 ────────────────────────────────────────────────
+        # DEFECT B (v1.2.3): this was the only one of the four outputs with no
+        # confidence blending. Because TimeSlotStats.failure_rate returns 0.0
+        # for an unseen slot (n < 1), a slot with ZERO observations fell
+        # straight through to the MOST permissive value (3) — the exact
+        # opposite of the cautious cold-start posture the other three
+        # mechanisms adopt, and precisely the case the blending exists for.
         if fr >= ADAPTIVE_FAILURE_RATE_HIGH or in_transition:
-            max_queue_depth = 1
+            depth_derived = 1
         elif fr >= ADAPTIVE_FAILURE_RATE_LOW:
-            max_queue_depth = 2
+            depth_derived = 2
         else:
-            max_queue_depth = 3
+            depth_derived = 3
+        depth_blended = (
+            confidence * depth_derived
+            + (1 - confidence) * ADAPTIVE_QUEUE_DEPTH_COLD_START
+        )
+        max_queue_depth = max(1, int(round(depth_blended)))
 
         return AdaptiveParams(
             poll_interval=poll_interval,
@@ -757,6 +806,34 @@ class AdaptiveModbusController:
 
     def _reset_slots(self) -> None:
         self._slots = [TimeSlotStats(slot_index=i) for i in range(ADAPTIVE_SLOT_COUNT)]
+
+    def _migrate_v1_rtt_scale(self) -> None:
+        """Discard v1 RTT samples — they are on a different scale (Defect A).
+
+        v1 stored the SUM of every chunk's round trip in a poll. v2 stores one
+        chunk's round trip. A P95 computed over a mixture is meaningless, and
+        because the list is FIFO-trimmed rather than time-windowed, the old
+        inflated values would dominate for a long time.
+
+        Deliberately narrow: only rtt_samples/rtt_p95_ms are cleared. The
+        failure and timeout counts, slot occupancy and decay bookkeeping are
+        independent of the RTT scale and represent months of learning, so they
+        are preserved.
+        """
+        cleared = 0
+        for slot in self._slots:
+            if slot.rtt_samples or slot.rtt_p95_ms:
+                cleared += 1
+            slot.rtt_samples = []
+            slot.rtt_p95_ms = 0.0
+        self._dirty = True
+        _LOGGER.warning(
+            "AdaptiveModbus[%s]: storage upgraded v1 -> v2. Cleared RTT "
+            "samples from %d time slots because they were recorded on the "
+            "pre-v1.2.3 batch-summed scale; failure-rate history is kept. "
+            "Gap and timeout will re-learn over the next few days.",
+            self.serial_number, cleared,
+        )
 
     def _apply_startup_decay(self) -> None:
         """Apply accumulated daily decay since the last save."""

@@ -72,6 +72,7 @@ ADAPTIVE_TIMEOUT_MAX   = _cmod.ADAPTIVE_TIMEOUT_MAX
 ADAPTIVE_GAP_MIN       = _cmod.ADAPTIVE_GAP_MIN
 ADAPTIVE_GAP_MAX       = _cmod.ADAPTIVE_GAP_MAX
 ADAPTIVE_DECAY_FACTOR  = _cmod.ADAPTIVE_DECAY_FACTOR
+ADAPTIVE_QUEUE_DEPTH_COLD_START = _cmod.ADAPTIVE_QUEUE_DEPTH_COLD_START
 ADAPTIVE_SLOT_COUNT    = _cmod.ADAPTIVE_SLOT_COUNT
 
 _LOOP = asyncio.new_event_loop()
@@ -105,6 +106,10 @@ def _make_ctrl() -> AdaptiveModbusController:
     ctrl._suppress_reason = ""
     ctrl.suppressed_observations = 0
     ctrl.settling_events = 0
+    # v1.2.3 instrumentation (diagnostics only)
+    ctrl.last_batch_ms = 0.0
+    ctrl.last_chunk_count = 0
+    ctrl.shed_count = 0
     return ctrl
 
 
@@ -801,3 +806,188 @@ class TestLearningGate(unittest.TestCase):
         raw = ctrl._serialize()
         self.assertFalse(raw["learning_enabled"])
         self.assertEqual(raw["suppressed_observations"], 42)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v1.2.3 — Defect A (RTT scale), Defect B (queue-depth blending)
+# ══════════════════════════════════════════════════════════════════════════════
+class TestDefectAScale(unittest.TestCase):
+    """rtt_p95_ms must be a PER-REQUEST figure, not a batch total.
+
+    Field evidence (2 months): the gap sat at its 500 ms ceiling 84% of the
+    time (time-weighted) and the timeout at its 60 s ceiling 42%. The gap
+    saturates at rtt >= 1250 ms and the timeout at rtt >= 12000 ms, so the
+    stored value exceeded twelve SECONDS for nearly half the window — not a
+    physically possible single Modbus round trip.
+    """
+
+    def _feed(self, ctrl, rtt_ms, n=60):
+        for _ in range(n):
+            ctrl.record_request(rtt_ms, success=True, timeout=False)
+
+    def test_realistic_per_request_rtt_does_not_saturate_gap(self):
+        """The regression the report asked for: healthy RTTs -> no ceiling."""
+        ctrl = _make_ctrl()
+        self._feed(ctrl, 350.0, n=200)   # a plausible single-chunk RTT
+        p = ctrl.get_params()
+        self.assertLess(p.request_gap.total_seconds() * 1000, 490,
+                        "healthy per-request RTT must not pin the gap")
+        self.assertLess(p.request_timeout.total_seconds(), 59)
+
+    def test_batch_scale_rtt_would_saturate_both(self):
+        """Control case: proves the assertion above is meaningful.
+
+        Feeding a batch-summed value (the pre-v1.2.3 behaviour) must pin both
+        parameters — otherwise the test above would pass for the wrong reason.
+        """
+        ctrl = _make_ctrl()
+        # 200 samples so confidence reaches 1.0 and the derived value is used
+        # unblended — otherwise the cold-start blend masks the saturation.
+        self._feed(ctrl, 9000.0, n=200)  # ~26 chunks x 350 ms, i.e. a batch total
+        p = ctrl.get_params()
+        # Gap saturates at rtt >= 1250 ms, so a batch total pins it hard.
+        self.assertGreaterEqual(p.request_gap.total_seconds() * 1000, 495)
+        # Timeout saturates only at rtt >= 12000 ms; at 9 s it lands at ~45 s,
+        # already three times the 15 s floor. The field data showed FULL
+        # timeout saturation 42% of the time, i.e. an implied rtt above 12 s.
+        self.assertGreaterEqual(p.request_timeout.total_seconds(), 40)
+
+    def test_field_scale_rtt_saturates_the_timeout_ceiling_too(self):
+        """Reproduces the observed 42% timeout-ceiling condition."""
+        ctrl = _make_ctrl()
+        self._feed(ctrl, 12500.0, n=200)
+        p = ctrl.get_params()
+        self.assertGreaterEqual(p.request_timeout.total_seconds(), 59)
+
+    def test_gap_only_reaches_ceiling_when_failure_rate_is_elevated(self):
+        ctrl = _make_ctrl()
+        for i in range(200):             # ~20% failures, genuinely unhealthy
+            ctrl.record_request(350.0, success=(i % 5 != 0), timeout=(i % 5 == 0))
+        p = ctrl.get_params()
+        self.assertGreater(p.request_gap.total_seconds() * 1000, 250)
+
+    def test_note_batch_is_diagnostic_only(self):
+        """Batch totals must never enter the learning model."""
+        ctrl = _make_ctrl()
+        self._feed(ctrl, 350.0, n=200)
+        before = ctrl._slots[ctrl._current_slot_index()].rtt_p95_ms
+        ctrl.note_batch(9000.0, 26)
+        after = ctrl._slots[ctrl._current_slot_index()].rtt_p95_ms
+        self.assertEqual(before, after)
+        self.assertEqual(ctrl.last_chunk_count, 26)
+
+
+class TestDefectBQueueDepthBlending(unittest.TestCase):
+    """Queue depth was the only output with no cold-start blending."""
+
+    def test_unseen_slot_no_longer_gets_most_permissive_depth(self):
+        ctrl = _make_ctrl()
+        p = ctrl.get_params()
+        self.assertEqual(p.confidence, 0.0)
+        self.assertLessEqual(p.max_queue_depth, ADAPTIVE_QUEUE_DEPTH_COLD_START)
+        self.assertLess(p.max_queue_depth, 3)
+
+    def test_mature_healthy_slot_still_reaches_full_depth(self):
+        ctrl = _make_ctrl()
+        for _ in range(400):
+            ctrl.record_request(300.0, success=True, timeout=False)
+        p = ctrl.get_params()
+        self.assertEqual(p.confidence, 1.0)
+        self.assertEqual(p.max_queue_depth, 3)
+
+    def test_mature_unhealthy_slot_clamps_to_one(self):
+        ctrl = _make_ctrl()
+        for i in range(400):
+            ctrl.record_request(300.0, success=(i % 4 != 0), timeout=(i % 4 == 0))
+        self.assertEqual(ctrl.get_params().max_queue_depth, 1)
+
+    def test_depth_never_below_one(self):
+        ctrl = _make_ctrl()
+        for _ in range(5):
+            ctrl.record_request(300.0, success=False, timeout=True)
+        self.assertGreaterEqual(ctrl.get_params().max_queue_depth, 1)
+
+    def test_cold_start_baseline_is_two_not_one(self):
+        """Depth 1 would shed aggressively on the very slots being protected.
+
+        Queue depth does not create concurrency (the guard holds a single
+        lock); it only bounds how many callers may wait. With up to five
+        sub-coordinators per inverter on a shared bus, 1 is a shedding
+        machine, so the cautious baseline is 2.
+        """
+        self.assertEqual(ADAPTIVE_QUEUE_DEPTH_COLD_START, 2)
+
+
+class TestShedNotLearned(unittest.TestCase):
+    """Defect D: shed requests must never enter the circadian model."""
+
+    def test_note_shed_does_not_touch_slot_statistics(self):
+        ctrl = _make_ctrl()
+        for _ in range(50):
+            ctrl.record_request(300.0, success=True, timeout=False)
+        slot = ctrl._slots[ctrl._current_slot_index()]
+        n_before, fr_before = slot.n, slot.failure_rate
+        for _ in range(30):
+            ctrl.note_shed()
+        self.assertEqual(slot.n, n_before)
+        self.assertEqual(slot.failure_rate, fr_before)
+        self.assertEqual(ctrl.shed_count, 30)
+
+    def test_feedback_loop_is_broken(self):
+        """The loop that made Defect B dangerous without Defect D.
+
+        shed -> recorded as failure -> failure rate up -> queue depth down ->
+        more shedding. With sheds excluded from learning, a burst of shedding
+        must leave the derived parameters untouched.
+        """
+        ctrl = _make_ctrl()
+        for _ in range(400):
+            ctrl.record_request(300.0, success=True, timeout=False)
+        before = ctrl.get_params()
+        for _ in range(200):
+            ctrl.note_shed()
+        after = ctrl.get_params()
+        self.assertEqual(before.max_queue_depth, after.max_queue_depth)
+        self.assertEqual(before.poll_interval, after.poll_interval)
+        self.assertEqual(before.request_gap, after.request_gap)
+
+
+class TestStorageMigrationV1toV2(unittest.TestCase):
+    """v1 RTT samples are on a different scale and must be discarded.
+
+    Without this, the Defect A fix would appear not to work: rtt_samples is
+    FIFO-trimmed rather than time-windowed, so historical batch-summed values
+    would dominate the P95 for a long time after the upgrade.
+    """
+
+    def test_rtt_state_cleared(self):
+        ctrl = _make_ctrl()
+        for slot in ctrl._slots[:5]:
+            slot.rtt_samples = [9000.0, 9500.0, 11000.0]
+            slot.rtt_p95_ms = 11000.0
+        ctrl._migrate_v1_rtt_scale()
+        for slot in ctrl._slots[:5]:
+            self.assertEqual(slot.rtt_samples, [])
+            self.assertEqual(slot.rtt_p95_ms, 0.0)
+
+    def test_failure_history_is_preserved(self):
+        """Only the RTT scale changed — months of failure learning must stay."""
+        ctrl = _make_ctrl()
+        slot = ctrl._slots[0]
+        slot.n, slot.failures, slot.timeouts = 300.0, 21.0, 9.0
+        slot.rtt_samples, slot.rtt_p95_ms = [9000.0], 9000.0
+        fr_before = slot.failure_rate
+        ctrl._migrate_v1_rtt_scale()
+        self.assertEqual(slot.n, 300.0)
+        self.assertEqual(slot.failures, 21.0)
+        self.assertEqual(slot.failure_rate, fr_before)
+        self.assertEqual(slot.rtt_p95_ms, 0.0)
+
+    def test_storage_version_is_2(self):
+        self.assertEqual(_MOD._STORAGE_VERSION, 2)
+
+    def test_migration_marks_state_dirty(self):
+        ctrl = _make_ctrl()
+        ctrl._dirty = False
+        ctrl._migrate_v1_rtt_scale()
+        self.assertTrue(ctrl._dirty)

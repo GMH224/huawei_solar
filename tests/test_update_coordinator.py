@@ -91,14 +91,35 @@ class TestExecuteBatchFixes(unittest.TestCase):
             "_execute_batch must declare tuple return type (BUG-10)",
         )
 
-    def test_returns_total_rtt_ms(self):
-        """BUG-10: total_rtt_ms must be returned from _execute_batch."""
-        self.assertIn("return merged, total_rtt_ms", _SOURCE)
+    def test_returns_per_request_rtt_not_batch_total(self):
+        """DEFECT A (v1.2.3): _execute_batch must return a PER-REQUEST RTT.
+
+        This replaces test_returns_total_rtt_ms, which asserted
+        ``return merged, total_rtt_ms`` — i.e. it pinned the defect in place.
+        BUG-10's fix (returning the RTT to the caller) was correct; the
+        quantity returned was not: it was the SUM over every chunk, consumed
+        downstream as if it were one Modbus round trip.
+        """
+        self.assertIn("return merged, max_chunk_rtt_ms", _SOURCE)
+        self.assertNotIn("return merged, total_rtt_ms", _SOURCE)
+
+    def test_batch_total_still_tracked_separately(self):
+        """The batch total is still measured — for diagnostics, not learning."""
+        self.assertIn("total_batch_ms", _SOURCE)
+        self.assertIn("self._last_chunk_count", _SOURCE)
+
+    def test_max_not_mean_chunk_rtt(self):
+        """MAX, because effective_timeout is applied PER CHUNK.
+
+        A mean would under-protect the slowest chunk in a cycle, which is
+        exactly the one the timeout has to cover.
+        """
+        self.assertIn("max_chunk_rtt_ms = max(max_chunk_rtt_ms, chunk_ms)", _SOURCE)
 
     def test_caller_unpacks_tuple(self):
-        """BUG-10: caller assigns fresh, total_rtt_ms from _execute_batch."""
+        """BUG-10: caller unpacks the per-request RTT from _execute_batch."""
         self.assertIn(
-            "fresh, total_rtt_ms = await self._execute_batch(",
+            "fresh, chunk_rtt_ms = await self._execute_batch(",
             _SOURCE,
         )
 
@@ -116,16 +137,20 @@ class TestExecuteBatchFixes(unittest.TestCase):
             "(causes double-count when outer handlers also record)",
         )
 
-    def test_adaptive_record_in_success_path_uses_total_rtt(self):
-        """BUG-4: success path passes total_rtt_ms to adaptive controller."""
+    def test_adaptive_record_in_success_path_uses_per_request_rtt(self):
+        """Success path passes the PER-REQUEST rtt to the adaptive controller."""
         self.assertIn(
+            "self._adaptive.record_request(chunk_rtt_ms, success=True",
+            _SOURCE,
+        )
+        self.assertNotIn(
             "self._adaptive.record_request(total_rtt_ms, success=True",
             _SOURCE,
         )
 
     def test_telemetry_record_after_execute_batch(self):
         """BUG-10: telemetry.record_request called AFTER _execute_batch."""
-        exec_pos = _SOURCE.find("fresh, total_rtt_ms = await self._execute_batch(")
+        exec_pos = _SOURCE.find("fresh, chunk_rtt_ms = await self._execute_batch(")
         rec_pos  = _SOURCE.find("self.telemetry.record_request(len(stale_names))")
         self.assertGreater(exec_pos, 0)
         self.assertGreater(rec_pos, exec_pos,

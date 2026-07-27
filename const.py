@@ -90,6 +90,17 @@ SERVICES = (
 #: adaptive learner cannot distinguish the two, so it must not learn from them.
 LEARNING_SETTLING_PERIOD_S: float = 300.0
 
+#: v1.2.3 (Defect B) — cold-start baseline for max_queue_depth.
+#:
+#: Deliberately 2, not the fully-conservative 1. Queue depth does NOT create
+#: concurrency (ModbusGuard holds a single asyncio.Lock); it only decides how
+#: many callers may WAIT before requests are shed. With up to five
+#: sub-coordinators per inverter, and more than one inverter on a shared bus,
+#: a depth of 1 sheds aggressively on exactly the unproven slots this blending
+#: exists to protect. 2 keeps a cautious posture without turning cold start
+#: into a shedding machine.
+ADAPTIVE_QUEUE_DEPTH_COLD_START: int = 2
+
 ADAPTIVE_SLOT_MINUTES: int = 15
 ADAPTIVE_SLOT_COUNT: int = 96          # 24 * 60 // ADAPTIVE_SLOT_MINUTES
 
