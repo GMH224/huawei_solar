@@ -110,6 +110,10 @@ def _make_ctrl() -> AdaptiveModbusController:
     ctrl.last_batch_ms = 0.0
     ctrl.last_chunk_count = 0
     ctrl.shed_count = 0
+    # v1.3.0 Phase 0 bus metrics
+    ctrl._bus_occupancy_pct = 0.0
+    ctrl._bus_wait_p95 = 0.0
+    ctrl._bus_service_p95 = 0.0
     return ctrl
 
 

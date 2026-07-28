@@ -365,6 +365,11 @@ class AdaptiveModbusController:
         self.last_batch_ms: float = 0.0
         self.last_chunk_count: int = 0
         self.shed_count: int = 0
+        # Bus-level metrics pushed in by the coordinator (the guard owns them;
+        # it is shared per endpoint, while this controller is per serial).
+        self._bus_occupancy_pct: float = 0.0
+        self._bus_wait_p95: float = 0.0
+        self._bus_service_p95: float = 0.0
         self._first_data_date: date | None = None
         self._dirty: bool = False
         self._save_task: asyncio.Task | None = None
@@ -522,6 +527,14 @@ class AdaptiveModbusController:
         self.last_batch_ms = batch_ms
         self.last_chunk_count = chunk_count
 
+    def note_bus_metrics(
+        self, occupancy_pct: float, wait_p95_ms: float, service_p95_ms: float
+    ) -> None:
+        """Diagnostics only — bus-level metrics from the shared guard."""
+        self._bus_occupancy_pct = occupancy_pct
+        self._bus_wait_p95 = wait_p95_ms
+        self._bus_service_p95 = service_p95_ms
+
     def note_shed(self) -> None:
         """Diagnostics only — a request shed by the shared bus guard."""
         self.shed_count += 1
@@ -620,6 +633,9 @@ class AdaptiveModbusController:
             "last_batch_ms": round(self.last_batch_ms, 1),
             "last_chunk_count": self.last_chunk_count,
             "shed_count": self.shed_count,
+            "bus_occupancy_pct": round(self._bus_occupancy_pct, 1),
+            "bus_wait_p95_ms": round(self._bus_wait_p95, 1),
+            "bus_service_p95_ms": round(self._bus_service_p95, 1),
             # v1.2.2 learning gate visibility
             "learning_enabled": self.learning_enabled,
             "learning_active": self.learning_active(),
@@ -903,6 +919,24 @@ _ADAPTIVE_SENSORS: list[tuple[str, str, str | None, str]] = [
     ("days_of_data",           "Adaptive days of data",        "d",   "mdi:calendar-range"),
     ("current_slot",           "Adaptive time slot",           None,  "mdi:clock-time-four-outline"),
     ("slot_requests",          "Adaptive slot requests",       None,  "mdi:counter"),
+    # ── v1.3.0 Phase 0 ───────────────────────────────────────────────────────
+    # v1.2.3 added these keys to _snapshot() but never gave them sensor
+    # definitions, and this module has no extra_state_attributes anywhere — so
+    # they were unreachable. Diagnosing the gap/timeout ceiling required
+    # BACK-SOLVING rtt_p95_ms from saturation thresholds. That should not be
+    # necessary twice.
+    ("rtt_p95_ms",             "Adaptive RTT p95",             "ms",  "mdi:speedometer"),
+    ("last_chunk_count",       "Adaptive last chunk count",    None,  "mdi:format-list-numbered"),
+    ("last_batch_ms",          "Adaptive last batch time",     "ms",  "mdi:timer-outline"),
+    ("shed_count",             "Adaptive shed requests",       None,  "mdi:call-split"),
+    # Bus-level metrics: the same physical line, reported per controller.
+    # bus_occupancy_pct is the FEEDFORWARD signal the scheduler will pace from.
+    # bus_wait_p95_ms vs bus_service_p95_ms is THE Phase 0 measurement:
+    # wait-dominated => queueing (a scheduler helps); service-dominated =>
+    # the device itself is slow (only demand reduction helps).
+    ("bus_occupancy_pct",      "Bus occupancy",                "%",   "mdi:gauge"),
+    ("bus_wait_p95_ms",        "Bus wait p95",                 "ms",  "mdi:timer-sand"),
+    ("bus_service_p95_ms",     "Bus service p95",              "ms",  "mdi:transmission-tower"),
 ]
 
 

@@ -426,7 +426,7 @@ class HuaweiSolarUpdateCoordinator(
             busy_retries = 0
             while True:
                 try:
-                    async with self.guard.request():
+                    async with self.guard.request(label=self.name) as _req:
                         t0 = time.monotonic()
                         async with asyncio.timeout(effective_timeout.total_seconds()):
                             chunk_result = await self.device.batch_update(chunk)
@@ -650,6 +650,15 @@ class HuaweiSolarUpdateCoordinator(
             # the daily decay factor are all tuned against a per-poll rate.
             # Only the RTT *value* is corrected to per-request scale.
             self._adaptive.note_batch(self._last_batch_ms, self._last_chunk_count)
+            # Bus-level metrics live on the shared guard (per endpoint) but are
+            # surfaced through each controller (per serial) for visibility.
+            try:
+                wait_p95, service_p95 = self.guard.wait_service_split()
+                self._adaptive.note_bus_metrics(
+                    self.guard.occupancy() * 100.0, wait_p95, service_p95
+                )
+            except Exception:  # noqa: BLE001 — instrumentation is never critical
+                _LOGGER.debug("%s: bus metric update failed", self.name, exc_info=True)
             self._adaptive.record_request(chunk_rtt_ms, success=True, timeout=False)
 
         # ── 11. Suspicious-zero guard for energy counters ─────────────────────

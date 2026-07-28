@@ -35,7 +35,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from datetime import timedelta
+from typing import Any
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -124,6 +126,22 @@ class ModbusGuard:
         #: Exposed so internal contention is observable rather than silently
         #: mixed into the inverter's failure statistics.
         self.shed_count: int = 0
+        # ── v1.3.0 Phase 0 instrumentation ───────────────────────────────────
+        #: Wall-clock time this guard has spent holding the line, and the
+        #: window it was measured over. Occupancy = busy / elapsed is the
+        #: FEEDFORWARD signal the scheduler will eventually pace from: unlike
+        #: failure rate it leads the problem instead of lagging it, and unlike
+        #: request count it reflects how long the line is actually tied up.
+        self._busy_s: float = 0.0
+        self._window_start: float = time.monotonic()
+        #: Rolling separation of the two costs. This distinction is the whole
+        #: point of Phase 0: long WAIT means requests queue behind each other
+        #: (our scheduling); long SERVICE means the device itself is slow
+        #: (the master's CPU). The field data cannot tell these apart.
+        self._wait_samples: deque[float] = deque(maxlen=256)
+        self._service_samples: deque[float] = deque(maxlen=256)
+        #: Optional sink for per-request records (bus_diagnostics.BusDiagnostics).
+        self.diagnostics: Any | None = None
 
     # ── adaptive parameter setters ────────────────────────────────────────────
 
@@ -146,12 +164,23 @@ class ModbusGuard:
     # ── context manager ───────────────────────────────────────────────────────
 
     class _RequestContext:
-        def __init__(self, guard: "ModbusGuard", priority: bool = False) -> None:
+        def __init__(
+            self,
+            guard: "ModbusGuard",
+            priority: bool = False,
+            label: str = "",
+        ) -> None:
             self._guard = guard
             self._priority = priority  # keep-alive uses priority=True, bypasses shedding
+            self._label = label        # who asked, for diagnostics attribution
+            self._t_submit: float = 0.0
+            self._t_admitted: float = 0.0
+            #: Time spent waiting for admission (lock + inter-request gap).
+            self.wait_ms: float = 0.0
 
-        async def __aenter__(self) -> None:
+        async def __aenter__(self) -> "ModbusGuard._RequestContext":
             guard = self._guard
+            self._t_submit = time.monotonic()
 
             if not self._priority and guard._queue_depth >= guard._max_queue_depth:
                 _LOGGER.debug(
@@ -181,6 +210,10 @@ class ModbusGuard:
                     )
                     await asyncio.sleep(wait)
 
+                self._t_admitted = time.monotonic()
+                self.wait_ms = (self._t_admitted - self._t_submit) * 1000
+                guard._wait_samples.append(self.wait_ms)
+
             except BaseException:
                 # MUST be BaseException, not Exception: asyncio.CancelledError is a
                 # BaseException.  A cancellation during lock.acquire() or during the
@@ -191,21 +224,78 @@ class ModbusGuard:
                 if lock_acquired:
                     guard._lock.release()
                 raise
+            return self
 
-        async def __aexit__(self, *_: object) -> None:
+        async def __aexit__(self, exc_type, *_: object) -> None:
             guard = self._guard
-            guard._last_request_end = time.monotonic()
+            now = time.monotonic()
+            service_ms = (now - self._t_admitted) * 1000 if self._t_admitted else 0.0
+            guard._last_request_end = now
             guard._queue_depth -= 1
             guard._lock.release()
 
-    def request(self, priority: bool = False) -> "_RequestContext":
+            # Occupancy accounting: only time actually holding the line counts.
+            if self._t_admitted:
+                guard._busy_s += (now - self._t_admitted)
+                guard._service_samples.append(service_ms)
+
+            sink = guard.diagnostics
+            if sink is not None:
+                try:
+                    sink.record(
+                        endpoint=guard.endpoint,
+                        label=self._label,
+                        wait_ms=self.wait_ms,
+                        service_ms=service_ms,
+                        queue_depth=guard._queue_depth,
+                        outcome="error" if exc_type else "ok",
+                    )
+                except Exception:  # noqa: BLE001 — diagnostics must never break I/O
+                    _LOGGER.exception("ModbusGuard[%s]: diagnostics sink failed",
+                                      guard.endpoint)
+
+    def request(
+        self, priority: bool = False, label: str = ""
+    ) -> "_RequestContext":
         """Return an async context manager that serialises Modbus access.
 
         priority=True is used by the keep-alive task to bypass queue-depth
         shedding — the keep-alive probe must always be able to run regardless
         of how many coordinators are waiting.
         """
-        return self._RequestContext(self, priority=priority)
+        return self._RequestContext(self, priority=priority, label=label)
+
+    def occupancy(self, reset: bool = False) -> float:
+        """Fraction of wall-clock time this guard has held the line (0.0-1.0).
+
+        The feedforward signal for the future scheduler. Unlike failure rate it
+        LEADS the problem: occupancy rises before queues build, whereas a
+        failure has already cost a timeout by the time it is recorded.
+        """
+        now = time.monotonic()
+        elapsed = now - self._window_start
+        if elapsed <= 0:
+            return 0.0
+        value = min(1.0, self._busy_s / elapsed)
+        if reset:
+            self._busy_s = 0.0
+            self._window_start = now
+        return value
+
+    def wait_service_split(self) -> tuple[float, float]:
+        """Return (p95 wait ms, p95 service ms) over the rolling window.
+
+        THE Phase 0 measurement. Long wait => requests queue behind one another
+        and a scheduler is the fix. Long service => the device itself is slow
+        and only demand reduction helps. Three days of field data could not
+        distinguish these, because nothing measured them separately.
+        """
+        def p95(samples: deque[float]) -> float:
+            if not samples:
+                return 0.0
+            ordered = sorted(samples)
+            return ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))]
+        return p95(self._wait_samples), p95(self._service_samples)
 
     @property
     def queue_depth(self) -> int:

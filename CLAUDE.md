@@ -1,7 +1,7 @@
 # CLAUDE.md — Huawei Solar Integration
 
 > **Maintained by Claude (Anthropic) on behalf of the community.**
-> Current version: **1.2.4** — see `manifest.json`.
+> Current version: **1.3.0** — see `manifest.json`.
 
 ---
 
@@ -663,6 +663,69 @@ timestamp, eliminating arithmetic errors on the power-flow card.
 - **New:** `tests/test_synchronized_power_coordinator.py` — 22 tests covering
   derived properties (all edge cases), happy path, partial failure, all-fail,
   consecutive failure counter, and telemetry recording.
+
+### v1.3.0 (2026-07-28)
+**Bus scheduler rework — Phase 0: instrumentation.** First of a staged series
+(see `DESIGN_bus_scheduler.md`). The 1.3.x line is the work-in-progress
+rework; **v2.0.0** will mark it complete. Rollback target: **v1.2.4**.
+
+**No behavioural change.** Nothing about polling, adaptation or scheduling is
+altered. This release only makes the system measurable.
+
+**Why.** Three days of field data across both inverters established that BOTH
+inverters' failure rates track the MASTER's workload (r = +0.935 / +0.909)
+while the 5 kW slave's own batch size is flat all day (1.5 → 1.6 vs the
+master's 1.5 → 4.3). The slave is ~20% of demand and is not the constraint.
+But the *mechanism* remained ambiguous between two possibilities that call for
+opposite fixes:
+
+  (a) requests queueing on our shared lock  -> a scheduler fixes it;
+  (b) the master's own CPU saturating (it relays the slave's frames on top of
+      its battery/meter/PV workload) -> only demand reduction helps.
+
+No sensor available today separates **time waiting for admission** from **time
+talking to the device**, which is exactly the split that settles it.
+
+**Added:**
+- `ModbusGuard` now measures wait and service time separately, tracks how long
+  it holds the line (`occupancy()`), and exposes `wait_service_split()` (p95 of
+  each). Requests carry a `label` for attribution. Accounting is correct on
+  error paths, verified by test.
+- `bus_diagnostics.py` — default-off per-request capture. Bounded ring buffer,
+  executor-thread writes (**never disk I/O on the event loop**, which would
+  inflate the very service times being measured), hard file cap with rotation,
+  and salted-hash pseudonyms so a capture can be shared without exposing the
+  installation. Every entry point is exception-guarded: a diagnostics fault
+  costs diagnostics and nothing else.
+- New `Modbus diagnostic capture` switch, **one per BUS** rather than per
+  inverter (the capture is a property of the shared connection). Disabled by
+  default in the entity registry, and deliberately NOT restored across
+  restarts so a capture can never be silently left running.
+- **The sensors v1.2.3 promised but never delivered.** That release added
+  `rtt_p95_ms`, `last_chunk_count`, `last_batch_ms` and `shed_count` to
+  `_snapshot()` but gave them no sensor definitions, and this module has no
+  `extra_state_attributes` anywhere — so they were unreachable, and diagnosing
+  the gap/timeout ceiling required back-solving `rtt_p95_ms` from saturation
+  thresholds. Now real sensors.
+- Bus-level sensors: `bus_occupancy_pct` (the feedforward signal the scheduler
+  will eventually pace from — it LEADS the problem, unlike failure rate which
+  lags it), plus `bus_wait_p95_ms` and `bus_service_p95_ms`.
+
+**Tests: 419 -> 433 passed, 1 skipped.** New `tests/test_bus_diagnostics.py`
+covers default-off behaviour, bounded memory with counted drops, JSONL output,
+write-failure containment, pseudonymisation (asserting no endpoint appears in
+the file), and the wait/service split under contention, when idle, and when an
+exception is raised inside the request context.
+
+**Adversarial verification:** run against v1.2.4 the file fails to collect at
+all (the module does not exist); with `bus_diagnostics.py` copied in but the
+old guard retained, **5 of 5** wait/service tests fail.
+
+**How to use it.** Enable `Modbus diagnostic capture` for a bounded window,
+then read `config/huawei_solar_diagnostics/bus_<tag>.jsonl`. Wait-dominated
+records mean queueing; service-dominated records mean the device itself is
+slow. That answer determines whether Phase 3 does the heavy lifting or whether
+priority and demand shaping already suffice.
 
 ### v1.2.4 (2026-07-27)
 **HOTFIX — v1.2.3 could not load. Upgrade immediately from v1.2.3.**

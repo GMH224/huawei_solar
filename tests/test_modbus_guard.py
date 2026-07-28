@@ -12,6 +12,8 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import time
+from collections import deque
 import importlib.util
 import pathlib
 import sys
@@ -51,6 +53,12 @@ def _fresh_guard(endpoint: str = "192.168.1.1:502") -> ModbusGuard:
     g._effective_gap = MIN_INTER_REQUEST_GAP.total_seconds()
     g._max_queue_depth = MAX_QUEUE_DEPTH
     g.shed_count = 0                    # v1.2.3 diagnostic counter
+    # v1.3.0 Phase 0 instrumentation
+    g._busy_s = 0.0
+    g._window_start = time.monotonic()
+    g._wait_samples = deque(maxlen=256)
+    g._service_samples = deque(maxlen=256)
+    g.diagnostics = None
     return g
 
 

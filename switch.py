@@ -20,6 +20,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .adaptive_modbus import AdaptiveModbusController
 from .battery_health_manager import BatteryHealthManager
+from .bus_diagnostics import BusDiagnostics
 from .const import CONF_ENABLE_PARAMETER_CONFIGURATION, DATA_DEVICE_DATAS
 from .types import (
     HuaweiSolarConfigEntry,
@@ -117,11 +118,23 @@ async def async_setup_entry(
     # failure here must never abort the switch platform (v1.1.7 contract).
     try:
         learning_switches: list[SwitchEntity] = []
+        seen_buses: set[str] = set()
         for ucs in device_data:
             bh_manager = BatteryHealthManager.get(ucs.device.serial_number)
             if bh_manager:
                 learning_switches.append(
                     AdaptiveLearningSwitchEntity(bh_manager)
+                )
+            # One diagnostics switch per BUS, not per inverter: the capture is
+            # a property of the shared physical connection.
+            coordinator = getattr(ucs, "update_coordinator", None)
+            guard = getattr(coordinator, "guard", None)
+            if guard is not None and guard.endpoint not in seen_buses:
+                seen_buses.add(guard.endpoint)
+                diagnostics = BusDiagnostics.get_or_create(hass, guard.endpoint)
+                guard.diagnostics = diagnostics
+                learning_switches.append(
+                    ModbusDiagnosticsSwitchEntity(diagnostics, ucs)
                 )
         if learning_switches:
             async_add_entities(learning_switches)
@@ -454,4 +467,59 @@ class AdaptiveLearningSwitchEntity(SwitchEntity):
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Freeze all learning for planned maintenance."""
         await self._apply(False)
+        self.async_write_ha_state()
+
+
+class ModbusDiagnosticsSwitchEntity(SwitchEntity):
+    """Per-request Modbus diagnostic capture for one physical bus.
+
+    Default OFF, and deliberately NOT restored across restarts, so a capture
+    can never be left silently running. Enable it for a bounded window when
+    investigating, then turn it off.
+
+    Records go to ``config/huawei_solar_diagnostics/bus_<tag>.jsonl`` — one JSON
+    object per request, with **wait time and service time separated**. That
+    split is the point: wait-dominated means requests queue behind one another
+    (a scheduler is the fix); service-dominated means the device itself is slow
+    (only reducing demand helps). No sensor available today distinguishes them.
+
+    The bus identifier is a salted hash, not the host or serial, so a capture
+    can be shared without exposing the installation.
+
+    Writes no inverter registers, and never blocks the event loop.
+    """
+
+    _attr_has_entity_name = True
+    _attr_should_poll = False
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_entity_registry_enabled_default = False
+    _attr_name = "Modbus diagnostic capture"
+    _attr_icon = "mdi:file-search-outline"
+
+    def __init__(self, diagnostics: BusDiagnostics, device_data: Any) -> None:
+        """Initialize the diagnostics switch."""
+        self._diagnostics = diagnostics
+        self._attr_device_info = device_data.device_info
+        self._attr_unique_id = (
+            f"{device_data.device.serial_number}_modbus_diagnostic_capture"
+        )
+
+    @property
+    def is_on(self) -> bool:
+        """Return True while capture is running."""
+        return self._diagnostics.enabled
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Expose capture health, including dropped records."""
+        return self._diagnostics.stats()
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        """Start capturing per-request records."""
+        self._diagnostics.set_enabled(True)
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        """Stop capturing and flush anything pending."""
+        self._diagnostics.set_enabled(False)
         self.async_write_ha_state()

@@ -48,6 +48,7 @@ _MODULES = [
     "modbus_telemetry",
     "adaptive_modbus",
     "battery_health",
+    "bus_diagnostics",
 ]
 
 

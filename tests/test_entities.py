@@ -288,6 +288,9 @@ def _load(modname: str):
 # switch, so it must resolve as a package submodule too.
 ADAPTIVE = _load("adaptive_modbus")
 sys.modules["huawei_solar.adaptive_modbus"] = ADAPTIVE
+# v1.3.0: switch.py imports the diagnostics capture for the per-bus switch.
+BUSDIAG = _load("bus_diagnostics")
+sys.modules["huawei_solar.bus_diagnostics"] = BUSDIAG
 
 BATTERY_HEALTH = _load("battery_health")
 sys.modules["huawei_solar.battery_health"] = BATTERY_HEALTH
