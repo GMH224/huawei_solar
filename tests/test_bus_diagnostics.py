@@ -141,6 +141,53 @@ class TestConfidentiality(unittest.TestCase):
         self.assertEqual(tag, BD.pseudonym(endpoint))          # stable
         self.assertNotEqual(tag, BD.pseudonym("192.168.1.56:502"))
 
+    def test_serial_in_coordinator_name_is_stripped(self):
+        """REGRESSION — the leak found in the first real field capture.
+
+        Coordinator names are built as
+        f"{device.serial_number}_..._update_coordinator", so passing
+        coordinator.name straight through wrote real serials into every
+        record. The original test only checked the ENDPOINT, so the leak
+        shipped despite the audit claiming no serials were present.
+        """
+        leaked = "HV2220098926_battery_data_update_coordinator"
+        clean = BD.sanitise_label(leaked)
+        self.assertNotIn("HV2220098926", clean)
+        self.assertIn("battery_data_update_coordinator", clean,
+                      "the useful part of the label must survive")
+
+    def test_sanitised_labels_are_stable_and_distinguishing(self):
+        """Two inverters must stay distinguishable after pseudonymisation."""
+        a = BD.sanitise_label("HV2220098926_data_update_coordinator")
+        b = BD.sanitise_label("HV2220080950_data_update_coordinator")
+        self.assertNotEqual(a, b)
+        self.assertEqual(a, BD.sanitise_label("HV2220098926_data_update_coordinator"))
+
+    def test_labels_without_serials_are_untouched(self):
+        for label in ("power_meter_data_update_coordinator",
+                      "config_data_update_coordinator"):
+            self.assertEqual(BD.sanitise_label(label), label)
+
+    def test_serial_survives_no_word_boundary(self):
+        """The first sanitiser used \\b and silently matched nothing.
+
+        "_" is a word character, so \\b never fires between the digits and the
+        underscore. Pinned so the anchoring cannot regress.
+        """
+        self.assertNotIn("HV2220098926", BD.sanitise_label("HV2220098926_x"))
+
+    def test_written_records_contain_no_serial(self):
+        dirpath = tempfile.mkdtemp()
+        hass = _FakeHass(dirpath)
+        d = BD.BusDiagnostics(hass, "192.168.1.55:502")
+        d.set_enabled(True)
+        for _ in range(BD.FLUSH_THRESHOLD):
+            d.record(endpoint="192.168.1.55:502",
+                     label="HV2220098926_battery_data_update_coordinator",
+                     wait_ms=1, service_ms=2, queue_depth=0, outcome="ok")
+        blob = open(os.path.join(dirpath, BD._SUBDIR, f"bus_{d.tag}.jsonl")).read()
+        self.assertNotIn("HV2220098926", blob)
+
     def test_records_contain_no_endpoint_or_serial(self):
         dirpath = tempfile.mkdtemp()
         hass = _FakeHass(dirpath)
@@ -228,6 +275,36 @@ class TestWaitServiceSplit(unittest.TestCase):
         self.assertGreater(service, 10, "service time must still be attributed")
         self.assertEqual(g.queue_depth, 0)
         self.assertFalse(g._lock.locked())
+
+    def test_register_count_and_tier_are_recorded(self):
+        """The second Phase 0 defect: these fields existed but were never set.
+
+        Without them a stall cannot be correlated with what was being read,
+        which is exactly the next question after the wait/service split.
+        """
+        captured = []
+
+        class Sink:
+            enabled = True
+            def record(self, **kw):
+                captured.append(kw)
+
+        async def run():
+            g = _fresh_guard()
+            g.diagnostics = Sink()
+            async with g.request(label="c") as req:
+                req.registers = 7
+                req.priority_tier = "FAST"
+        asyncio.run(run())
+        self.assertEqual(captured[0]["registers"], 7)
+        self.assertEqual(captured[0]["priority"], "FAST")
+
+    def test_request_context_exposes_detail_fields(self):
+        async def run():
+            g = _fresh_guard()
+            async with g.request(label="c") as req:
+                return req.registers, req.priority_tier
+        self.assertEqual(asyncio.run(run()), (None, None))
 
     def test_diagnostics_sink_receives_records(self):
         captured = []

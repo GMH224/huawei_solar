@@ -40,6 +40,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 from collections import deque
 from typing import Any
@@ -67,6 +68,35 @@ _SUBDIR = "huawei_solar_diagnostics"
 def pseudonym(value: str) -> str:
     """Stable, non-reversible short identifier for a serial or endpoint."""
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+
+
+#: A token is treated as a serial if it contains a run of >=6 digits.
+#: Deliberately NOT anchored with \b: coordinator names are underscore-joined
+#: ("<serial>_battery_data_update_coordinator") and "_" is a word
+#: character, so \b never fires at the digit/underscore boundary — the first
+#: attempt at this regex silently matched nothing.
+_DIGIT_RUN_RE = re.compile(r"\d{6,}")
+
+
+def sanitise_label(label: str) -> str:
+    """Replace serial-like tokens in a coordinator name with a pseudonym.
+
+    DEFECT (v1.3.0, found in the first field capture): coordinator names are
+    built as ``f"{device.serial_number}_..._update_coordinator"``, so passing
+    ``coordinator.name`` straight through wrote real serial numbers into every
+    record — despite this module pseudonymising the endpoint and the audit
+    claiming no serials were present. The test only asserted the *endpoint*
+    was absent, so the leak went unnoticed.
+
+    Sanitising here rather than at the call site means every future caller is
+    covered by default, including ones that do not know to be careful.
+    """
+    parts = label.split("_")
+    out = [
+        f"dev{pseudonym(part)[:4]}" if _DIGIT_RUN_RE.search(part) else part
+        for part in parts
+    ]
+    return "_".join(out)
 
 
 class BusDiagnostics:
@@ -150,8 +180,7 @@ class BusDiagnostics:
             {
                 "t": round(time.time(), 3),
                 "bus": self.tag,
-                # `label` is a coordinator name, already free of serials.
-                "src": label,
+                        "src": sanitise_label(label),
                 "wait_ms": round(wait_ms, 1),
                 "service_ms": round(service_ms, 1),
                 "qd": queue_depth,

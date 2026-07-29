@@ -87,7 +87,12 @@ from .const import (
 from .modbus_guard import ModbusGuard, ModbusQueueShed
 from .modbus_telemetry import ModbusTelemetry
 from .night_mode import InverterMode, NightModeDetector
-from .register_cache import RegisterCache, RegisterTier, is_energy_counter
+from .register_cache import (
+    RegisterCache,
+    RegisterTier,
+    classify_register,
+    is_energy_counter,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -336,6 +341,23 @@ class HuaweiSolarUpdateCoordinator(
             return self._adaptive.get_params().poll_interval
         return self._day_interval
 
+def _chunk_tier(chunk: list[RegisterName]) -> str:
+    """Coarsest (most time-critical) cache tier present in a chunk.
+
+    Recorded per request so a stall can be correlated with WHAT was being read.
+    The tier already exists in register_cache and drives caching; this makes it
+    visible in the diagnostic capture too, and is the same signal a future
+    priority scheduler would order on.
+    """
+    try:
+        tiers = {classify_register(name) for name in chunk}
+        if not tiers:
+            return "empty"
+        return min(tiers).name          # RegisterTier is an IntEnum: FAST < ... < STATIC
+    except Exception:  # noqa: BLE001 — instrumentation must never break a poll
+        return "unknown"
+
+
     # ── core batch executor with chunking + 0x06 retry (opts. 2, 4) ──────────
 
     def _record_timeout(self) -> None:
@@ -427,6 +449,10 @@ class HuaweiSolarUpdateCoordinator(
             while True:
                 try:
                     async with self.guard.request(label=self.name) as _req:
+                        # Attribute this exchange to what it actually reads, so
+                        # a stall can be correlated with register count/tier.
+                        _req.registers = len(chunk)
+                        _req.priority_tier = _chunk_tier(chunk)
                         t0 = time.monotonic()
                         async with asyncio.timeout(effective_timeout.total_seconds()):
                             chunk_result = await self.device.batch_update(chunk)

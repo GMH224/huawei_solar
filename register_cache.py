@@ -231,6 +231,15 @@ _TIER_OVERRIDES: dict[str, "RegisterTier"] = {
 
 
 @lru_cache(maxsize=256)
+def classify_register(name: "RegisterName") -> RegisterTier:
+    """Public wrapper around the cached tier classifier.
+
+    Exposed so the coordinator can record which tier a request belongs to in
+    the diagnostic capture, without reaching into a private helper.
+    """
+    return _classify(name)
+
+
 def _classify(name: RegisterName) -> RegisterTier:
     """Return the volatility tier for a register name.
 

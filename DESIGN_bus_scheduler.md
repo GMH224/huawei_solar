@@ -1,6 +1,17 @@
 # Design — Modbus Bus Scheduler
 
-**Status:** proposal for review. No code written.
+**Status:** ⚠️ **CORE ASSUMPTION INVALIDATED BY MEASUREMENT (2026-07-28).**
+Phase 0 shipped and produced field data showing the bus queue is empty
+(median wait 0.0 ms; qd=0 in 371/400 records) while service time is 90% of
+elapsed request time, with single exchanges reaching 33 s. The bottleneck is
+the DEVICE, not contention on our lock.
+
+Consequences: **Phase 3 (occupancy admission control) is largely unnecessary**
+— there is no queue to build. **Phase 2 (priority ordering) loses most of its
+value** — there is no queue to reorder. This document is retained for the
+problem statement and for Phase 0, which did its job. Phases 1–3 must be
+redesigned around the real question: *which registers or access patterns cause
+multi-second stalls.* See AUDIT_1.3.1.md §4.
 **Date:** 2026-07-28
 **Baseline:** v1.2.4 (running, stable — the rollback target)
 **Supersedes:** Defect C (§7 of the bug report) and §9.5, which are absorbed here.

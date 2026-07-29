@@ -173,6 +173,13 @@ class ModbusGuard:
             self._guard = guard
             self._priority = priority  # keep-alive uses priority=True, bypasses shedding
             self._label = label        # who asked, for diagnostics attribution
+            #: Per-request detail filled in by the CALLER after admission
+            #: (v1.3.0 fix). The first field capture wrote these as null
+            #: because the fields existed but nothing populated them — so the
+            #: capture could not correlate stall duration with what was
+            #: actually being read, which is the whole next question.
+            self.registers: int | None = None
+            self.priority_tier: str | None = None
             self._t_submit: float = 0.0
             self._t_admitted: float = 0.0
             #: Time spent waiting for admission (lock + inter-request gap).
@@ -249,6 +256,8 @@ class ModbusGuard:
                         service_ms=service_ms,
                         queue_depth=guard._queue_depth,
                         outcome="error" if exc_type else "ok",
+                        registers=self.registers,
+                        priority=self.priority_tier,
                     )
                 except Exception:  # noqa: BLE001 — diagnostics must never break I/O
                     _LOGGER.exception("ModbusGuard[%s]: diagnostics sink failed",

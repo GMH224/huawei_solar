@@ -1,7 +1,7 @@
 # CLAUDE.md — Huawei Solar Integration
 
 > **Maintained by Claude (Anthropic) on behalf of the community.**
-> Current version: **1.3.0** — see `manifest.json`.
+> Current version: **1.3.1** — see `manifest.json`.
 
 ---
 
@@ -663,6 +663,62 @@ timestamp, eliminating arithmetic errors on the power-flow card.
 - **New:** `tests/test_synchronized_power_coordinator.py` — 22 tests covering
   derived properties (all edge cases), happy path, partial failure, all-fail,
   consecutive failure counter, and telemetry recording.
+
+### v1.3.1 (2026-07-28)
+**Phase 0 instrumentation fixes.** Both defects were found by reading the
+FIRST real capture file — neither was visible in testing.
+
+**Defect 1 — serial numbers leaked into the capture (confidentiality).**
+Coordinator names are built as
+``f"{device.serial_number}_..._update_coordinator"``, and the guard was passed
+``coordinator.name`` verbatim. Every record therefore contained a real serial,
+despite this module pseudonymising the endpoint and AUDIT_1.3.0 §4 asserting
+no serials were present. The existing test only checked that the *endpoint*
+was absent, so the leak shipped.
+
+- `sanitise_label()` now pseudonymises any underscore-separated token
+  containing a run of 6+ digits, applied inside `record()` so every future
+  caller is covered by default rather than having to know to be careful.
+- Two inverters remain distinguishable (`dev8c0f_` vs `devdc46_`) and the
+  useful part of the label survives.
+- **Note on the first attempt:** an anchored regex (`\b...\b`) silently
+  matched nothing, because "_" is a word character so `\b` never fires at the
+  digit/underscore boundary. Pinned by
+  `test_serial_survives_no_word_boundary`.
+
+**Defect 2 — `regs` and `prio` were always null.** The fields existed in the
+record schema but nothing populated them, so a stall could not be correlated
+with *what* was being read — precisely the next question after the wait/service
+split. The request context now exposes `registers` and `priority_tier`, set by
+the coordinator per chunk. `register_cache.classify_register()` is a new public
+wrapper so the tier can be read without reaching into a private helper.
+
+**Findings from the first capture (400 records, 2.5 h)** — these change the
+plan and are recorded in full in AUDIT_1.3.1.md:
+
+| | median | p90 | p99 | max |
+|---|---|---|---|---|
+| wait_ms | **0.0** | 0.1 | 8,500 | 10,405 |
+| service_ms | **61.7** | 9,780 | 27,291 | 32,786 |
+
+Service time is **90%** of all elapsed request time and the queue is empty in
+371 of 400 records. **Mechanism (b) is confirmed: the device is slow, not our
+queueing.** Single exchanges reach 33 seconds.
+
+This also vindicates the `rtt_p95_ms ≈ 12000` figure that v1.2.4's audit
+dismissed as a relearning transient — it was real. The later conclusion that
+per-chunk RTT was "sub-second", inferred from settled-slot gap values, was
+wrong.
+
+**Consequence for the roadmap:** Phase 3 (occupancy-based admission control)
+is largely unnecessary — its premise was queue build-up, and there is no
+queue. Phase 2 (priority ordering) loses most of its value for the same
+reason: there is no queue to reorder. The open question is now *which
+registers or access patterns trigger multi-second stalls*, which the next
+capture can answer now that `regs`/`prio` are populated.
+
+**Tests: 433 -> 440 passed, 1 skipped.** Adversarial verification against the
+shipped v1.3.0 tree: **7 of 7** new tests fail.
 
 ### v1.3.0 (2026-07-28)
 **Bus scheduler rework — Phase 0: instrumentation.** First of a staged series
