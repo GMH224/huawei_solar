@@ -362,8 +362,15 @@ Field measurement showed any request touching SLOW-tier content costs
 ~2.9 s + 377 ms/register, versus ~6 ms for a FAST/NORMAL-only request of the
 same size.
 
+Since v1.3.4 the whole SLOW/STATIC cohort is also refreshed **together** when
+any of them comes due, rather than dribbling in one or two at a time — measured
+~6x less expensive-exchange cost.
+
 **Effect on battery health:** the lifetime charge/discharge counters are
-SLOW-tier, so segment endpoints may be up to 15 minutes stale. This is already
+SLOW-tier, so segment endpoints may be up to 15 minutes stale. Coalescing works
+in your favour here: because the cohort refreshes as one, the counters and the
+other slow registers now share a timestamp instead of being scattered across a
+15-minute window. This is already
 handled — `CounterMonitor` flags carried-forward values and segments refuse to
 open on them (v1.2.3, Finding C) — but `stale_endpoint_skips` in the health
 index attributes is the number to watch if capacity segments stop completing.

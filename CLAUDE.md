@@ -1,7 +1,7 @@
 # CLAUDE.md — Huawei Solar Integration
 
 > **Maintained by Claude (Anthropic) on behalf of the community.**
-> Current version: **1.3.3** — see `manifest.json`.
+> Current version: **1.3.4** — see `manifest.json`.
 
 ---
 
@@ -663,6 +663,92 @@ timestamp, eliminating arithmetic errors on the power-flow card.
 - **New:** `tests/test_synchronized_power_coordinator.py` — 22 tests covering
   derived properties (all edge cases), happy path, partial failure, all-fail,
   consecutive failure counter, and telemetry recording.
+
+### v1.3.4 (2026-07-29)
+**SLOW-tier coalescing.** Deeper analysis of the same 3,400-record capture
+found the dominant remaining cost — and showed that v1.3.3's TTL change alone
+would deliver far less than its changelog claimed.
+
+**The measurement that changed the picture.** Expensive reads (regs >= 9,
+excluding the FAST-only power_meter coordinator):
+
+| coordinator | expensive reads/h | interval |
+|---|---|---|
+| `data_update_coordinator` | **37.9** | every **1.6 min** |
+| `battery_data_update_coordinator` | 18.3 | every 3.3 min |
+| `config_data_update_coordinator` | 5.9 | every 10.2 min |
+
+A 300 s SLOW TTL should permit at most ~12/h. `data` was doing **38/h**.
+
+**Why:** TTLs are timestamped per register. A coordinator's ~26 SLOW registers
+were last read at ~26 different moments, so they expire at ~26 different
+moments, and nearly every 30 s poll drags one or two newly-due registers in —
+paying the full ~2.9 s fixed entry cost each time.
+
+**Correcting v1.3.3's claim:** raising the TTL to 900 s cuts each register's
+rate 3x but NOT the number of distinct expiry moments — 26 registers at 900 s
+still expire ~1.7x/minute. The "~3x fewer expensive exchanges" stated in the
+v1.3.3 changelog was wrong.
+
+**(1) Coalescing.** When any expensive register comes due, the WHOLE
+SLOW/STATIC cohort for that cache is refreshed in the same exchange, giving
+them a shared expiry. A continuous dribble of ~13-register reads becomes one
+larger read per TTL period:
+
+```
+today     : 37.9/h x (2.9 + 13 x 0.377) s ~ 296 s/h   (8.2% of wall clock)
+coalesced :  4.0/h x (2.9 + 26 x 0.377) s ~  51 s/h   (~6x less)
+```
+
+Same insight that makes splitting expensive reads a pessimisation, applied in
+reverse: pay the entry toll as rarely as possible, carry as much as possible
+each time. Cheap (FAST/NORMAL) registers are deliberately NOT pulled in — that
+would undo v1.3.3's tier separation. Default ON, disableable via options.
+
+**(2) Queueing instrumentation.** The full capture shows knock-on blocking is
+worse than an earlier 900-record sample suggested: **210 of 467** long
+exchanges had another request waiting, and **291 requests waited >1 s for a
+total of 1,362 s**. New `bus_requests_waited` and `bus_total_wait_s` sensors
+make v1.3.3's tier separation measurable rather than assumed.
+
+**(3) Optional night deferral — DEFAULT OFF.** Holds non-urgent expensive
+refreshes until night mode, bounded at 3x TTL so deferral can never become
+starvation. Off by default because the capture spans 04:00-15:00 UTC only:
+there is no evidence yet that expensive reads are cheaper at night.
+
+*A conflict found while building it:* night mode multiplies every non-FAST TTL
+by 10, so "defer to night" would have deferred reads into a window where they
+were not due either — the feature would only have added delay. When
+night-preference is active and night mode is on, the expensive tier is now
+judged against its BASE TTL. Found by a failing test; the mechanism was fixed
+rather than the expectation.
+
+**(4) Errors not actioned.** 18 of 3,400 requests (0.5%) ended in `error`.
+Below the threshold worth changing behaviour for; the capture already records
+them if that changes.
+
+**New sensors:** `bus_requests_waited`, `bus_total_wait_s`,
+`coalesce_events`, `coalesced_registers`.
+**New options:** batch slow-register refreshes (on), defer to night (off).
+
+**Also fixed — latent first-flush bug in the diagnostic capture.**
+`BusDiagnostics._last_flush` was initialised to `0.0`, which the rate-limit
+check read as "flushed at monotonic time 0". On a host whose `time.monotonic()`
+was still below `MIN_FLUSH_INTERVAL_S` (a freshly booted machine or container)
+the **first** flush was suppressed and records sat in the buffer until 30 s of
+uptime had elapsed. Now a `None` sentinel meaning "never flushed".
+
+Found because the capture tests failed intermittently in the full suite while
+passing in isolation. Worth recording: in the field this would have shown up as
+"the capture file sometimes doesn't appear" — silent, and only sometimes.
+
+**Tests: 455 -> 467 passed, 1 skipped**, deterministic across six consecutive
+full-suite runs. Adversarial: 7 of 21 fail against v1.3.3.
+
+**Expected next capture:** expensive reads down from ~38/h toward ~4-8/h on
+`data_update_coordinator`, `coalesce_events` climbing, chunk sizes clustering
+near the full cohort size instead of spreading 9-27, and `bus_total_wait_s`
+growing more slowly than the 1,362 s per 28.8 h baseline.
 
 ### v1.3.3 (2026-07-29)
 **Tier-aware Modbus reads.** First release driven by the Phase 0 capture —

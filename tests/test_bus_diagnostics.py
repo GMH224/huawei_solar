@@ -85,6 +85,44 @@ class TestCaptureDisabledByDefault(unittest.TestCase):
         self.assertFalse(fresh.enabled)
 
 
+class TestFlushRateLimit(unittest.TestCase):
+    """The first flush must never be rate-limited.
+
+    REGRESSION: `_last_flush` was initialised to 0.0, which the rate-limit
+    check read as "flushed at monotonic time 0". On a host whose
+    time.monotonic() was still below MIN_FLUSH_INTERVAL_S — a freshly booted
+    machine or container — the FIRST flush was suppressed and records sat in
+    the buffer. It showed up as an intermittent test failure, which is exactly
+    how it would have behaved in the field: silently, and only sometimes.
+    """
+
+    def setUp(self):
+        BD.BusDiagnostics.clear_registry()
+        self.dir = tempfile.mkdtemp()
+
+    def test_last_flush_starts_as_none(self):
+        d = BD.BusDiagnostics(_FakeHass(self.dir), "e")
+        self.assertIsNone(d._last_flush)
+
+    def test_first_flush_happens_even_at_low_monotonic(self):
+        hass = _FakeHass(self.dir)
+        d = BD.BusDiagnostics(hass, "e")
+        d.set_enabled(True)
+        for _ in range(BD.FLUSH_THRESHOLD):
+            d.record(endpoint="e", label="c", wait_ms=1, service_ms=2,
+                     queue_depth=0, outcome="ok")
+        self.assertGreaterEqual(hass.jobs, 1, "first flush must not be suppressed")
+
+    def test_second_flush_is_rate_limited(self):
+        hass = _FakeHass(self.dir)
+        d = BD.BusDiagnostics(hass, "e")
+        d.set_enabled(True)
+        for _ in range(BD.FLUSH_THRESHOLD * 2):
+            d.record(endpoint="e", label="c", wait_ms=1, service_ms=2,
+                     queue_depth=0, outcome="ok")
+        self.assertEqual(hass.jobs, 1, "a burst must not cause continuous I/O")
+
+
 class TestCaptureBounded(unittest.TestCase):
     def setUp(self):
         BD.BusDiagnostics.clear_registry()
@@ -219,6 +257,8 @@ def _fresh_guard(endpoint="e"):
     g._wait_samples = deque(maxlen=256)
     g._service_samples = deque(maxlen=256)
     g.diagnostics = None
+    g.total_wait_ms = 0.0
+    g.requests_waited = 0
     return g
 
 

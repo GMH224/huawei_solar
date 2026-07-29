@@ -104,6 +104,16 @@ _TIER_BASE_TTL: dict[RegisterTier, float] = {
 }
 
 
+#: Master switch for SLOW-tier coalescing (v1.3.4). Exposed so the behaviour
+#: can be disabled in the field without a code change if it ever misbehaves.
+COALESCE_SLOW_TIER_DEFAULT = True
+
+#: How far past its TTL an expensive register may be held while waiting for
+#: night mode (item 3). Bounded so deferral can never become starvation: at
+#: 3x the SLOW TTL a register is refreshed regardless of time of day.
+SLOW_DEFER_MAX_TTL_MULTIPLE = 3.0
+
+
 def set_slow_tier_ttl(seconds: float) -> None:
     """Override the SLOW-tier base TTL (options flow).
 
@@ -350,6 +360,21 @@ class RegisterCache:
         self._store: dict[RegisterName, _CacheEntry] = {}
         self._telemetry = telemetry
         self._night_mode: bool = False
+        # ── v1.3.4 SLOW-tier coalescing ─────────────────────────────────────
+        self._coalesce_slow_tier: bool = COALESCE_SLOW_TIER_DEFAULT
+        #: Registers pulled forward into a due expensive read, and how many
+        #: times that happened. Exposed as diagnostics so the effect is
+        #: measurable rather than assumed.
+        self.coalesced_registers: int = 0
+        self.coalesce_events: int = 0
+        self.deferred_expensive: int = 0
+        #: v1.3.4 (item 3) — defer non-urgent expensive refreshes out of
+        #: daylight. DEFAULT OFF: the Phase 0 capture covers 04:00-15:00 UTC
+        #: only, so there is no night data to confirm that expensive reads are
+        #: cheaper (or even equally costly) at night. Enabling this without
+        #: that evidence would be exactly the kind of unmeasured assumption
+        #: this project has already been bitten by twice.
+        self._prefer_night_for_slow: bool = False
 
     # ── night-mode control ────────────────────────────────────────────────────
 
@@ -361,6 +386,24 @@ class RegisterCache:
         singleton becomes available after construction.
         """
         self._telemetry = telemetry
+
+    def set_coalesce_slow_tier(self, enabled: bool) -> None:
+        """Enable/disable SLOW-tier coalescing (options flow)."""
+        self._coalesce_slow_tier = bool(enabled)
+
+    def set_prefer_night_for_slow(self, enabled: bool) -> None:
+        """Defer non-urgent expensive refreshes to night mode (default off)."""
+        self._prefer_night_for_slow = bool(enabled)
+
+    def coalescing_stats(self) -> dict:
+        """Diagnostics for the coalescing behaviour."""
+        return {
+            "coalesce_enabled": self._coalesce_slow_tier,
+            "coalesce_events": self.coalesce_events,
+            "coalesced_registers": self.coalesced_registers,
+            "prefer_night_for_slow": self._prefer_night_for_slow,
+            "deferred_expensive": self.deferred_expensive,
+        }
 
     def set_night_mode(self, active: bool) -> None:
         """Enable or disable night-mode TTL stretching."""
@@ -408,14 +451,36 @@ class RegisterCache:
         stale: list[RegisterName] = []
         cache_hits = 0
         default_ttl_s = default_ttl.total_seconds()
+        expensive_due = False
+        expensive_fresh: list[RegisterName] = []
 
         for name in names:
             entry = self._store.get(name)
             if entry is None or entry.dirty:
                 stale.append(name)
+                if entry is not None and entry.tier >= RegisterTier.SLOW:
+                    expensive_due = True
+                elif entry is None and _classify(name) >= RegisterTier.SLOW:
+                    expensive_due = True
                 continue
 
             ttl = self._effective_ttl(entry)
+
+            # (item 3, v1.3.4) Night-preference and the night TTL multiplier
+            # pull in OPPOSITE directions: night mode stretches every non-FAST
+            # TTL by NIGHT_TTL_MULTIPLIER (x10), so "defer expensive reads to
+            # night" would defer them into a window where they are not due
+            # either — the feature would do nothing but delay.
+            #
+            # So when night-preference is active AND we are in night mode, the
+            # expensive tier is judged against its BASE TTL: held back during
+            # daylight, refreshed promptly once night arrives.
+            if (
+                self._prefer_night_for_slow
+                and self._night_mode
+                and entry.tier >= RegisterTier.SLOW
+            ):
+                ttl = _TIER_BASE_TTL[entry.tier]
 
             # For NORMAL tier, never use a TTL shorter than default_ttl so that
             # the coordinator's own interval is always respected as a minimum.
@@ -424,9 +489,64 @@ class RegisterCache:
 
             age = now - entry.ts
             if age >= ttl:
+                # (item 3, v1.3.4) Optionally hold an expensive refresh back
+                # until night mode — but only while it is not badly overdue, so
+                # deferral can never become starvation. DEFAULT OFF: no night
+                # data exists yet to show expensive reads are cheaper at night.
+                if (
+                    self._prefer_night_for_slow
+                    and not self._night_mode
+                    and entry.tier >= RegisterTier.SLOW
+                    and age < ttl * SLOW_DEFER_MAX_TTL_MULTIPLE
+                ):
+                    cache_hits += 1
+                    self.deferred_expensive += 1
+                    continue
                 stale.append(name)
+                if entry.tier >= RegisterTier.SLOW:
+                    expensive_due = True
             else:
                 cache_hits += 1
+                if entry.tier >= RegisterTier.SLOW:
+                    expensive_fresh.append(name)
+
+        # ── SLOW-tier coalescing (v1.3.4) ────────────────────────────────────
+        #
+        # Field measurement: any request touching SLOW/STATIC content costs
+        # ~2,900 ms FIXED plus ~377 ms per register, while a FAST/NORMAL-only
+        # request costs ~6 ms regardless of size. The dominant term is the
+        # per-request entry cost, not the per-register one.
+        #
+        # TTLs are timestamped per register, so a coordinator's ~26 SLOW
+        # registers expire at ~26 different moments. The measured result was
+        # `data_update_coordinator` performing 37.9 expensive reads per hour —
+        # one every 1.6 minutes — against a 300 s TTL that should have allowed
+        # at most ~12/h. Nearly every poll dragged in one or two newly-due SLOW
+        # registers and paid the full 2.9 s toll for them.
+        #
+        # Raising the TTL alone does NOT fix this: 26 registers expiring
+        # independently every 900 s still yields ~1.7 expiries per minute.
+        #
+        # So: once ANY expensive register is due, refresh the WHOLE expensive
+        # cohort in the same request. They then share an expiry and move
+        # together, turning a continuous dribble of ~13-register reads into one
+        # larger read per TTL period.
+        #
+        #   today      : 37.9/h x (2.9 + 13 x 0.377) s ~ 296 s/h
+        #   coalesced  :  4.0/h x (2.9 + 26 x 0.377) s ~  51 s/h    (~6x less)
+        #
+        # This is the same insight that makes SPLITTING expensive reads a
+        # pessimisation, applied in reverse: pay the entry toll as rarely as
+        # possible and carry as much as possible each time.
+        if self._coalesce_slow_tier and expensive_due and expensive_fresh:
+            stale.extend(expensive_fresh)
+            cache_hits -= len(expensive_fresh)
+            self.coalesced_registers += len(expensive_fresh)
+            self.coalesce_events += 1
+            _LOGGER.debug(
+                "Register cache: coalescing %d fresh SLOW-tier register(s) "
+                "into a due expensive read", len(expensive_fresh),
+            )
 
         # Report all hits in a single batched call — one time.monotonic() and
         # one deque.extend() instead of N individual calls.

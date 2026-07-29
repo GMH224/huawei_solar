@@ -194,3 +194,125 @@ class TestCostModel(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v1.3.4 — SLOW-tier coalescing, night deferral, wait instrumentation
+# ══════════════════════════════════════════════════════════════════════════════
+from datetime import timedelta
+
+
+def _cache():
+    c = RC.RegisterCache()
+    return c
+
+
+def _seed(cache, name, tier, age_s, now):
+    """Put an entry in the cache with a controlled age."""
+    e = RC._CacheEntry(value=1, raw=1, ts=now - age_s, tier=tier)
+    cache._store[name] = e
+    return e
+
+
+class TestSlowTierCoalescing(unittest.TestCase):
+    """(1) The dominant remaining cost, and why TTL alone does not fix it.
+
+    Measured: `data_update_coordinator` performed 37.9 expensive reads/hour —
+    one every 1.6 min — against a 300 s TTL that should allow ~12/h. TTLs are
+    per register, so ~26 SLOW registers expire at ~26 different moments and
+    nearly every poll drags one in, paying the full ~2.9 s entry cost.
+
+    Raising the TTL cuts each register's rate but NOT the number of distinct
+    expiry moments: 26 registers at 900 s still expire ~1.7x/minute.
+    Coalescing collapses them onto a shared expiry.
+    """
+
+    def setUp(self):
+        self.now = RC.time.monotonic()
+        self.ttl = timedelta(seconds=30)
+
+    def test_due_expensive_register_pulls_in_fresh_siblings(self):
+        c = _cache()
+        names = ["slow_a", "slow_b", "slow_c"]
+        _seed(c, "slow_a", Tier.SLOW, 99999, self.now)     # overdue
+        _seed(c, "slow_b", Tier.SLOW, 1, self.now)         # fresh
+        _seed(c, "slow_c", Tier.SLOW, 1, self.now)         # fresh
+        stale = c.filter_stale(names, self.ttl)
+        self.assertEqual(set(stale), set(names),
+                         "one due expensive register must refresh the cohort")
+        self.assertEqual(c.coalesce_events, 1)
+        self.assertEqual(c.coalesced_registers, 2)
+
+    def test_cheap_registers_are_not_pulled_in(self):
+        """Coalescing must not inflate a chunk with FAST/NORMAL registers.
+
+        Those cost ~6 ms and have their own cadence; dragging them along would
+        defeat the tier separation shipped in v1.3.3.
+        """
+        c = _cache()
+        _seed(c, "slow_a", Tier.SLOW, 99999, self.now)
+        _seed(c, "fast_b", Tier.FAST, 0.0, self.now)
+        _seed(c, "norm_c", Tier.NORMAL, 0.0, self.now)
+        stale = c.filter_stale(["slow_a", "fast_b", "norm_c"], self.ttl)
+        self.assertIn("slow_a", stale)
+        self.assertNotIn("norm_c", stale)
+
+    def test_no_coalescing_when_nothing_expensive_is_due(self):
+        c = _cache()
+        _seed(c, "slow_a", Tier.SLOW, 1, self.now)
+        _seed(c, "slow_b", Tier.SLOW, 1, self.now)
+        stale = c.filter_stale(["slow_a", "slow_b"], self.ttl)
+        self.assertEqual(stale, [])
+        self.assertEqual(c.coalesce_events, 0)
+
+    def test_coalescing_can_be_disabled(self):
+        c = _cache()
+        c.set_coalesce_slow_tier(False)
+        _seed(c, "slow_a", Tier.SLOW, 99999, self.now)
+        _seed(c, "slow_b", Tier.SLOW, 1, self.now)
+        stale = c.filter_stale(["slow_a", "slow_b"], self.ttl)
+        self.assertEqual(stale, ["slow_a"])
+        self.assertEqual(c.coalesce_events, 0)
+
+    def test_expected_cost_reduction(self):
+        """The arithmetic that justifies the change."""
+        fixed, per_reg = 2924.0, 377.0
+        today = 37.9 * (fixed + 13 * per_reg) / 1000
+        coalesced = 4.0 * (fixed + 26 * per_reg) / 1000
+        self.assertGreater(today / coalesced, 4.0)
+
+
+class TestNightDeferral(unittest.TestCase):
+    """(3) Deliberately OFF by default — no night data exists yet."""
+
+    def setUp(self):
+        self.now = RC.time.monotonic()
+        self.ttl = timedelta(seconds=30)
+
+    def test_disabled_by_default(self):
+        self.assertFalse(_cache()._prefer_night_for_slow)
+
+    def test_defers_expensive_refresh_in_daylight_when_enabled(self):
+        c = _cache()
+        c.set_prefer_night_for_slow(True)
+        c.set_night_mode(False)
+        _seed(c, "slow_a", Tier.SLOW, RC._TIER_BASE_TTL[Tier.SLOW] * 1.2, self.now)
+        stale = c.filter_stale(["slow_a"], self.ttl)
+        self.assertEqual(stale, [])
+        self.assertEqual(c.deferred_expensive, 1)
+
+    def test_deferral_cannot_starve(self):
+        """Past the bound, an overdue register is refreshed regardless."""
+        c = _cache()
+        c.set_prefer_night_for_slow(True)
+        c.set_night_mode(False)
+        age = RC._TIER_BASE_TTL[Tier.SLOW] * (RC.SLOW_DEFER_MAX_TTL_MULTIPLE + 1)
+        _seed(c, "slow_a", Tier.SLOW, age, self.now)
+        self.assertEqual(c.filter_stale(["slow_a"], self.ttl), ["slow_a"])
+
+    def test_night_mode_allows_the_refresh(self):
+        c = _cache()
+        c.set_prefer_night_for_slow(True)
+        c.set_night_mode(True)
+        _seed(c, "slow_a", Tier.SLOW, RC._TIER_BASE_TTL[Tier.SLOW] * 1.2, self.now)
+        self.assertEqual(c.filter_stale(["slow_a"], self.ttl), ["slow_a"])

@@ -731,8 +731,15 @@ class HuaweiSolarUpdateCoordinator(
             # surfaced through each controller (per serial) for visibility.
             try:
                 wait_p95, service_p95 = self.guard.wait_service_split()
+                stats = self.cache.coalescing_stats()
                 self._adaptive.note_bus_metrics(
-                    self.guard.occupancy() * 100.0, wait_p95, service_p95
+                    self.guard.occupancy() * 100.0,
+                    wait_p95,
+                    service_p95,
+                    requests_waited=self.guard.requests_waited,
+                    total_wait_s=self.guard.total_wait_ms / 1000.0,
+                    coalesce_events=int(stats.get("coalesce_events", 0)),
+                    coalesced_registers=int(stats.get("coalesced_registers", 0)),
                 )
             except Exception:  # noqa: BLE001 — instrumentation is never critical
                 _LOGGER.debug("%s: bus metric update failed", self.name, exc_info=True)

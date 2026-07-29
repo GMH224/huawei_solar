@@ -114,7 +114,14 @@ class BusDiagnostics:
         self.tag = pseudonym(endpoint)
         self.enabled: bool = False
         self._buffer: deque[dict[str, Any]] = deque(maxlen=MAX_BUFFERED_RECORDS)
-        self._last_flush: float = 0.0
+        #: None = never flushed. Initialising to 0.0 was a latent bug: the
+        #: rate-limit check reads it as "flushed at monotonic time 0", so on a
+        #: host where time.monotonic() is still below MIN_FLUSH_INTERVAL_S
+        #: (freshly booted machine or container) the FIRST flush was suppressed
+        #: and records sat in the buffer until 30 s of uptime had passed. It
+        #: surfaced as an intermittent test failure rather than a wrong value,
+        #: which is exactly how it would have behaved in the field.
+        self._last_flush: float | None = None
         self._flush_in_progress: bool = False
         self.records_captured: int = 0
         self.records_dropped: int = 0
@@ -198,7 +205,11 @@ class BusDiagnostics:
         now = time.monotonic()
         if self._flush_in_progress:
             return
-        if not force and (now - self._last_flush) < MIN_FLUSH_INTERVAL_S:
+        if (
+            not force
+            and self._last_flush is not None
+            and (now - self._last_flush) < MIN_FLUSH_INTERVAL_S
+        ):
             return
         if not self._buffer:
             return

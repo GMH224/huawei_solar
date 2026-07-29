@@ -114,6 +114,10 @@ def _make_ctrl() -> AdaptiveModbusController:
     ctrl._bus_occupancy_pct = 0.0
     ctrl._bus_wait_p95 = 0.0
     ctrl._bus_service_p95 = 0.0
+    ctrl._bus_requests_waited = 0
+    ctrl._bus_total_wait_s = 0.0
+    ctrl._coalesce_events = 0
+    ctrl._coalesced_registers = 0
     return ctrl
 
 

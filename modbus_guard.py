@@ -140,6 +140,12 @@ class ModbusGuard:
         #: (the master's CPU). The field data cannot tell these apart.
         self._wait_samples: deque[float] = deque(maxlen=256)
         self._service_samples: deque[float] = deque(maxlen=256)
+        #: (item 2, v1.3.4) Cumulative queueing cost. The Phase 0 capture showed
+        #: 291 requests waiting >1 s for a total of 1,362 s — the main
+        #: justification for tier separation. Tracking it makes the effect
+        #: measurable instead of assumed.
+        self.total_wait_ms: float = 0.0
+        self.requests_waited: int = 0
         #: Optional sink for per-request records (bus_diagnostics.BusDiagnostics).
         self.diagnostics: Any | None = None
 
@@ -220,6 +226,9 @@ class ModbusGuard:
                 self._t_admitted = time.monotonic()
                 self.wait_ms = (self._t_admitted - self._t_submit) * 1000
                 guard._wait_samples.append(self.wait_ms)
+                guard.total_wait_ms += self.wait_ms
+                if self.wait_ms > 1000.0:
+                    guard.requests_waited += 1
 
             except BaseException:
                 # MUST be BaseException, not Exception: asyncio.CancelledError is a

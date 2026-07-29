@@ -59,6 +59,8 @@ def _fresh_guard(endpoint: str = "192.168.1.1:502") -> ModbusGuard:
     g._wait_samples = deque(maxlen=256)
     g._service_samples = deque(maxlen=256)
     g.diagnostics = None
+    g.total_wait_ms = 0.0
+    g.requests_waited = 0
     return g
 
 
