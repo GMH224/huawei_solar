@@ -293,5 +293,86 @@ class TestCoordinatorMethodOwnership(unittest.TestCase):
         )
 
 
+class TestCoordinatorClassIntegrity(unittest.TestCase):
+    """Each coordinator class must actually CONTAIN its required methods.
+
+    REGRESSION (v1.3.1): a module-level ``def`` (column 0) was inserted inside
+    a class body. In Python that TERMINATES the class — every method defined
+    after it, including ``_async_update_data``, silently became a module-level
+    function. Home Assistant then hit its base-class stub:
+
+        NotImplementedError: Update method not implemented
+
+    ...and every sensor on the integration failed to update.
+
+    ``ast.parse`` accepted the file. All 440 tests passed. Nothing noticed,
+    because no test instantiates a coordinator — a gap AUDIT_1.2.4 §6.1
+    recorded as open, and which then caused the very next outage.
+
+    This check is deliberately structural (AST): it needs no HA runtime, and
+    it fails on exactly the shape of mistake that caused the incident.
+    """
+
+    #: Methods HA requires, or that the integration's own error paths call.
+    REQUIRED = {
+        "HuaweiSolarUpdateCoordinator": {
+            "_async_update_data", "_execute_batch", "_record_timeout",
+            "_record_failure", "_record_shed",
+        },
+        "HuaweiSolarOptimizerUpdateCoordinator": {
+            "_async_update_data", "_record_failure",
+        },
+    }
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tree = ast.parse((_ROOT / "update_coordinator.py").read_text())
+        cls.classes = {
+            n.name: n for n in cls.tree.body if isinstance(n, ast.ClassDef)
+        }
+
+    def test_required_methods_are_inside_their_class(self):
+        for cls_name, required in self.REQUIRED.items():
+            with self.subTest(cls=cls_name):
+                self.assertIn(cls_name, self.classes)
+                defined = {
+                    m.name for m in self.classes[cls_name].body
+                    if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))
+                }
+                missing = required - defined
+                self.assertFalse(
+                    missing,
+                    f"{cls_name} is missing {sorted(missing)} — most likely a "
+                    f"module-level def was inserted into the class body, which "
+                    f"silently ends the class",
+                )
+
+    def test_classes_are_not_suspiciously_small(self):
+        """A truncated class body is the symptom; catch it directly."""
+        for cls_name, minimum in (("HuaweiSolarUpdateCoordinator", 8),
+                                  ("HuaweiSolarOptimizerUpdateCoordinator", 3)):
+            with self.subTest(cls=cls_name):
+                count = sum(
+                    1 for m in self.classes[cls_name].body
+                    if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))
+                )
+                self.assertGreaterEqual(count, minimum)
+
+    def test_no_module_level_def_between_class_methods(self):
+        """Pin the failure mode itself, across every module in the package."""
+        for path in sorted(_ROOT.glob("*.py")):
+            tree = ast.parse(path.read_text())
+            for node in tree.body:
+                if not isinstance(node, ast.ClassDef):
+                    continue
+                for item in node.body:
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        # A method's col_offset must be indented relative to
+                        # its class; column 0 means the class body ended.
+                        with self.subTest(file=path.name, cls=node.name,
+                                          fn=item.name):
+                            self.assertGreater(item.col_offset, node.col_offset)
+
+
 if __name__ == "__main__":
     unittest.main()

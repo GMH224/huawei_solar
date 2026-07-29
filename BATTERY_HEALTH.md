@@ -354,6 +354,20 @@ Check `learning_enabled`, `learning_active`, `settling_events` and
 `suppressed_observations` on the adaptive diagnostic sensors, to confirm what
 happened across a maintenance window.
 
+## 7f. Modbus tier separation (v1.3.3)
+
+Since v1.3.3 the integration reads SLOW/STATIC registers in separate requests
+from FAST/NORMAL ones, and refreshes them every 15 minutes rather than 5.
+Field measurement showed any request touching SLOW-tier content costs
+~2.9 s + 377 ms/register, versus ~6 ms for a FAST/NORMAL-only request of the
+same size.
+
+**Effect on battery health:** the lifetime charge/discharge counters are
+SLOW-tier, so segment endpoints may be up to 15 minutes stale. This is already
+handled — `CounterMonitor` flags carried-forward values and segments refuse to
+open on them (v1.2.3, Finding C) — but `stale_endpoint_skips` in the health
+index attributes is the number to watch if capacity segments stop completing.
+
 ## 8. Known limitations
 
 1. **Circularity:** SOH_cap depends on BMS SOC. Freshness weighting and the

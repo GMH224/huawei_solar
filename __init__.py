@@ -39,6 +39,8 @@ from homeassistant.helpers.device_registry import DeviceInfo
 
 from .const import (
     CONF_BH_ENABLED,
+    CONF_SLOW_TIER_TTL_S,
+    DEFAULT_SLOW_TIER_TTL_S,
     CONF_ENABLE_PARAMETER_CONFIGURATION,
     CONF_SLAVE_IDS,
     CONFIGURATION_UPDATE_INTERVAL,
@@ -54,6 +56,7 @@ from .const import (
 from .adaptive_modbus import AdaptiveModbusController
 from .battery_health_manager import BatteryHealthManager
 from .modbus_guard import ModbusGuard
+from .register_cache import set_slow_tier_ttl
 from .modbus_keepalive import ModbusKeepAlive
 from .modbus_telemetry import ModbusTelemetry
 from .services import async_setup_services
@@ -234,6 +237,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
         # must never be able to delay, cancel, or fail config-entry setup.
         # Nothing here is awaited on the setup critical path and every failure
         # mode is swallowed and logged.  See _async_setup_battery_health().
+        # v1.3.3: apply the configured SLOW-tier refresh interval before any
+        # polling starts, so the first cycle already uses it.
+        try:
+            set_slow_tier_ttl(
+                entry.options.get(CONF_SLOW_TIER_TTL_S, DEFAULT_SLOW_TIER_TTL_S)
+            )
+        except Exception:  # noqa: BLE001 — never break setup over a tunable
+            _LOGGER.exception("Could not apply SLOW-tier TTL option")
+
         _async_setup_battery_health(hass, entry, device_datas)
         # v1.2.2: gate BOTH learners across HA start-up and shutdown.
         try:

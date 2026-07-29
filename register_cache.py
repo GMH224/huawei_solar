@@ -76,12 +76,47 @@ class RegisterTier(IntEnum):
 
 
 # Base TTLs (seconds)
+#
+# v1.3.3 — SLOW raised 300 s -> 900 s on field evidence.
+#
+# Reading a SLOW/STATIC register is not marginally more expensive than a
+# FAST one; it is CATEGORICALLY more expensive. Measured over 3,400 requests:
+#
+#   chunk of FAST/NORMAL only  : ~6 ms regardless of size (18 registers: 6.2 ms)
+#   chunk containing SLOW/STATIC: ~2,900 ms + 377 ms/register
+#
+# 99% of all Modbus service time on this installation was spent in the 20.7%
+# of requests that touched SLOW-tier content; `data_update_coordinator` alone
+# accounted for 52% of it. Tier separation (see _split_by_cost) stops those
+# exchanges DELAYING time-critical reads, but only reducing their FREQUENCY
+# reduces the total cost — and these are, by their own classification,
+# registers that change slowly: temperatures, alarms, device status, daily and
+# lifetime counters.
+#
+# 900 s is a deliberately moderate first step (~3x fewer expensive exchanges)
+# rather than the 1800 s cap, so the effect can be measured before going
+# further. Tunable via the options flow.
 _TIER_BASE_TTL: dict[RegisterTier, float] = {
     RegisterTier.FAST:   0.0,
     RegisterTier.NORMAL: 30.0,
-    RegisterTier.SLOW:   300.0,
+    RegisterTier.SLOW:   900.0,
     RegisterTier.STATIC: 3600.0,
 }
+
+
+def set_slow_tier_ttl(seconds: float) -> None:
+    """Override the SLOW-tier base TTL (options flow).
+
+    Applies to entries created after the call; existing entries pick it up on
+    their next tier reset. Clamped to a sane band so a mistyped option cannot
+    either hammer the bus or effectively disable slow-changing data.
+    """
+    clamped = max(300.0, min(3600.0, float(seconds)))
+    _TIER_BASE_TTL[RegisterTier.SLOW] = clamped
+    _LOGGER.info(
+        "register_cache: SLOW-tier base TTL set to %.0f s "
+        "(expensive registers refresh this often)", clamped,
+    )
 
 # Adaptive cap TTLs (seconds) — TTL will not grow beyond this
 _TIER_CAP_TTL: dict[RegisterTier, float] = {

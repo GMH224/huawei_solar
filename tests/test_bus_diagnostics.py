@@ -150,18 +150,18 @@ class TestConfidentiality(unittest.TestCase):
         record. The original test only checked the ENDPOINT, so the leak
         shipped despite the audit claiming no serials were present.
         """
-        leaked = "HV2220098926_battery_data_update_coordinator"
+        leaked = "HV9990001111_battery_data_update_coordinator"
         clean = BD.sanitise_label(leaked)
-        self.assertNotIn("HV2220098926", clean)
+        self.assertNotIn("HV9990001111", clean)
         self.assertIn("battery_data_update_coordinator", clean,
                       "the useful part of the label must survive")
 
     def test_sanitised_labels_are_stable_and_distinguishing(self):
         """Two inverters must stay distinguishable after pseudonymisation."""
-        a = BD.sanitise_label("HV2220098926_data_update_coordinator")
-        b = BD.sanitise_label("HV2220080950_data_update_coordinator")
+        a = BD.sanitise_label("HV9990001111_data_update_coordinator")
+        b = BD.sanitise_label("HV9990002222_data_update_coordinator")
         self.assertNotEqual(a, b)
-        self.assertEqual(a, BD.sanitise_label("HV2220098926_data_update_coordinator"))
+        self.assertEqual(a, BD.sanitise_label("HV9990001111_data_update_coordinator"))
 
     def test_labels_without_serials_are_untouched(self):
         for label in ("power_meter_data_update_coordinator",
@@ -174,7 +174,7 @@ class TestConfidentiality(unittest.TestCase):
         "_" is a word character, so \\b never fires between the digits and the
         underscore. Pinned so the anchoring cannot regress.
         """
-        self.assertNotIn("HV2220098926", BD.sanitise_label("HV2220098926_x"))
+        self.assertNotIn("HV9990001111", BD.sanitise_label("HV9990001111_x"))
 
     def test_written_records_contain_no_serial(self):
         dirpath = tempfile.mkdtemp()
@@ -183,10 +183,10 @@ class TestConfidentiality(unittest.TestCase):
         d.set_enabled(True)
         for _ in range(BD.FLUSH_THRESHOLD):
             d.record(endpoint="192.168.1.55:502",
-                     label="HV2220098926_battery_data_update_coordinator",
+                     label="HV9990001111_battery_data_update_coordinator",
                      wait_ms=1, service_ms=2, queue_depth=0, outcome="ok")
         blob = open(os.path.join(dirpath, BD._SUBDIR, f"bus_{d.tag}.jsonl")).read()
-        self.assertNotIn("HV2220098926", blob)
+        self.assertNotIn("HV9990001111", blob)
 
     def test_records_contain_no_endpoint_or_serial(self):
         dirpath = tempfile.mkdtemp()

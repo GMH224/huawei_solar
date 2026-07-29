@@ -150,26 +150,62 @@ def _chunk(names: list[RegisterName], size: int) -> list[list[RegisterName]]:
     return [names[i : i + size] for i in range(0, len(names), size)]
 
 
-def _chunk_tier(chunk: list[RegisterName]) -> str:
-    """Coarsest (most time-critical) cache tier present in a chunk.
+# ──────────────────────────────────────────────────────────────────────────────
+# Main coordinator
+# ──────────────────────────────────────────────────────────────────────────────
 
-    Recorded per request so a stall can be correlated with WHAT was being read.
-    The tier already exists in register_cache and drives caching; this makes it
-    visible in the diagnostic capture too, and is the same signal a future
-    priority scheduler would order on.
+def _chunk_tier(chunk: list[RegisterName]) -> str:
+    """Label a chunk by the SLOWEST tier it contains, plus its composition.
+
+    v1.3.3 FIX: this previously returned ``min(tiers)`` — the *fastest* tier
+    present — so a chunk holding 1 FAST and 26 SLOW registers was labelled
+    "FAST". In the field capture **all 3,400 records were labelled FAST**,
+    including every 19+ register chunk and a 51.5 s outlier, which made the
+    field useless for the exact correlation it was added for.
+
+    ``max`` is the right choice because cost follows the slowest content: a
+    single SLOW register drags the whole exchange onto the inverter's slow
+    internal path. Example output: ``"SLOW:F1/N2/S24"``.
     """
     try:
-        tiers = {classify_register(name) for name in chunk}
+        tiers = [classify_register(name) for name in chunk]
         if not tiers:
             return "empty"
-        return min(tiers).name          # RegisterTier is an IntEnum: FAST < ... < STATIC
+        counts = {t: 0 for t in RegisterTier}
+        for t in tiers:
+            counts[t] += 1
+        composition = "/".join(
+            f"{t.name[0]}{counts[t]}" for t in RegisterTier if counts[t]
+        )
+        return f"{max(tiers).name}:{composition}"
     except Exception:  # noqa: BLE001 — instrumentation must never break a poll
         return "unknown"
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Main coordinator
-# ──────────────────────────────────────────────────────────────────────────────
+def _split_by_cost(names: list[RegisterName]) -> tuple[list, list]:
+    """Partition registers into (cheap, expensive) by cache tier.
+
+    Field evidence (3,400 requests): a chunk containing only FAST/NORMAL
+    registers completes in ~6 ms regardless of size, while any chunk
+    containing SLOW/STATIC content costs roughly
+
+        service_ms ~ 2,900 + 377 x registers
+
+    i.e. a ~2.9 SECOND fixed entry cost. The `power_meter` coordinator, which
+    reads only FAST-tier registers, stayed at 6.2 ms through 18-register
+    chunks in the same window that put `battery` chunks of the same size at
+    6,353 ms — so the driver is tier, not count.
+    """
+    cheap: list[RegisterName] = []
+    expensive: list[RegisterName] = []
+    for name in names:
+        try:
+            tier = classify_register(name)
+        except Exception:  # noqa: BLE001 — never break a poll over classification
+            tier = RegisterTier.NORMAL
+        (expensive if tier >= RegisterTier.SLOW else cheap).append(name)
+    return cheap, expensive
+
 
 class HuaweiSolarUpdateCoordinator(
     DataUpdateCoordinator[dict[RegisterName, Result[Any]]]
@@ -416,7 +452,22 @@ class HuaweiSolarUpdateCoordinator(
         Returns merged results from all chunks.
         """
         sorted_names = _sort_by_modbus_address(names)
-        chunks = _chunk(sorted_names, BATCH_CHUNK_SIZE)
+        # (2) TIER-SEPARATED CHUNKING (v1.3.3).
+        #
+        # Cheap (FAST/NORMAL) and expensive (SLOW/STATIC) registers are read in
+        # SEPARATE requests, so a routine power/SOC read is never trapped behind
+        # an exchange that touches the inverter's slow internal path.
+        #
+        # The expensive set is deliberately kept TOGETHER rather than split
+        # small. Because the cost is ~2.9 s fixed + ~377 ms/register, splitting
+        # 27 expensive registers into four chunks of 7 would cost ~22.2 s
+        # against ~13.1 s as one chunk — each sub-request pays the entry toll
+        # again. A flat BATCH_CHUNK_SIZE reduction would therefore make this
+        # WORSE, which is why the size cap is left alone.
+        cheap_names, expensive_names = _split_by_cost(sorted_names)
+        chunks = _chunk(cheap_names, BATCH_CHUNK_SIZE) + _chunk(
+            expensive_names, BATCH_CHUNK_SIZE
+        )
         merged: dict[RegisterName, Result[Any]] = {}
         # DEFECT A (v1.2.3) — two DIFFERENT quantities, previously conflated.
         #

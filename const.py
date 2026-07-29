@@ -231,6 +231,14 @@ CONF_BH_INSTALL_DATE = "bh_install_date"
 #: sensor can be replaced without code changes; absent or unavailable simply
 #: disables the derived attributes.
 CONF_BH_AMBIENT_ENTITY = "bh_ambient_entity"
+
+#: v1.3.3 — refresh interval for SLOW-tier registers, seconds.
+#: These are categorically expensive on Huawei hardware (~2.9 s fixed cost per
+#: exchange that touches them, vs ~6 ms for FAST/NORMAL-only chunks), and they
+#: are by definition slow-changing. Raising this is the only lever that reduces
+#: TOTAL Modbus cost; tier separation only stops them delaying other reads.
+CONF_SLOW_TIER_TTL_S = "slow_tier_ttl_s"
+DEFAULT_SLOW_TIER_TTL_S = 900
 CONF_BH_WARRANTY_THROUGHPUT_KWH = "bh_warranty_throughput_kwh"
 CONF_BH_WEIGHT_CAPACITY = "bh_weight_capacity"
 CONF_BH_WEIGHT_EFFICIENCY = "bh_weight_efficiency"

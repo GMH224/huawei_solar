@@ -43,6 +43,8 @@ import homeassistant.helpers.config_validation as cv
 
 from .const import (
     CONF_BH_AMBIENT_ENTITY,
+    CONF_SLOW_TIER_TTL_S,
+    DEFAULT_SLOW_TIER_TTL_S,
     CONF_BH_ENABLED,
     CONF_BH_INSTALL_DATE,
     CONF_BH_MIN_SEGMENT_DELTA_SOC,
@@ -1452,6 +1454,11 @@ class BatteryHealthOptionsFlowHandler(config_entries.OptionsFlow):
                     CONF_BH_ENABLED,
                     default=options.get(CONF_BH_ENABLED, True),
                 ): bool,
+                vol.Optional(
+                    CONF_SLOW_TIER_TTL_S,
+                    default=options.get(CONF_SLOW_TIER_TTL_S,
+                                        DEFAULT_SLOW_TIER_TTL_S),
+                ): vol.All(vol.Coerce(int), vol.Range(min=300, max=3600)),
                 vol.Optional(
                     CONF_BH_AMBIENT_ENTITY,
                     default=options.get(CONF_BH_AMBIENT_ENTITY, ""),

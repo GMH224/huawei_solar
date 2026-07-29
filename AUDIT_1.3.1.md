@@ -25,7 +25,7 @@ Coordinator names are constructed as
 `coordinator.name` verbatim, so **every record contained a real serial number**:
 
 ```
-{"src":"HV2220098926_battery_data_update_coordinator", ...}
+{"src":"<SERIAL>_battery_data_update_coordinator", ...}
 ```
 
 This directly contradicted AUDIT_1.3.0 §4, which stated that records carry "a

@@ -1,7 +1,7 @@
 # CLAUDE.md — Huawei Solar Integration
 
 > **Maintained by Claude (Anthropic) on behalf of the community.**
-> Current version: **1.3.1** — see `manifest.json`.
+> Current version: **1.3.3** — see `manifest.json`.
 
 ---
 
@@ -663,6 +663,117 @@ timestamp, eliminating arithmetic errors on the power-flow card.
 - **New:** `tests/test_synchronized_power_coordinator.py` — 22 tests covering
   derived properties (all edge cases), happy path, partial failure, all-fail,
   consecutive failure counter, and telemetry recording.
+
+### v1.3.3 (2026-07-29)
+**Tier-aware Modbus reads.** First release driven by the Phase 0 capture —
+3,400 requests over 28.8 h on a shared two-inverter bus. First release in this
+series that changes *behaviour*.
+
+**The measurement.** Cost is categorical, not marginal:
+
+| chunk contents | service time |
+|---|---|
+| FAST/NORMAL only | **~6 ms**, independent of size (18 registers: 6.2 ms) |
+| contains SLOW/STATIC | **~2,900 ms + 377 ms/register** |
+
+`power_meter_data_update_coordinator` (FAST-tier only) stayed at 6.2 ms through
+18-register chunks in the same window that put `battery` chunks of the *same
+size* at 6,353 ms. Same device, ~1,000x apart — the driver is **tier, not
+count**. 99% of all service time was spent in the 20.7% of requests touching
+SLOW-tier content; `data_update_coordinator` alone was 52% of it.
+
+**(1) `_chunk_tier()` reported the WRONG tier.** It returned `min(tiers)` — the
+*fastest* tier present — so a chunk of 1 FAST + 26 SLOW registers was labelled
+`FAST`. **All 3,400 field records came back `FAST`**, including every 19+
+register chunk and a 51.5 s outlier. The field added in v1.3.1 to correlate
+stalls with content could not do so. Now reports the **slowest** tier plus
+composition, e.g. `SLOW:F1/N2/S24`.
+
+**(2) Tier-separated chunking.** Cheap (FAST/NORMAL) and expensive
+(SLOW/STATIC) registers are now read in separate requests, so a routine
+power/SOC read is never trapped behind an exchange on the inverter's slow
+internal path.
+
+The expensive set is deliberately kept **together**. Because cost is ~2.9 s
+fixed + ~377 ms/register, splitting 27 expensive registers into four chunks of
+seven costs **~22.2 s against ~13.1 s as one** — each sub-request pays the
+entry toll again. A flat `BATCH_CHUNK_SIZE` reduction would therefore make
+things *worse*; `test_batch_chunk_size_not_reduced` guards against that being
+"optimised" later.
+
+**(3) SLOW-tier refresh interval 300 s -> 900 s.** Tier separation stops
+expensive reads *delaying* other traffic but does not reduce their total cost;
+only frequency does. These are by their own classification slow-changing
+registers — temperatures, alarms, device status, daily and lifetime counters.
+900 s is a deliberately moderate ~3x reduction rather than the 1,800 s cap, so
+the effect can be measured before going further. Tunable via the options flow
+(`Slow-register refresh interval`, 300-3600 s, clamped in code).
+
+**Tests: 443 -> 455 passed, 1 skipped.** New `tests/test_tier_separation.py`
+pins the prio fix, the tier split, the "do not fragment the expensive set"
+decision, the TTL change and its clamping, and the cost arithmetic itself.
+**Adversarial verification: 8 of 12 fail against v1.3.2.**
+
+**Analysis credit:** the tier-not-count diagnosis was the operator's, from
+their own capture analysis. The larger 3,400-record set then corrected the cost
+model from a pure per-register slope (~685 ms/reg) to fixed-plus-marginal —
+which reversed the chunk-splitting recommendation.
+
+**Expected effect:** time-critical reads no longer blocked behind multi-second
+exchanges; total expensive-exchange count down ~3x. **Not** expected: lower
+per-exchange cost — that is the inverter's firmware and is not ours to fix.
+
+**Open:** the capture covers 04:00-15:00 UTC only. No night data, so it cannot
+say whether the expensive-register cost is constant around the clock. If it is,
+something *else* drives the day/night failure pattern seen earlier.
+
+### v1.3.2 (2026-07-29)
+**HOTFIX — v1.3.1 broke every sensor. Upgrade immediately from v1.3.1.**
+
+```
+NotImplementedError: Update method not implemented
+  homeassistant/helpers/update_coordinator.py:314 in _async_update_data
+```
+
+**Root cause.** The `_chunk_tier()` helper added in v1.3.1 was inserted as a
+module-level `def` (column 0) **inside the class body** of
+`HuaweiSolarUpdateCoordinator`. In Python that TERMINATES the class: every
+method defined after it — including `_async_update_data` — silently became a
+module-level function. Home Assistant then reached its base-class stub and
+raised on every entity update.
+
+`ast.parse` accepted the file. All 440 tests passed. **No test instantiates a
+coordinator** — a gap recorded as open in AUDIT_1.2.4 §6.1, which then caused
+the very next outage.
+
+**Fix.** `_chunk_tier()` moved to true module level, before the class. Verified
+structurally: `HuaweiSolarUpdateCoordinator` again has 14 methods and
+`HuaweiSolarOptimizerUpdateCoordinator` 5, both including
+`_async_update_data`.
+
+Credit to the operator, who diagnosed and patched this independently; the fix
+here is the same relocation, applied cleanly.
+
+**New tests — `TestCoordinatorClassIntegrity`:**
+- required methods are actually *inside* their class (the direct check);
+- classes are not suspiciously small (catches a truncated body generally);
+- **no method in ANY module of the package sits at `col_offset` 0 relative to
+  its class** — this pins the exact failure mode across the whole codebase, not
+  just the file that broke.
+
+Structural (AST) rather than runtime, so it needs no HA environment and cannot
+rot.
+
+**Adversarial verification:** run against the broken v1.3.1 tree,
+`test_required_methods_are_inside_their_class` fails.
+
+**Tests: 440 -> 443 passed, 1 skipped.**
+
+**Process note.** This is the third defect of the same family: tests asserting
+*shape* (source strings, `ast.parse`, imports) rather than *behaviour*. Import
+tests were added in v1.2.4 and were not enough — a module can import perfectly
+while a class inside it has been silently truncated. Coordinator
+*instantiation* tests remain the outstanding gap.
 
 ### v1.3.1 (2026-07-28)
 **Phase 0 instrumentation fixes.** Both defects were found by reading the
