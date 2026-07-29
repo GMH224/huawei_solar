@@ -150,6 +150,23 @@ def _chunk(names: list[RegisterName], size: int) -> list[list[RegisterName]]:
     return [names[i : i + size] for i in range(0, len(names), size)]
 
 
+def _chunk_tier(chunk: list[RegisterName]) -> str:
+    """Coarsest (most time-critical) cache tier present in a chunk.
+
+    Recorded per request so a stall can be correlated with WHAT was being read.
+    The tier already exists in register_cache and drives caching; this makes it
+    visible in the diagnostic capture too, and is the same signal a future
+    priority scheduler would order on.
+    """
+    try:
+        tiers = {classify_register(name) for name in chunk}
+        if not tiers:
+            return "empty"
+        return min(tiers).name          # RegisterTier is an IntEnum: FAST < ... < STATIC
+    except Exception:  # noqa: BLE001 — instrumentation must never break a poll
+        return "unknown"
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Main coordinator
 # ──────────────────────────────────────────────────────────────────────────────
@@ -340,23 +357,6 @@ class HuaweiSolarUpdateCoordinator(
         if self._adaptive:
             return self._adaptive.get_params().poll_interval
         return self._day_interval
-
-def _chunk_tier(chunk: list[RegisterName]) -> str:
-    """Coarsest (most time-critical) cache tier present in a chunk.
-
-    Recorded per request so a stall can be correlated with WHAT was being read.
-    The tier already exists in register_cache and drives caching; this makes it
-    visible in the diagnostic capture too, and is the same signal a future
-    priority scheduler would order on.
-    """
-    try:
-        tiers = {classify_register(name) for name in chunk}
-        if not tiers:
-            return "empty"
-        return min(tiers).name          # RegisterTier is an IntEnum: FAST < ... < STATIC
-    except Exception:  # noqa: BLE001 — instrumentation must never break a poll
-        return "unknown"
-
 
     # ── core batch executor with chunking + 0x06 retry (opts. 2, 4) ──────────
 
