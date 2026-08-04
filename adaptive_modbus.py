@@ -372,8 +372,6 @@ class AdaptiveModbusController:
         self._bus_service_p95: float = 0.0
         self._bus_requests_waited: int = 0
         self._bus_total_wait_s: float = 0.0
-        self._coalesce_events: int = 0
-        self._coalesced_registers: int = 0
         self._first_data_date: date | None = None
         self._dirty: bool = False
         self._save_task: asyncio.Task | None = None
@@ -538,17 +536,20 @@ class AdaptiveModbusController:
         service_p95_ms: float,
         requests_waited: int = 0,
         total_wait_s: float = 0.0,
-        coalesce_events: int = 0,
-        coalesced_registers: int = 0,
     ) -> None:
-        """Diagnostics only — bus-level and cache-level counters."""
+        """Diagnostics only — bus-level counters.
+
+        v1.3.5: dropped coalesce_events/coalesced_registers — that mechanism
+        was removed (see const.py). ``last_chunk_count`` (via note_batch) now
+        reports something more useful than before: with address-aware
+        chunking it is the real count of physical Modbus exchanges a poll
+        needed, so a falling value is direct evidence the fix is working.
+        """
         self._bus_occupancy_pct = occupancy_pct
         self._bus_wait_p95 = wait_p95_ms
         self._bus_service_p95 = service_p95_ms
         self._bus_requests_waited = requests_waited
         self._bus_total_wait_s = total_wait_s
-        self._coalesce_events = coalesce_events
-        self._coalesced_registers = coalesced_registers
 
     def note_shed(self) -> None:
         """Diagnostics only — a request shed by the shared bus guard."""
@@ -653,8 +654,6 @@ class AdaptiveModbusController:
             "bus_service_p95_ms": round(self._bus_service_p95, 1),
             "bus_requests_waited": self._bus_requests_waited,
             "bus_total_wait_s": round(self._bus_total_wait_s, 1),
-            "coalesce_events": self._coalesce_events,
-            "coalesced_registers": self._coalesced_registers,
             # v1.2.2 learning gate visibility
             "learning_enabled": self.learning_enabled,
             "learning_active": self.learning_active(),
@@ -960,8 +959,6 @@ _ADAPTIVE_SENSORS: list[tuple[str, str, str | None, str]] = [
     ("bus_requests_waited",    "Bus requests delayed",         None,  "mdi:timer-alert-outline"),
     ("bus_total_wait_s",       "Bus total wait",               "s",   "mdi:timer-sand-full"),
     # (item 1) Is coalescing firing, and how much is it pulling forward?
-    ("coalesce_events",        "Register coalesce events",     None,  "mdi:call-merge"),
-    ("coalesced_registers",    "Registers coalesced",          None,  "mdi:layers-triple"),
 ]
 
 

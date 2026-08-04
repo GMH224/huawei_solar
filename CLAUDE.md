@@ -1,7 +1,7 @@
 # CLAUDE.md — Huawei Solar Integration
 
 > **Maintained by Claude (Anthropic) on behalf of the community.**
-> Current version: **1.3.5** — see `manifest.json`.
+> Current version: **1.3.6** — see `manifest.json`.
 
 ---
 
@@ -663,6 +663,70 @@ timestamp, eliminating arithmetic errors on the power-flow card.
 - **New:** `tests/test_synchronized_power_coordinator.py` — 22 tests covering
   derived properties (all edge cases), happy path, partial failure, all-fail,
   consecutive failure counter, and telemetry recording.
+
+### v1.3.6 (2026-08-05)
+**HOTFIX — the shipped v1.3.5 package failed to load. Upgrade immediately by
+performing a CLEAN install (delete the integration directory first, do not
+extract over it).**
+
+```
+ImportError: cannot import name 'CONF_COALESCE_SLOW_TIER' from
+'custom_components.huawei_solar.const'
+```
+
+**What actually happened.** The v1.3.5 zip that was delivered was verified
+byte-for-byte against the working tree before packaging and does **not**
+reference `CONF_COALESCE_SLOW_TIER` anywhere — confirmed again here by
+diffing the archived zip's `__init__.py` directly. The error's own shape
+confirms this: it describes `__init__.py` importing a name that `const.py`
+no longer defines — i.e. a `__init__.py` from **before** the v1.3.5 removal,
+paired with a `const.py` from **after** it. That combination cannot occur
+from a clean extraction of one consistent zip; it is the signature of an
+install where `__init__.py` was not actually overwritten (a stale file left
+behind from v1.3.4, or a cached compiled version), while other files were.
+
+**This does not change the recommendation:** delete
+`/config/custom_components/huawei_solar` entirely, then extract v1.3.6 fresh.
+
+**What this release actually fixes — a real, separate gap.** Investigating
+the report exposed that `__init__.py` — the actual Home Assistant entry
+point, and the one file whose failure takes down the entire integration —
+was **never covered** by any test in this suite. `test_module_imports.py`
+(added in v1.2.4 for exactly this class of defect) imports every production
+module for real except this one, because `__init__.py`'s transitive
+dependency graph (HA's config-entry, service-registration and entity-platform
+machinery, plus the full `huawei_solar` device hierarchy) is too large to
+stub cheaply. A full runtime import was attempted here and succeeded once
+that graph was fully stubbed — but the stub surface required was large,
+single-purpose, and orthogonal to the actual defect class, so it was not kept.
+
+**Fix — a materially better test than a full import.** New
+`TestConstImportsAreDefined` in `test_module_imports.py` performs an AST
+cross-check: for every `.py` file in the package, every name it imports
+`from .const import ...` must actually be defined in `const.py`. This is
+dependency-free, runs in milliseconds, and — critically — catches **any**
+future instance of this defect class in **any** file, not just a scripted
+reproduction of this one incident. Adversarially verified: the exact reported
+failure was reproduced by temporarily reintroducing the stale import into a
+working copy of `__init__.py`, confirmed to fail the new test, then reverted
+— rather than merely asserted to work.
+
+**Also pinned:** `test_the_specific_v1_3_5_incident_names_stay_gone` — the
+four retired v1.3.4 option names must not appear in `const.py` or in the text
+of any production file, closing the loop on the specific incident as well as
+the general class.
+
+**Tests: 467 -> 469 passed, 1 skipped**, deterministic across repeated runs.
+
+**Process note.** This is the second time in the 1.3.x line that a real
+deployment failure traced back to a file outside the coverage of
+`test_module_imports.py` (v1.3.2's truncated-class bug was inside a covered
+file but a different failure shape; this one was in an uncovered file
+entirely). `__init__.py` remains too expensive to import fully in this
+suite's fast, dependency-light test style — the AST cross-check adopted here
+is offered as the general pattern for closing this kind of gap without that
+cost: structural properties that are true of correct code can often be
+checked directly, without needing the code to actually run.
 
 ### v1.3.5 (2026-08-04)
 **Address-aware Modbus chunking — replaces the tier-based cost model

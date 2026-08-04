@@ -39,11 +39,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 
 from .const import (
     CONF_BH_ENABLED,
-    CONF_COALESCE_SLOW_TIER,
-    CONF_PREFER_NIGHT_FOR_SLOW,
     CONF_SLOW_TIER_TTL_S,
-    DEFAULT_COALESCE_SLOW_TIER,
-    DEFAULT_PREFER_NIGHT_FOR_SLOW,
     DEFAULT_SLOW_TIER_TTL_S,
     CONF_ENABLE_PARAMETER_CONFIGURATION,
     CONF_SLAVE_IDS,
@@ -250,25 +246,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
         except Exception:  # noqa: BLE001 — never break setup over a tunable
             _LOGGER.exception("Could not apply SLOW-tier TTL option")
 
-        # v1.3.4: apply the cache tuning options to every coordinator's cache.
-        try:
-            coalesce = entry.options.get(
-                CONF_COALESCE_SLOW_TIER, DEFAULT_COALESCE_SLOW_TIER)
-            prefer_night = entry.options.get(
-                CONF_PREFER_NIGHT_FOR_SLOW, DEFAULT_PREFER_NIGHT_FOR_SLOW)
-            for device_data in device_datas:
-                for coord in (
-                    getattr(device_data, "update_coordinator", None),
-                    getattr(device_data, "configuration_update_coordinator", None),
-                    getattr(device_data, "power_meter_update_coordinator", None),
-                    getattr(device_data, "energy_storage_update_coordinator", None),
-                ):
-                    cache = getattr(coord, "cache", None)
-                    if cache is not None:
-                        cache.set_coalesce_slow_tier(coalesce)
-                        cache.set_prefer_night_for_slow(prefer_night)
-        except Exception:  # noqa: BLE001 — never break setup over a tunable
-            _LOGGER.exception("Could not apply register-cache tuning options")
+        # v1.3.4's coalesce/night-defer options were REMOVED in v1.3.5
+        # (see const.py) after causing a production outage. Nothing to apply
+        # here any more.
 
         _async_setup_battery_health(hass, entry, device_datas)
         # v1.2.2: gate BOTH learners across HA start-up and shutdown.
