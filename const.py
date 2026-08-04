@@ -240,16 +240,11 @@ CONF_BH_AMBIENT_ENTITY = "bh_ambient_entity"
 CONF_SLOW_TIER_TTL_S = "slow_tier_ttl_s"
 DEFAULT_SLOW_TIER_TTL_S = 900
 
-#: v1.3.4 — coalesce the SLOW-tier cohort into one exchange when any of them
-#: comes due. Default ON: measured ~6x reduction in expensive-exchange cost.
-CONF_COALESCE_SLOW_TIER = "coalesce_slow_tier"
-DEFAULT_COALESCE_SLOW_TIER = True
-
-#: v1.3.4 — hold non-urgent expensive refreshes until night mode.
-#: Default OFF: the Phase 0 capture covers 04:00-15:00 UTC only, so there is
-#: no evidence yet that expensive reads are cheaper at night.
-CONF_PREFER_NIGHT_FOR_SLOW = "prefer_night_for_slow"
-DEFAULT_PREFER_NIGHT_FOR_SLOW = False
+#: v1.3.4's coalesce/night-defer options were REMOVED in v1.3.5. Coalescing
+#: caused a production outage (every battery entity unavailable) within hours
+#: of deployment — see AUDIT_1.3.5.md. Retired rather than merely defaulted
+#: off, so a future edit cannot silently re-enable a mechanism now understood
+#: to be actively harmful.
 CONF_BH_WARRANTY_THROUGHPUT_KWH = "bh_warranty_throughput_kwh"
 CONF_BH_WEIGHT_CAPACITY = "bh_weight_capacity"
 CONF_BH_WEIGHT_EFFICIENCY = "bh_weight_efficiency"

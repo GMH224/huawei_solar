@@ -43,11 +43,7 @@ import homeassistant.helpers.config_validation as cv
 
 from .const import (
     CONF_BH_AMBIENT_ENTITY,
-    CONF_COALESCE_SLOW_TIER,
-    CONF_PREFER_NIGHT_FOR_SLOW,
     CONF_SLOW_TIER_TTL_S,
-    DEFAULT_COALESCE_SLOW_TIER,
-    DEFAULT_PREFER_NIGHT_FOR_SLOW,
     DEFAULT_SLOW_TIER_TTL_S,
     CONF_BH_ENABLED,
     CONF_BH_INSTALL_DATE,
@@ -1457,16 +1453,6 @@ class BatteryHealthOptionsFlowHandler(config_entries.OptionsFlow):
                 vol.Optional(
                     CONF_BH_ENABLED,
                     default=options.get(CONF_BH_ENABLED, True),
-                ): bool,
-                vol.Optional(
-                    CONF_COALESCE_SLOW_TIER,
-                    default=options.get(CONF_COALESCE_SLOW_TIER,
-                                        DEFAULT_COALESCE_SLOW_TIER),
-                ): bool,
-                vol.Optional(
-                    CONF_PREFER_NIGHT_FOR_SLOW,
-                    default=options.get(CONF_PREFER_NIGHT_FOR_SLOW,
-                                        DEFAULT_PREFER_NIGHT_FOR_SLOW),
                 ): bool,
                 vol.Optional(
                     CONF_SLOW_TIER_TTL_S,

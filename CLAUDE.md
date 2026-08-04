@@ -1,7 +1,7 @@
 # CLAUDE.md — Huawei Solar Integration
 
 > **Maintained by Claude (Anthropic) on behalf of the community.**
-> Current version: **1.3.4** — see `manifest.json`.
+> Current version: **1.3.5** — see `manifest.json`.
 
 ---
 
@@ -663,6 +663,99 @@ timestamp, eliminating arithmetic errors on the power-flow card.
 - **New:** `tests/test_synchronized_power_coordinator.py` — 22 tests covering
   derived properties (all edge cases), happy path, partial failure, all-fail,
   consecutive failure counter, and telemetry recording.
+
+### v1.3.5 (2026-08-04)
+**Address-aware Modbus chunking — replaces the tier-based cost model
+entirely.** v1.3.4's SLOW-tier coalescing was enabled in the field and caused
+every battery entity to go unavailable within hours (see AUDIT_1.3.5.md for
+the full incident record). Recovery data — a 29,000-request capture spanning
+4 days, taken with coalescing off — overturned the model both v1.3.3 and
+v1.3.4 were built on.
+
+**The finding.** Whether a request costs ~7-60 ms or ~2,900+ ms was believed
+to depend on register TIER (FAST/NORMAL vs SLOW/STATIC). It doesn't. The real
+driver, confirmed against the actual Huawei register address map
+(`huawei_solar` 3.0.5, `MAX_BATCHED_REGISTERS_GAP=16`,
+`MAX_BATCHED_REGISTERS_COUNT=64`): `batch_update()` silently splits a request
+into multiple sequential physical Modbus exchanges whenever the registers it
+is given span more than 64 addresses or contain a gap of 16 or more — and
+each additional physical exchange costs roughly one further ~2,900-3,000 ms
+fixed toll, **regardless of tier**. A representative main-inverter register
+set (`input_power` .. `internal_temperature`, real addresses 32064-32087)
+forms one contiguous 9-register block corroborating the field's own
+directly-measured regs=7-vs-8 threshold. Tier correlated with cost only
+because this integration's SLOW/STATIC registers happen to be large and
+address-scattered — a confound, not a cause.
+
+**This explains the whole incident.** Coalescing deliberately gathered a
+coordinator's entire SLOW/STATIC cohort into one request, which **guarantees
+maximum address scatter** (alarms, device status, daily/lifetime counters are
+scattered across unrelated functional blocks) — forcing the most possible
+internal sub-exchanges per poll. It also plausibly explains the transaction-ID
+desync symptom investigated earlier (`modbus_failure.md`): our adaptive gap
+is enforced between calls to `guard.request()`, but NOT between the vendor
+library's internal sub-splits — by the time it decides to split, our pacing
+can no longer apply between the pieces.
+
+**Fix — address-aware chunking.** `_address_group()` reproduces the vendor
+library's own grouping rule in our own code, applied to ALL stale registers
+before `batch_update()` is ever called. Each address-contiguous group becomes
+its own, separately-paced `guard.request()`. This closes the pacing gap
+above, and — unlike tier-based splitting — never fragments a group that could
+have shared one physical exchange: field evidence shows 744 requests were
+forced into their own small exchange purely by the old tier split, even
+though they were small enough to potentially share a physical read with a
+same-poll cheap group under the real address rule.
+
+**Removed outright, not merely disabled:** SLOW-tier coalescing and
+night-deferral (`register_cache.py`, `const.py`, `config_flow.py`,
+`__init__.py`, `adaptive_modbus.py` sensors, UI strings). Both were built on
+the disproven tier-cost model; re-adding either requires fresh evidence, not
+a config flag flip. `_split_by_cost()` is gone; `_modbus_address()` is
+replaced by `_modbus_span()`, a direct lookup against the library's own
+`REGISTERS` table (previously a best-effort reflection walk over several
+guessed attribute paths that never resolved register *length* at all).
+
+**Kept:** SLOW-tier TTL raised 300 s -> 900 s (v1.3.3) — a caching decision
+(how often slow-changing data needs refreshing) that is orthogonal to the
+per-request cost model and remains valid regardless of which model is
+correct. `_chunk_tier()`'s slowest-tier-plus-composition label (v1.3.3 fix)
+is retained as a diagnostic field only — informative, no longer load-bearing
+for chunking decisions.
+
+**Tests: 467 total** (rewrote `test_tier_separation.py` in place — same
+filename, entirely new content, since "tier separation" is the retired
+concept). New coverage: the grouping algorithm against a synthetic address
+table (empty input, single register, tight packing, gap-at-boundary,
+span-over-limit, the exact scattered shape that caused the incident, no
+register lost or duplicated); validation against the REAL installed
+`huawei_solar` register table (skipped, not failed, if unavailable);
+`_modbus_span` robustness on garbage input; and explicit regression guards
+asserting coalescing/night-deferral cannot silently return.
+
+**Process note — a genuine off-by-one, caught before shipping.** Early
+analysis (and this changelog's first draft) described the representative
+register block as "exactly 8 registers." Re-verification found it is 9. Every
+claim above was corrected to match, including the test assertions — an
+example of exactly the kind of imprecision this project has been bitten by
+before, caught this time by writing the test against the real address table
+rather than trusting the recollected number.
+
+**Cross-test infrastructure fix.** The new real-register-map test initially
+used `try: import huawei_solar except ImportError: <stub>` to prefer the real
+library, which failed intermittently depending on pytest collection order —
+other test files in this suite install incomplete `huawei_solar` stubs, and
+this file (sorting late alphabetically) often collected after one was already
+cached. Fixed with an explicit save/purge/import-real/restore pattern scoped
+to `setUpClass`/`tearDownClass`, so the real library is used when validating
+and every other test file's stub is left untouched.
+
+**Deployment note.** This is offline, validated work — not yet deployed. The
+operator's live system remains on v1.2.4 with v1.3.4's coalescing left off,
+which is confirmed stable. Recommended validation before deployment: enable
+`Modbus diagnostic capture`, run a full day/night cycle, and confirm
+`last_chunk_count` drops and `prio` labels show real variation (a regression
+back to uniform `FAST` would indicate the fix did not take effect).
 
 ### v1.3.4 (2026-07-29)
 **SLOW-tier coalescing.** Deeper analysis of the same 3,400-record capture

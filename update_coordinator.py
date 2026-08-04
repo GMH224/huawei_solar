@@ -112,29 +112,34 @@ def _backoff_seconds(consecutive: int) -> float:
 
 
 @lru_cache(maxsize=512)
-def _modbus_address(name: RegisterName) -> int:
-    """Resolve a register's Modbus address via the library's register metadata.
+def _modbus_span(name: RegisterName) -> tuple[int, int]:
+    """Resolve a register's (start, end) Modbus address span.
 
-    The result is constant for a given register name, so it is memoised: the
-    set of unique RegisterNames in a session is bounded (≤ ~200), turning the
-    reflection-heavy attribute walk into a one-time cost per register instead
-    of an every-poll cost during batch sorting.
+    v1.3.5 REPLACEMENT of a reflection-based best-effort lookup that only
+    guessed at a start address via several fallback attribute paths and never
+    resolved LENGTH at all. That was good enough for sorting, but address-aware
+    grouping (see _address_group()) needs the real span of every register to
+    reproduce the vendor library's own batching rule exactly — so this now
+    reads directly from the same ``REGISTERS`` table
+    ``huawei_solar.device.base.batch_update()`` uses internally. Memoised: the
+    set of unique RegisterNames in a session is bounded (~200).
+
+    Falls back to a synthetic 1-wide span when a name is not found (e.g. a
+    future library version drops or renames a register) rather than raising —
+    grouping degrades to "treat as unknown-width", never to a crash.
     """
-    for path in (
-        "register_definition.register",
-        "register_definition.address",
-        "address",
-        "value",
-    ):
-        try:
-            obj: Any = name
-            for part in path.split("."):
-                obj = getattr(obj, part)
-            if isinstance(obj, int):
-                return obj
-        except AttributeError:
-            continue
-    return 0
+    try:
+        from huawei_solar.registers import REGISTERS
+        reg = REGISTERS[name]
+        return reg.register, reg.register + reg.length - 1
+    except Exception:  # noqa: BLE001 — never let a lookup failure break a poll
+        return 0, 0
+
+
+def _modbus_address(name: RegisterName) -> int:
+    """Resolve a register's START Modbus address. Kept for callers that only
+    need a sort key (address-aware grouping needs the full span; see above)."""
+    return _modbus_span(name)[0]
 
 
 def _sort_by_modbus_address(names: list[RegisterName]) -> list[RegisterName]:
@@ -182,29 +187,79 @@ def _chunk_tier(chunk: list[RegisterName]) -> str:
         return "unknown"
 
 
-def _split_by_cost(names: list[RegisterName]) -> tuple[list, list]:
-    """Partition registers into (cheap, expensive) by cache tier.
+#: Mirrors huawei_solar.device.base.MAX_BATCHED_REGISTERS_GAP /
+#: _COUNT — the vendor library's OWN rule for how many named registers it
+#: will fold into one physical Modbus exchange inside a single
+#: ``batch_update()`` call. Two independent-address-space-per-request
+#: constants, duplicated here (not imported) because we must be able to group
+#: registers BEFORE calling the library, in order to issue each group as our
+#: OWN separately-paced request (see _address_group / Defect E below) — by the
+#: time the library does its internal splitting, it is too late for our
+#: adaptive gap to apply between the pieces.
+_ADDRESS_GROUP_MAX_GAP = 16
+_ADDRESS_GROUP_MAX_SPAN = 64
 
-    Field evidence (3,400 requests): a chunk containing only FAST/NORMAL
-    registers completes in ~6 ms regardless of size, while any chunk
-    containing SLOW/STATIC content costs roughly
 
-        service_ms ~ 2,900 + 377 x registers
+def _address_group(names: list[RegisterName]) -> list[list[RegisterName]]:
+    """Partition ADDRESS-SORTED registers into contiguous groups.
 
-    i.e. a ~2.9 SECOND fixed entry cost. The `power_meter` coordinator, which
-    reads only FAST-tier registers, stayed at 6.2 ms through 18-register
-    chunks in the same window that put `battery` chunks of the same size at
-    6,353 ms — so the driver is tier, not count.
+    DEFECT E (v1.3.5) — retires the tier-based cost model entirely.
+
+    Field measurement first suggested cost tracked register TIER (SLOW/STATIC
+    content ~2,900 ms + 377 ms/register vs ~6 ms for FAST/NORMAL). That
+    correlation was real but NOT causal: it was confounded by SLOW-tier
+    register sets in this integration happening to be large and scattered
+    across the address map. A much larger capture (29,000 requests) found the
+    TRUE variable: `huawei_solar.device.base.batch_update()` groups the
+    registers it is given into physical Modbus exchanges using EXACTLY the
+    rule reproduced below (gap < 16, span <= 64) — and a chunk that this rule
+    forces into 2+ physical exchanges costs roughly one MORE ~2.9-3.0 s fixed
+    entry toll per exchange, REGARDLESS of tier:
+
+        regs=7  (fits in 1 exchange): ~7-60 ms,   independent of tier
+        regs=8  (forced into 2)     : ~2,800-4,600 ms, independent of tier
+
+    Corroborated against the REAL register address map (huawei_solar 3.0.5):
+    a representative main-inverter register set (input_power ..
+    internal_temperature, addresses 32064-32087) forms a single CONTIGUOUS
+    9-register block, followed by a register 18 addresses further on
+    (accumulated_yield_energy, gap 18 > 16, forced into a new group). The
+    field's own directly-measured threshold sits at regs=8 (7 fast, 8+
+    mostly slow); this representative set is one register larger because it
+    is an approximation of the real coordinator's exact entity list, which
+    is not statically enumerable (see _collect_register_names) — the two
+    numbers are consistent, not required to match exactly.
+
+    THE FIX: group registers into physical-exchange-sized batches OURSELVES,
+    using the library's own rule, BEFORE calling batch_update() — so each
+    group becomes a SEPARATE guard.request(), individually paced by the
+    adaptive gap. Previously the library did this splitting internally,
+    invisible to us and with NO pacing between the pieces — plausibly the
+    cause of the "unexpected response, discarding bytes" transaction-ID
+    desync seen in the field log immediately preceding a suspected freeze.
+
+    Names must already be address-sorted (see _sort_by_modbus_address).
     """
-    cheap: list[RegisterName] = []
-    expensive: list[RegisterName] = []
-    for name in names:
-        try:
-            tier = classify_register(name)
-        except Exception:  # noqa: BLE001 — never break a poll over classification
-            tier = RegisterTier.NORMAL
-        (expensive if tier >= RegisterTier.SLOW else cheap).append(name)
-    return cheap, expensive
+    if not names:
+        return []
+    groups: list[list[RegisterName]] = []
+    current: list[RegisterName] = [names[0]]
+    _, current_end = _modbus_span(names[0])
+    group_start, _ = _modbus_span(names[0])
+
+    for name in names[1:]:
+        start, end = _modbus_span(name)
+        gap = start - current_end - 1
+        span = end - group_start
+        if gap < _ADDRESS_GROUP_MAX_GAP and span <= _ADDRESS_GROUP_MAX_SPAN:
+            current.append(name)
+            current_end = max(current_end, end)
+        else:
+            groups.append(current)
+            current = [name]
+            group_start, current_end = start, end
+    groups.append(current)
+    return groups
 
 
 class HuaweiSolarUpdateCoordinator(
@@ -452,22 +507,30 @@ class HuaweiSolarUpdateCoordinator(
         Returns merged results from all chunks.
         """
         sorted_names = _sort_by_modbus_address(names)
-        # (2) TIER-SEPARATED CHUNKING (v1.3.3).
+        # (v1.3.5, Defect E) ADDRESS-AWARE CHUNKING — replaces v1.3.3's tier
+        # separation and v1.3.4's coalescing, BOTH of which are retired.
         #
-        # Cheap (FAST/NORMAL) and expensive (SLOW/STATIC) registers are read in
-        # SEPARATE requests, so a routine power/SOC read is never trapped behind
-        # an exchange that touches the inverter's slow internal path.
+        # Group registers into physical-Modbus-exchange-sized batches using
+        # the SAME rule huawei_solar.device.base.batch_update() uses
+        # internally (gap<16, span<=64) — see _address_group() for the full
+        # rationale and the real-register-map evidence. Each group becomes
+        # its OWN guard.request() below, so the adaptive gap is enforced
+        # BETWEEN every physical exchange, not just once per poll — closing
+        # the pacing gap that plausibly caused the transaction-ID desync
+        # ("unexpected response ... discarding bytes") seen in the field log.
         #
-        # The expensive set is deliberately kept TOGETHER rather than split
-        # small. Because the cost is ~2.9 s fixed + ~377 ms/register, splitting
-        # 27 expensive registers into four chunks of 7 would cost ~22.2 s
-        # against ~13.1 s as one chunk — each sub-request pays the entry toll
-        # again. A flat BATCH_CHUNK_SIZE reduction would therefore make this
-        # WORSE, which is why the size cap is left alone.
-        cheap_names, expensive_names = _split_by_cost(sorted_names)
-        chunks = _chunk(cheap_names, BATCH_CHUNK_SIZE) + _chunk(
-            expensive_names, BATCH_CHUNK_SIZE
-        )
+        # A group that stays within one physical exchange is cheap regardless
+        # of tier (~7-60 ms observed); a group forced across the boundary
+        # costs roughly one further ~2.9-3.0 s fixed toll. There is nothing
+        # left to gain by further splitting a group that is ALREADY one
+        # physical exchange, so BATCH_CHUNK_SIZE still caps how large any
+        # single group may grow before we split it ourselves as a safety net
+        # (the vendor library caps at 64 addresses of SPAN, not count, so a
+        # sparse but very wide group could in principle contain more names
+        # than is comfortable to hold in one PDU).
+        chunks: list[list[RegisterName]] = []
+        for group in _address_group(sorted_names):
+            chunks.extend(_chunk(group, BATCH_CHUNK_SIZE))
         merged: dict[RegisterName, Result[Any]] = {}
         # DEFECT A (v1.2.3) — two DIFFERENT quantities, previously conflated.
         #
@@ -731,15 +794,12 @@ class HuaweiSolarUpdateCoordinator(
             # surfaced through each controller (per serial) for visibility.
             try:
                 wait_p95, service_p95 = self.guard.wait_service_split()
-                stats = self.cache.coalescing_stats()
                 self._adaptive.note_bus_metrics(
                     self.guard.occupancy() * 100.0,
                     wait_p95,
                     service_p95,
                     requests_waited=self.guard.requests_waited,
                     total_wait_s=self.guard.total_wait_ms / 1000.0,
-                    coalesce_events=int(stats.get("coalesce_events", 0)),
-                    coalesced_registers=int(stats.get("coalesced_registers", 0)),
                 )
             except Exception:  # noqa: BLE001 — instrumentation is never critical
                 _LOGGER.debug("%s: bus metric update failed", self.name, exc_info=True)
