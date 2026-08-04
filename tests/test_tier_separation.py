@@ -1,26 +1,50 @@
-"""Tier-aware chunking, prio labelling and SLOW-tier TTL (v1.3.3).
+"""Address-aware Modbus chunking, SLOW-tier TTL, and cache tests (v1.3.5).
 
-FIELD BASIS (3,400 requests over 28.8 h, one shared bus):
+HISTORY — this file replaces ``test_tier_separation.py``.
 
-  chunk of FAST/NORMAL only    : ~6 ms regardless of size (18 regs -> 6.2 ms)
-  chunk containing SLOW/STATIC : ~2,900 ms + 377 ms/register
+v1.3.3 found that requests touching SLOW/STATIC-tier registers cost far more
+than FAST/NORMAL ones, and chunked by tier accordingly. v1.3.4 pushed that
+further: coalesce a coordinator's whole SLOW/STATIC cohort into one request.
+Enabled in the field, coalescing caused every battery entity to go
+unavailable within hours — see AUDIT_1.3.5.md for the incident record.
 
-  99% of all service time was spent in the 20.7% of requests touching
-  SLOW-tier content; `data_update_coordinator` alone was 52% of it.
+A 29,000-request capture taken during recovery found the TIER correlation was
+a CONFOUND, not the cause. The real driver, confirmed against the actual
+Huawei register address map (huawei_solar 3.0.5):
 
-The fixed ~2.9 s entry cost is what makes SPLITTING the expensive set a
-pessimisation: 27 expensive registers cost ~13.1 s as one chunk but ~22.2 s as
-four chunks of seven. These tests pin that reasoning so a future "just lower
-BATCH_CHUNK_SIZE" change cannot quietly undo it.
+    huawei_solar.device.base.batch_update() groups the registers it is given
+    into physical Modbus exchanges using MAX_BATCHED_REGISTERS_GAP=16 and
+    MAX_BATCHED_REGISTERS_COUNT=64 (address gap / span). A register set that
+    fits in ONE physical exchange costs ~7-60 ms REGARDLESS OF TIER. A set
+    forced into two or more costs roughly one further ~2,900-3,000 ms fixed
+    toll per exchange — again regardless of tier.
+
+    A representative main-inverter register set (input_power ..
+    internal_temperature, real addresses 32064-32087) forms a single
+    9-register contiguous block, followed by a register 18 addresses further
+    on (accumulated_yield_energy) -- corroborating, not exactly reproducing,
+    the field's own directly-measured regs=7-vs-8 threshold (the two differ
+    by one register because the exact real coordinator entity list is not
+    statically enumerable; see the module docstring in update_coordinator.py).
+
+v1.3.5 retires coalescing and night-deferral outright (not merely disables
+them — see const.py) and replaces tier-based chunking with _address_group(),
+which reproduces the vendor library's OWN grouping rule in our own code, so
+each group can be issued as a separately-paced request instead of being
+split invisibly (and unpaced) inside the library.
+
+SLOW-tier TTL (300 -> 900 s, v1.3.3) is KEPT: it is a caching decision (how
+often slow-changing data needs refreshing at all), independent of the
+per-request cost model that has now been corrected.
 """
 from __future__ import annotations
 
-import ast
 import importlib.util
 import pathlib
 import sys
 import types
 import unittest
+from datetime import timedelta
 
 _ROOT = pathlib.Path(__file__).parent.parent
 
@@ -35,7 +59,9 @@ def _load(name):
 
 
 if "tsep" not in sys.modules:
-    p = types.ModuleType("tsep"); p.__path__ = []; sys.modules["tsep"] = p
+    p = types.ModuleType("tsep")
+    p.__path__ = []
+    sys.modules["tsep"] = p
 
 for n in ("homeassistant", "homeassistant.core", "homeassistant.helpers",
           "homeassistant.helpers.storage"):
@@ -49,7 +75,8 @@ if not hasattr(sys.modules["homeassistant.helpers.storage"], "Store"):
 
 hs = sys.modules.get("huawei_solar")
 if hs is None:
-    hs = types.ModuleType("huawei_solar"); hs.__path__ = []
+    hs = types.ModuleType("huawei_solar")
+    hs.__path__ = []
     sys.modules["huawei_solar"] = hs
 if not hasattr(hs, "RegisterName"):
     class RegisterName(str):
@@ -62,257 +89,323 @@ RC = _load("register_cache")
 Tier = RC.RegisterTier
 
 
+# ── Pure-function extraction of the address-grouping algorithm ──────────────
+#
+# update_coordinator.py pulls in Home Assistant's DataUpdateCoordinator and a
+# large surface of the huawei_solar library, which is heavy and fragile to
+# stub in isolation. _modbus_span/_address_group are pure functions with no
+# such dependency (the library import inside _modbus_span is lazy and
+# exception-guarded), so they are extracted by source slice and exec'd in a
+# minimal namespace — the same technique test_module_imports.py's structural
+# checks are built on, applied here to get fast, dependency-free execution
+# rather than just AST inspection.
+def _extract_address_functions():
+    src = (_ROOT / "update_coordinator.py").read_text()
+    modspan_start = src.index("@lru_cache(maxsize=512)\ndef _modbus_span")
+    modspan_end = src.index("def _modbus_address(name")
+    modspan_src = src[modspan_start:modspan_end]
+    group_start = src.index("_ADDRESS_GROUP_MAX_GAP = 16")
+    group_end = src.index("class HuaweiSolarUpdateCoordinator")
+    group_src = src[group_start:group_end]
+
+    ns: dict = {
+        "RegisterName": hs.RegisterName,
+    }
+    header = "from functools import lru_cache\n"
+    exec(header + modspan_src + group_src, ns)
+    return ns
+
+
+_NS = _extract_address_functions()
+_modbus_span = _NS["_modbus_span"]
+_address_group = _NS["_address_group"]
+MAX_GAP = _NS["_ADDRESS_GROUP_MAX_GAP"]
+MAX_SPAN = _NS["_ADDRESS_GROUP_MAX_SPAN"]
+
+
+def _fake_table(monkeypatch_ns, table: dict[str, tuple[int, int]]):
+    """Point _modbus_span at a synthetic (name -> (start, end)) table.
+
+    Deterministic and independent of any installed library version or of
+    another test module's `huawei_solar` stub — the exact fragility that has
+    caused cross-test collisions in this suite before.
+    """
+    def fake_span(name):
+        return table.get(str(name), (0, 0))
+    monkeypatch_ns["_modbus_span"] = fake_span
+
+
+class TestAddressGroupAlgorithm(unittest.TestCase):
+    """The grouping rule itself, against a synthetic address table.
+
+    Mirrors huawei_solar.device.base.batch_update()'s own rule EXACTLY
+    (gap < 16, span <= 64), verified against the real library's constants in
+    TestRealRegisterMap below.
+    """
+
+    def _group(self, table: dict[str, tuple[int, int]], names: list[str]):
+        saved = _NS["_modbus_span"]
+        try:
+            _fake_table(_NS, table)
+            return _NS["_address_group"]([hs.RegisterName(n) for n in names])
+        finally:
+            _NS["_modbus_span"] = saved
+
+    def test_empty_input(self):
+        self.assertEqual(self._group({}, []), [])
+
+    def test_single_register_is_one_group(self):
+        table = {"a": (100, 100)}
+        groups = self._group(table, ["a"])
+        self.assertEqual(len(groups), 1)
+
+    def test_tightly_packed_registers_form_one_group(self):
+        """The exact shape of the real input_power..internal_temperature
+        block: contiguous, 8 registers, span 24 -- must be ONE group."""
+        table = {chr(97 + i): (100 + i, 100 + i) for i in range(8)}
+        groups = self._group(table, list(table))
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(len(groups[0]), 8)
+
+    def test_gap_at_the_boundary_splits(self):
+        """gap == MAX_GAP must still split (the rule is gap < 16, not <=)."""
+        table = {"a": (100, 100), "b": (100 + 1 + MAX_GAP, 100 + 1 + MAX_GAP)}
+        groups = self._group(table, ["a", "b"])
+        self.assertEqual(len(groups), 2)
+
+    def test_gap_just_under_boundary_stays_together(self):
+        table = {"a": (100, 100), "b": (100 + MAX_GAP, 100 + MAX_GAP)}
+        groups = self._group(table, ["a", "b"])
+        self.assertEqual(len(groups), 1)
+
+    def test_span_over_limit_splits_even_with_no_gap(self):
+        """A dense run of registers wider than MAX_SPAN must still split,
+        even though every individual gap is 0 (the real library enforces
+        BOTH constraints independently)."""
+        table = {str(i): (100 + i, 100 + i) for i in range(MAX_SPAN + 5)}
+        groups = self._group(table, list(table))
+        self.assertGreaterEqual(len(groups), 2)
+        total = sum(len(g) for g in groups)
+        self.assertEqual(total, MAX_SPAN + 5)   # no register lost
+
+    def test_reproduces_the_field_incident_shape(self):
+        """The exact address layout that caused the outage: a coordinator's
+        SLOW/STATIC cohort (v1.3.4 coalescing) scattered across many
+        unrelated functional blocks, each far from the others."""
+        table = {
+            "alarm_1": (32008, 32008),
+            "state_1": (32000, 32000),   # 8 from alarm_1: SAME group as it
+            "daily_yield": (32114, 32115),   # 105 from alarm_1: new group
+            "device_status": (35000, 35001),  # far from all: new group
+            "counter_a": (40000, 40001),      # far from all: new group
+        }
+        groups = self._group(table, list(table))
+        # state_1/alarm_1 are close enough (8 apart) to share a group; the
+        # other three are each far enough to force their own — FOUR groups
+        # for what coalescing would have crammed into ONE. That is precisely
+        # what caused the outage: 4 exchanges worth of fixed toll (~12 s)
+        # instead of one ~7-60 ms exchange for whichever subset was actually
+        # tightly packed.
+        self.assertEqual(len(groups), 4)
+
+    def test_no_register_is_ever_lost_or_duplicated(self):
+        table = {f"r{i}": (100 + i * 20, 100 + i * 20) for i in range(30)}
+        names = list(table)
+        groups = self._group(table, names)
+        flat = [str(n) for g in groups for n in g]
+        self.assertEqual(sorted(flat), sorted(names))
+        self.assertEqual(len(flat), len(names))
+
+
+class TestRealRegisterMap(unittest.TestCase):
+    """Validates _address_group against the ACTUAL huawei_solar 3.0.5 register
+    table — the direct evidentiary link between the incident and the fix.
+
+    Every other test file in this suite installs its OWN incomplete
+    `huawei_solar` stub into sys.modules, and this file (sorting late
+    alphabetically) is collected after most of them — so a fake is very
+    likely already cached under that name by the time this class runs.
+    setUpClass therefore force-purges every ``huawei_solar*`` entry, imports
+    the GENUINE site-packages install fresh, and tearDownClass restores
+    exactly what was there before, so no other test file is affected.
+
+    Skipped (not failed) if the real package cannot be found at all: it is a
+    runtime dependency of the integration, not of the test suite.
+    """
+
+    _saved_modules: dict = {}
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib
+        cls._saved_modules = {}
+        for name in list(sys.modules):
+            if name == "huawei_solar" or name.startswith("huawei_solar."):
+                cls._saved_modules[name] = sys.modules.pop(name)
+        try:
+            importlib.invalidate_caches()
+            from huawei_solar.registers import REGISTERS
+            import huawei_solar.register_names as rn
+        except ImportError:
+            cls._restore()
+            raise unittest.SkipTest(
+                "huawei_solar library not installed in this environment; "
+                "this test validates against the real vendor register map "
+                "when available (pip install huawei-solar==3.0.5)"
+            )
+        cls.REGISTERS = REGISTERS
+        cls.rn = rn
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._restore()
+
+    @classmethod
+    def _restore(cls):
+        for name in list(sys.modules):
+            if name == "huawei_solar" or name.startswith("huawei_solar."):
+                del sys.modules[name]
+        for name, mod in cls._saved_modules.items():
+            sys.modules[name] = mod
+        cls._saved_modules = {}
+
+    def _real_names(self, candidates):
+        out = []
+        for name in candidates:
+            try:
+                self.REGISTERS[self.rn.RegisterName(name)]
+                out.append(self.rn.RegisterName(name))
+            except KeyError:
+                pass
+        return out
+
+    def test_main_inverter_block_matches_field_evidence(self):
+        """A representative register set validated during the incident
+        analysis: a large contiguous power/temperature block, PV strings,
+        and a scattered yield pair -- corroborates the field's directly
+        measured regs=7-vs-8 threshold (see module docstring for why this
+        set's block is 9 wide rather than exactly 8: it is an approximation
+        of the real coordinator's entity list, not a static enumeration)."""
+        candidates = [
+            "input_power", "active_power", "day_active_power_peak",
+            "efficiency", "internal_temperature", "daily_yield_energy",
+            "accumulated_yield_energy", "pv_01_voltage", "pv_01_current",
+            "pv_02_voltage", "pv_02_current", "grid_voltage",
+            "reactive_power", "power_factor", "grid_frequency",
+        ]
+        names = self._real_names(candidates)
+        names.sort(key=lambda n: _modbus_span(n)[0])
+        groups = _address_group(names)
+        sizes = sorted(len(g) for g in groups)
+        # PV pair (4), the wide contiguous power/temp block, and the
+        # yield-energy pair -- three groups, matching the real address map.
+        self.assertEqual(len(groups), 3)
+        self.assertEqual(sizes, [2, 4, 9])
+        self.assertGreaterEqual(
+            max(sizes), 8,
+            "the large contiguous power/temperature block must stay whole "
+            "and must be at or above the field's measured regs=8 threshold",
+        )
+
+    def test_rated_power_is_far_enough_to_split(self):
+        """rated_power sits ~1,925 registers from the main block in the real
+        map -- must never be grouped with it."""
+        names = self._real_names(["rated_power", "input_power", "active_power"])
+        names.sort(key=lambda n: _modbus_span(n)[0])
+        groups = _address_group(names)
+        self.assertEqual(len(groups), 2)
+
+    def test_modbus_span_resolves_real_addresses(self):
+        start, end = _modbus_span(self.rn.RegisterName("active_power"))
+        self.assertEqual((start, end), (32080, 32081))
+
+
+class TestModbusSpanRobustness(unittest.TestCase):
+    """_modbus_span must never raise, with or without the real library."""
+
+    def test_unknown_register_degrades_to_zero_width(self):
+        result = _modbus_span(hs.RegisterName("definitely_not_a_real_register"))
+        self.assertEqual(result, (0, 0))
+
+    def test_never_raises_on_garbage_input(self):
+        for bad in (hs.RegisterName(""), hs.RegisterName("🔥"), hs.RegisterName("a" * 500)):
+            with self.subTest(value=bad):
+                self.assertEqual(_modbus_span(bad), (0, 0))
+
+
 class TestSlowTierTTL(unittest.TestCase):
-    """(3) Only reducing FREQUENCY reduces total cost."""
+    """(v1.3.3, kept) Slow-changing data needs refreshing less often.
+
+    This is a CACHING decision, independent of the v1.3.5 per-request cost
+    model correction: how often we bother reading slow-changing registers at
+    all is a separate question from how expensive any one read is.
+    """
 
     def test_slow_ttl_raised_from_300(self):
         self.assertGreaterEqual(RC._TIER_BASE_TTL[Tier.SLOW], 900.0)
 
     def test_fast_and_normal_unchanged(self):
-        """The cheap tiers must NOT be slowed — they are not the problem."""
         self.assertEqual(RC._TIER_BASE_TTL[Tier.FAST], 0.0)
         self.assertEqual(RC._TIER_BASE_TTL[Tier.NORMAL], 30.0)
 
     def test_ttl_override_is_clamped(self):
         original = RC._TIER_BASE_TTL[Tier.SLOW]
         try:
-            RC.set_slow_tier_ttl(10)          # absurdly low
+            RC.set_slow_tier_ttl(10)
             self.assertGreaterEqual(RC._TIER_BASE_TTL[Tier.SLOW], 300.0)
-            RC.set_slow_tier_ttl(999999)      # absurdly high
+            RC.set_slow_tier_ttl(999999)
             self.assertLessEqual(RC._TIER_BASE_TTL[Tier.SLOW], 3600.0)
             RC.set_slow_tier_ttl(1200)
             self.assertEqual(RC._TIER_BASE_TTL[Tier.SLOW], 1200.0)
         finally:
             RC._TIER_BASE_TTL[Tier.SLOW] = original
 
-    def test_expensive_exchange_frequency_reduced(self):
-        """900 s vs 300 s is ~3x fewer expensive exchanges per day."""
-        before = 86400 / 300
-        after = 86400 / RC._TIER_BASE_TTL[Tier.SLOW]
-        self.assertLessEqual(after, before / 2.5)
 
+class TestCoalescingAndNightDeferralAreGone(unittest.TestCase):
+    """v1.3.5 retires these outright — pinned so they cannot silently return.
 
-class TestChunkSourceContract(unittest.TestCase):
-    """(1) and (2), asserted structurally against the source.
-
-    update_coordinator.py cannot be imported without a full HA runtime, so
-    these are AST/source checks — but they pin the exact decisions that the
-    field data drove, with the reasoning attached.
+    Coalescing caused a real outage. Re-adding it (or night-deferral, which
+    shared its now-disproven rationale) must be a deliberate, documented
+    decision with fresh evidence, not an accidental reintroduction via a
+    merge or a copy-pasted option block.
     """
 
-    @classmethod
-    def setUpClass(cls):
-        cls.src = (_ROOT / "update_coordinator.py").read_text()
-        cls.tree = ast.parse(cls.src)
+    def test_register_cache_has_no_coalescing_state_or_methods(self):
+        cache = RC.RegisterCache()
+        for attr in ("_coalesce_slow_tier", "coalesced_registers",
+                     "coalesce_events", "set_coalesce_slow_tier",
+                     "coalescing_stats"):
+            self.assertFalse(
+                hasattr(cache, attr),
+                f"RegisterCache.{attr} should not exist — coalescing was "
+                f"retired in v1.3.5 after causing a production outage",
+            )
 
-    def _fn(self, name):
-        for node in ast.walk(self.tree):
-            if isinstance(node, ast.FunctionDef) and node.name == name:
-                return node
-        return None
+    def test_register_cache_has_no_night_deferral_state_or_methods(self):
+        cache = RC.RegisterCache()
+        for attr in ("_prefer_night_for_slow", "deferred_expensive",
+                     "set_prefer_night_for_slow"):
+            self.assertFalse(hasattr(cache, attr))
 
-    # ── (1) prio labelling ──────────────────────────────────────────────────
-    def test_chunk_tier_reports_slowest_not_fastest(self):
-        """REGRESSION: min() labelled a 26-SLOW chunk as 'FAST'.
-
-        All 3,400 field records came back 'FAST', including a 51.5 s outlier,
-        making the field useless for the correlation it existed for.
-        """
-        fn = self._fn("_chunk_tier")
-        self.assertIsNotNone(fn)
-        # Strip the docstring: it deliberately NAMES the old min() bug, so a
-        # naive source search would match the explanation of the defect.
-        executable = ast.Module(
-            body=[n for n in fn.body if not (
-                isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant)
-                and isinstance(n.value.value, str))],
-            type_ignores=[],
+    def test_filter_stale_ignores_extra_kwargs_gracefully(self):
+        """Sanity: the simplified filter_stale signature still works."""
+        cache = RC.RegisterCache()
+        stale = cache.filter_stale(
+            [hs.RegisterName("some_register")], timedelta(seconds=30)
         )
-        body = ast.unparse(executable)
-        self.assertIn("max(tiers)", body)
-        self.assertNotIn("min(tiers)", body)
+        self.assertEqual(stale, [hs.RegisterName("some_register")])
 
-    def test_chunk_tier_reports_composition(self):
-        """A tier label alone cannot distinguish 1 SLOW from 26 SLOW."""
-        fn = self._fn("_chunk_tier")
-        self.assertIn("composition", ast.unparse(fn))
+    def test_const_no_longer_defines_removed_options(self):
+        const_src = (_ROOT / "const.py").read_text()
+        for token in ("CONF_COALESCE_SLOW_TIER", "CONF_PREFER_NIGHT_FOR_SLOW",
+                      "DEFAULT_COALESCE_SLOW_TIER", "DEFAULT_PREFER_NIGHT_FOR_SLOW"):
+            self.assertNotIn(token, const_src)
 
-    # ── (2) tier separation ─────────────────────────────────────────────────
-    def test_split_by_cost_exists_and_splits_at_slow(self):
-        fn = self._fn("_split_by_cost")
-        self.assertIsNotNone(fn, "_split_by_cost must exist")
-        body = ast.unparse(fn)
-        self.assertIn("RegisterTier.SLOW", body)
-        self.assertIn("expensive", body)
-
-    def test_chunking_separates_cheap_from_expensive(self):
-        self.assertIn("cheap_names, expensive_names = _split_by_cost", self.src)
-        self.assertIn("_chunk(cheap_names, BATCH_CHUNK_SIZE)", self.src)
-
-    def test_expensive_set_is_not_fragmented(self):
-        """The fixed ~2.9 s entry cost makes splitting a pessimisation.
-
-        27 expensive registers: ~13.1 s as one chunk, ~22.2 s as four of seven.
-        The expensive group must therefore use the FULL BATCH_CHUNK_SIZE, not
-        a reduced cap.
-        """
-        self.assertIn("_chunk(\n            expensive_names, BATCH_CHUNK_SIZE\n        )", self.src)
-
-    def test_batch_chunk_size_not_reduced(self):
-        """Guard against a future 'just lower the chunk size' change."""
-        const = (_ROOT / "const.py").read_text()
-        for line in const.splitlines():
-            if line.strip().startswith("BATCH_CHUNK_SIZE"):
-                value = int(line.split("=")[1].split("#")[0].strip())
-                self.assertGreaterEqual(
-                    value, 20,
-                    "lowering BATCH_CHUNK_SIZE fragments the expensive set and "
-                    "multiplies the ~2.9 s per-request entry cost",
-                )
-
-
-class TestCostModel(unittest.TestCase):
-    """The arithmetic that drove the design decision, pinned."""
-
-    FIXED_MS = 2924.0
-    PER_REG_MS = 377.0
-
-    def cost(self, regs, chunks=1):
-        per = regs / chunks
-        return chunks * (self.FIXED_MS + self.PER_REG_MS * per)
-
-    def test_splitting_expensive_registers_is_worse(self):
-        one = self.cost(27, 1)
-        four = self.cost(27, 4)
-        self.assertGreater(four, one)
-        self.assertGreater(four - one, 8000)      # ~9 s worse
-
-    def test_separating_cheap_registers_is_free(self):
-        """Cheap chunks cost ~6 ms, so an extra request is negligible."""
-        self.assertLess(6.0, self.FIXED_MS / 100)
+    def test_update_coordinator_no_longer_calls_split_by_cost(self):
+        src = (_ROOT / "update_coordinator.py").read_text()
+        self.assertNotIn("_split_by_cost", src)
+        self.assertIn("_address_group", src)
 
 
 if __name__ == "__main__":
     unittest.main()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# v1.3.4 — SLOW-tier coalescing, night deferral, wait instrumentation
-# ══════════════════════════════════════════════════════════════════════════════
-from datetime import timedelta
-
-
-def _cache():
-    c = RC.RegisterCache()
-    return c
-
-
-def _seed(cache, name, tier, age_s, now):
-    """Put an entry in the cache with a controlled age."""
-    e = RC._CacheEntry(value=1, raw=1, ts=now - age_s, tier=tier)
-    cache._store[name] = e
-    return e
-
-
-class TestSlowTierCoalescing(unittest.TestCase):
-    """(1) The dominant remaining cost, and why TTL alone does not fix it.
-
-    Measured: `data_update_coordinator` performed 37.9 expensive reads/hour —
-    one every 1.6 min — against a 300 s TTL that should allow ~12/h. TTLs are
-    per register, so ~26 SLOW registers expire at ~26 different moments and
-    nearly every poll drags one in, paying the full ~2.9 s entry cost.
-
-    Raising the TTL cuts each register's rate but NOT the number of distinct
-    expiry moments: 26 registers at 900 s still expire ~1.7x/minute.
-    Coalescing collapses them onto a shared expiry.
-    """
-
-    def setUp(self):
-        self.now = RC.time.monotonic()
-        self.ttl = timedelta(seconds=30)
-
-    def test_due_expensive_register_pulls_in_fresh_siblings(self):
-        c = _cache()
-        names = ["slow_a", "slow_b", "slow_c"]
-        _seed(c, "slow_a", Tier.SLOW, 99999, self.now)     # overdue
-        _seed(c, "slow_b", Tier.SLOW, 1, self.now)         # fresh
-        _seed(c, "slow_c", Tier.SLOW, 1, self.now)         # fresh
-        stale = c.filter_stale(names, self.ttl)
-        self.assertEqual(set(stale), set(names),
-                         "one due expensive register must refresh the cohort")
-        self.assertEqual(c.coalesce_events, 1)
-        self.assertEqual(c.coalesced_registers, 2)
-
-    def test_cheap_registers_are_not_pulled_in(self):
-        """Coalescing must not inflate a chunk with FAST/NORMAL registers.
-
-        Those cost ~6 ms and have their own cadence; dragging them along would
-        defeat the tier separation shipped in v1.3.3.
-        """
-        c = _cache()
-        _seed(c, "slow_a", Tier.SLOW, 99999, self.now)
-        _seed(c, "fast_b", Tier.FAST, 0.0, self.now)
-        _seed(c, "norm_c", Tier.NORMAL, 0.0, self.now)
-        stale = c.filter_stale(["slow_a", "fast_b", "norm_c"], self.ttl)
-        self.assertIn("slow_a", stale)
-        self.assertNotIn("norm_c", stale)
-
-    def test_no_coalescing_when_nothing_expensive_is_due(self):
-        c = _cache()
-        _seed(c, "slow_a", Tier.SLOW, 1, self.now)
-        _seed(c, "slow_b", Tier.SLOW, 1, self.now)
-        stale = c.filter_stale(["slow_a", "slow_b"], self.ttl)
-        self.assertEqual(stale, [])
-        self.assertEqual(c.coalesce_events, 0)
-
-    def test_coalescing_can_be_disabled(self):
-        c = _cache()
-        c.set_coalesce_slow_tier(False)
-        _seed(c, "slow_a", Tier.SLOW, 99999, self.now)
-        _seed(c, "slow_b", Tier.SLOW, 1, self.now)
-        stale = c.filter_stale(["slow_a", "slow_b"], self.ttl)
-        self.assertEqual(stale, ["slow_a"])
-        self.assertEqual(c.coalesce_events, 0)
-
-    def test_expected_cost_reduction(self):
-        """The arithmetic that justifies the change."""
-        fixed, per_reg = 2924.0, 377.0
-        today = 37.9 * (fixed + 13 * per_reg) / 1000
-        coalesced = 4.0 * (fixed + 26 * per_reg) / 1000
-        self.assertGreater(today / coalesced, 4.0)
-
-
-class TestNightDeferral(unittest.TestCase):
-    """(3) Deliberately OFF by default — no night data exists yet."""
-
-    def setUp(self):
-        self.now = RC.time.monotonic()
-        self.ttl = timedelta(seconds=30)
-
-    def test_disabled_by_default(self):
-        self.assertFalse(_cache()._prefer_night_for_slow)
-
-    def test_defers_expensive_refresh_in_daylight_when_enabled(self):
-        c = _cache()
-        c.set_prefer_night_for_slow(True)
-        c.set_night_mode(False)
-        _seed(c, "slow_a", Tier.SLOW, RC._TIER_BASE_TTL[Tier.SLOW] * 1.2, self.now)
-        stale = c.filter_stale(["slow_a"], self.ttl)
-        self.assertEqual(stale, [])
-        self.assertEqual(c.deferred_expensive, 1)
-
-    def test_deferral_cannot_starve(self):
-        """Past the bound, an overdue register is refreshed regardless."""
-        c = _cache()
-        c.set_prefer_night_for_slow(True)
-        c.set_night_mode(False)
-        age = RC._TIER_BASE_TTL[Tier.SLOW] * (RC.SLOW_DEFER_MAX_TTL_MULTIPLE + 1)
-        _seed(c, "slow_a", Tier.SLOW, age, self.now)
-        self.assertEqual(c.filter_stale(["slow_a"], self.ttl), ["slow_a"])
-
-    def test_night_mode_allows_the_refresh(self):
-        c = _cache()
-        c.set_prefer_night_for_slow(True)
-        c.set_night_mode(True)
-        _seed(c, "slow_a", Tier.SLOW, RC._TIER_BASE_TTL[Tier.SLOW] * 1.2, self.now)
-        self.assertEqual(c.filter_stale(["slow_a"], self.ttl), ["slow_a"])
