@@ -376,3 +376,77 @@ class TestCoordinatorClassIntegrity(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestConstImportsAreDefined(unittest.TestCase):
+    """Every name imported from ``const`` must actually be defined there.
+
+    REGRESSION — the exact failure that broke v1.3.5's deployed package:
+
+        ImportError: cannot import name 'CONF_COALESCE_SLOW_TIER' from
+        'custom_components.huawei_solar.const'
+
+    v1.3.5 removed CONF_COALESCE_SLOW_TIER and CONF_PREFER_NIGHT_FOR_SLOW
+    (and their DEFAULT_ counterparts) from const.py after retiring the
+    coalescing/night-deferral mechanism they configured — but a working copy
+    of the deployed package retained a stale ``__init__.py`` still importing
+    them, which fails at import time before any test in this suite (or the
+    module-import checks above) ever gets a chance to run, because
+    ``__init__.py`` itself was never in the covered module list.
+
+    This check is deliberately NOT a runtime import of ``__init__.py``:
+    that module transitively pulls in Home Assistant's config-entry,
+    service-registration and entity-platform machinery plus the full
+    huawei_solar device hierarchy, which would require stubbing a large and
+    constantly-shifting surface unrelated to the actual defect class. A pure
+    AST cross-check of "every name imported from const.py is defined in
+    const.py" catches this exact bug — and any future instance of the same
+    class, in ANY file, not just __init__.py — in milliseconds and with zero
+    runtime dependencies.
+    """
+
+    @staticmethod
+    def _names_imported_from(path: pathlib.Path, module: str) -> set[str]:
+        tree = ast.parse(path.read_text())
+        names: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == module:
+                names.update(alias.name for alias in node.names)
+        return names
+
+    @staticmethod
+    def _names_defined_in(path: pathlib.Path) -> set[str]:
+        tree = ast.parse(path.read_text())
+        names: set[str] = set()
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                names.update(
+                    t.id for t in node.targets if isinstance(t, ast.Name)
+                )
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                names.add(node.target.id)
+        return names
+
+    def test_every_const_import_resolves(self):
+        const_names = self._names_defined_in(_ROOT / "const.py")
+        for pyfile in sorted(_ROOT.glob("*.py")):
+            if pyfile.name == "const.py":
+                continue
+            imported = self._names_imported_from(pyfile, "const")
+            missing = imported - const_names
+            with self.subTest(file=pyfile.name):
+                self.assertFalse(
+                    missing,
+                    f"{pyfile.name} imports {sorted(missing)} from const, "
+                    f"but const.py does not define them",
+                )
+
+    def test_the_specific_v1_3_5_incident_names_stay_gone(self):
+        """Pins the exact regression, not just the general class."""
+        const_src = (_ROOT / "const.py").read_text()
+        for name in ("CONF_COALESCE_SLOW_TIER", "CONF_PREFER_NIGHT_FOR_SLOW",
+                     "DEFAULT_COALESCE_SLOW_TIER", "DEFAULT_PREFER_NIGHT_FOR_SLOW"):
+            self.assertNotIn(name, const_src)
+            for pyfile in sorted(_ROOT.glob("*.py")):
+                with self.subTest(file=pyfile.name, name=name):
+                    self.assertNotIn(name, pyfile.read_text())
