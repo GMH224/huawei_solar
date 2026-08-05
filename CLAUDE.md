@@ -1,7 +1,7 @@
 # CLAUDE.md — Huawei Solar Integration
 
 > **Maintained by Claude (Anthropic) on behalf of the community.**
-> Current version: **1.3.13** — see `manifest.json`.
+> Current version: **1.3.14** — see `manifest.json`.
 
 ---
 
@@ -663,6 +663,108 @@ timestamp, eliminating arithmetic errors on the power-flow card.
 - **New:** `tests/test_synchronized_power_coordinator.py` — 22 tests covering
   derived properties (all edge cases), happy path, partial failure, all-fail,
   consecutive failure counter, and telemetry recording.
+
+### v1.3.14 (2026-08-05)
+**Defects L, M, N, O — four fixes from one review pass: three reported
+independently by the operator (L, M, N), one bonus find while reviewing
+switch.py for a separate reason (O). All four target the same theme this
+session has been working through all night: nothing on the setup/reload
+critical path should be able to block indefinitely, outlive the entry that
+created it, or fail in a way Home Assistant can't retry cleanly.**
+
+**Defect L — the Defect K deferred-poll task had no lifecycle of its own.**
+`_schedule_deferred_first_poll()` (v1.3.13) called
+`self.hass.async_create_task(_deferred())` with no stored handle and no tie
+to the config entry. If the entry reloaded or unloaded before the stagger
+delay elapsed, the old task kept running regardless — and since Defect J1
+made every coordinator's guard correctly resolve to the SAME shared
+`ModbusGuard` for a bus, a stale task's eventual `async_request_refresh()`
+could inject uncoordinated traffic into that same shared queue at exactly
+the moment a fresh setup was trying to establish itself.
+
+Fixed with two independent layers: the task is now created via
+`entry.async_create_background_task()` (falling back to
+`hass.async_create_task()` if no entry was supplied), which Home Assistant
+cancels automatically on unload — and, as a second, independent guard
+against the narrow race where the sleep completes right as unload begins,
+the deferred coroutine checks a new `self._shutdown` flag (set via
+`entry.async_on_unload()`) before calling `async_request_refresh()`.
+`HuaweiSolarUpdateCoordinator.__init__` gained an `entry` parameter,
+threaded through from all six construction call sites in `__init__.py`.
+
+**Defect M — `create_device_instance()` had no bound of its own.** The
+very first `await` in `async_setup_entry` — establishing the connection and
+running the vendor library's device-detection sequence — had no timeout.
+A field traceback this session confirmed this can be slow enough, right
+after a reconnect, that Home Assistant's own external setup timeout
+cancels the whole entry with an unhandled `asyncio.CancelledError` —
+which, being a `BaseException` rather than an `Exception`, bypassed every
+existing `ConfigEntryNotReady` handler already in this function (all of
+which catch ordinary exceptions like `TimeoutError` and
+`ConnectionException` just fine).
+
+Rather than trying to intercept and reinterpret an external cancellation,
+the call is now wrapped in `asyncio.wait_for(..., timeout=DEVICE_CONNECT_TIMEOUT)`
+(45s — generously above the ~30-40s worst case directly observed for this
+phase, but meaningfully shorter than the ~50s+ at which the external
+cancellation was seen to fire). On timeout, we now give up first, in a
+controlled way, raising our own `ConfigEntryNotReady` — which Home
+Assistant already retries cleanly — instead of being caught by an external
+cancellation with a raw, alarming traceback.
+
+**Defect N — optimizer discovery had the same gap.**
+`device.get_optimizer_system_information_data()` in
+`_setup_inverter_device_data` — a one-time vendor-library file read,
+outside `ModbusGuard`, run before the optimizer coordinator (whose own
+first refresh was already backgrounded for Defect G) even exists — had no
+bound either. Its existing `except Exception` guard stops it from
+crashing setup, but does nothing to stop it from extending the overall
+setup duration before failing. Fixed the same way as Defect M: wrapped in
+`asyncio.wait_for(..., timeout=OPTIMIZER_DISCOVERY_TIMEOUT)` (30s — a
+reasoned, moderate bound; no direct field measurement exists yet for this
+specific call, unlike Defect M's create_device_instance figures). On
+timeout, optimizer entities are simply skipped for this setup pass —
+identical in effect to the existing `except Exception` fallback — and
+retried automatically on the next reload.
+
+**Defect O — a 10x constant/comment mismatch in `switch.py`.**
+`MAX_STATUS_CHANGE_TIME_SECONDS = 3000` sat beside a comment reading
+*"Maximum status change time is 5 minutes"* — 3000s is 50 minutes, not 5.
+Found while reviewing this file for the operator's separate (deferred,
+lower-priority) guard-bypass finding. Corrected to `300`, matching both
+the comment's stated intent and the physically reasonable figure for a
+SUN2000's actual startup/shutdown sequence.
+
+**What stayed deliberately out of scope for this release.** The operator
+also flagged that `switch.py`'s on/off polling loop bypasses `ModbusGuard`
+entirely — a real, lower-severity finding (bounded to a user-triggered
+action, not the setup path) that was explicitly agreed to defer rather
+than bundle in here. Also unchanged: the underlying reason a client-level
+TCP/RTU connection object is not explicitly closed when
+`create_device_instance()` fails during initial connection — an existing
+gap (present before this release, for every exception type this phase can
+raise, not something this release introduces or worsens) noted for a
+future look rather than expanded into scope tonight.
+
+**Adversarial verification.** New `tests/test_defects_l_m_n_o.py` (13
+tests) covering all four defects together: behavioural reproductions of
+the old vs. new deferred-poll pattern (proving the old pattern fires stray
+refreshes after "unload" and the new one doesn't, with no regression to
+normal operation); behavioural confirmation that a slow connect/discovery
+call raises promptly under `asyncio.wait_for` rather than hanging; static
+(AST) checks that the real source uses `entry.async_create_background_task`
+and checks `self._shutdown`, that `create_device_instance(...)` and
+`get_optimizer_system_information_data(...)` are both wrapped in
+`asyncio.wait_for` with a nearby `except TimeoutError` → `ConfigEntryNotReady`
+conversion, and a direct value check that `MAX_STATUS_CHANGE_TIME_SECONDS`
+equals 300. Run against the pristine pre-session baseline, all four static
+checks fail correctly (three with "not found" — these mechanisms did not
+exist before this session — and Defect O's with the exact wrong value,
+3000).
+
+**Tests: 507 -> 520 passed, 1 skipped**, deterministic across 3 repeated
+runs. `update_coordinator.py`, `__init__.py`, `const.py`, and `switch.py`
+changed among production files.
 
 ### v1.3.13 (2026-08-05)
 **Defect K — the coordinator first-poll stagger delay blocked a

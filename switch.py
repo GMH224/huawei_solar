@@ -299,7 +299,15 @@ class HuaweiSolarOnOffSwitchEntity(
     """Huawei Solar Switch Entity."""
 
     POLL_FREQUENCY_SECONDS = 15
-    MAX_STATUS_CHANGE_TIME_SECONDS = 3000  # Maximum status change time is 5 minutes
+    # v1.3.14 FIX (Defect O): this constant was 3000 (50 minutes) while the
+    # comment beside it, and the one in async_turn_on/async_turn_off below,
+    # both stated "5 minutes" (300s) -- a 10x mismatch between the code and
+    # its own documented intent, found while reviewing this file for a
+    # separate issue. 300s matches the stated intent and is also the
+    # physically reasonable figure for a SUN2000's actual startup/shutdown
+    # sequence; corrected rather than the comments, since a 50-minute
+    # worst-case poll loop was almost certainly never the intent.
+    MAX_STATUS_CHANGE_TIME_SECONDS = 300  # Maximum status change time is 5 minutes
 
     def __init__(
         self,

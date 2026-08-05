@@ -63,6 +63,7 @@ from huawei_solar import (
 from huawei_solar.device.base import HuaweiSolarDevice
 from huawei_solar.files import OptimizerRealTimeData
 
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.debounce import Debouncer
 from homeassistant.helpers.device_registry import DeviceInfo
@@ -298,6 +299,7 @@ class HuaweiSolarUpdateCoordinator(
         update_timeout: timedelta = UPDATE_TIMEOUT,
         start_delay: timedelta = timedelta(0),
         bus_endpoint: str = "",
+        entry: ConfigEntry | None = None,
     ) -> None:
         super().__init__(
             hass, logger,
@@ -312,6 +314,15 @@ class HuaweiSolarUpdateCoordinator(
         self._start_delay = start_delay
         self._first_poll_done: bool = False
         self._backoff_cycle: int = 0   # incremented every poll during back-off
+
+        # v1.3.14 FIX (Defect L, part 1): the entry is threaded through so
+        # the deferred first-poll task (below) can be tied to the entry's
+        # own lifecycle rather than outliving it. See
+        # _schedule_deferred_first_poll for the full explanation.
+        self._entry = entry
+        self._shutdown = False
+        if entry is not None:
+            entry.async_on_unload(self._mark_shutdown)
 
         # Bus-level guard (shared by all coordinators on the same RS485 bus)
         endpoint = bus_endpoint or device.serial_number
@@ -609,13 +620,51 @@ class HuaweiSolarUpdateCoordinator(
 
     # ── poll logic ────────────────────────────────────────────────────────────
 
+    def _mark_shutdown(self) -> None:
+        """Called when this coordinator's config entry unloads (see Defect
+        L). Guards the deferred first-poll task against firing on a
+        coordinator whose entry is already gone, as a second, independent
+        layer of defence on top of the task cancellation below."""
+        self._shutdown = True
+
     def _schedule_deferred_first_poll(self) -> None:
         """Run the actual first poll, after the stagger delay, as a
-        background task instead of sleeping inline (see Defect K below)."""
+        background task instead of sleeping inline (see Defect K).
+
+        v1.3.14 FIX (Defect L, part 1): this used to call
+        `self.hass.async_create_task(_deferred())` with no stored handle
+        and no tie to the config entry's lifecycle. If the entry reloaded
+        or unloaded before the stagger delay elapsed, the old task kept
+        running regardless, and its eventual `async_request_refresh()`
+        call would run against a coordinator no longer considered "active"
+        by anything -- yet still holding a real, guard-registered
+        ModbusGuard reference (the SAME shared guard every other
+        coordinator on this bus uses, since Defect J1), meaning a stale
+        task could inject uncoordinated Modbus traffic at exactly the
+        moment a fresh setup attempt is trying to establish itself.
+
+        Fixed with two independent layers:
+        1. `entry.async_create_background_task()` (falling back to
+           `hass.async_create_task()` if no entry was provided) instead of
+           a bare, untracked task -- Home Assistant cancels
+           entry-scoped background tasks automatically on unload/reload,
+           which is the primary fix.
+        2. An explicit `self._shutdown` check inside the deferred
+           coroutine itself, set by `_mark_shutdown()` via
+           `entry.async_on_unload()`, as a second, independent guard
+           against the narrow race where the sleep completes right as
+           unload begins but before task cancellation has propagated.
+        """
 
         async def _deferred() -> None:
             try:
                 await asyncio.sleep(self._start_delay.total_seconds())
+                if self._shutdown:
+                    _LOGGER.debug(
+                        "%s: deferred first-poll skipped -- entry unloaded "
+                        "before the stagger delay elapsed", self.name,
+                    )
+                    return
                 await self.async_request_refresh()
             except Exception:  # noqa: BLE001 — background task must not raise
                 _LOGGER.exception(
@@ -623,7 +672,13 @@ class HuaweiSolarUpdateCoordinator(
                     "the coordinator's normal schedule", self.name,
                 )
 
-        self.hass.async_create_task(_deferred())
+        create_task = getattr(self._entry, "async_create_background_task", None)
+        if self._entry is not None and create_task is not None:
+            create_task(
+                self.hass, _deferred(), f"{self.name}_deferred_first_poll"
+            )
+        else:  # pragma: no cover — no entry provided, or an older HA core
+            self.hass.async_create_task(_deferred())
 
     async def _async_update_data(self) -> dict[RegisterName, Result[Any]]:
         # ── 0. First-poll stagger ─────────────────────────────────────────────

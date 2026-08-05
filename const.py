@@ -30,6 +30,27 @@ CONFIGURATION_UPDATE_INTERVAL = timedelta(minutes=15)
 OPTIMIZER_UPDATE_INTERVAL = timedelta(minutes=5)
 OPTIMIZER_UPDATE_TIMEOUT = timedelta(minutes=2)
 
+# v1.3.14 (Defect N): bound for the ONE-TIME optimizer discovery scan
+# (device.get_optimizer_system_information_data(), a vendor-library file
+# read) performed once per inverter with optimizers, directly on the entry
+# setup critical path in _setup_inverter_device_data -- before the
+# optimizer coordinator's own first refresh even exists to be backgrounded
+# (that part was already fixed for Defect G). This call is outside
+# ModbusGuard, had no explicit timeout of its own, and its own
+# `except Exception` guard does not stop it from extending the overall
+# setup duration before failing -- contributing to the same setup-timeout
+# risk as Defects G, M, and the create_device_instance() latency this
+# session found directly. No field measurement exists yet for this
+# specific call's typical duration (unlike create_device_instance's ~30-40s
+# worst case), so 30s is a reasoned, moderate bound: generous for a
+# single-frame file read, but meaningfully shorter than
+# OPTIMIZER_UPDATE_TIMEOUT (2 min, which governs the coordinator's regular,
+# backgrounded polling, not this one-time setup-path scan). On timeout,
+# optimizer entities are simply skipped for this setup pass -- identical
+# to the existing `except Exception` fallback already in place, and
+# retried automatically on the next reload.
+OPTIMIZER_DISCOVERY_TIMEOUT = timedelta(seconds=30)
+
 # v1.3.9 (Defect H): bound for the write-permission probe performed once per
 # SUN2000 device during SENSOR PLATFORM SETUP (sensor.py:create_sun2000_entities)
 # to decide whether to add one optional entity (Active Power Control Mode).
@@ -45,6 +66,30 @@ OPTIMIZER_UPDATE_TIMEOUT = timedelta(minutes=2)
 # answers this in well under a second, so there is nothing to gain by
 # waiting as long as we would for a real data poll.
 WRITE_PERMISSION_CHECK_TIMEOUT = timedelta(seconds=5)
+
+# v1.3.14 (Defect M): bound for create_device_instance() -- the very first
+# call in async_setup_entry, establishing the connection and running the
+# vendor library's own device-detection sequence (several individual
+# register reads, e.g. DAYLIGHT_SAVING_TIME). A field traceback confirmed
+# this specific call can be slow enough, right after a reconnect, that Home
+# Assistant's OWN external config-entry setup timeout cancels the whole
+# setup with an unhandled asyncio.CancelledError -- which is not a
+# TimeoutError and is not caught by `except Exception` (CancelledError is a
+# BaseException), so it bypassed every existing ConfigEntryNotReady
+# handler in async_setup_entry.
+#
+# Rather than trying to catch and reinterpret an external cancellation
+# (fighting normal asyncio cancellation semantics), this bounds the SAME
+# call with our own, shorter timeout, so that on a slow/still-reconnecting
+# device we are always the one who gives up first, in a controlled way --
+# raising our own ConfigEntryNotReady, which Home Assistant already knows
+# how to retry cleanly -- rather than being caught by an external
+# cancellation with a raw, alarming traceback. 45s is chosen generously
+# above the ~30-40s worst case directly observed for this phase in the
+# field (multiple individual slow register reads during detection), while
+# still meaningfully shorter than the ~50s+ at which the external
+# cancellation was observed to fire for the entry's setup as a whole.
+DEVICE_CONNECT_TIMEOUT = timedelta(seconds=45)
 
 # v1.3.11 (Defect J, reported by an independent ICS audit and confirmed
 # against source): bound for the static min/max register reads performed

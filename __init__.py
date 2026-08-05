@@ -1,5 +1,6 @@
 """The Huawei Solar integration."""
 
+import asyncio
 import logging
 from datetime import timedelta
 
@@ -46,9 +47,11 @@ from .const import (
     CONFIGURATION_UPDATE_INTERVAL,
     DATA_DEVICE_DATAS,
     DATA_SYNC_POWER_COORDINATOR,
+    DEVICE_CONNECT_TIMEOUT,
     DOMAIN,
     ENERGY_STORAGE_UPDATE_INTERVAL,
     INVERTER_UPDATE_INTERVAL,
+    OPTIMIZER_DISCOVERY_TIMEOUT,
     OPTIMIZER_UPDATE_INTERVAL,
     POWER_METER_UPDATE_INTERVAL,
     SYNC_POWER_UPDATE_INTERVAL,
@@ -174,7 +177,30 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
                 unit_id=entry.data[CONF_SLAVE_IDS][0],
             )
 
-        primary_device = await create_device_instance(client)
+        # v1.3.14 FIX (Defect M): bound this call ourselves so we give up,
+        # cleanly, before Home Assistant's own external setup timeout can
+        # cancel us mid-connection (see const.DEVICE_CONNECT_TIMEOUT for
+        # the full reasoning and the field evidence behind this bound).
+        try:
+            primary_device = await asyncio.wait_for(
+                create_device_instance(client),
+                timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
+            )
+        except TimeoutError as err:
+            host = entry.data.get(CONF_HOST) or entry.data.get(CONF_PORT)
+            _LOGGER.warning(
+                "Connecting to and identifying the inverter at %s took "
+                "longer than %.0fs. The device may still be completing "
+                "its own reconnect after a previous session ended; this "
+                "will be retried automatically",
+                host, DEVICE_CONNECT_TIMEOUT.total_seconds(),
+            )
+            raise ConfigEntryNotReady(
+                f"Timed out connecting to and identifying the inverter at "
+                f"{host} after {DEVICE_CONNECT_TIMEOUT.total_seconds():.0f}s. "
+                "It may still be finishing its own reconnect; this will be "
+                "retried automatically."
+            ) from err
 
         # Derive the bus endpoint once from the config entry.
         # All inverters on the same physical RS485 bus share this endpoint
@@ -715,6 +741,7 @@ async def _setup_inverter_device_data(
         update_interval=INVERTER_UPDATE_INTERVAL,
         start_delay=_staggered_start_delay("main", device_index),
         bus_endpoint=bus_endpoint,
+            entry=entry,
     )
 
     # Create telemetry singleton and attach to the main coordinator.
@@ -764,6 +791,7 @@ async def _setup_inverter_device_data(
             update_interval=POWER_METER_UPDATE_INTERVAL,
             start_delay=_staggered_start_delay("power_meter", device_index),
             bus_endpoint=bus_endpoint,
+            entry=entry,
         )
         power_meter_update_coordinator.attach_telemetry(telemetry)
         power_meter_update_coordinator.attach_adaptive(adaptive)
@@ -791,6 +819,7 @@ async def _setup_inverter_device_data(
             update_interval=ENERGY_STORAGE_UPDATE_INTERVAL,
             start_delay=_staggered_start_delay("energy_storage", device_index),
             bus_endpoint=bus_endpoint,
+            entry=entry,
         )
         energy_storage_update_coordinator.attach_telemetry(telemetry)
         energy_storage_update_coordinator.attach_adaptive(adaptive)
@@ -833,8 +862,12 @@ async def _setup_inverter_device_data(
         not isinstance(device.primary_device, SmartLoggerDevice)
     ):
         try:
-            optimizer_system_infos = (
-                await device.get_optimizer_system_information_data()
+            # v1.3.14 FIX (Defect N): bounded so a slow/still-reconnecting
+            # device can't hold entry setup open indefinitely on this one
+            # discovery scan (see const.OPTIMIZER_DISCOVERY_TIMEOUT).
+            optimizer_system_infos = await asyncio.wait_for(
+                device.get_optimizer_system_information_data(),
+                timeout=OPTIMIZER_DISCOVERY_TIMEOUT.total_seconds(),
             )
 
             optimizers_device_infos = {
@@ -859,6 +892,13 @@ async def _setup_inverter_device_data(
             )
             optimizer_update_coordinator.attach_telemetry(telemetry)
             optimizer_update_coordinator.attach_adaptive(adaptive)
+        except TimeoutError:
+            _LOGGER.warning(
+                "%s: optimizer discovery took longer than %.0fs; skipping "
+                "optimizer entities for this setup. Will be retried on the "
+                "next reload. All other entities are unaffected",
+                device.serial_number, OPTIMIZER_DISCOVERY_TIMEOUT.total_seconds(),
+            )
         except PermissionDeniedError as exception:
             _LOGGER.info(
                 "Cannot create optimizer sensor entities as the integration has insufficient permissions. "
@@ -880,6 +920,7 @@ async def _setup_inverter_device_data(
             update_interval=CONFIGURATION_UPDATE_INTERVAL,
             start_delay=_staggered_start_delay("configuration", device_index),
             bus_endpoint=bus_endpoint,
+            entry=entry,
         )
         configuration_update_coordinator.attach_telemetry(telemetry)
         configuration_update_coordinator.attach_adaptive(adaptive)
@@ -953,6 +994,7 @@ async def _setup_device_data(
         device=device,
         name=f"{device.serial_number}_data_update_coordinator",
         update_interval=INVERTER_UPDATE_INTERVAL,
+        entry=entry,
     )
 
     if entry.data.get(CONF_ENABLE_PARAMETER_CONFIGURATION, False):
@@ -962,6 +1004,7 @@ async def _setup_device_data(
             device=device,
             name=f"{device.serial_number}_config_data_update_coordinator",
             update_interval=CONFIGURATION_UPDATE_INTERVAL,
+            entry=entry,
         )
     else:
         configuration_update_coordinator = None
