@@ -1,7 +1,7 @@
 # CLAUDE.md — Huawei Solar Integration
 
 > **Maintained by Claude (Anthropic) on behalf of the community.**
-> Current version: **1.3.9** — see `manifest.json`.
+> Current version: **1.3.10** — see `manifest.json`.
 
 ---
 
@@ -663,6 +663,79 @@ timestamp, eliminating arithmetic errors on the power-flow card.
 - **New:** `tests/test_synchronized_power_coordinator.py` — 22 tests covering
   derived properties (all edge cases), happy path, partial failure, all-fail,
   consecutive failure counter, and telemetry recording.
+
+### v1.3.10 (2026-08-05)
+**Defect I — the first-poll stagger scheme was device-blind. Confirmed by
+name from a real debug capture of a two-inverter reload: ModbusGuard's
+adaptively-learned queue depth (1, correct for steady-state traffic) was
+overwhelmed by same-type coordinators on two daisy-chained devices waking
+for their first poll at the identical offset, forcing shed+retry cycles
+that cost ~20s per collision — the largest identified remaining
+contributor to the multi-minute startup window.**
+
+**The evidence.** Debug logging on a v1.3.9 reload (two inverters,
+`HV2220098926` and `HV2220080950`, sharing one `ModbusGuard` endpoint,
+`192.168.7.22:502`) showed, right where the config and battery
+coordinators' first fetches stalled:
+
+```
+ModbusGuard[192.168.7.22:502]: queue full (2/1) — shedding request
+HV2220080950_config_data_update_coordinator: request shed by bus guard (queue full (2/1))
+HV2220080950_config_data_update_coordinator: Modbus timeout #1
+Retry after triggered. Scheduling next update in 10 second(s)
+Error fetching HV2220080950_config_data_update_coordinator data: Timeout... no response in 20 s
+```
+
+`config_data_update_coordinator`'s first fetch took 19.454s;
+`battery_data_update_coordinator`'s took 20.472s — both matching two
+shed-and-retry-after-10s rounds exactly.
+
+**Root cause.** `_COORDINATOR_START_DELAYS` (v1.0.3) staggers a *single*
+device's four coordinator types (main/power_meter/energy_storage/
+configuration) across their first poll — a good scheme for one device, but
+applied identically to every device sharing a bus. Two daisy-chained
+inverters' `configuration` coordinators both wake at +10s; both
+`energy_storage` coordinators both at +14s; and so on — a guaranteed
+same-type collision, once per coordinator type, on every single boot and
+reload.
+
+**Why the fix is a smarter stagger, not a bigger queue.** `ModbusGuard`'s
+actual queue depth isn't a fixed constant — `adaptive_modbus.py` computes
+it continuously from a confidence-weighted blend of learned history and a
+cold-start default. The observed depth of 1 came from **71 days of real
+learned history** on this bus, i.e. depth=1 is the value this project's own
+adaptive layer determined is correct for steady-state traffic. Widening it
+globally would override that learned value for the other 99.9% of the time
+to paper over a ~20s startup-only collision — the same class of mistake
+this project's process rules already warn against (a plausible-sounding
+global change, unvalidated against the case that actually matters). The
+fix instead targets the actual, specific, confirmed mechanism: eliminate
+the collision at its source.
+
+**Fix.** `_staggered_start_delay(kind, device_index)` adds
+`device_index * _MULTI_DEVICE_STAGGER_STRIDE` (5s) on top of the existing
+per-type offset. Device 0 (the primary device) is completely unaffected —
+identical timing to before. Device 1 (and any further daisy-chained
+device) gets its own, non-overlapping stagger window. `device_index` is
+threaded from the existing primary/slave-device setup loop in
+`async_setup_entry` through `_setup_device_data` and
+`_setup_inverter_device_data`. Scoped entirely to the one-time first-poll
+delay (`if not self._first_poll_done`, unchanged) — nothing about
+steady-state adaptive behaviour is touched.
+
+**Adversarial verification.** New `tests/test_multi_device_stagger.py`:
+behavioural tests confirm device 0's offsets are byte-identical to the
+pre-fix values (no behaviour change for the common single-device case),
+that every coordinator type gets a distinct offset for device 1 vs device
+0, and that this scales cleanly to a third and fourth device. Static (AST)
+checks confirm every `start_delay=` call site goes through
+`_staggered_start_delay(...)`, not a raw `_COORDINATOR_START_DELAYS[...]`
+lookup, and that `_setup_inverter_device_data` accepts `device_index`. Run
+against the pre-fix `__init__.py`, both static tests fail correctly; against
+this release, both pass.
+
+**Tests: 481 -> 487 passed, 1 skipped**, deterministic across 3 repeated
+runs. Only `__init__.py` changed among production files.
 
 ### v1.3.9 (2026-08-05)
 **Defect H — an unbounded, unhandled write-permission probe on the SENSOR

@@ -88,6 +88,42 @@ _COORDINATOR_START_DELAYS = {
     "configuration": timedelta(seconds=10),
 }
 
+# v1.3.10 FIX (Defect I): the offsets above stagger the FOUR COORDINATOR
+# TYPES within one device's first poll -- they say nothing about a SECOND
+# device sharing the same physical bus. Daisy-chained inverters (and any
+# other multi-device installation on one ModbusGuard endpoint) reuse these
+# exact same per-type offsets for every device, so e.g. device 0's and
+# device 1's "configuration" coordinators both wake for their first poll at
+# +10s, both "energy_storage" coordinators both at +14s, and so on --
+# guaranteeing a same-type collision on every reload/restart, once per
+# coordinator type, regardless of how many devices share the bus.
+#
+# Confirmed directly from a debug capture of a real two-inverter reload:
+# ModbusGuard's *adaptive, learned* queue depth (from 71 days of real
+# history) was 1 at the time -- correctly so for this bus's steady-state
+# traffic -- and the resulting shed+10s-retry cycles on the colliding
+# config/battery coordinators cost ~20s each, accounting for the bulk of
+# the multi-minute startup window (see AUDIT_1.3.10.md). Deliberately NOT
+# fixed by widening the queue depth: that value is adaptively learned from
+# real steady-state conditions and overriding it globally would change
+# behaviour for the other 99.9% of the time to paper over a ~20s startup-
+# only collision -- the same class of mistake this project's adaptive
+# layer exists to avoid (see the queue-depth learning in adaptive_modbus.py
+# and MAX_QUEUE_DEPTH's docstring in modbus_guard.py).
+#
+# Fixed instead by adding a per-device offset on top of the per-type one,
+# so each additional device sharing a bus gets its own, non-overlapping
+# stagger window. 5s chosen to comfortably clear a single coordinator's
+# first-poll exchange (observed well under 1s when healthy) while keeping
+# the total spread modest even with several daisy-chained devices.
+_MULTI_DEVICE_STAGGER_STRIDE = timedelta(seconds=5)
+
+
+def _staggered_start_delay(kind: str, device_index: int) -> timedelta:
+    """First-poll stagger for coordinator *kind* on the *device_index*-th
+    device sharing this entry's bus (0 = primary device)."""
+    return _COORDINATOR_START_DELAYS[kind] + device_index * _MULTI_DEVICE_STAGGER_STRIDE
+
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS: list[Platform] = [
@@ -164,16 +200,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
             entry,
             primary_device,
             bus_endpoint=bus_endpoint,
+            device_index=0,
         )
 
         device_datas: list[HuaweiSolarDeviceData] = [primary_device_data]
 
-        for extra_unit_id in entry.data[CONF_SLAVE_IDS][1:]:
+        for device_index, extra_unit_id in enumerate(entry.data[CONF_SLAVE_IDS][1:], start=1):
             sub_device = await create_sub_device_instance(primary_device, extra_unit_id)
             # sub_device shares the same physical RS485 bus as primary_device
             # — passing bus_endpoint gives it the same ModbusGuard instance.
+            # device_index (v1.3.10) staggers this device's first-poll timing
+            # away from the primary device's, since they share one guard —
+            # see _staggered_start_delay / Defect I.
             sub_device_data = await _setup_device_data(
-                hass, entry, sub_device, bus_endpoint=bus_endpoint
+                hass, entry, sub_device, bus_endpoint=bus_endpoint, device_index=device_index
             )
 
             device_datas.append(sub_device_data)
@@ -642,6 +682,7 @@ async def _setup_inverter_device_data(
     device: SUN2000Device,
     connecting_inverter_device_id: tuple[str, str] | None,
     bus_endpoint: str = "",
+    device_index: int = 0,
 ) -> HuaweiSolarInverterData:
     device_registry = dr.async_get(hass)
 
@@ -671,7 +712,7 @@ async def _setup_inverter_device_data(
         device=device,
         name=f"{device.serial_number}_data_update_coordinator",
         update_interval=INVERTER_UPDATE_INTERVAL,
-        start_delay=_COORDINATOR_START_DELAYS["main"],
+        start_delay=_staggered_start_delay("main", device_index),
         bus_endpoint=bus_endpoint,
     )
 
@@ -720,7 +761,7 @@ async def _setup_inverter_device_data(
             device=device,
             name=f"{device.serial_number}_power_meter_data_update_coordinator",
             update_interval=POWER_METER_UPDATE_INTERVAL,
-            start_delay=_COORDINATOR_START_DELAYS["power_meter"],
+            start_delay=_staggered_start_delay("power_meter", device_index),
             bus_endpoint=bus_endpoint,
         )
         power_meter_update_coordinator.attach_telemetry(telemetry)
@@ -747,7 +788,7 @@ async def _setup_inverter_device_data(
             device=device,
             name=f"{device.serial_number}_battery_data_update_coordinator",
             update_interval=ENERGY_STORAGE_UPDATE_INTERVAL,
-            start_delay=_COORDINATOR_START_DELAYS["energy_storage"],
+            start_delay=_staggered_start_delay("energy_storage", device_index),
             bus_endpoint=bus_endpoint,
         )
         energy_storage_update_coordinator.attach_telemetry(telemetry)
@@ -836,7 +877,7 @@ async def _setup_inverter_device_data(
             device=device,
             name=f"{device.serial_number}_config_data_update_coordinator",
             update_interval=CONFIGURATION_UPDATE_INTERVAL,
-            start_delay=_COORDINATOR_START_DELAYS["configuration"],
+            start_delay=_staggered_start_delay("configuration", device_index),
             bus_endpoint=bus_endpoint,
         )
         configuration_update_coordinator.attach_telemetry(telemetry)
@@ -874,11 +915,12 @@ async def _setup_device_data(
     entry: ConfigEntry,
     device: HuaweiSolarDevice,
     bus_endpoint: str = "",
+    device_index: int = 0,
 ) -> HuaweiSolarDeviceData:
     """Create the correct DeviceInfo-objects, which can be used to correctly assign to entities in this integration."""
     if isinstance(device, SUN2000Device):
         return await _setup_inverter_device_data(
-            hass, entry, device, None, bus_endpoint=bus_endpoint
+            hass, entry, device, None, bus_endpoint=bus_endpoint, device_index=device_index
         )
 
     device_registry = dr.async_get(hass)
