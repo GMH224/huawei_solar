@@ -91,6 +91,15 @@ WRITE_PERMISSION_CHECK_TIMEOUT = timedelta(seconds=5)
 # cancellation was observed to fire for the entry's setup as a whole.
 DEVICE_CONNECT_TIMEOUT = timedelta(seconds=45)
 
+# v1.3.18 (Defect U/Finding 3, independent ICS audit of v1.3.17): bound for
+# primary_device.client.disconnect() during async_unload_entry. This runs
+# BEFORE every teardown loop that follows it (telemetry, the adaptive
+# controller, keep-alive, battery health, the shared guard) -- a wedged or
+# half-dead transport blocking here would prevent ALL of that cleanup from
+# ever running. A clean disconnect should be near-instant; 10s is generous
+# headroom without meaningfully delaying unload in the normal case.
+DISCONNECT_TIMEOUT = timedelta(seconds=10)
+
 # v1.3.11 (Defect J, reported by an independent ICS audit and confirmed
 # against source): bound for the static min/max register reads performed
 # once per number entity, during NUMBER PLATFORM SETUP

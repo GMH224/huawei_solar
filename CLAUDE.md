@@ -1,7 +1,7 @@
 # CLAUDE.md — Huawei Solar Integration
 
 > **Maintained by Claude (Anthropic) on behalf of the community.**
-> Current version: **1.3.17** — see `manifest.json`.
+> Current version: **1.3.18** — see `manifest.json`.
 
 ---
 
@@ -663,6 +663,83 @@ timestamp, eliminating arithmetic errors on the power-flow card.
 - **New:** `tests/test_synchronized_power_coordinator.py` — 22 tests covering
   derived properties (all edge cases), happy path, partial failure, all-fail,
   consecutive failure counter, and telemetry recording.
+
+### v1.3.18 (2026-08-05)
+**Defect U — three findings (1, 2, 3) from a second independent ICS audit,
+this time of v1.3.17. All High severity, all confirmed against source.
+Findings 4-7 from the same report (switch polling bypassing the guard,
+config_flow's own copy of the unbounded-connect pattern, an unbounded
+service-validation read) are deliberately deferred to a follow-up release
+— scoped this way on purpose, not overlooked.**
+
+**Finding 1 — login and slave discovery had no bound of their own.**
+`primary_device.login(...)` (when parameter configuration is enabled) and
+`create_sub_device_instance(...)` (once per daisy-chained slave) were both
+unbounded, direct `await`s — the same class of risk Defect M (v1.3.14)
+closed for the primary device's initial connection, just for two call
+sites that fix never covered. Because slave discovery runs in a sequential
+loop, one slow slave could stall discovery of every device after it
+indefinitely.
+
+Fixed the same way as Defect M: both wrapped in `asyncio.wait_for(...,
+timeout=DEVICE_CONNECT_TIMEOUT)`, converting a timeout into a clean,
+retryable `ConfigEntryNotReady` instead of leaving either exposed to Home
+Assistant's own external setup-cancellation.
+
+**Finding 2 — a partially-completed setup could leak background tasks.**
+`_setup_inverter_device_data()` starts a real background task
+(`ModbusKeepAlive.start()`) for each device as setup proceeds. If a LATER
+step in the same setup attempt then failed — a second daisy-chained device
+timing out during discovery, for instance — every existing exception
+handler in `async_setup_entry` only ever called `primary_device.stop()`.
+Nothing tore down keep-alive tasks already started for devices that came
+before the failure. Since Home Assistant does not guarantee
+`async_unload_entry()` runs after a failed `async_setup_entry()`, such a
+task could survive as an orphan, running against a device object the next
+setup attempt no longer has any reference to.
+
+Fixed with a new `_run_cleanup_callbacks()` helper: `async_setup_entry` now
+accumulates a `cleanup_callbacks` list (threaded through
+`_setup_device_data`/`_setup_inverter_device_data` as an optional
+`register_cleanup` parameter), and `_setup_inverter_device_data` registers
+`keepalive.stop` immediately after `keepalive.start()`. All five exception
+handlers in `async_setup_entry` now run every accumulated cleanup callback,
+in reverse registration order, before doing anything else — with each
+callback isolated so one failing to clean up never prevents the others.
+
+**Finding 3 — unload could hang on a wedged disconnect, skipping
+teardown.** `async_unload_entry()` awaited
+`primary_device.client.disconnect()` directly, with no timeout, sitting
+*before* every teardown loop that follows it: `ModbusTelemetry`,
+`AdaptiveModbusController`, `ModbusKeepAlive`, `BatteryHealthManager`, and
+the shared `ModbusGuard`'s removal. A wedged or half-dead transport
+blocking there would prevent all of that cleanup from ever running,
+turning an unload-time transport problem into a stuck reload or config
+change for the whole entry.
+
+Fixed with a new `DISCONNECT_TIMEOUT` (10s — a clean disconnect should be
+near-instant; generous headroom without meaningfully delaying the normal
+case) bounding the call via `asyncio.wait_for`, with any failure (timeout
+or otherwise) logged and swallowed so teardown always proceeds regardless
+of whether disconnect itself actually succeeded.
+
+**Adversarial verification.** New `tests/test_setup_unload_robustness.py`
+(11 tests): `_run_cleanup_callbacks`'s exact logic is reproduced in
+isolation (it has no Home Assistant or device-layer dependencies of its
+own) and behaviourally tested — runs in reverse order, one failing
+callback doesn't block the rest, both sync and async callables work — plus
+an adversarial comparison proving an unguarded runner really would stop
+early on the first failure. Static (AST) checks confirm the real source:
+both Finding 1 call sites are wrapped in `asyncio.wait_for`;
+`_run_cleanup_callbacks` exists and is called at least five times in
+`async_setup_entry` (once per exception handler);
+`_setup_inverter_device_data` registers `keepalive.stop` for cleanup; and
+`async_unload_entry` wraps `disconnect()` in `asyncio.wait_for` with a
+nearby `except Exception`. Run against the pristine pre-session baseline,
+all 7 static checks fail correctly.
+
+**Tests: 555 -> 566 passed, 1 skipped**, deterministic across 3 repeated
+runs. `__init__.py` and `const.py` changed among production files.
 
 ### v1.3.17 (2026-08-05)
 **Defect T — the back-off state machine could get permanently wedged, with

@@ -1,6 +1,8 @@
 """The Huawei Solar integration."""
 
 import asyncio
+from collections.abc import Callable
+import inspect
 import logging
 from datetime import timedelta
 
@@ -48,6 +50,7 @@ from .const import (
     DATA_DEVICE_DATAS,
     DATA_SYNC_POWER_COORDINATOR,
     DEVICE_CONNECT_TIMEOUT,
+    DISCONNECT_TIMEOUT,
     DOMAIN,
     ENERGY_STORAGE_UPDATE_INTERVAL,
     INVERTER_UPDATE_INTERVAL,
@@ -129,6 +132,43 @@ def _staggered_start_delay(kind: str, device_index: int) -> timedelta:
 
 _LOGGER = logging.getLogger(__name__)
 
+
+async def _run_cleanup_callbacks(callbacks: list[Callable[[], object]]) -> None:
+    """Run every accumulated cleanup callback, isolating failures so one
+    callback raising never prevents the rest from running.
+
+    v1.3.18 FIX (Defect U, from an independent ICS audit of v1.3.17): a
+    partially-completed setup attempt that had already started long-lived
+    resources for one or more devices (currently: the keep-alive background
+    task started in `_setup_inverter_device_data`) had no way to roll those
+    resources back if a LATER step in the SAME setup attempt then failed --
+    e.g. a second daisy-chained device timing out during discovery, after
+    the first device's keep-alive task was already running. Every existing
+    exception handler in `async_setup_entry` only ever called
+    `primary_device.stop()`; nothing tore down keep-alive tasks already
+    started for devices that came before the failure.
+    
+    This matters because Home Assistant does not guarantee
+    `async_unload_entry()` runs after a failed `async_setup_entry()` -- so
+    an orphaned background task could survive to interfere with the next
+    setup attempt for the same device (a duplicate keep-alive loop running
+    against a device object the next attempt no longer has a reference to).
+    
+    Runs callbacks in reverse registration order (last-created, first torn
+    down -- the usual teardown convention) and supports both sync and
+    async callables, though the one callback registered today
+    (`ModbusKeepAlive.stop`) is synchronous.
+    """
+    for cb in reversed(callbacks):
+        try:
+            result = cb()
+            if inspect.isawaitable(result):
+                await result
+        except Exception:  # noqa: BLE001 — one failing cleanup must not block the rest
+            _LOGGER.exception(
+                "Error while cleaning up a resource after a failed setup attempt"
+            )
+
 PLATFORMS: list[Platform] = [
     Platform.BUTTON,
     Platform.NUMBER,
@@ -142,6 +182,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
     """Set up Huawei Solar from a config entry."""
 
     primary_device = None
+    # v1.3.18 FIX (Defect U): accumulates cleanup callbacks for long-lived
+    # resources (currently: keep-alive tasks) started for devices already
+    # set up successfully in THIS attempt, so they can be torn down if a
+    # LATER device or step in the same attempt fails -- see
+    # _run_cleanup_callbacks for the full reasoning.
+    cleanup_callbacks: list[Callable[[], object]] = []
     try:
         # Multiple inverters can be connected to each other via a daisy chain,
         # via an internal modbus-network (ie. not the same modbus network that we are
@@ -214,12 +260,38 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
                 and entry.data.get(CONF_USERNAME)
                 and entry.data.get(CONF_PASSWORD)
             ):
+                # v1.3.18 FIX (Defect U/Finding 1, independent ICS audit of
+                # v1.3.17): this login call had no bound of its own. On a
+                # slow or still-reconnecting device, exactly the same
+                # setup-timeout risk as Defect M (v1.3.14) applied here too
+                # -- just for the login handshake instead of the initial
+                # connection. Bounded with the same DEVICE_CONNECT_TIMEOUT
+                # used for that call, converting a timeout into a clean
+                # ConfigEntryNotReady rather than leaving it exposed to
+                # an external cancellation.
                 try:
-                    await primary_device.login(
-                        entry.data[CONF_USERNAME], entry.data[CONF_PASSWORD]
+                    await asyncio.wait_for(
+                        primary_device.login(
+                            entry.data[CONF_USERNAME], entry.data[CONF_PASSWORD]
+                        ),
+                        timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
                     )
                 except InvalidCredentials as err:
                     raise ConfigEntryAuthFailed from err
+                except TimeoutError as err:
+                    _LOGGER.warning(
+                        "Logging in to the inverter at %s took longer than "
+                        "%.0fs. The device may still be completing its own "
+                        "reconnect; this will be retried automatically",
+                        entry.data.get(CONF_HOST) or entry.data.get(CONF_PORT),
+                        DEVICE_CONNECT_TIMEOUT.total_seconds(),
+                    )
+                    raise ConfigEntryNotReady(
+                        f"Timed out logging in to the inverter after "
+                        f"{DEVICE_CONNECT_TIMEOUT.total_seconds():.0f}s. "
+                        "It may still be finishing its own reconnect; this "
+                        "will be retried automatically."
+                    ) from err
 
         primary_device_data = await _setup_device_data(
             hass,
@@ -227,19 +299,42 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
             primary_device,
             bus_endpoint=bus_endpoint,
             device_index=0,
+            register_cleanup=cleanup_callbacks.append,
         )
 
         device_datas: list[HuaweiSolarDeviceData] = [primary_device_data]
 
         for device_index, extra_unit_id in enumerate(entry.data[CONF_SLAVE_IDS][1:], start=1):
-            sub_device = await create_sub_device_instance(primary_device, extra_unit_id)
+            # v1.3.18 FIX (Defect U/Finding 1): sub-device discovery had no
+            # bound either, and the loop is sequential -- one slow slave
+            # could stall discovery of every later one indefinitely. Same
+            # DEVICE_CONNECT_TIMEOUT bound and ConfigEntryNotReady
+            # conversion as the primary device's own connection (Defect M).
+            try:
+                sub_device = await asyncio.wait_for(
+                    create_sub_device_instance(primary_device, extra_unit_id),
+                    timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
+                )
+            except TimeoutError as err:
+                _LOGGER.warning(
+                    "Discovering slave device %s took longer than %.0fs. "
+                    "The bus may still be settling after a reconnect; this "
+                    "will be retried automatically",
+                    extra_unit_id, DEVICE_CONNECT_TIMEOUT.total_seconds(),
+                )
+                raise ConfigEntryNotReady(
+                    f"Timed out discovering slave device {extra_unit_id} "
+                    f"after {DEVICE_CONNECT_TIMEOUT.total_seconds():.0f}s. "
+                    "This will be retried automatically."
+                ) from err
             # sub_device shares the same physical RS485 bus as primary_device
             # — passing bus_endpoint gives it the same ModbusGuard instance.
             # device_index (v1.3.10) staggers this device's first-poll timing
             # away from the primary device's, since they share one guard —
             # see _staggered_start_delay / Defect I.
             sub_device_data = await _setup_device_data(
-                hass, entry, sub_device, bus_endpoint=bus_endpoint, device_index=device_index
+                hass, entry, sub_device, bus_endpoint=bus_endpoint,
+                device_index=device_index, register_cleanup=cleanup_callbacks.append,
             )
 
             device_datas.append(sub_device_data)
@@ -377,6 +472,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
                 "without start-up suppression"
             )
     except ConnectionInterruptedException as err:
+        await _run_cleanup_callbacks(cleanup_callbacks)
         if primary_device is not None:
             await primary_device.stop()
         host = entry.data.get(CONF_HOST) or entry.data.get(CONF_PORT)
@@ -391,6 +487,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
             "The inverter only supports one Modbus connection at a time."
         ) from err
     except ConnectionException as err:
+        await _run_cleanup_callbacks(cleanup_callbacks)
         if primary_device is not None:
             await primary_device.stop()
         host = entry.data.get(CONF_HOST) or entry.data.get(CONF_PORT)
@@ -407,6 +504,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
         ) from err
 
     except TimeoutError as err:
+        await _run_cleanup_callbacks(cleanup_callbacks)
         if primary_device is not None:
             await primary_device.stop()
         _LOGGER.warning(
@@ -420,6 +518,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
         ) from err
 
     except HuaweiSolarException as err:
+        await _run_cleanup_callbacks(cleanup_callbacks)
         if primary_device is not None:
             await primary_device.stop()
         _LOGGER.warning(
@@ -434,6 +533,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
     except Exception:
         # always try to stop the bridge, as it will keep retrying
         # in the background otherwise!
+        # v1.3.18 FIX (Defect U): also tear down any long-lived resources
+        # (keep-alive tasks) already started for devices that succeeded
+        # earlier in this same, now-failed, setup attempt.
+        await _run_cleanup_callbacks(cleanup_callbacks)
         if primary_device is not None:
             await primary_device.stop()
         raise
@@ -634,7 +737,29 @@ async def async_unload_entry(
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         device_datas: list[HuaweiSolarDeviceData] = entry.runtime_data[DATA_DEVICE_DATAS]
         primary_device = device_datas[0].device
-        await primary_device.client.disconnect()
+
+        # v1.3.18 FIX (Defect U/Finding 3, independent ICS audit of
+        # v1.3.17): this used to be a bare `await
+        # primary_device.client.disconnect()`, with no timeout, sitting
+        # BEFORE every teardown loop below (telemetry, the adaptive
+        # controller, keep-alive, battery health, the shared guard). A
+        # wedged or half-dead transport could block here indefinitely,
+        # preventing ALL of that cleanup from ever running -- turning an
+        # unload-time transport problem into a stuck reload/config-change
+        # for the entire entry. Bounded with a short timeout, and any
+        # failure (timeout or otherwise) is logged and swallowed so
+        # teardown below always proceeds regardless of whether disconnect
+        # actually succeeded.
+        try:
+            await asyncio.wait_for(
+                primary_device.client.disconnect(),
+                timeout=DISCONNECT_TIMEOUT.total_seconds(),
+            )
+        except Exception:  # noqa: BLE001 — never let a stuck disconnect block teardown
+            _LOGGER.exception(
+                "Error disconnecting from the inverter during unload; "
+                "continuing with entry teardown regardless"
+            )
 
         # Tear down ONLY this entry's singletons.  These registries are
         # process-global and may hold instances belonging to other config
@@ -710,6 +835,7 @@ async def _setup_inverter_device_data(
     connecting_inverter_device_id: tuple[str, str] | None,
     bus_endpoint: str = "",
     device_index: int = 0,
+    register_cleanup: Callable[[Callable[[], object]], None] | None = None,
 ) -> HuaweiSolarInverterData:
     device_registry = dr.async_get(hass)
 
@@ -773,6 +899,15 @@ async def _setup_inverter_device_data(
         on_connection_restored=update_coordinator.on_connection_restored,
     )
     await keepalive.start()
+    # v1.3.18 FIX (Defect U): register this task for teardown if a LATER
+    # step in the same setup attempt fails -- without this, a second
+    # daisy-chained device timing out during discovery would leave this
+    # device's keep-alive loop running indefinitely, orphaned, since Home
+    # Assistant does not guarantee async_unload_entry() runs after a failed
+    # async_setup_entry() (see _run_cleanup_callbacks for the full
+    # reasoning).
+    if register_cleanup is not None:
+        register_cleanup(keepalive.stop)
 
     # Add power meter device if a power meter is detected
     if device.power_meter_type is not None:
@@ -958,11 +1093,13 @@ async def _setup_device_data(
     device: HuaweiSolarDevice,
     bus_endpoint: str = "",
     device_index: int = 0,
+    register_cleanup: Callable[[Callable[[], object]], None] | None = None,
 ) -> HuaweiSolarDeviceData:
     """Create the correct DeviceInfo-objects, which can be used to correctly assign to entities in this integration."""
     if isinstance(device, SUN2000Device):
         return await _setup_inverter_device_data(
-            hass, entry, device, None, bus_endpoint=bus_endpoint, device_index=device_index
+            hass, entry, device, None, bus_endpoint=bus_endpoint, device_index=device_index,
+            register_cleanup=register_cleanup,
         )
 
     device_registry = dr.async_get(hass)
