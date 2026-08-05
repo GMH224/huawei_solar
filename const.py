@@ -46,6 +46,21 @@ OPTIMIZER_UPDATE_TIMEOUT = timedelta(minutes=2)
 # waiting as long as we would for a real data poll.
 WRITE_PERMISSION_CHECK_TIMEOUT = timedelta(seconds=5)
 
+# v1.3.11 (Defect J, reported by an independent ICS audit and confirmed
+# against source): bound for the static min/max register reads performed
+# once per number entity, during NUMBER PLATFORM SETUP
+# (number.py:HuaweiSolarNumberEntity.create()), to populate a fixed
+# native_min_value/native_max_value. Like WRITE_PERMISSION_CHECK_TIMEOUT
+# above, these are raw device.client.get() calls -- outside ModbusGuard,
+# with no timeout and no exception handling at the call site -- awaited
+# once per entity before async_add_entities() returns. On an installation
+# with several number entities carrying static bounds, and/or a device that
+# is slow or busy (the exact condition this session's field investigation
+# found to be common right after a reload), this extends platform setup
+# per entity and adds avoidable, unpaced Modbus traffic during the same
+# startup window Defects H and I already targeted.
+STATIC_BOUND_READ_TIMEOUT = timedelta(seconds=5)
+
 # When the inverter is in night/sleep mode (PV power ≈ 0) all coordinators
 # slow to this interval.  Most registers are frozen at night so polling faster
 # than 5 minutes is wasteful and stresses the Modbus interface.

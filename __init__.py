@@ -247,6 +247,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
                     has_meter=has_meter,
                     has_battery=has_battery,
                     update_interval=SYNC_POWER_UPDATE_INTERVAL,
+                    bus_endpoint=bus_endpoint,
                 )
                 # Attach INV1's telemetry so sync-coordinator reads are counted
                 # in the same Modbus traffic dashboard as the other coordinators.

@@ -1241,10 +1241,23 @@ async def create_sun2000_entities(ucs: HuaweiSolarInverterData) -> list[SensorEn
             for entity_description in THREE_PHASE_METER_ENTITY_DESCRIPTIONS
         )
 
+    # v1.3.12 FIX (Defect V2-1, independent ICS audit): the bounded
+    # write-permission probe used to run BEFORE checking
+    # ucs.configuration_update_coordinator, because Python evaluates `and`
+    # left to right and the probe was the second condition. On any device
+    # where CONF_ENABLE_PARAMETER_CONFIGURATION is off (no configuration
+    # coordinator at all), the entity below could never be added regardless
+    # of the probe's result -- yet the probe still ran, spending up to
+    # WRITE_PERMISSION_CHECK_TIMEOUT and real Modbus traffic for nothing.
+    # The bound from Defect H (v1.3.9) keeps this from ever stalling setup
+    # unboundedly, but it does not make the wasted work free, and a
+    # multi-inverter installation pays this once per ineligible device on
+    # every boot/reload. Cheap, free checks now run first; the bounded
+    # probe only runs once the entity is already known to be eligible.
     if (
         not isinstance(ucs.device.primary_device, (EMMADevice, SmartLoggerDevice))
-        and await _has_write_permission_bounded(ucs.device, ucs.device.serial_number)
         and ucs.configuration_update_coordinator
+        and await _has_write_permission_bounded(ucs.device, ucs.device.serial_number)
     ):
         entities_to_add.append(
             HuaweiSolarActivePowerControlModeEntity(

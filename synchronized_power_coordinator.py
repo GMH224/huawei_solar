@@ -191,6 +191,7 @@ class SynchronizedPowerCoordinator(DataUpdateCoordinator[SynchronizedPowerData])
         has_battery: bool,
         update_interval: timedelta = SYNC_POWER_UPDATE_INTERVAL,
         update_timeout: timedelta = UPDATE_TIMEOUT,
+        bus_endpoint: str = "",
     ) -> None:
         super().__init__(
             hass,
@@ -205,19 +206,50 @@ class SynchronizedPowerCoordinator(DataUpdateCoordinator[SynchronizedPowerData])
         self._update_timeout = update_timeout
         self._telemetry: ModbusTelemetry | None = None
 
+        # v1.3.11 FIX (Defect J, reported by an independent ICS audit and
+        # confirmed against source): guards were keyed on inv1/inv2's own
+        # serial_number, NOT the shared bus endpoint every other coordinator
+        # in this codebase uses (see update_coordinator.py:
+        # `endpoint = bus_endpoint or device.serial_number`). ModbusGuard's
+        # registry is keyed by that string, so this created TWO ENTIRELY
+        # SEPARATE guard objects for this coordinator's reads -- distinct
+        # from, and with zero awareness of, the ONE shared guard every other
+        # coordinator (main/battery/power_meter/config, for both devices) was
+        # already using for the same physical bus. This coordinator's reads
+        # were therefore never actually serialized against the rest of this
+        # bus's traffic at all, on any installation with a shared RS485 bus
+        # (daisy-chained inverters) -- exactly the collision risk
+        # ModbusGuard exists to prevent, and worth calling out clearly: this
+        # is a plausible contributor to the broader multi-coordinator
+        # shedding pattern seen in this session's field investigation
+        # (AUDIT_1.3.10.md), on top of Defect I.
+        #
+        # Fixed by using the SAME `bus_endpoint or device.serial_number`
+        # fallback convention as update_coordinator.py, and by threading
+        # `bus_endpoint` in from __init__.py (which already computes it once
+        # per entry). Both inverters on one entry share one physical bus, so
+        # they now correctly resolve to the SAME ModbusGuard instance that
+        # every other coordinator on this entry already shares -- not just
+        # a same-object match between inv1/inv2 as before, but the actual
+        # shared-bus guard.
+        primary_endpoint = bus_endpoint or inv1_device.serial_number
         # Primary guard: serialises all reads for this coordinator.
         # Because both inverters are on the same SmartLogger/SDongle TCP
         # connection, holding the primary guard prevents interleaving on the
         # shared physical bus.
-        self._primary_guard = ModbusGuard.get_or_create(inv1_device.serial_number)
+        self._primary_guard = ModbusGuard.get_or_create(primary_endpoint)
 
         # Secondary guard: acquired separately after primary releases, for the
-        # INV2 read.  If INV2 has its own serial number it has its own guard;
-        # if somehow the same serial is reused (shouldn't happen) this is the
-        # same object — no deadlock risk because we never hold both simultaneously.
+        # INV2 read. With the shared bus_endpoint fix above this now resolves
+        # to the SAME guard object as _primary_guard whenever inv1 and inv2
+        # share one physical bus (the common case) -- correct, and no
+        # deadlock risk because we never hold both simultaneously.
+        secondary_endpoint = (
+            (bus_endpoint or inv2_device.serial_number) if inv2_device is not None else None
+        )
         self._secondary_guard: ModbusGuard | None = (
-            ModbusGuard.get_or_create(inv2_device.serial_number)
-            if inv2_device is not None
+            ModbusGuard.get_or_create(secondary_endpoint)
+            if secondary_endpoint is not None
             else None
         )
 

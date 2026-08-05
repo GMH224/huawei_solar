@@ -1,7 +1,7 @@
 # CLAUDE.md — Huawei Solar Integration
 
 > **Maintained by Claude (Anthropic) on behalf of the community.**
-> Current version: **1.3.10** — see `manifest.json`.
+> Current version: **1.3.12** — see `manifest.json`.
 
 ---
 
@@ -663,6 +663,122 @@ timestamp, eliminating arithmetic errors on the power-flow card.
 - **New:** `tests/test_synchronized_power_coordinator.py` — 22 tests covering
   derived properties (all edge cases), happy path, partial failure, all-fail,
   consecutive failure counter, and telemetry recording.
+
+### v1.3.12 (2026-08-05)
+**Defect V2-1 — a second, deeper pass from the same independent ICS audit
+(addendum report, against v1.3.10) found the write-permission probe in
+`sensor.py` was evaluated too early in its own eligibility check, wasting
+the bounded-but-real probe on devices that could never use it. Medium
+severity, small fix.**
+
+**Reported and verified.** `create_sun2000_entities()`'s guard for the
+optional Active Power Control Mode entity read:
+
+```python
+if (
+    not isinstance(ucs.device.primary_device, (EMMADevice, SmartLoggerDevice))
+    and await _has_write_permission_bounded(ucs.device, ucs.device.serial_number)
+    and ucs.configuration_update_coordinator
+):
+```
+
+Python's `and` short-circuits left to right, so the bounded probe (Defect
+H, v1.3.9) ran *before* the free `ucs.configuration_update_coordinator`
+check. On any device with `CONF_ENABLE_PARAMETER_CONFIGURATION` off (no
+configuration coordinator at all), the entity below could never be added
+regardless of the probe's outcome — yet the probe still ran, spending real
+Modbus traffic and up to `WRITE_PERMISSION_CHECK_TIMEOUT` for nothing. A
+multi-inverter installation pays this once per ineligible device, on every
+boot and reload.
+
+**Fix.** Reordered so both cheap, free checks (`isinstance`,
+`ucs.configuration_update_coordinator`) run first; the bounded probe now
+only executes once the entity is already known to be eligible. Defect H's
+bound (v1.3.9) remains in place unchanged — this is purely an ordering fix
+on top of it, not a re-litigation of whether the probe needs a timeout.
+
+**Adversarial verification.** New `tests/test_write_permission_ordering.py`:
+an AST check confirms the `ucs.configuration_update_coordinator` check's
+position in the condition precedes the awaited probe's position — run
+against the pristine pre-fix ordering (present since this code was first
+written, unchanged by any of v1.3.9 through v1.3.11), it fails correctly;
+against this release, it passes. A companion behavioural test confirms the
+general short-circuit semantics this fix relies on.
+
+**Tests: 498 -> 500 passed, 1 skipped**, deterministic across 3 repeated
+runs. Only `sensor.py` changed among production files.
+
+### v1.3.11 (2026-08-05)
+**Defect J — three findings from an independent ICS audit of the v1.3.10
+package, each verified against source before fixing (nothing taken on
+trust). One Critical, one High, one Medium.**
+
+**J1 (Critical) — SynchronizedPowerCoordinator's ModbusGuard was keyed on
+the wrong thing, silently defeating bus-level lock sharing.**
+`synchronized_power_coordinator.py` created its guards with
+`ModbusGuard.get_or_create(inv1_device.serial_number)` /
+`(inv2_device.serial_number)` — confirmed exactly as reported, at the
+reported lines. Every other coordinator in this codebase keys its guard on
+the shared bus endpoint (`bus_endpoint or device.serial_number`, per
+`update_coordinator.py`). Keying on serial_number instead meant this
+coordinator's reads resolved to a **completely separate `ModbusGuard`
+instance**, with zero awareness of the queue depth, pacing, or in-flight
+requests every other coordinator on the same physical bus was tracking.
+On any installation with daisy-chained inverters sharing one RS485 bus —
+this project's own field installation among them — this coordinator's
+traffic was never actually serialized against the rest of the bus at all.
+This is a plausible, additional contributor to the broader multi-coordinator
+shedding pattern this session's field investigation found only partially
+explained by Defect I (`AUDIT_1.3.10.md`).
+
+Fixed by threading `bus_endpoint` into `SynchronizedPowerCoordinator`
+(from `__init__.py`, which already computes it once per entry) and using
+the same `bus_endpoint or device.serial_number` convention as every other
+coordinator. Both inverters on one entry now correctly resolve to the
+exact same shared `ModbusGuard` instance as all the others.
+
+**J2 (High) — number.py performed unbounded, unhandled raw Modbus reads
+during platform setup.** `HuaweiSolarNumberEntity.create()` called
+`await device.client.get(...)` directly, twice, once per number entity
+with static min/max bounds — confirmed at the reported lines. This is the
+same class of defect as Defect H (`sensor.py`'s write-permission probe,
+`AUDIT_1.3.9.md`): no timeout, no exception handling, on the NUMBER
+PLATFORM's own setup critical path, awaited once per affected entity
+before `async_add_entities()` returns.
+
+Fixed with the same pattern as Defect H: new `_read_static_bound()` bounds
+each read to a new `STATIC_BOUND_READ_TIMEOUT` (5s) and catches every
+exception, never letting one propagate into platform setup. On timeout or
+failure the bound is simply left unset — identical in effect to the
+entity's own existing "no static key configured" case.
+
+**J3 (Medium) — dynamic min/max bounds were never cleared when their
+source register disappeared.** `_handle_coordinator_update()` only assigned
+`_dynamic_min_value`/`_dynamic_max_value` when the corresponding register
+was present in the coordinator's data; when absent (a transient bus issue,
+or a capability that stops being reported), the previous value was left in
+place indefinitely, potentially misleading UI validation. Fixed: both are
+now assigned via `register.value if register else None`, clearing the
+bound explicitly rather than leaving it stale.
+
+**A wider check was also done**, per this project's existing convention:
+`select.py` and `button.py` have no similar setup-time raw-read pattern.
+`switch.py`'s two `device.client.get()` calls are inside a bounded,
+user-action polling loop (`async_turn_on`/`async_turn_off`, waiting for a
+device state change), already covered by the write-path audit in
+`AUDIT_1.3.9.md` §5 — not a new instance of this defect class.
+
+**Adversarial verification.** New `tests/test_ics_audit_findings.py`:
+static (AST) checks for all three findings, each run against the pre-fix
+files and confirmed to fail at the exact reported line numbers (212, 219
+for J1; 394, 400 for J2), then confirmed to pass against this release.
+Behavioural tests for J1 (guard-key resolution arithmetic), J2 (bounded
+read against fake slow/failing/healthy devices, mirroring Defect H's
+verification style), and J3 (the reset-on-absence semantics).
+
+**Tests: 487 -> 498 passed, 1 skipped**, deterministic across 3 repeated
+runs. `synchronized_power_coordinator.py`, `number.py`, `const.py`, and
+`__init__.py` changed among production files.
 
 ### v1.3.10 (2026-08-05)
 **Defect I — the first-poll stagger scheme was device-blind. Confirmed by

@@ -1,5 +1,6 @@
 """Number entities for Huawei Solar."""
 
+import asyncio
 from dataclasses import dataclass
 import logging
 
@@ -22,7 +23,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import CONF_ENABLE_PARAMETER_CONFIGURATION, DATA_DEVICE_DATAS
+from .const import CONF_ENABLE_PARAMETER_CONFIGURATION, DATA_DEVICE_DATAS, STATIC_BOUND_READ_TIMEOUT
 from .types import (
     HuaweiSolarConfigEntry,
     HuaweiSolarDeviceData,
@@ -336,6 +337,47 @@ async def async_setup_entry(
     async_add_entities(entities_to_add)
 
 
+async def _read_static_bound(
+    device: HuaweiSolarDevice, key: RegisterName, kind: str
+) -> float | None:
+    """Bounded, isolated read of a static min/max register.
+
+    v1.3.11 FIX (Defect J). This used to be an inline
+    `await device.client.get(key)` with no timeout and no exception
+    handling, directly on the NUMBER PLATFORM SETUP critical path
+    (HuaweiSolarNumberEntity.create(), called once per number entity before
+    async_add_entities() returns). Bounded here to
+    STATIC_BOUND_READ_TIMEOUT for the same reason as sensor.py's
+    _has_write_permission_bounded (Defect H): a slow or busy device must
+    not be able to stall platform setup, and an exception here must never
+    propagate -- doing so would take down every number entity on the
+    entry, not just this one bound. On timeout or failure the bound is
+    simply left unset (identical in effect to the entity's own existing
+    "no static key configured" case) rather than blocking or crashing.
+    """
+    try:
+        result = await asyncio.wait_for(
+            device.client.get(key), timeout=STATIC_BOUND_READ_TIMEOUT.total_seconds()
+        )
+        return result.value
+    except TimeoutError:
+        _LOGGER.warning(
+            "static_bound_read[%s/%s]: timed out after %.0fs; entity will "
+            "use its default %s bound for this setup. All other entities "
+            "are unaffected",
+            device.serial_number, key,
+            STATIC_BOUND_READ_TIMEOUT.total_seconds(), kind,
+        )
+        return None
+    except Exception:  # noqa: BLE001 — must never break platform setup
+        _LOGGER.exception(
+            "static_bound_read[%s/%s]: failed; entity will use its default "
+            "%s bound for this setup. All other entities are unaffected",
+            device.serial_number, key, kind,
+        )
+        return None
+
+
 class HuaweiSolarNumberEntity(
     CoordinatorEntity[HuaweiSolarUpdateCoordinator], HuaweiSolarEntity, NumberEntity
 ):
@@ -390,15 +432,15 @@ class HuaweiSolarNumberEntity(
 
         static_max_value = None
         if description.static_maximum_key:
-            static_max_value = (
-                await device.client.get(description.static_maximum_key)
-            ).value
+            static_max_value = await _read_static_bound(
+                device, description.static_maximum_key, "maximum"
+            )
 
         static_min_value = None
         if description.static_minimum_key:
-            static_min_value = (
-                await device.client.get(description.static_minimum_key)
-            ).value
+            static_min_value = await _read_static_bound(
+                device, description.static_minimum_key, "minimum"
+            )
 
         return cls(
             coordinator,
@@ -424,17 +466,18 @@ class HuaweiSolarNumberEntity(
                 min_register = self.coordinator.data.get(
                     self.entity_description.dynamic_minimum_key
                 )
-
-                if min_register:
-                    self._dynamic_min_value = min_register.value
+                # v1.3.11 FIX (Defect J, part 3): previously only assigned
+                # when present, so a register that disappears (transient bus
+                # issue, or a capability that stops being reported) left the
+                # entity advertising a stale bound indefinitely instead of
+                # falling back to the entity's static/default bound.
+                self._dynamic_min_value = min_register.value if min_register else None
 
             if self.entity_description.dynamic_maximum_key:
                 max_register = self.coordinator.data.get(
                     self.entity_description.dynamic_maximum_key
                 )
-
-                if max_register:
-                    self._dynamic_max_value = max_register.value
+                self._dynamic_max_value = max_register.value if max_register else None
         else:
             self._attr_available = False
             self._attr_native_value = None
