@@ -29,7 +29,7 @@ Huawei register address map (huawei_solar 3.0.5):
 
 v1.3.5 retires coalescing and night-deferral outright (not merely disables
 them — see const.py) and replaces tier-based chunking with _address_group(),
-which reproduces the vendor library's OWN grouping rule in our own code, so
+which reproduces the huawei_solar package's OWN grouping rule in our own code, so
 each group can be issued as a separately-paced request instead of being
 split invisibly (and unpaced) inside the library.
 
@@ -238,10 +238,31 @@ class TestRealRegisterMap(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         import importlib
+
+        # v1.3.16: a second test file (test_modbus_keepalive_registername.py)
+        # now also needs genuine real-library access, for an unrelated
+        # defect. huawei_solar has a non-idempotent import-time side effect
+        # (registering PDU classes into tmodbus's global registry) that
+        # raises if the real modules are imported a second time in one
+        # process -- so if the real package is already cached (that other
+        # file's own class already loaded it earlier in this session),
+        # reuse it directly instead of forcing a second import that would
+        # collide. This is an addition, not a behaviour change: the
+        # assertions below are unaffected either way.
+        cached = sys.modules.get("huawei_solar")
+        if cached is not None and getattr(cached, "__file__", None) is not None:
+            from huawei_solar.registers import REGISTERS
+            import huawei_solar.register_names as rn
+            cls.REGISTERS = REGISTERS
+            cls.rn = rn
+            cls._did_purge = False
+            return
+
         cls._saved_modules = {}
         for name in list(sys.modules):
             if name == "huawei_solar" or name.startswith("huawei_solar."):
                 cls._saved_modules[name] = sys.modules.pop(name)
+        cls._did_purge = True
         try:
             importlib.invalidate_caches()
             from huawei_solar.registers import REGISTERS
@@ -250,7 +271,7 @@ class TestRealRegisterMap(unittest.TestCase):
             cls._restore()
             raise unittest.SkipTest(
                 "huawei_solar library not installed in this environment; "
-                "this test validates against the real vendor register map "
+                "this test validates against the real huawei_solar register map "
                 "when available (pip install huawei-solar==3.0.5)"
             )
         cls.REGISTERS = REGISTERS
@@ -258,7 +279,16 @@ class TestRealRegisterMap(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls._restore()
+        # v1.3.16: deliberately does NOT restore a prior stub (see the
+        # setUpClass comment above) -- every stub-creating file in this
+        # suite unconditionally overwrites sys.modules["huawei_solar"] at
+        # its own import time regardless of prior state, so nothing
+        # depends on this class putting a stub back. Restoring here was
+        # actively harmful once a second consumer of the real library
+        # existed: it undid this class's own real import, causing whichever
+        # class ran next to see a stub again and re-trigger the exact
+        # tmodbus collision this whole guard exists to avoid.
+        pass
 
     @classmethod
     def _restore(cls):
