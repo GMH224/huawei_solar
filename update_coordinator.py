@@ -319,10 +319,15 @@ class HuaweiSolarUpdateCoordinator(
         # the deferred first-poll task (below) can be tied to the entry's
         # own lifecycle rather than outliving it. See
         # _schedule_deferred_first_poll for the full explanation.
+        #
+        # v1.3.15 (Defect P): the same unload callback also removes this
+        # device's contribution from the shared guard's aggregate (see
+        # _on_entry_unload), so a torn-down device's learned parameters
+        # cannot keep influencing the bus after it's gone.
         self._entry = entry
         self._shutdown = False
         if entry is not None:
-            entry.async_on_unload(self._mark_shutdown)
+            entry.async_on_unload(self._on_entry_unload)
 
         # Bus-level guard (shared by all coordinators on the same RS485 bus)
         endpoint = bus_endpoint or device.serial_number
@@ -620,12 +625,21 @@ class HuaweiSolarUpdateCoordinator(
 
     # ── poll logic ────────────────────────────────────────────────────────────
 
-    def _mark_shutdown(self) -> None:
-        """Called when this coordinator's config entry unloads (see Defect
-        L). Guards the deferred first-poll task against firing on a
-        coordinator whose entry is already gone, as a second, independent
-        layer of defence on top of the task cancellation below."""
+    def _on_entry_unload(self) -> None:
+        """Called when this coordinator's config entry unloads (Defect L,
+        extended for Defect P). Two independent cleanup actions:
+
+        1. Sets self._shutdown, guarding the deferred first-poll task
+           against firing on a coordinator whose entry is already gone
+           (see _schedule_deferred_first_poll) -- a second, independent
+           layer on top of that task's own cancellation.
+        2. Removes this device from the shared ModbusGuard's aggregate
+           (see ModbusGuard.remove_source) so its last-reported gap/queue-
+           depth parameters stop influencing the bus once the device is
+           torn down.
+        """
         self._shutdown = True
+        self.guard.remove_source(self.device.serial_number)
 
     def _schedule_deferred_first_poll(self) -> None:
         """Run the actual first poll, after the stagger delay, as a
@@ -650,7 +664,7 @@ class HuaweiSolarUpdateCoordinator(
            entry-scoped background tasks automatically on unload/reload,
            which is the primary fix.
         2. An explicit `self._shutdown` check inside the deferred
-           coroutine itself, set by `_mark_shutdown()` via
+           coroutine itself, set by `_on_entry_unload()` via
            `entry.async_on_unload()`, as a second, independent guard
            against the narrow race where the sleep completes right as
            unload begins but before task cancellation has propagated.
@@ -726,8 +740,8 @@ class HuaweiSolarUpdateCoordinator(
         # ── 1. Adaptive params → push to shared bus guard ─────────────────────
         if self._adaptive:
             params = self._adaptive.get_params()
-            self.guard.update_gap(params.request_gap.total_seconds())
-            self.guard.update_max_queue_depth(params.max_queue_depth)
+            self.guard.update_gap(self.device.serial_number, params.request_gap.total_seconds())
+            self.guard.update_max_queue_depth(self.device.serial_number, params.max_queue_depth)
             effective_timeout = params.request_timeout
             if not self.cache.night_mode:
                 self.update_interval = params.poll_interval
@@ -1022,8 +1036,8 @@ class HuaweiSolarOptimizerUpdateCoordinator(
 
         if self._adaptive:
             params = self._adaptive.get_params()
-            self.guard.update_gap(params.request_gap.total_seconds())
-            self.guard.update_max_queue_depth(params.max_queue_depth)
+            self.guard.update_gap(self.device.serial_number, params.request_gap.total_seconds())
+            self.guard.update_max_queue_depth(self.device.serial_number, params.max_queue_depth)
             effective_timeout = params.request_timeout
         else:
             effective_timeout = OPTIMIZER_UPDATE_TIMEOUT
@@ -1166,6 +1180,16 @@ async def create_optimizer_update_coordinator(
         _LOGGER.exception(
             "optimizer_coordinator[%s]: could not schedule first refresh",
             device.serial_number,
+        )
+
+    # v1.3.15 FIX (Defect P): remove this device's contribution to the
+    # shared guard's aggregate when the entry unloads -- see
+    # ModbusGuard.remove_source and HuaweiSolarUpdateCoordinator's own
+    # _on_entry_unload (this coordinator is a sibling class, not a
+    # subclass, so the same cleanup is registered directly here instead).
+    if entry is not None:
+        entry.async_on_unload(
+            lambda: coordinator.guard.remove_source(device.serial_number)
         )
 
     return coordinator

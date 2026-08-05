@@ -1,7 +1,7 @@
 # CLAUDE.md — Huawei Solar Integration
 
 > **Maintained by Claude (Anthropic) on behalf of the community.**
-> Current version: **1.3.14** — see `manifest.json`.
+> Current version: **1.3.15** — see `manifest.json`.
 
 ---
 
@@ -663,6 +663,97 @@ timestamp, eliminating arithmetic errors on the power-flow card.
 - **New:** `tests/test_synchronized_power_coordinator.py` — 22 tests covering
   derived properties (all edge cases), happy path, partial failure, all-fail,
   consecutive failure counter, and telemetry recording.
+
+### v1.3.15 (2026-08-05)
+**Defects P, Q, R — three findings from a full, fresh-eyes ICS sweep of the
+runtime codebase, deliberately conducted without reference to any existing
+test or audit file. All three had been named or suspected at various points
+across this project's history and postponed; fixed together to establish a
+clean base before further work.**
+
+**Defect P — ModbusGuard's adaptive parameters were last-writer-wins across
+multiple devices sharing one bus. This is "Defect C" from the original
+2026-08-04 handoff, re-confirmed independently by reading the code fresh.**
+Every coordinator calls `self.guard.update_gap(...)` /
+`self.guard.update_max_queue_depth(...)` every poll, using its own
+per-device adaptive controller's learned parameters. `self.guard` is the
+shared, per-bus singleton (correctly shared since Defect J1, v1.3.11); the
+old setters were plain overwrites — whichever device polled most recently
+silently replaced the bus's operating parameters, with no awareness that a
+sibling device's controller might have just set something different a
+moment earlier. A device having a rough patch could have its own correctly
+conservative gap undone by another device's more optimistic one, and vice
+versa — a plausible, previously un-investigated contributor to the
+multi-coordinator contention pattern this session's field investigation
+kept finding only partially explained.
+
+Fixed by having `update_gap()`/`update_max_queue_depth()` take the
+reporting device's serial number as `source` and track every current
+contributor's clamped value separately; the guard's effective gap/depth is
+now the **safest** option across all contributors — the widest gap
+(`max`), the shallowest queue depth (`min`) — rather than whichever device
+reported last. New `remove_source()`, called from both coordinator
+classes' unload cleanup, so a torn-down device's parameters stop
+influencing the bus once it's gone. Zero behavioural change for
+single-device installations (the majority case), verified directly.
+
+**Defect Q — several write paths didn't invalidate the register cache, so
+sensors could show stale data after a successful write.**
+`register_cache.py`'s dirty-flag mechanism requires an explicit
+`coordinator.invalidate_cache(name)` call — it is not automatic just
+because a write happened. `select.py`'s `StorageModeSelectEntity`,
+`button.py`'s stop-forcible-charge sequence (four registers), and every
+one of `services.py`'s ~15 write functions (forcible charge/discharge,
+TOU periods, capacity control periods, maximum feed grid power, and more)
+relied solely on `async_refresh()`/`async_request_refresh()` afterward —
+which triggers a normal poll that still consults the cache's own
+staleness filter, so a register whose TTL hadn't yet naturally expired
+(up to 30 minutes for SLOW-tier registers) would be served its pre-write
+value. A successful write could look exactly like it had silently failed.
+
+Fixed in `select.py` and `button.py` directly. In `services.py`, rather
+than adding an `invalidate_cache` call after each of the ~39 individual
+`dd.device.set(...)` call sites (error-prone, easy to miss one), a new
+`_set_and_invalidate()` helper wraps the write and the invalidation
+together, and every call site now goes through it.
+
+**Defect R — no locking between concurrent service calls to the same
+device.** `switch.py`'s on/off entity already serialises against itself via
+`self._change_lock`; none of `services.py`'s ~15 module-level write
+functions had any equivalent. Two automations (or a user action racing an
+automation) targeting the same device's forcible-charge/discharge
+registers could genuinely interleave their multi-step write sequences —
+both completing "successfully" while leaving the inverter in whatever
+contradictory state the interleaving produced. Distinct from, and in a
+sense worse than, the already-documented "partial completion on failure"
+risk (`AUDIT_1.3.9.md` §5), since here both sequences succeed individually.
+
+Fixed with a per-device-serial `asyncio.Lock` registry
+(`_get_device_write_lock()`, the same singleton-registry pattern already
+used throughout this codebase for `ModbusGuard`, `AdaptiveModbusController`,
+etc.), and every one of the 14 write functions now wraps its device-lookup
+result in `async with _get_device_write_lock(dd.device.serial_number):`
+before performing any writes. Different devices never block each other;
+only two operations on the *same* device now serialise.
+
+**Adversarial verification.** New `tests/test_sweep_findings_p_q_r.py` (21
+tests): behavioural reproductions proving the old guard pattern really
+does let one device clobber another's setting, and the new pattern
+resolves to the safest option regardless of report order; a reproduction
+of `_set_and_invalidate` confirming it invalidates the written register;
+behavioural proof that two operations sharing a lock genuinely serialise
+(and that operations on *different* devices do not block each other); and
+10 static (AST) checks across all three defects, run against the pristine
+pre-session baseline (fail correctly on all 10) and against this release
+(pass on all 10).
+
+**Tests: 520 -> 541 passed, 1 skipped**, deterministic across 3 repeated
+runs. `modbus_guard.py`, `update_coordinator.py`, `select.py`, `button.py`,
+and `services.py` changed among production files. Pre-existing tests in
+`tests/test_modbus_guard.py` that called the old single-argument
+`update_gap()`/`update_max_queue_depth()` signature were updated to the
+new signature (a necessary, non-behavioural test-maintenance change, not a
+weakening of coverage — confirmed by the adversarial run above).
 
 ### v1.3.14 (2026-08-05)
 **Defects L, M, N, O — four fixes from one review pass: three reported

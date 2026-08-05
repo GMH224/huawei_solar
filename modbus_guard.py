@@ -23,11 +23,21 @@ Usage (in coordinators)
 -----------------------
     endpoint = ModbusGuard.endpoint_for(entry.data)
     guard = ModbusGuard.get_or_create(endpoint)
-    guard.update_gap(params.request_gap.total_seconds())
-    guard.update_max_queue_depth(params.max_queue_depth)
+    guard.update_gap(device.serial_number, params.request_gap.total_seconds())
+    guard.update_max_queue_depth(device.serial_number, params.max_queue_depth)
 
     async with guard.request():
         result = await device.batch_update(names)
+
+Multi-device aggregation (v1.3.15)
+-----------------------------------
+update_gap()/update_max_queue_depth() take the reporting device's serial
+number as *source* and track every current contributor's clamped value
+separately. The guard's effective gap/depth is the SAFEST option across
+all contributors (widest gap, shallowest queue depth) rather than whichever
+device happened to report last -- see Defect P in AUDIT_1.3.15.md for the
+full history. Call remove_source(serial_number) when a device's coordinator
+unloads so it stops influencing the aggregate.
 """
 
 from __future__ import annotations
@@ -122,6 +132,30 @@ class ModbusGuard:
         self._queue_depth: int = 0
         self._effective_gap: float = MIN_INTER_REQUEST_GAP.total_seconds()
         self._max_queue_depth: int = MAX_QUEUE_DEPTH
+        # v1.3.15 FIX (Defect P / "Defect C" from the original 2026-08-04
+        # handoff): update_gap()/update_max_queue_depth() used to be plain
+        # setters -- self._effective_gap = clamp(gap_seconds), overwriting
+        # whatever the previous caller had set. On a bus shared by more than
+        # one device (daisy-chained inverters), every device's coordinator
+        # calls these every poll with ITS OWN adaptive controller's learned
+        # params -- so the bus's actual operating parameters at any instant
+        # were simply whichever device happened to poll most recently, not
+        # a reconciled view of every device sharing the bus. A device having
+        # a rough patch could have its own (correctly conservative) gap
+        # silently overwritten moments later by another device's more
+        # aggressive setting, and vice versa.
+        #
+        # Fixed by tracking each contributing source's clamped value
+        # separately and deriving the aggregate as the SAFEST option across
+        # all current contributors: the widest gap (max) and the shallowest
+        # queue depth (min). A device that needs more caution now makes the
+        # whole shared bus more cautious, rather than being overridden by a
+        # sibling device's more optimistic view. Sources are removed via
+        # remove_source() when their coordinator's entry unloads, so a
+        # torn-down device's learned parameters cannot permanently pin the
+        # aggregate after it's gone.
+        self._gap_contributions: dict[str, float] = {}
+        self._depth_contributions: dict[str, int] = {}
         #: Diagnostic counter (v1.2.3): how many requests this guard has shed.
         #: Exposed so internal contention is observable rather than silently
         #: mixed into the inverter's failure statistics.
@@ -151,21 +185,61 @@ class ModbusGuard:
 
     # ── adaptive parameter setters ────────────────────────────────────────────
 
-    def update_gap(self, gap_seconds: float) -> None:
-        """Set the inter-request gap. Clamped to [150 ms, 500 ms].
+    def update_gap(self, source: str, gap_seconds: float) -> None:
+        """Report *source*'s (a device serial number) learned inter-request
+        gap. Clamped to [150 ms, 500 ms] as before, but no longer a plain
+        overwrite: the guard's effective gap is the MAXIMUM (safest, widest)
+        across every device currently sharing this bus, so one device's
+        conservative learning cannot be silently undone by a sibling
+        device's more optimistic one (Defect P).
 
         The 150 ms floor is a hardware constraint (SUN2000 Modbus FSM reset
         time ≈ 100 ms) and is never reduced regardless of network health.
         Gemini recommended 30 ms; this was rejected — it causes pervasive
         0x06 SLAVE_DEVICE_BUSY responses on all SUN2000 hardware.
         """
-        self._effective_gap = max(
-            MIN_INTER_REQUEST_GAP.total_seconds(), min(gap_seconds, 0.500)
-        )
+        clamped = max(MIN_INTER_REQUEST_GAP.total_seconds(), min(gap_seconds, 0.500))
+        self._gap_contributions[source] = clamped
+        self._effective_gap = max(self._gap_contributions.values())
 
-    def update_max_queue_depth(self, depth: int) -> None:
-        """Set the maximum queue depth. Clamped to [1, MAX_QUEUE_DEPTH]."""
-        self._max_queue_depth = max(1, min(depth, MAX_QUEUE_DEPTH))
+    def update_max_queue_depth(self, source: str, depth: int) -> None:
+        """Report *source*'s (a device serial number) learned max queue
+        depth. Clamped to [1, MAX_QUEUE_DEPTH] as before; the guard's
+        effective depth is the MINIMUM (safest, shallowest) across every
+        device currently sharing this bus (Defect P) -- see update_gap()
+        for the full reasoning, which applies symmetrically here.
+        """
+        clamped = max(1, min(depth, MAX_QUEUE_DEPTH))
+        self._depth_contributions[source] = clamped
+        self._max_queue_depth = min(self._depth_contributions.values())
+
+    def remove_source(self, source: str) -> None:
+        """Drop *source*'s contribution to the shared aggregate (its
+        coordinator's config entry unloaded or reloaded). Without this, a
+        torn-down device's last-reported gap/depth would keep influencing
+        the bus's effective parameters forever, even for a device that no
+        longer exists. Safe to call for a source that never contributed
+        (e.g. a coordinator that unloads before its first poll) or to call
+        more than once (multiple coordinators for the same device all
+        unload together and each may call this with the same source) --
+        both are no-ops beyond the first successful removal.
+
+        Reverts to the pre-contribution defaults (the tightest gap, the
+        deepest queue) once the last contributor is removed, matching this
+        guard's original single-device starting state.
+        """
+        self._gap_contributions.pop(source, None)
+        self._depth_contributions.pop(source, None)
+        self._effective_gap = (
+            max(self._gap_contributions.values())
+            if self._gap_contributions
+            else MIN_INTER_REQUEST_GAP.total_seconds()
+        )
+        self._max_queue_depth = (
+            min(self._depth_contributions.values())
+            if self._depth_contributions
+            else MAX_QUEUE_DEPTH
+        )
 
     # ── context manager ───────────────────────────────────────────────────────
 

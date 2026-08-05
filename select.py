@@ -334,4 +334,11 @@ class StorageModeSelectEntity(
         )
         self._attr_current_option = option
 
+        # v1.3.15 FIX (Defect Q, part 1): this write was not invalidating
+        # the cached register, so the async_request_refresh() below could
+        # be served the pre-write cached value if STORAGE_WORKING_MODE_SETTINGS
+        # hadn't naturally expired yet -- the entity would then continue
+        # showing outdated data despite the write having succeeded.
+        self.coordinator.invalidate_cache(rn.STORAGE_WORKING_MODE_SETTINGS)
+
         await self.coordinator.async_request_refresh()

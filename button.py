@@ -114,6 +114,21 @@ class StopForcibleChargeButtonEntity(HuaweiSolarEntity, ButtonEntity):
         )
 
         if self._configuration_update_coordinator:
+            # v1.3.15 FIX (Defect Q, part 2): none of the four writes above
+            # were invalidating their cached registers, so the
+            # async_request_refresh() below could be served pre-write
+            # cached values for any register whose TTL hadn't naturally
+            # expired yet -- sensors reflecting this state could continue
+            # showing the OLD (still-forcibly-charging/discharging) values
+            # for as long as that register's cache TTL lasted, looking
+            # exactly like the stop command silently failed.
+            for name in (
+                rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_WRITE,
+                rn.STORAGE_FORCIBLE_DISCHARGE_POWER,
+                rn.STORAGE_FORCED_CHARGING_AND_DISCHARGING_PERIOD,
+                rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SETTING_MODE,
+            ):
+                self._configuration_update_coordinator.invalidate_cache(name)
             await self._configuration_update_coordinator.async_request_refresh()
 
 
