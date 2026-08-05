@@ -1,7 +1,7 @@
 # CLAUDE.md — Huawei Solar Integration
 
 > **Maintained by Claude (Anthropic) on behalf of the community.**
-> Current version: **1.3.12** — see `manifest.json`.
+> Current version: **1.3.13** — see `manifest.json`.
 
 ---
 
@@ -663,6 +663,90 @@ timestamp, eliminating arithmetic errors on the power-flow card.
 - **New:** `tests/test_synchronized_power_coordinator.py` — 22 tests covering
   derived properties (all edge cases), happy path, partial failure, all-fail,
   consecutive failure counter, and telemetry recording.
+
+### v1.3.13 (2026-08-05)
+**Defect K — the coordinator first-poll stagger delay blocked a
+synchronous caller, confirmed as the direct mechanism behind a real
+"Setup of config entry ... cancelled" field incident: the exact error this
+project has been trying to explain since the original 2026-08-04 handoff.**
+
+**The evidence — a full traceback, captured for the first time.** A field
+reload was captured with debug logging on and produced, for the first time
+in this entire investigation, a complete traceback for the cancellation
+error:
+
+```
+File ".../homeassistant/helpers/entity_platform.py", line 858, in _async_add_entity
+    await entity.async_device_update(warning=False)
+File ".../homeassistant/helpers/entity.py", line 1378, in async_device_update
+    await self.async_update()
+File ".../homeassistant/helpers/update_coordinator.py", line 711, in async_update
+    await self.coordinator.async_request_refresh()
+  ...
+File "/config/custom_components/huawei_solar/update_coordinator.py", line 616, in _async_update_data
+    await asyncio.sleep(self._start_delay.total_seconds())
+File ".../asyncio/tasks.py", line 704, in sleep
+    return await future
+asyncio.exceptions.CancelledError
+```
+
+**Root cause.** `_async_update_data()`'s first-poll stagger
+(`_COORDINATOR_START_DELAYS`, v1.0.3) slept inline:
+`await asyncio.sleep(self._start_delay.total_seconds())`. This delay was
+designed with only the coordinator's own background polling schedule in
+mind. The traceback proves `_async_update_data()` is also reachable
+**synchronously**, from Home Assistant's own entity-add machinery during
+platform setup — meaning the sleep directly extended a real, in-progress
+Home Assistant setup call by up to the full stagger delay. Worse still for
+a second daisy-chained device since Defect I (v1.3.10) added a per-device
+offset on top of the per-type one (up to 19s for `energy_storage` on
+device index 1, versus 14s before). When cumulative setup time (device
+detection, per-entity setup, this sleep) exceeded whatever timeout Home
+Assistant enforces on config entry setup, Home Assistant cancelled the
+in-progress setup — landing, in the captured incident, exactly mid-sleep.
+
+**This closes an investigation that has spanned this entire session and
+predates it.** The original 2026-08-04 handoff flagged "Setup of config
+entry cancelled" recurring for 4+ hours with causal attribution explicitly
+marked unresolved; this is the first time a full traceback has actually
+been caught for it.
+
+**Fix.** The sleep no longer runs inline. `_async_update_data()`'s first
+call now returns immediately — a copy of any existing cached data, or an
+empty dict on a genuine first call (already an established, safe pattern
+in this same method for "nothing to poll," and identical to how every
+entity already handles "no data yet") — and schedules the real first poll
+as a background task (`_schedule_deferred_first_poll()`) that sleeps for
+the stagger delay and then calls `async_request_refresh()` itself. This
+preserves the exact same effect on bus traffic (nothing real hits the bus
+before the stagger deadline — the whole point of `_COORDINATOR_START_DELAYS`
+and Defect I's device-aware extension of it) without ever occupying a
+caller's stack for the delay, synchronous or not.
+
+**Adversarial verification.** New `tests/test_deferred_first_poll.py`:
+an isolated reproduction of the exact fixed logic proves the first call
+returns near-instantly even with a 10-second configured delay, that no
+real work happens on that first call, and that the deferred background
+task performs the real work once the delay elapses. A companion
+adversarial test proves the OLD (inline-sleep) pattern really does block
+the caller for the full delay, confirming the fixed pattern's pass is
+meaningful. A static (AST) check confirms the real `update_coordinator.py`
+no longer awaits `asyncio.sleep(...)` directly inside the stagger block
+(only reachable from inside the deferred task's own coroutine) and that
+`_schedule_deferred_first_poll` exists. Run against the pre-fix file, both
+static checks fail at the exact original line (616); against this release,
+they pass.
+
+**What this release does NOT claim.** The exact reason a particular
+entity's add ended up on this synchronous path (rather than the push-based
+pattern most `CoordinatorEntity` usage relies on) was not independently
+root-caused against Home Assistant's own internals — this fix closes the
+risk regardless of that mechanism, by making the delay structurally
+incapable of blocking any caller, synchronous or not, rather than by
+patching whichever specific entity triggered it this time.
+
+**Tests: 500 -> 507 passed, 1 skipped**, deterministic across 3 repeated
+runs. Only `update_coordinator.py` changed among production files.
 
 ### v1.3.12 (2026-08-05)
 **Defect V2-1 — a second, deeper pass from the same independent ICS audit

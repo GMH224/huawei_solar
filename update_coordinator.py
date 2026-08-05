@@ -269,7 +269,8 @@ class HuaweiSolarUpdateCoordinator(
 
     Poll cycle steps
     ----------------
-    0.  First-poll start_delay (coordinator jitter).
+    0.  First-poll start_delay (coordinator jitter) — deferred as a
+        background task since v1.3.13 so it can never block a caller.
     1.  Fetch adaptive params; push gap + queue_depth to shared bus guard.
     2.  Collect register names from active HA entities.
     3.  Cache filter — skip fresh registers (tier-aware TTL).
@@ -608,12 +609,64 @@ class HuaweiSolarUpdateCoordinator(
 
     # ── poll logic ────────────────────────────────────────────────────────────
 
+    def _schedule_deferred_first_poll(self) -> None:
+        """Run the actual first poll, after the stagger delay, as a
+        background task instead of sleeping inline (see Defect K below)."""
+
+        async def _deferred() -> None:
+            try:
+                await asyncio.sleep(self._start_delay.total_seconds())
+                await self.async_request_refresh()
+            except Exception:  # noqa: BLE001 — background task must not raise
+                _LOGGER.exception(
+                    "%s: deferred first-poll refresh failed; will retry on "
+                    "the coordinator's normal schedule", self.name,
+                )
+
+        self.hass.async_create_task(_deferred())
+
     async def _async_update_data(self) -> dict[RegisterName, Result[Any]]:
         # ── 0. First-poll stagger ─────────────────────────────────────────────
         if not self._first_poll_done:
             self._first_poll_done = True
             if self._start_delay.total_seconds() > 0:
-                await asyncio.sleep(self._start_delay.total_seconds())
+                # v1.3.13 FIX (Defect K): this used to be
+                # `await asyncio.sleep(self._start_delay.total_seconds())`
+                # directly inline, which blocks WHOEVER calls
+                # _async_update_data() for that entire delay. A field
+                # traceback confirmed this method is reachable
+                # SYNCHRONOUSLY from Home Assistant's own entity-add
+                # machinery during platform setup
+                # (entity_platform._async_add_entity ->
+                # entity.async_device_update -> async_update ->
+                # coordinator.async_request_refresh()), not only from the
+                # coordinator's own background scheduling that this delay
+                # was designed for. Sleeping here therefore directly
+                # extended a synchronous Home Assistant setup call by up to
+                # the full stagger delay -- worse still for higher device
+                # indices since Defect I (v1.3.10) added a per-device
+                # offset on top of the per-type one. A CancelledError
+                # arriving mid-sleep, when Home Assistant's own setup
+                # timeout ran out, is the confirmed mechanism behind a real
+                # field incident: "Setup of config entry ... cancelled"
+                # (see AUDIT_1.3.13.md) -- the exact error this project has
+                # been trying to explain since the very first handoff.
+                #
+                # Fixed by never blocking here at all. Whatever calls this
+                # method gets an immediate answer -- a copy of the last
+                # known data if any exists, or an empty dict on a genuine
+                # first call (already an established, safe pattern in this
+                # exact method -- see the `if not all_names: return {}`
+                # case a few lines below, and every entity's existing
+                # handling of "no data yet" via `if self.coordinator.data
+                # and ...`). The REAL first poll is scheduled as a
+                # background task that sleeps for the stagger delay and
+                # then calls async_request_refresh() itself -- preserving
+                # the exact same effect on bus traffic (nothing real hits
+                # the bus before the deadline) without ever occupying a
+                # caller's stack for it.
+                self._schedule_deferred_first_poll()
+                return dict(self.data) if self.data else {}
 
         # ── 1. Adaptive params → push to shared bus guard ─────────────────────
         if self._adaptive:
