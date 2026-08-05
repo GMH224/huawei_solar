@@ -775,9 +775,24 @@ async def async_unload_entry(
                 telemetry.stop()
             ModbusTelemetry.remove(serial)
 
+            # v1.3.19 FIX (Defect V/Finding 10, independent ICS audit): the
+            # old sync stop() only ever scheduled the dirty-state flush as
+            # a fire-and-forget background task, which could be cancelled
+            # or simply never run before teardown finished. async_unload()
+            # awaits the flush deterministically. Same fault-isolation
+            # pattern already used for battery_health just below: a failed
+            # flush must never prevent the rest of the entry from
+            # unloading cleanly.
             controller = AdaptiveModbusController.get(serial)
             if controller:
-                controller.stop()
+                try:
+                    await controller.async_unload()
+                except Exception:  # noqa: BLE001
+                    _LOGGER.exception(
+                        "adaptive[%s]: unload failed; continuing with "
+                        "entry teardown", serial,
+                    )
+                    controller.stop()
             AdaptiveModbusController.remove(serial)
 
             keepalive = ModbusKeepAlive.get(serial)
@@ -877,6 +892,16 @@ async def _setup_inverter_device_data(
         hass, device.serial_number, inverter_device_info
     )
     update_coordinator.attach_telemetry(telemetry)
+    # v1.3.19 FIX (Defect V/Finding 1, independent ICS audit): v1.3.18's
+    # Defect U only registered keepalive.stop for cleanup-on-setup-failure,
+    # reasoning that telemetry and the adaptive controller were "idempotent
+    # singletons with no independent ongoing work" -- which turned out to
+    # be wrong for both: telemetry.stop() cancels a real periodic timer,
+    # and (see below) the adaptive controller manages real background save
+    # tasks and persisted state. Registered here for symmetry with what
+    # async_unload_entry already does for a successful unload.
+    if register_cleanup is not None:
+        register_cleanup(telemetry.stop)
 
     # Create the circadian adaptive learning controller and load persisted
     # statistics from HA storage.  All coordinators for this inverter share
@@ -886,6 +911,13 @@ async def _setup_inverter_device_data(
     )
     await adaptive.async_load()
     update_coordinator.attach_adaptive(adaptive)
+    # v1.3.19 FIX (Defect V/Finding 1): registered for the same reason as
+    # telemetry above. Uses async_unload() (Defect V/Finding 10 -- flushes
+    # any dirty learning state deterministically) rather than the plain
+    # sync stop(), since _run_cleanup_callbacks already supports awaiting
+    # async callables and the more reliable option costs nothing extra here.
+    if register_cleanup is not None:
+        register_cleanup(adaptive.async_unload)
 
     # Create the keep-alive / connection health probe.
     # The callbacks wire directly into the main coordinator so that a

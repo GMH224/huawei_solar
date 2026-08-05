@@ -443,6 +443,21 @@ class AdaptiveModbusController:
         persist synchronously before cancelling so no learning data is lost on
         reload or shutdown.  ``async_create_task`` is used so the save runs on
         the HA event loop without requiring ``stop()`` itself to be a coroutine.
+
+        v1.3.19 NOTE (Defect V/Finding 10, independent ICS audit): despite
+        this docstring's original claim, scheduling `_async_save()` via
+        `async_create_task` is NOT synchronous/deterministic -- the task
+        may be cancelled or simply never get a chance to run before
+        teardown finishes, exactly when the system is unstable and the
+        data matters most. `stop()` is kept as-is (synchronous, best-effort)
+        for callers that cannot await -- e.g. the setup-failure rollback
+        path (Defect U, v1.3.18), where losing a few minutes of not-yet-
+        persisted learning is an acceptable trade-off for keeping cleanup
+        itself simple and synchronous. For a REAL unload, where losing
+        learning data is not acceptable, use `async_unload()` instead,
+        which awaits the flush deterministically -- the same two-method
+        split (sync `stop()` + async `async_unload()`) already used by
+        `BatteryHealthManager` for exactly this reason.
         """
         if self._unsub_push:
             self._unsub_push()
@@ -450,9 +465,28 @@ class AdaptiveModbusController:
         if self._save_task and not self._save_task.done():
             self._save_task.cancel()
             self._save_task = None
-        # Flush any unsaved data synchronously before the integration tears down.
+        # Best-effort only — see async_unload() for the deterministic path.
         if self._dirty:
             self.hass.async_create_task(self._async_save())
+
+    async def async_unload(self) -> None:
+        """Deterministic teardown: cancel background tasks and, if dirty,
+        AWAIT the flush to completion before returning (Defect V, v1.3.19).
+
+        Use this instead of `stop()` wherever the caller can await and
+        losing not-yet-persisted learning data is not acceptable -- a real
+        entry unload/reload being the primary case. Mirrors
+        `BatteryHealthManager.async_unload()`'s existing pattern in this
+        codebase for the same reason.
+        """
+        if self._unsub_push:
+            self._unsub_push()
+            self._unsub_push = None
+        if self._save_task and not self._save_task.done():
+            self._save_task.cancel()
+            self._save_task = None
+        if self._dirty:
+            await self._async_save()
 
     # ── public API ────────────────────────────────────────────────────────────
 

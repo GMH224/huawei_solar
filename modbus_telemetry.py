@@ -247,10 +247,25 @@ class ModbusTelemetry:
 
     @callback
     def _push_to_listeners(self, _now: datetime) -> None:
-        """Push updated telemetry to all registered HA entities."""
+        """Push updated telemetry to all registered HA entities.
+
+        v1.3.19 FIX (Defect V, independent ICS audit): this loop used to
+        call each listener directly with no exception isolation -- one
+        misbehaving callback raising would stop iteration entirely, so
+        every listener registered AFTER the failing one silently stopped
+        receiving updates. Each callback is now isolated so one bad
+        consumer can never suppress the rest.
+        """
         snap = self.snapshot()
         for cb_fn in self._listeners:
-            cb_fn(snap)
+            try:
+                cb_fn(snap)
+            except Exception:  # noqa: BLE001 — one bad listener must not break the others
+                _LOGGER.exception(
+                    "%s: telemetry listener callback raised; skipping it "
+                    "for this update, other listeners are unaffected",
+                    self.serial_number,
+                )
 
     def stop(self) -> None:
         """Cancel the periodic push timer."""

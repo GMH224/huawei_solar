@@ -49,6 +49,7 @@ from .const import (
     SERVICE_SET_TOU_PERIODS,
     SERVICE_SET_ZERO_POWER_GRID_CONNECTION,
     SERVICE_STOP_FORCIBLE_CHARGE,
+    SERVICE_VALIDATION_READ_TIMEOUT,
 )
 from .types import (
     HuaweiSolarConfigEntry,
@@ -332,7 +333,25 @@ async def _validate_power_value(
     # this already checked by voluptuous:
     assert isinstance(power, int)
 
-    maximum_active_power = (await dd.device.get(max_value_key)).value
+    # v1.3.19 FIX (Defect V/Finding 8, independent ICS audit): this read
+    # had no bound of its own, and runs BEFORE any write -- while the
+    # per-device write lock (Defect R, v1.3.15) is already held for the
+    # whole service call. An unbounded read here doesn't just risk hanging
+    # this one call, it blocks every OTHER write action for the same
+    # device too, for as long as it takes.
+    try:
+        maximum_active_power = (
+            await asyncio.wait_for(
+                dd.device.get(max_value_key),
+                timeout=SERVICE_VALIDATION_READ_TIMEOUT.total_seconds(),
+            )
+        ).value
+    except TimeoutError as err:
+        raise ValueError(
+            f"Timed out reading the maximum allowed power ({max_value_key}) "
+            f"after {SERVICE_VALIDATION_READ_TIMEOUT.total_seconds():.0f}s; "
+            "the inverter may be busy. Try again shortly."
+        ) from err
 
     if maximum_active_power is None:
         raise ValueError(

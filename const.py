@@ -100,6 +100,18 @@ DEVICE_CONNECT_TIMEOUT = timedelta(seconds=45)
 # headroom without meaningfully delaying unload in the normal case.
 DISCONNECT_TIMEOUT = timedelta(seconds=10)
 
+# v1.3.19 (Defect V/Finding 8, independent ICS audit): bound for the
+# maximum-power validation read in services.py's _validate_power_value(),
+# performed BEFORE any write, while the per-device write lock (Defect R,
+# v1.3.15) is already held for the entire service call. An unbounded read
+# here doesn't just risk hanging this one service call -- it now also
+# blocks every OTHER write action for the same device for as long as it
+# takes, since Defect R made this lock genuinely exclusive. A single
+# register read; a healthy device answers in well under a second (see the
+# same reasoning as WRITE_PERMISSION_CHECK_TIMEOUT / STATIC_BOUND_READ_TIMEOUT
+# elsewhere in this file), so there's nothing to gain by waiting longer.
+SERVICE_VALIDATION_READ_TIMEOUT = timedelta(seconds=10)
+
 # v1.3.11 (Defect J, reported by an independent ICS audit and confirmed
 # against source): bound for the static min/max register reads performed
 # once per number entity, during NUMBER PLATFORM SETUP

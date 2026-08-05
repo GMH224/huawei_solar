@@ -309,6 +309,13 @@ class HuaweiSolarOnOffSwitchEntity(
     # worst-case poll loop was almost certainly never the intent.
     MAX_STATUS_CHANGE_TIME_SECONDS = 300  # Maximum status change time is 5 minutes
 
+    # v1.3.19 (Defect V/Finding 7, reported independently by two separate
+    # ICS audits): bound for each individual status read below. A healthy
+    # device answers in well under a second; this is generous headroom
+    # without letting one slow read consume an outsized share of the
+    # overall MAX_STATUS_CHANGE_TIME_SECONDS budget.
+    STATUS_POLL_READ_TIMEOUT_SECONDS = 15
+
     def __init__(
         self,
         # not the HuaweiSolarConfigurationUpdateCoordinator as
@@ -356,20 +363,76 @@ class HuaweiSolarOnOffSwitchEntity(
 
         self.async_write_ha_state()
 
+    async def _poll_device_status_bounded(self) -> str | None:
+        """Read DEVICE_STATUS through the shared bus guard, bounded by a
+        per-read timeout, instead of a raw, unguarded client call.
+
+        v1.3.19 FIX (Defect V/Finding 7): this used to be
+        `await self.device.client.get(rn.DEVICE_STATUS)` directly --
+        outside ModbusGuard entirely, unpaced, and with no timeout of its
+        own. Under contention, this could inject extra raw reads while the
+        main coordinators were already polling, and a single slow read
+        could block the whole status-change operation -- and, since it
+        runs while self._change_lock is held, every OTHER action on this
+        entity too -- for an unbounded amount of time. Returns None on any
+        failure (timeout, shed, or otherwise) rather than raising, so the
+        caller can simply treat it as "still don't know, try again next
+        cycle" exactly like a normal coordinator poll would.
+        """
+        try:
+            async with self.coordinator.guard.request(
+                label=f"{self.device.serial_number}_switch_status"
+            ):
+                result = await asyncio.wait_for(
+                    self.device.client.get(rn.DEVICE_STATUS),
+                    timeout=self.STATUS_POLL_READ_TIMEOUT_SECONDS,
+                )
+            return result.value
+        except Exception:  # noqa: BLE001 — a failed poll just means "try again next cycle"
+            _LOGGER.debug(
+                "%s: status poll failed; will retry on the next cycle",
+                self.device.serial_number,
+            )
+            return None
+
+    async def _wait_for_status(self, is_target_status) -> bool:
+        """Poll DEVICE_STATUS until `is_target_status(status)` is True or
+        the overall deadline elapses, whichever comes first. Returns
+        whether the target status was reached.
+
+        v1.3.19 FIX (Defect V/Finding 5, reported independently by two
+        separate ICS audits): this loop used to be bounded by an iteration
+        count (`MAX_STATUS_CHANGE_TIME_SECONDS // POLL_FREQUENCY_SECONDS`),
+        with each iteration doing an unbounded sleep-then-read. In the best
+        case (every read instant) that adds up to the stated 5-minute
+        limit -- but since each read had no bound of its own, the REAL
+        wall-clock duration could exceed that limit by an arbitrary amount
+        if any single read blocked. Now tracks an explicit monotonic
+        deadline, enforced around both the sleep and the read, so the
+        total operation genuinely cannot exceed
+        MAX_STATUS_CHANGE_TIME_SECONDS regardless of how long any
+        individual read takes.
+        """
+        deadline = time.monotonic() + self.MAX_STATUS_CHANGE_TIME_SECONDS
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(self.POLL_FREQUENCY_SECONDS, remaining))
+            if time.monotonic() >= deadline:
+                return False
+            status = await self._poll_device_status_bounded()
+            if status is not None and is_target_status(status):
+                return True
+
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the setting on."""
         async with self._change_lock:
             await self.device.set(rn.STARTUP, 0)
 
             # Turning on can take up to 5 minutes... We'll poll every 15 seconds
-            for _ in range(
-                self.MAX_STATUS_CHANGE_TIME_SECONDS // self.POLL_FREQUENCY_SECONDS
-            ):
-                await asyncio.sleep(self.POLL_FREQUENCY_SECONDS)
-                device_status = (await self.device.client.get(rn.DEVICE_STATUS)).value
-                if not self._is_off(device_status):
-                    self._attr_is_on = True
-                    break
+            if await self._wait_for_status(lambda status: not self._is_off(status)):
+                self._attr_is_on = True
 
         await self.coordinator.async_request_refresh()
 
@@ -378,15 +441,9 @@ class HuaweiSolarOnOffSwitchEntity(
         async with self._change_lock:
             await self.device.set(rn.SHUTDOWN, 0)
 
-            # Turning on can take up to 5 minutes... We'll poll every 15 seconds
-            for _ in range(
-                self.MAX_STATUS_CHANGE_TIME_SECONDS // self.POLL_FREQUENCY_SECONDS
-            ):
-                await asyncio.sleep(self.POLL_FREQUENCY_SECONDS)
-                device_status = (await self.device.client.get(rn.DEVICE_STATUS)).value
-                if self._is_off(device_status):
-                    self._attr_is_on = False
-                    break
+            # Turning off can take up to 5 minutes... We'll poll every 15 seconds
+            if await self._wait_for_status(self._is_off):
+                self._attr_is_on = False
 
         await self.coordinator.async_request_refresh()
 

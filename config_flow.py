@@ -58,6 +58,7 @@ from .const import (
     CONF_SLAVE_IDS,
     DEFAULT_PORT,
     DEFAULT_USERNAME,
+    DEVICE_CONNECT_TIMEOUT,
     DOMAIN,
 )
 
@@ -74,7 +75,14 @@ async def validate_serial_setup(port: str, unit_ids: list[int]) -> dict[str, Any
     )
     try:
         await client.connect()
-        device = await create_device_instance(client)
+        # v1.3.19 FIX (Defect V/Finding 3): same unbounded pattern as
+        # validate_network_setup, found by sweeping for it here too --
+        # not explicitly named by either audit's evidence lines, but the
+        # identical shape of the same defect.
+        device = await asyncio.wait_for(
+            create_device_instance(client),
+            timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
+        )
 
         _LOGGER.info(
             "Successfully connected to device %s %s with SN %s",
@@ -91,7 +99,10 @@ async def validate_serial_setup(port: str, unit_ids: list[int]) -> dict[str, Any
         # Also validate the other slave-ids
         for slave_id in unit_ids[1:]:
             try:
-                slave_bridge = await create_sub_device_instance(device, slave_id)
+                slave_bridge = await asyncio.wait_for(
+                    create_sub_device_instance(device, slave_id),
+                    timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
+                )
 
                 _LOGGER.info(
                     "Successfully connected to sub device %s with ID %s: %s with SN %s",
@@ -100,7 +111,7 @@ async def validate_serial_setup(port: str, unit_ids: list[int]) -> dict[str, Any
                     slave_bridge.model_name,
                     slave_bridge.serial_number,
                 )
-            except HuaweiSolarException as err:
+            except (HuaweiSolarException, TimeoutError) as err:
                 _LOGGER.error("Could not connect to slave %s", slave_id)
                 raise DeviceException(f"Could not connect to slave {slave_id}") from err
 
@@ -316,7 +327,20 @@ async def _connect_to_discovered_devices(
     client = create_tcp_client(host=host, port=port, unit_id=primary_unit_id)
     try:
         await client.connect()
-        device = await create_device_instance(client)
+        # v1.3.19 FIX (Defect V/Finding 3, reported independently by two
+        # separate ICS audits): create_device_instance had no bound of its
+        # own in this config-flow path -- the same risk already closed for
+        # the runtime setup path (Defect M, v1.3.14; Finding 1, v1.3.18).
+        # A slow or still-reconnecting device could stall the setup wizard
+        # indefinitely. Bare TimeoutError is deliberately left to propagate
+        # here rather than being converted to a custom exception: every
+        # caller of this function already catches TimeoutError alongside
+        # ConnectionException/ModbusConnectionError as an expected,
+        # user-facing "could not connect" case.
+        device = await asyncio.wait_for(
+            create_device_instance(client),
+            timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
+        )
 
         _LOGGER.info(
             "Successfully connected to primary device with unit_id %s: %s %s with SN %s",
@@ -328,13 +352,19 @@ async def _connect_to_discovered_devices(
 
         has_write_permission = elevated_permissions and (
             not isinstance(device, HuaweiSolarDeviceWithLogin)
-            or await device.has_write_permission()
+            or await asyncio.wait_for(
+                device.has_write_permission(),
+                timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
+            )
         )
 
         unit_ids = [primary_unit_id]
         for sub_unit_id in sub_unit_ids:
             try:
-                sub_device = await create_sub_device_instance(device, sub_unit_id)
+                sub_device = await asyncio.wait_for(
+                    create_sub_device_instance(device, sub_unit_id),
+                    timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
+                )
                 _LOGGER.info(
                     "Successfully connected to sub device with unit_id %s. %s: %s with SN %s",
                     sub_unit_id,
@@ -343,7 +373,7 @@ async def _connect_to_discovered_devices(
                     sub_device.serial_number,
                 )
                 unit_ids.append(sub_unit_id)
-            except HuaweiSolarException:
+            except (HuaweiSolarException, TimeoutError):
                 _LOGGER.exception(
                     "Error while connecting to sub device with unit_id %s. Skipping",
                     sub_unit_id,
@@ -386,7 +416,12 @@ async def validate_network_setup(
 
     try:
         try:
-            device = await create_device_instance(client)
+            # v1.3.19 FIX (Defect V/Finding 3): bounded, same reasoning as
+            # _connect_to_discovered_devices above.
+            device = await asyncio.wait_for(
+                create_device_instance(client),
+                timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
+            )
         except (ConnectionException, ModbusConnectionError, TimeoutError) as err:
             # TCP connected but device closed the connection → wrong slave ID.
             raise DeviceException(
@@ -403,12 +438,18 @@ async def validate_network_setup(
 
         has_write_permission = elevated_permissions and (
             not isinstance(device, HuaweiSolarDeviceWithLogin)
-            or await device.has_write_permission()
+            or await asyncio.wait_for(
+                device.has_write_permission(),
+                timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
+            )
         )
 
         for unit_id in unit_ids[1:]:
             try:
-                sub_device = await create_sub_device_instance(device, unit_id)
+                sub_device = await asyncio.wait_for(
+                    create_sub_device_instance(device, unit_id),
+                    timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
+                )
 
                 _LOGGER.info(
                     "Successfully connected to sub device %s %s: %s with SN %s",
@@ -453,24 +494,51 @@ async def validate_network_setup_login(
         port=port,
         unit_id=unit_id,
     )
+    # v1.3.19 FIX (Defect V/Finding 2, independent ICS audit): `bridge` used
+    # to be referenced in `finally` without being initialised beforehand.
+    # If create_device_instance(client) failed before `bridge` was ever
+    # assigned, `finally`'s `if bridge is not None` raised UnboundLocalError
+    # -- replacing the real connection failure with a confusing, unrelated
+    # error, and leaving the raw TCP client's state ambiguous (never
+    # explicitly disconnected either way). Initialising `bridge = None`
+    # here, and explicitly disconnecting the raw client in `finally` when
+    # `bridge` was never created, makes cleanup independent of exactly how
+    # far setup got before failing.
+    bridge = None
     try:
         # these parameters have already been tested in validate_input, so this should work fine!
         await client.connect()
-        bridge = await create_device_instance(client)
+        # v1.3.19 FIX (Defect V/Finding 3): bounded, same reasoning as
+        # validate_network_setup / _connect_to_discovered_devices above.
+        bridge = await asyncio.wait_for(
+            create_device_instance(client),
+            timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
+        )
 
         assert isinstance(bridge, HuaweiSolarDeviceWithLogin)
 
-        await bridge.login(username, password)
+        await asyncio.wait_for(
+            bridge.login(username, password),
+            timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
+        )
 
         # verify that we have write-permission now
 
-        return await bridge.has_write_permission()
+        return await asyncio.wait_for(
+            bridge.has_write_permission(),
+            timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
+        )
     except InvalidCredentials:
         return False
     finally:
         if bridge is not None:
             # Cleanup this inverter object explicitly to prevent it from trying to maintain a modbus connection
             await bridge.stop()
+        else:
+            # bridge was never created (connect() or create_device_instance()
+            # failed first) -- the raw client still needs disconnecting.
+            with contextlib.suppress(Exception):
+                await client.disconnect()
 
 
 def parse_unit_ids(unit_ids: str) -> list[int]:
@@ -514,11 +582,44 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     # Used across the auto/scan/finish discovery steps
     _discovery_task: asyncio.Task | None = None
     _discovered_primary_unit_id: int | None = None
-    _discovered_sub_unit_ids: list[int] = []
     _failed_slave_id: int | None = None
+
+    def __init__(self) -> None:
+        """Initialise per-flow instance state.
+
+        v1.3.19 FIX (Defect V/Finding 4, independent ICS audit):
+        `_discovered_sub_unit_ids` used to be declared as a MUTABLE list
+        at class scope (`_discovered_sub_unit_ids: list[int] = []`).
+        Every other attribute here is an immutable default (`None`,
+        `False`, an `int`) and safe to declare at class level -- assigning
+        `self.x = ...` always creates an instance attribute, never mutates
+        the class-level value. A mutable default is different: if any code
+        path ever mutated it in place (e.g. `.append(...)`) before this
+        particular instance's own value had been assigned, that mutation
+        would become visible to every OTHER ConfigFlow instance sharing
+        the same class-level list -- dangerous in a multi-step setup flow,
+        where an abandoned or concurrent flow could silently influence a
+        later one. No such in-place mutation was found in the current code
+        (every use either reassigns the whole list or only reads it), but
+        this is exactly the kind of latent trap that's easy to
+        reintroduce later without noticing. Fixed at the root by giving
+        each instance its own list from construction.
+        """
+        super().__init__()
+        self._discovered_sub_unit_ids: list[int] = []
 
     def _reset_discovery_state(self) -> None:
         """Clear all state used by the discovery progress steps."""
+        # v1.3.19 FIX (Defect V/Finding 5, independent ICS audit): this
+        # used to just set self._discovery_task = None without cancelling
+        # the underlying task first. If the flow was reset or abandoned
+        # while a scan was still running, that background task kept
+        # running regardless -- continuing to probe the bus after the UI
+        # had already moved on, exactly the kind of hidden traffic that
+        # causes ICS contention and confusing retry behaviour. Same defect
+        # shape as Defect L (v1.3.14), a different file.
+        if self._discovery_task is not None and not self._discovery_task.done():
+            self._discovery_task.cancel()
         self._discovery_task = None
         self._discovered_primary_unit_id = None
         self._discovered_sub_unit_ids = []

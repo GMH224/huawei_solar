@@ -1,7 +1,7 @@
 # CLAUDE.md — Huawei Solar Integration
 
 > **Maintained by Claude (Anthropic) on behalf of the community.**
-> Current version: **1.3.18** — see `manifest.json`.
+> Current version: **1.3.19** — see `manifest.json`.
 
 ---
 
@@ -663,6 +663,143 @@ timestamp, eliminating arithmetic errors on the power-flow card.
 - **New:** `tests/test_synchronized_power_coordinator.py` — 22 tests covering
   derived properties (all edge cases), happy path, partial failure, all-fail,
   consecutive failure counter, and telemetry recording.
+
+### v1.3.19 (2026-08-05)
+**Defect V — the full remaining backlog from two audits closed in one
+release: the four findings deferred from the v1.3.17 audit
+(`AUDIT_1.3.18.md` §5), plus all ten findings from a third independent
+audit, this time of v1.3.18. Ten unique fixes across seven files after
+deduplication.**
+
+**Finding 1 — cleanup-on-setup-failure only covered `keepalive.stop`, not
+telemetry or the adaptive controller.** This audit caught a gap in this
+project's own v1.3.18 scoping decision (`AUDIT_1.3.18.md` §3.1
+explicitly reasoned these two were "idempotent singletons with no
+independent ongoing work" — verified false: both have real teardown work,
+a periodic timer and a dirty-state flush respectively). Both now
+registered via `register_cleanup`, matching `keepalive.stop`; the adaptive
+controller uses its new `async_unload()` (Finding 10, see below) rather
+than the plain `stop()`, since the cleanup runner already supports
+awaiting async callables.
+
+**Finding 2 — `config_flow.py`'s `bridge` referenced before guaranteed
+assignment.** `validate_network_setup_login`'s `finally` block checked
+`if bridge is not None` without `bridge` ever being initialised — if
+`create_device_instance(client)` failed before that assignment ran,
+`UnboundLocalError` replaced the real connection failure with an unrelated
+one, and the raw TCP client was never explicitly disconnected either way.
+Fixed: `bridge = None` before the `try`; `finally` now disconnects the raw
+client directly when `bridge` was never created.
+
+**Finding 3 — the same unbounded connect/login/discovery pattern already
+fixed for the runtime path, still present in the setup wizard.** Reported
+independently by both audits. `validate_serial_setup`,
+`_connect_to_discovered_devices`, `validate_network_setup`, and
+`validate_network_setup_login` all had unbounded
+`create_device_instance`/`create_sub_device_instance`/`login`/
+`has_write_permission` calls. All four now wrapped in `asyncio.wait_for(...,
+timeout=DEVICE_CONNECT_TIMEOUT)` — reusing the same 45s bound and reasoning
+already established for the runtime path (Defect M, v1.3.14; Finding 1,
+v1.3.18). Bare `TimeoutError` is deliberately left to propagate rather than
+converted to a custom exception: every caller already catches
+`TimeoutError` alongside `ConnectionException`/`ModbusConnectionError` as
+an expected, user-facing "could not connect" case — no new handling needed
+anywhere. The auto/scan-discovery family (`_auto_slave_discovery` and
+siblings) was checked and deliberately left alone: it already uses
+`create_scan_tcp_client`, purpose-built with its own short scan timeout,
+unlike the general-purpose client the fixed functions used for a one-time
+connect-and-validate.
+
+**Finding 4 — mutable discovery state at class scope.**
+`_discovered_sub_unit_ids: list[int] = []` was declared as a mutable
+default on the `ConfigFlow` class itself — the classic Python trap where
+in-place mutation before an instance's own value is first assigned would
+be visible across every flow instance sharing the class. No such mutation
+was found in the current code (every use reassigns the whole list or only
+reads it), but this is exactly the kind of latent trap that's easy to
+reintroduce unnoticed. Fixed by adding `ConfigFlow.__init__`, giving each
+instance its own list from construction; every other class-level attribute
+(all immutable defaults) was left as-is, since only mutable defaults carry
+this risk.
+
+**Finding 5 — the discovery background task was never cancelled on
+reset.** `_reset_discovery_state()` set `self._discovery_task = None`
+without calling `.cancel()` first — an abandoned or reset flow's scan
+could keep running in the background, continuing to probe the bus after
+the UI had moved on. Same defect shape as Defect L (v1.3.14), a different
+file. Fixed: cancel before dropping the reference.
+
+**Finding 6 — telemetry listener callbacks had no exception isolation.**
+`ModbusTelemetry._push_to_listeners` called each registered callback
+directly in a loop with no `try`/`except` — one misbehaving listener
+raising stopped every listener registered after it from ever receiving
+updates. Fixed: each callback isolated individually.
+
+**Finding 7 — switch status polling bypassed the guard, bounded by
+iteration count not wall-clock time.** Reported independently three
+separate times across this session's audits (`AUDIT_1.3.9.md` §5,
+`AUDIT_1.3.15.md` §4/Defect O, and now both remaining audits). Completely
+redesigned: new `_poll_device_status_bounded()` routes the status read
+through `ModbusGuard` with its own `asyncio.wait_for` bound instead of a
+raw `device.client.get()` call; new `_wait_for_status()` tracks an actual
+`time.monotonic()` deadline enforced around both the sleep and the read,
+so the total operation genuinely cannot exceed
+`MAX_STATUS_CHANGE_TIME_SECONDS` regardless of how long any individual
+read takes — replacing the old `for _ in range(...)` loop entirely. This
+finding is not deferred a fourth time.
+
+**Finding 8 — service power validation read unbounded, while the Defect R
+write lock is already held.** `services.py`'s `_validate_power_value()`
+performed an unbounded read before any write, blocking every OTHER write
+action for the same device for as long as it took, since Defect R
+(v1.3.15) made that lock genuinely exclusive. Bounded with a new
+`SERVICE_VALIDATION_READ_TIMEOUT` (10s).
+
+**Finding 9 — the synchronized power coordinator's four reads were not
+one atomic transaction, despite its own docstring's claim.** Each of the
+four power-flow reads acquires and releases its guard separately; other
+coordinators sharing the same guard can genuinely interleave between them.
+Holding one guard acquisition across the whole sequence was considered and
+rejected — it would block every other coordinator on the same bus for the
+full duration, directly undermining the fairness Defect P (v1.3.15) was
+built to guarantee across devices sharing a bus. Fixed by correcting the
+inaccurate documentation (both the class and method docstrings previously
+claimed "uninterrupted"/"one contiguous sequence") and adding a new
+`sample_span_ms` field to `SynchronizedPowerData`, measuring the actual
+wall-clock spread between the first and last successful read in a tick —
+so the sample's real time-skew is visible and measured rather than
+silently assumed away.
+
+**Finding 10 — the adaptive controller's dirty-state flush was
+fire-and-forget.** `AdaptiveModbusController.stop()`'s docstring claimed
+to persist "synchronously," but the implementation scheduled the save via
+`hass.async_create_task(self._async_save())` — genuinely fire-and-forget;
+the task could be cancelled or simply never run before teardown finished,
+losing learning data exactly when the system is unstable and it matters
+most. New `async_unload()` awaits the flush deterministically, mirroring
+`BatteryHealthManager.async_unload()`'s existing two-method pattern in
+this exact codebase (sync `stop()` for lower-stakes callers; async
+`async_unload()` where the caller can await and losing data isn't
+acceptable). `async_unload_entry`'s teardown loop now calls it with the
+same fault-isolation wrapper already used for battery health: a failed
+flush must never prevent the rest of the entry from unloading cleanly.
+
+**Adversarial verification.** New `tests/test_ics_audit_v3_findings.py`
+(26 tests) covering all ten findings: static (AST) checks against the real
+source for structural confirmation, plus behavioural reproductions where
+meaningful — the discovery-task-cancellation hazard (adversarially proven
+real: an unguarded reset genuinely leaves a task running), the telemetry
+listener isolation (one failing callback doesn't block the rest), and the
+adaptive flush's determinism (the flush is confirmed to complete before
+`async_unload()` returns, not merely scheduled). Run against the pristine
+pre-session baseline, 20 of the file's 23 static checks fail correctly
+(the remaining 3 in that run are pure behavioural tests with no static
+counterpart).
+
+**Tests: 566 -> 592 passed, 1 skipped**, deterministic across 3 repeated
+runs. `__init__.py`, `config_flow.py`, `switch.py`, `modbus_telemetry.py`,
+`services.py`, `adaptive_modbus.py`, `synchronized_power_coordinator.py`,
+and `const.py` changed among production files.
 
 ### v1.3.18 (2026-08-05)
 **Defect U — three findings (1, 2, 3) from a second independent ICS audit,

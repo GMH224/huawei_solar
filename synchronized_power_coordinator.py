@@ -67,6 +67,7 @@ entities unavailable and the normal back-off logic takes over.
 from __future__ import annotations
 
 import asyncio
+import time
 import logging
 from dataclasses import dataclass
 from datetime import timedelta
@@ -89,10 +90,27 @@ _LOGGER = logging.getLogger(__name__)
 
 @dataclass(slots=True)
 class SynchronizedPowerData:
-    """Snapshot of all power-flow values from a single coordinator tick.
+    """Best-effort, near-simultaneous snapshot of power-flow values from a
+    single coordinator tick -- NOT a true atomic transaction.
+
+    v1.3.19 NOTE (Defect V/Finding 9, independent ICS audit): each field is
+    read via its own, separate ModbusGuard acquisition (see
+    SynchronizedPowerCoordinator._async_update_data) rather than one
+    acquisition held across all four reads. Other coordinators sharing the
+    same guard CAN interleave between them. This is a deliberate trade-off,
+    not an oversight: holding one guard for the entire read sequence would
+    block every other coordinator on the same bus for the whole sequence's
+    duration, working directly against the fairness Defect P (v1.3.15) was
+    built to guarantee across devices sharing a bus. `sample_span_ms`
+    reports how much wall-clock time actually separated the first and last
+    successful read in this tick, so a consumer can judge how tightly
+    grouped a given sample really was rather than assuming perfect
+    simultaneity.
 
     All fields share the same ``last_updated`` timestamp because they are
-    populated from the same ``DataUpdateCoordinator`` cycle.
+    populated from the same ``DataUpdateCoordinator`` cycle -- that
+    timestamp marks when the COORDINATOR finished, not that the underlying
+    values were captured at the same physical instant.
 
     ``None`` indicates that the reading failed (device unavailable / not
     installed).  Sensors must treat ``None`` as unavailable.
@@ -122,6 +140,13 @@ class SynchronizedPowerData:
     has_inv2: bool = False
     has_meter: bool = False
     has_battery: bool = False
+
+    #: Wall-clock milliseconds between the first and last successful read
+    #: in this tick (v1.3.19, Defect V/Finding 9) -- diagnostic only, gives
+    #: visibility into how time-skewed a given sample actually was, since
+    #: the four reads are not one atomic transaction. ``None`` if fewer
+    #: than two reads succeeded this tick (nothing to measure a span over).
+    sample_span_ms: float | None = None
 
     # ── Derived properties ────────────────────────────────────────────────────
 
@@ -264,17 +289,39 @@ class SynchronizedPowerCoordinator(DataUpdateCoordinator[SynchronizedPowerData])
     # ── poll ───────────────────────────────────────────────────────────────────
 
     async def _async_update_data(self) -> SynchronizedPowerData:
-        """Read all power-flow registers in one contiguous Modbus sequence.
+        """Read all power-flow registers as a best-effort, near-simultaneous
+        sample -- NOT one atomic transaction.
 
-        Each read is a minimal single-register ``batch_update`` call guarded by
-        the primary guard so the block is uninterrupted.  Partial failures are
-        tolerated and reported as ``None`` in the result.
+        v1.3.19 NOTE (Defect V/Finding 9, independent ICS audit): each read
+        is a minimal single-register ``batch_update`` call, but each
+        acquires and releases its guard SEPARATELY -- this docstring
+        previously (incorrectly) claimed the block was "uninterrupted".
+        Other coordinators sharing the same guard can genuinely interleave
+        between these four reads. Holding one guard acquisition across the
+        whole sequence was considered and rejected: it would block every
+        other coordinator on the same bus for the full duration, directly
+        undermining the fairness Defect P (v1.3.15) was built to guarantee.
+        `sample_span_ms` on the returned data reports how much wall-clock
+        time actually separated the first and last successful read, so
+        this is measured and visible rather than silently assumed away.
+        Partial failures are tolerated and reported as ``None`` in the
+        result.
         """
         inv1_pv: float | None = None
         grid: float | None = None
         battery: float | None = None
         inv2_pv: float | None = None
         any_success = False
+        first_success_at: float | None = None
+        last_success_at: float | None = None
+
+        def _mark_success() -> None:
+            nonlocal any_success, first_success_at, last_success_at
+            any_success = True
+            now = time.monotonic()
+            if first_success_at is None:
+                first_success_at = now
+            last_success_at = now
 
         timeout = self._update_timeout.total_seconds()
 
@@ -286,7 +333,7 @@ class SynchronizedPowerCoordinator(DataUpdateCoordinator[SynchronizedPowerData])
                 async with asyncio.timeout(timeout):
                     result = await self._inv1.batch_update([rn.INPUT_POWER])
                     inv1_pv = _extract_w(result, rn.INPUT_POWER)
-                    any_success = True
+                    _mark_success()
                     if self._telemetry:
                         self._telemetry.record_request(1)
         except Exception as exc:  # noqa: BLE001
@@ -306,7 +353,7 @@ class SynchronizedPowerCoordinator(DataUpdateCoordinator[SynchronizedPowerData])
                             [rn.POWER_METER_ACTIVE_POWER]
                         )
                         grid = _extract_w(result, rn.POWER_METER_ACTIVE_POWER)
-                        any_success = True
+                        _mark_success()
                         if self._telemetry:
                             self._telemetry.record_request(1)
             except Exception as exc:  # noqa: BLE001
@@ -325,7 +372,7 @@ class SynchronizedPowerCoordinator(DataUpdateCoordinator[SynchronizedPowerData])
                             [rn.STORAGE_CHARGE_DISCHARGE_POWER]
                         )
                         battery = _extract_w(result, rn.STORAGE_CHARGE_DISCHARGE_POWER)
-                        any_success = True
+                        _mark_success()
                         if self._telemetry:
                             self._telemetry.record_request(1)
             except Exception as exc:  # noqa: BLE001
@@ -343,7 +390,7 @@ class SynchronizedPowerCoordinator(DataUpdateCoordinator[SynchronizedPowerData])
                     async with asyncio.timeout(timeout):
                         result = await self._inv2.batch_update([rn.INPUT_POWER])
                         inv2_pv = _extract_w(result, rn.INPUT_POWER)
-                        any_success = True
+                        _mark_success()
                         if self._telemetry:
                             self._telemetry.record_request(1)
             except Exception as exc:  # noqa: BLE001
@@ -368,6 +415,12 @@ class SynchronizedPowerCoordinator(DataUpdateCoordinator[SynchronizedPowerData])
             )
         self._consecutive_failures = 0
 
+        sample_span_ms = (
+            (last_success_at - first_success_at) * 1000.0
+            if first_success_at is not None and last_success_at is not None
+            else None
+        )
+
         return SynchronizedPowerData(
             inv1_pv_power=inv1_pv,
             inv2_pv_power=inv2_pv,
@@ -376,6 +429,7 @@ class SynchronizedPowerCoordinator(DataUpdateCoordinator[SynchronizedPowerData])
             has_inv2=self._inv2 is not None,
             has_meter=self._has_meter,
             has_battery=self._has_battery,
+            sample_span_ms=sample_span_ms,
         )
 
 
