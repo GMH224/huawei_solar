@@ -1,7 +1,7 @@
 # CLAUDE.md — Huawei Solar Integration
 
 > **Maintained by Claude (Anthropic) on behalf of the community.**
-> Current version: **1.3.8** — see `manifest.json`.
+> Current version: **1.3.9** — see `manifest.json`.
 
 ---
 
@@ -663,6 +663,109 @@ timestamp, eliminating arithmetic errors on the power-flow card.
 - **New:** `tests/test_synchronized_power_coordinator.py` — 22 tests covering
   derived properties (all edge cases), happy path, partial failure, all-fail,
   consecutive failure counter, and telemetry recording.
+
+### v1.3.9 (2026-08-05)
+**Defect H — an unbounded, unhandled write-permission probe on the SENSOR
+PLATFORM setup critical path. Deployed after v1.3.8 still showed the
+"still starting up" banner lasting ~2 minutes; field log confirmed it was
+here, not in anything v1.3.7/v1.3.8 touched.**
+
+**The evidence.** A Home Assistant core log from a v1.3.8 boot showed:
+
+```
+04:10:52 WARNING [homeassistant.components.sensor] Setup of sensor platform huawei_solar is taking over 10 seconds.
+04:11:29 ERROR [custom_components.huawei_solar] Error fetching ..._config_data_update_coordinator data: Timeout... no response in 20 s
+04:11:29 ERROR [custom_components.huawei_solar] Error fetching ..._battery_data_update_coordinator data: Timeout... no response in 21 s
+```
+
+The first line is Home Assistant's own watchdog for the *sensor platform's*
+`async_setup_entry` (in `sensor.py`) specifically — a different function
+from the entry-level `async_setup_entry` (in `__init__.py`) that v1.3.7 and
+v1.3.8 both worked on. The two 20-21s timeouts in the same window
+independently confirm the device genuinely was not responding quickly at
+that point — not a coincidence, corroborating evidence.
+
+**Root cause.** `create_sun2000_entities()` (`sensor.py`), called once per
+inverter from the sensor platform's own setup, contained:
+
+```python
+and await ucs.device.has_write_permission()
+```
+
+— a raw device-level probe (read a test register, write it back) used only
+to decide whether to add one optional entity (Active Power Control Mode).
+This call:
+- Bypasses `ModbusGuard` and the adaptive controller entirely — no pacing,
+  no shared backoff intelligence, nothing this project built over the past
+  two weeks applies to it.
+- Had **no timeout of its own** — bounded only by whatever the vendor
+  library's internal per-request timeout happens to allow (up to ~20-30s
+  across the read+write pair, matching the timeouts logged for other
+  coordinators in the same window).
+- Had **no exception handling at the call site** — an exception other than
+  the two the vendor library already catches internally
+  (`PermissionDeniedError`, `WriteException`) would have propagated up and
+  taken down the entire sensor platform setup — every sensor entity on the
+  entry, not just this one optional one.
+
+Run once per SUN2000 device, sequentially, on **every single boot and
+reload** — a real, material contributor to the 2-3 minute startup window,
+independent of and in addition to the two mechanisms v1.3.7 and v1.3.8
+already fixed.
+
+**Fix.** New `_has_write_permission_bounded()` wraps the call in
+`asyncio.wait_for()` against a new `WRITE_PERMISSION_CHECK_TIMEOUT` (5s —
+a healthy device answers in well under a second; there is nothing to gain
+by waiting as long as a real data poll would), and catches every exception,
+never letting one propagate into platform setup. On timeout or failure the
+optional entity is simply skipped for this pass (identical in effect to the
+vendor library's own existing "no permission" outcome) and re-attempted
+automatically on the next reload.
+
+**A second, smaller thing this fix incidentally corrects:** `sensor.py` had
+no `_LOGGER` defined anywhere, despite one existing call site
+(`_LOGGER.exception(...)` inside the battery-health fault-isolation
+handler, v1.1.7) already using it — a latent `NameError` waiting to fire
+the first time that handler's `except` block was ever actually exercised,
+silently defeating the very fault-isolation it exists to provide. Adding
+`_LOGGER = logging.getLogger(__name__)` for this release's own use also
+fixes that latent bug as a side effect. Flagged explicitly rather than
+buried, per project convention.
+
+**Audited, not fixed, in this release — a related question worth asking
+after finding Defect H:** every write-capable entity (`number.py`,
+`switch.py`, `select.py`, `button.py`) and every write flow in
+`services.py` also calls `device.set(...)` directly, also bypassing
+`ModbusGuard`/the adaptive controller, also with no explicit local
+exception handling. **This is a structurally different, lower-severity
+situation, not the same defect:** these calls run in response to explicit
+user actions or service calls, not during entry/platform setup, so Home
+Assistant's own service-call machinery isolates a failure to that single
+action — it cannot take down other entities or the whole integration the
+way Defect H could. The vendor library's own transport-level
+`DEFAULT_TIMEOUT` (10s) also already bounds each underlying request, so
+these calls are not literally unbounded. Real, smaller gaps remain (worst
+case ~20-30s per write with no local timeout of our own; several
+multi-step `services.py` sequences — e.g. forcible charge/discharge — could
+leave a partially-applied write sequence if a later step in the same
+sequence fails; no locally friendly error message on failure). None of
+this was part of what was reported or reproduced this session, and fixing
+it is deliberately deferred rather than bundled in here — see
+`AUDIT_1.3.9.md` §5 for the full audit and the reasoning for not touching
+it now.
+
+**Adversarial verification.** New `tests/test_write_permission_bounded.py`:
+a fake device that never resolves confirms the wrapper times out instead of
+hanging (and a companion test proves the fake actually reproduces the
+original hazard when called the old, unwrapped way); a fake device that
+raises confirms the exception never propagates; a healthy fake device
+confirms the check still works normally. A static check confirms
+`create_sun2000_entities` no longer calls `.has_write_permission()`
+directly — run against the pre-fix file, it fails at the exact original
+line (1188); against this release, it passes.
+
+**Tests: 475 -> 481 passed, 1 skipped**, deterministic across 3 repeated
+runs. Only `sensor.py` and `const.py` changed among production files.
 
 ### v1.3.8 (2026-08-05)
 **Defect G — the config entry's own setup was blocking on real Modbus reads,

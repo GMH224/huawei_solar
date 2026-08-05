@@ -30,6 +30,22 @@ CONFIGURATION_UPDATE_INTERVAL = timedelta(minutes=15)
 OPTIMIZER_UPDATE_INTERVAL = timedelta(minutes=5)
 OPTIMIZER_UPDATE_TIMEOUT = timedelta(minutes=2)
 
+# v1.3.9 (Defect H): bound for the write-permission probe performed once per
+# SUN2000 device during SENSOR PLATFORM SETUP (sensor.py:create_sun2000_entities)
+# to decide whether to add one optional entity (Active Power Control Mode).
+# This is a raw device-level read+write, outside ModbusGuard/adaptive pacing
+# entirely, and was previously awaited with no bound at all -- on a
+# slow/still-recovering device it could stall platform setup for as long as
+# the vendor library's own per-request timeout allowed (up to ~20-30s across
+# the read+write pair), once per inverter, on every single boot and reload.
+# A short, dedicated timeout here means a slow device costs at most this
+# much extra setup time per device, and simply skips the optional entity for
+# this pass (it is re-attempted on the next reload) rather than blocking
+# everyone. Deliberately shorter than UPDATE_TIMEOUT: a healthy device
+# answers this in well under a second, so there is nothing to gain by
+# waiting as long as we would for a real data poll.
+WRITE_PERMISSION_CHECK_TIMEOUT = timedelta(seconds=5)
+
 # When the inverter is in night/sleep mode (PV power ≈ 0) all coordinators
 # slow to this interval.  Most registers are frozen at night so polling faster
 # than 5 minutes is wasteful and stresses the Modbus interface.

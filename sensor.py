@@ -1,5 +1,7 @@
 """Support for Huawei inverter monitoring API."""
 
+import asyncio
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -46,7 +48,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DATA_DEVICE_DATAS, DATA_SYNC_POWER_COORDINATOR
+from .const import DATA_DEVICE_DATAS, DATA_SYNC_POWER_COORDINATOR, WRITE_PERMISSION_CHECK_TIMEOUT
 from .adaptive_modbus import AdaptiveModbusController, create_adaptive_entities
 from .battery_health_entities import create_battery_health_entities
 from .battery_health_manager import BatteryHealthManager
@@ -66,6 +68,8 @@ from .update_coordinator import (
 )
 
 PARALLEL_UPDATES = 1
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -1128,6 +1132,60 @@ BATTERY_TEMPLATE_SENSOR_DESCRIPTIONS: tuple[BatteryTemplateEntityDescription, ..
 )
 
 
+async def _has_write_permission_bounded(device: Any, serial_number: str) -> bool:
+    """Bounded, isolated wrapper around ``device.has_write_permission()``.
+
+    v1.3.9 FIX (Defect H). This used to be called with no timeout and no
+    exception handling at all, directly inside SENSOR PLATFORM SETUP
+    (create_sun2000_entities, below) -- once per SUN2000 device, on every
+    single boot and reload. It is a raw device-level read-then-write-back
+    probe, entirely outside ModbusGuard/the adaptive controller, used only
+    to decide whether to add one optional entity (Active Power Control
+    Mode). On a device that is still busy or reconnecting -- exactly the
+    condition observed in the field immediately after a restart, alongside
+    other coordinators independently timing out at 20-21s in the same
+    window -- this could stall the ENTIRE sensor platform's setup for as
+    long as the vendor library's own per-request timeout allowed, per
+    device, contributing materially to Home Assistant's "still starting
+    up" banner running 2-3 minutes instead of the ~20s typical of most
+    integrations (see AUDIT_1.3.9.md).
+
+    Bounded here to WRITE_PERMISSION_CHECK_TIMEOUT: a healthy, responsive
+    device answers in well under a second, so there is nothing to gain by
+    waiting as long as we would for a real data poll. On timeout or any
+    other failure, the optional entity is simply skipped for this pass --
+    identical in effect to the vendor library's own existing "no
+    permission" outcome, and re-attempted automatically on the next
+    reload. This must never propagate: an uncaught exception here would
+    abort ALL sensor entities for ALL devices on this entry, not just this
+    one optional one (the same class of blast radius already guarded
+    against for battery-health and adaptive-diagnostic entities elsewhere
+    in this file).
+    """
+    try:
+        return await asyncio.wait_for(
+            device.has_write_permission(),
+            timeout=WRITE_PERMISSION_CHECK_TIMEOUT.total_seconds(),
+        )
+    except TimeoutError:
+        _LOGGER.warning(
+            "write_permission_check[%s]: timed out after %.0fs; skipping the "
+            "Active Power Control Mode entity for this setup. Will be "
+            "retried on the next reload. All other entities are unaffected",
+            serial_number,
+            WRITE_PERMISSION_CHECK_TIMEOUT.total_seconds(),
+        )
+        return False
+    except Exception:  # noqa: BLE001 — must never break platform setup
+        _LOGGER.exception(
+            "write_permission_check[%s]: failed; skipping the Active Power "
+            "Control Mode entity for this setup. All other entities are "
+            "unaffected",
+            serial_number,
+        )
+        return False
+
+
 async def create_sun2000_entities(ucs: HuaweiSolarInverterData) -> list[SensorEntity]:
     """Create SUN2000 sensor entities."""
     entities_to_add: list[SensorEntity] = []
@@ -1185,7 +1243,7 @@ async def create_sun2000_entities(ucs: HuaweiSolarInverterData) -> list[SensorEn
 
     if (
         not isinstance(ucs.device.primary_device, (EMMADevice, SmartLoggerDevice))
-        and await ucs.device.has_write_permission()
+        and await _has_write_permission_bounded(ucs.device, ucs.device.serial_number)
         and ucs.configuration_update_coordinator
     ):
         entities_to_add.append(
