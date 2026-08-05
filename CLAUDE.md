@@ -1,7 +1,7 @@
 # CLAUDE.md — Huawei Solar Integration
 
 > **Maintained by Claude (Anthropic) on behalf of the community.**
-> Current version: **1.3.16** — see `manifest.json`.
+> Current version: **1.3.17** — see `manifest.json`.
 
 ---
 
@@ -663,6 +663,77 @@ timestamp, eliminating arithmetic errors on the power-flow card.
 - **New:** `tests/test_synchronized_power_coordinator.py` — 22 tests covering
   derived properties (all edge cases), happy path, partial failure, all-fail,
   consecutive failure counter, and telemetry recording.
+
+### v1.3.17 (2026-08-05)
+**Defect T — the back-off state machine could get permanently wedged, with
+Home Assistant reporting "success" the entire time. Confirmed directly
+from a field debug capture showing a back-off cycle counter climbing past
+10 with zero interleaved failures, while most non-FAST-tier entities
+stayed `unknown` indefinitely.**
+
+**The evidence.** Every "successful" poll's total duration matched its own
+back-off sleep almost exactly (9.617s call vs 9.6s sleep, 9.712s vs 9.7s,
+10.460s vs 10.5s...), across 20+ consecutive cycles, with no shed, timeout,
+or stale-cache-fallback message logged in between. That meant essentially
+no time was spent actually talking to the device after waking from each
+back-off sleep — the coordinator was reporting success without ever really
+trying.
+
+**Root cause.** `_async_update_data()` has two early-return branches that
+serve a cached snapshot without raising an exception:
+1. "Every register is still within its cache TTL" (step 4).
+2. "Priority filtering during back-off emptied the read set" — FAST tier
+   always attempted, NORMAL only every Nth cycle, SLOW/STATIC deferred
+   entirely — and on this particular cycle nothing qualified (step 5).
+
+Home Assistant sees no exception either way and logs `success: True` — but
+neither branch reaches the real success path further down that resets
+`_consecutive_timeouts`, `_consecutive_failures`, and `_backoff_cycle` to
+zero. A coordinator that has entered back-off could therefore hit either
+branch every single cycle, forever, without ever attempting a genuine
+Modbus exchange — meaning it could never observe that the device had
+recovered, and remained wedged in back-off indefinitely. Since back-off
+deliberately defers NORMAL/SLOW/STATIC registers, a coordinator stuck this
+way would never again read efficiency, daily yield, alarms, temperatures,
+or most of what a device's entity page shows — exactly matching the field
+screenshots.
+
+**Fix.** New `_pick_backoff_canary()` forces a single, cheap register
+through as a genuine connectivity test whenever either early-return branch
+would otherwise let a full cycle pass without attempting anything at all
+— preferring a FAST-tier register (consistent with back-off's existing
+"only FAST tier" policy) and falling back to any available register rather
+than testing nothing. If the device answers, the real success path is
+reached and back-off state resets correctly, exactly as it always should
+have. If it doesn't, the existing failure handling applies exactly as it
+already does for a genuine timeout — back-off correctly continues, because
+the device genuinely hasn't recovered. Applied at both early-return sites;
+`in_backoff` is now computed once, early, so both can share the same
+guard.
+
+**Adversarial verification.** New `tests/test_backoff_canary.py`: the exact
+branching logic (steps 3-5 of `_async_update_data`) is reproduced in an
+isolated mini-coordinator in both its old and new form. The old pattern is
+shown to genuinely wedge forever across 20 simulated cycles when nothing
+is stale, and separately when priority-filtering empties the read set —
+the adversarial proof the hazard is real, not theoretical. The new pattern
+is shown to force a real attempt in both scenarios, to correctly reset and
+stay recovered after a successful canary, and — the explicit no-regression
+check — to keep back-off correctly active (still genuinely retrying, not
+silently giving up) when the device really is still failing. Static (AST)
+checks confirm `_pick_backoff_canary` exists and is called at least twice
+inside the correct `_async_update_data` (disambiguated from the sibling
+optimizer coordinator's same-named method by return type). Run against the
+pristine pre-session baseline, both static checks fail correctly.
+
+**Scope note.** The sibling `HuaweiSolarOptimizerUpdateCoordinator` was
+checked and does not share this defect — its own `_async_update_data`
+always attempts a real read regardless of back-off status; the back-off
+sleep there only delays the attempt, never replaces it with a silent
+cached-data return.
+
+**Tests: 547 -> 555 passed, 1 skipped**, deterministic across 3 repeated
+runs. Only `update_coordinator.py` changed among production files.
 
 ### v1.3.16 (2026-08-05)
 **Defect S — `ModbusKeepAlive`'s keep-alive probe has never successfully

@@ -112,6 +112,36 @@ def _backoff_seconds(consecutive: int) -> float:
     return max(0.0, delay + jitter)
 
 
+def _pick_backoff_canary(
+    candidates: list[RegisterName], cache: RegisterCache
+) -> RegisterName | None:
+    """Pick one register to force a genuine Modbus attempt during back-off,
+    when normal filtering would otherwise let a whole poll cycle pass
+    without trying anything at all (Defect T, v1.3.17).
+
+    Without this, a coordinator that has entered back-off can become
+    permanently wedged there: every early-return path in
+    `_async_update_data` ("everything's still within its cache TTL",
+    "nothing FAST-tier due this particular cycle") reports success to Home
+    Assistant without ever attempting real communication, so the device's
+    actual recovery is never observed and the back-off state is never
+    reset. Forcing one cheap, real attempt every cycle closes that hole:
+    if the device answers, the real success path resets back-off
+    correctly; if it doesn't, the existing failure handling applies
+    exactly as it already does for a genuine timeout.
+
+    Prefers a FAST-tier register (cheapest, and consistent with back-off's
+    existing "only FAST tier" policy for genuinely due registers) so this
+    does not undermine the deliberate SLOW/STATIC deferral back-off relies
+    on to reduce load. Falls back to any available register rather than
+    reading nothing, since testing the connection at all is the point.
+    """
+    for n in candidates:
+        if cache.tier_of(n) == RegisterTier.FAST:
+            return n
+    return candidates[0] if candidates else None
+
+
 @lru_cache(maxsize=512)
 def _modbus_span(name: RegisterName) -> tuple[int, int]:
     """Resolve a register's (start, end) Modbus address span.
@@ -760,18 +790,57 @@ class HuaweiSolarUpdateCoordinator(
         # ── 3. Cache filter ───────────────────────────────────────────────────
         stale_names = self.cache.filter_stale(all_names, self._day_interval)
 
+        # v1.3.17 FIX (Defect T): computed early (before either early-return
+        # below) so both can be guarded against the same hazard -- see the
+        # canary-forcing logic just below for the full explanation.
+        in_backoff = self._consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS
+
         # ── 4. Fully cached ───────────────────────────────────────────────────
         if not stale_names:
-            _LOGGER.debug(
-                "%s: %d register(s) all cached — skipping Modbus [night=%s]",
-                self.name, len(all_names), self.cache.night_mode,
-            )
-            if self.telemetry:
-                self.telemetry.record_skipped_poll()
-            return {n: v for n in all_names if (v := self.cache.get(n)) is not None}
+            if in_backoff:
+                # v1.3.17 FIX (Defect T): while genuinely in back-off, this
+                # coordinator must never go a full cycle without attempting
+                # AT LEAST ONE real Modbus exchange -- otherwise it can
+                # remain wedged in back-off forever. This exact scenario was
+                # confirmed in the field: every register happened to still
+                # be within its cache TTL, so this branch returned the
+                # cached snapshot immediately, Home Assistant logged
+                # "success" (no exception was raised), and
+                # _consecutive_timeouts/_backoff_cycle were never reset --
+                # because that reset only happens after a REAL attempt
+                # completes, further down in this function, which this
+                # early return skips entirely. The coordinator therefore
+                # had no way to ever discover the device had recovered, and
+                # stayed in back-off indefinitely -- observed directly as a
+                # back-off cycle counter climbing into double digits with
+                # no failure logged in between, while most non-FAST-tier
+                # entities remained permanently `unknown` (back-off, by
+                # design, defers NORMAL/SLOW/STATIC registers entirely; see
+                # step 5 below -- so a coordinator that can never leave
+                # back-off can never read them again).
+                #
+                # Fixed by forcing a single, cheap register through as a
+                # genuine test of the connection whenever back-off would
+                # otherwise let a full cycle pass without trying anything at
+                # all. If the device answers, this reaches the real success
+                # path further down and correctly resets back-off state. If
+                # it doesn't, the existing failure handling applies exactly
+                # as it already does elsewhere in this function -- back-off
+                # correctly continues, because the device genuinely hasn't
+                # recovered yet.
+                canary = _pick_backoff_canary(all_names, self.cache)
+                if canary is not None:
+                    stale_names = [canary]
+            if not stale_names:
+                _LOGGER.debug(
+                    "%s: %d register(s) all cached — skipping Modbus [night=%s]",
+                    self.name, len(all_names), self.cache.night_mode,
+                )
+                if self.telemetry:
+                    self.telemetry.record_skipped_poll()
+                return {n: v for n in all_names if (v := self.cache.get(n)) is not None}
 
         # ── 5. Priority polling during back-off (opt. 6) ─────────────────────
-        in_backoff = self._consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS
         if in_backoff:
             self._backoff_cycle += 1
             wait = _backoff_seconds(
@@ -794,9 +863,20 @@ class HuaweiSolarUpdateCoordinator(
                     if self._backoff_cycle % BACKOFF_NORMAL_DIVISOR == 0:
                         priority_names.append(n)
                 # SLOW and STATIC are skipped entirely during back-off
-            # If nothing is due this cycle (no FAST stale, not a NORMAL cycle),
-            # read nothing and serve the cached snapshot — do NOT fall back to
-            # reading SLOW/STATIC, which would defeat the deferral.
+            # v1.3.17 FIX (Defect T): the same hazard as step 4 above, one
+            # level down -- priority-filtering stale_names down to nothing
+            # (no FAST-tier register was stale, and this wasn't an Nth
+            # NORMAL cycle) used to mean "read nothing, serve the cached
+            # snapshot", silently extending back-off with no test of
+            # recovery. Force a canary here too, drawn from the full
+            # register set (not just stale_names, which by construction
+            # contains no FAST-tier candidate in this branch) so the pick
+            # still prefers a cheap FAST-tier register over an arbitrary
+            # SLOW/STATIC one.
+            if not priority_names:
+                canary = _pick_backoff_canary(all_names, self.cache)
+                if canary is not None:
+                    priority_names = [canary]
             stale_names = priority_names
         else:
             self._backoff_cycle = 0
