@@ -52,6 +52,8 @@ def _fresh_guard(endpoint: str = "192.168.1.1:502") -> ModbusGuard:
     g._queue_depth = 0
     g._effective_gap = MIN_INTER_REQUEST_GAP.total_seconds()
     g._max_queue_depth = MAX_QUEUE_DEPTH
+    g._gap_contributions = {}      # v1.3.15 (Defect P) multi-device aggregation
+    g._depth_contributions = {}
     g.shed_count = 0                    # v1.2.3 diagnostic counter
     # v1.3.0 Phase 0 instrumentation
     g._busy_s = 0.0
@@ -169,37 +171,37 @@ class TestAdaptiveParams(unittest.TestCase):
 
     def test_update_gap_clamped_to_min(self):
         g = _fresh_guard()
-        g.update_gap(0.001)          # 1 ms — below 150 ms hardware floor
+        g.update_gap("test-device", 0.001)          # 1 ms — below 150 ms hardware floor
         self.assertEqual(g._effective_gap, MIN_INTER_REQUEST_GAP.total_seconds())
 
     def test_update_gap_clamped_to_max(self):
         g = _fresh_guard()
-        g.update_gap(10.0)           # 10 s — above 500 ms ceiling
+        g.update_gap("test-device", 10.0)           # 10 s — above 500 ms ceiling
         self.assertEqual(g._effective_gap, 0.500)
 
     def test_update_gap_valid(self):
         g = _fresh_guard()
-        g.update_gap(0.300)
+        g.update_gap("test-device", 0.300)
         self.assertAlmostEqual(g._effective_gap, 0.300, places=5)
 
     def test_update_max_queue_depth_clamped_low(self):
         g = _fresh_guard()
-        g.update_max_queue_depth(0)
+        g.update_max_queue_depth("test-device", 0)
         self.assertEqual(g._max_queue_depth, 1)
 
     def test_update_max_queue_depth_clamped_high(self):
         g = _fresh_guard()
-        g.update_max_queue_depth(99)
+        g.update_max_queue_depth("test-device", 99)
         self.assertEqual(g._max_queue_depth, MAX_QUEUE_DEPTH)
 
     def test_update_max_queue_depth_valid(self):
         g = _fresh_guard()
-        g.update_max_queue_depth(2)
+        g.update_max_queue_depth("test-device", 2)
         self.assertEqual(g._max_queue_depth, 2)
 
     def test_effective_gap_ms_property(self):
         g = _fresh_guard()
-        g.update_gap(0.250)
+        g.update_gap("test-device", 0.250)
         self.assertAlmostEqual(g.effective_gap_ms, 250.0, places=2)
 
 
@@ -211,7 +213,7 @@ class TestInterRequestGap(unittest.TestCase):
         import time
         async def _go():
             g = _fresh_guard()
-            g.update_gap(0.050)      # 50 ms
+            g.update_gap("test-device", 0.050)      # 50 ms
             async with g.request():
                 pass
             t0 = time.monotonic()
@@ -226,7 +228,7 @@ class TestInterRequestGap(unittest.TestCase):
         import time
         async def _go():
             g = _fresh_guard()
-            g.update_gap(0.200)
+            g.update_gap("test-device", 0.200)
             t0 = time.monotonic()
             async with g.request():
                 pass
@@ -289,7 +291,7 @@ class TestCancellationDoesNotDeadlock(unittest.TestCase):
     def test_cancel_during_gap_releases_lock_and_counter(self):
         async def scenario():
             g = ModbusGuard.get_or_create("10.0.0.9:502")
-            g.update_gap(0.5)  # long enough gap to be cancelled mid-sleep
+            g.update_gap("test-device", 0.5)  # long enough gap to be cancelled mid-sleep
 
             async with g.request():  # first request sets _last_request_end
                 pass
