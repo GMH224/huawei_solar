@@ -1,7 +1,7 @@
 # CLAUDE.md — Huawei Solar Integration
 
 > **Maintained by Claude (Anthropic) on behalf of the community.**
-> Current version: **1.3.15** — see `manifest.json`.
+> Current version: **1.3.16** — see `manifest.json`.
 
 ---
 
@@ -663,6 +663,90 @@ timestamp, eliminating arithmetic errors on the power-flow card.
 - **New:** `tests/test_synchronized_power_coordinator.py` — 22 tests covering
   derived properties (all edge cases), happy path, partial failure, all-fail,
   consecutive failure counter, and telemetry recording.
+
+### v1.3.16 (2026-08-05)
+**Defect S — `ModbusKeepAlive`'s keep-alive probe has never successfully
+run. Found in the field (a "5K" inverter's diagnostics page showing every
+sensor as `Unknown`), traced to a real bug in this project's own
+integration code.**
+
+**The report.** A screenshot of `Inverter 5K`'s (`HV2220080950`)
+diagnostics page showed every sensor `Unknown` after over an hour running,
+alongside chronic adaptive-controller distress (RTT p95 6.25s, 613s
+cumulative bus wait, back-off cycle 70+). A Home Assistant log covering the
+same window showed, recurring every 15-45 seconds without exception:
+
+```
+ModbusKeepAlive[HV2220080950]: unexpected error in run loop: 'NewType' object is not subscriptable
+```
+
+**Root cause.** `_get_keepalive_register()` used
+`RegisterName[KEEPALIVE_REGISTER]` — Enum-style subscript/member-name
+lookup — guarded by `except KeyError`. `RegisterName` is a
+`typing.NewType` over `str` in the huawei_solar package this integration
+depends on, not an Enum; subscripting a `NewType` always raises
+`TypeError: 'NewType' object is not subscriptable`, a different exception
+than the one being caught. The error was therefore never actually handled:
+it propagated out of `_get_keepalive_register()`, out of `_probe()`
+(called before `_probe()`'s own try block even starts), and was only ever
+silenced by `_run()`'s outer catch-all — on every single keep-alive cycle,
+for every device, since this code was written. The keep-alive probe (fast
+connection-loss detection, distinct from the coordinators' own regular
+polling, which continued working independently) has never once succeeded.
+
+**This was our own bug, and is documented as such.** An unverified
+assumption in our own integration code about a type's runtime shape
+(Enum-like member lookup), never checked against how that type actually
+behaves, paired with an exception handler narrow enough to miss the real
+failure mode the moment that assumption was wrong. This holds regardless
+of which package defines `RegisterName` or that package's own history —
+see the corrected BUG-9 FOLLOW-UP note in `modbus_keepalive.py`, and this
+changelog entry, for language corrected during this investigation to
+reflect that plainly rather than attributing it to an unrelated external
+dependency.
+
+**Fix.** `_get_keepalive_register()` now validates the configured register
+name directly against `huawei_solar.registers.REGISTERS` — the same
+authoritative table already used elsewhere in this project (e.g.
+`update_coordinator.py`'s `_modbus_span()`) — and constructs the value with
+`RegisterName(...)` (a call, which works for both Enum and NewType-style
+types) instead of `RegisterName[...]` (a subscript, which only works for
+Enums). On an invalid register name, logs a clear warning and returns
+`None`, matching the original defensive intent of BUG-9's fix — just
+correctly, this time.
+
+**Adversarial verification.** New
+`tests/test_modbus_keepalive_registername.py`: exercises the genuine,
+installed `huawei_solar` package directly (not a fake), since the entire
+point of the defect is a mismatch between an assumption in our code and
+that package's actual behaviour — a fake could not prove the fix works
+against what our integration really runs against. Confirms `RegisterName`
+really is non-subscriptable (reproducing the exact original crash),
+confirms the new call-based resolution succeeds and correctly reports a
+genuinely invalid register name as `None` rather than raising, and
+statically confirms `_get_keepalive_register` no longer subscripts
+`RegisterName` and does validate against `REGISTERS`. Run against the
+pre-fix source, both static checks fail at the exact original line (93).
+
+**A test-infrastructure lesson, worth recording.** The genuine
+`huawei_solar` package has a non-idempotent import-time side effect
+(registering PDU classes into a shared `tmodbus` registry) that raises if
+its real modules are imported a second time in one process. This
+collided with an existing, working pattern in `test_tier_separation.py`
+(which already handles this by purging and freshly importing the real
+package, since most other test files in this suite install lightweight
+stubs). Fixed by adding an "already real? reuse it, don't force a second
+import" guard to both files, and removing an unnecessary restore-on-teardown
+step that — once a second consumer of the real package existed — was
+actively undoing each class's own successful import and reintroducing the
+exact collision the guard exists to prevent. `test_tier_separation.py`'s
+own assertions are unchanged; only its real-library bootstrapping was
+touched, verified stable across every collection order tried.
+
+**Tests: 541 -> 547 passed, 1 skipped**, deterministic across 3 repeated
+runs and multiple explicit file-orderings. `modbus_keepalive.py` changed
+among production files; `tests/test_tier_separation.py` received a small,
+non-behavioural infrastructure fix alongside the new test file.
 
 ### v1.3.15 (2026-08-05)
 **Defects P, Q, R — three findings from a full, fresh-eyes ICS sweep of the

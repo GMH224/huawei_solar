@@ -44,9 +44,31 @@ BUG-2  ``asyncio.ensure_future()`` is deprecated since Python 3.10.  Fixed
        by using ``asyncio.get_event_loop().create_task()`` with a fallback to
        ``asyncio.ensure_future()`` for older runtimes.
 BUG-9  ``RegisterName[KEEPALIVE_REGISTER]`` raised ``KeyError`` if the enum
-       member name did not exist (e.g., library version mismatch).  Fixed with
-       a try/except that falls back to skipping the probe rather than crashing
-       the loop.
+       member name did not exist.  Fixed with a try/except that falls back
+       to skipping the probe rather than crashing the loop.
+BUG-9  FOLLOW-UP (v1.3.16): the original fix above assumed ``RegisterName``
+       was Enum-like (supporting member lookup via ``[...]``, raising
+       ``KeyError`` on an invalid name). It is not — in the installed
+       ``huawei_solar`` package this integration depends on, ``RegisterName``
+       is a ``typing.NewType`` over ``str``, which does not support
+       subscripting at all. ``RegisterName[KEEPALIVE_REGISTER]`` therefore
+       always raised ``TypeError: 'NewType' object is not subscriptable`` —
+       a different exception than the ``except KeyError`` above was written
+       to catch, so it was NOT actually caught: it propagated out of this
+       function on every single call, out of ``_probe()``, and was only ever
+       silenced by ``_run()``'s outer catch-all ("unexpected error in run
+       loop"), on every keep-alive cycle. The keep-alive probe has therefore
+       never successfully run. This was an unverified assumption in our own
+       integration code about the register-name type's runtime shape — ours
+       to own outright, regardless of which package defines that type or how
+       its history got there. Fixed by validating directly against
+       ``huawei_solar.registers.REGISTERS`` (the same authoritative table
+       this project already uses elsewhere, e.g. ``update_coordinator.py``'s
+       ``_modbus_span()``) instead of assuming
+       anything about ``RegisterName``'s own runtime shape, and by
+       constructing the value with ``RegisterName(...)`` (a call, which
+       works identically whether the type is an Enum or a NewType) rather
+       than ``RegisterName[...]`` (a subscript, which only works for Enums).
 """
 
 from __future__ import annotations
@@ -85,21 +107,31 @@ _KEEPALIVE_REGISTER_NAME: RegisterName | None = None
 
 
 def _get_keepalive_register() -> RegisterName | None:
-    """Return the RegisterName for the keep-alive probe, or None on failure."""
+    """Return the RegisterName for the keep-alive probe, or None on failure.
+
+    v1.3.16 FIX (Defect S -- see the BUG-9 FOLLOW-UP note above for the full
+    history): validated directly against the real, authoritative register
+    table rather than assuming RegisterName supports Enum-style ``[...]``
+    member lookup, which it does not for the huawei_solar package this
+    integration depends on.
+    """
     global _KEEPALIVE_REGISTER_NAME
     if _KEEPALIVE_REGISTER_NAME is not None:
         return _KEEPALIVE_REGISTER_NAME
-    try:
-        _KEEPALIVE_REGISTER_NAME = RegisterName[KEEPALIVE_REGISTER]
-        return _KEEPALIVE_REGISTER_NAME
-    except KeyError:
+
+    from huawei_solar.registers import REGISTERS
+
+    if KEEPALIVE_REGISTER not in REGISTERS:
         _LOGGER.warning(
-            "ModbusKeepAlive: KEEPALIVE_REGISTER '%s' is not a valid RegisterName "
-            "member — keep-alive probes will be skipped.  "
+            "ModbusKeepAlive: KEEPALIVE_REGISTER '%s' is not a valid register "
+            "name — keep-alive probes will be skipped.  "
             "Check the KEEPALIVE_REGISTER constant in const.py.",
             KEEPALIVE_REGISTER,
         )
         return None
+
+    _KEEPALIVE_REGISTER_NAME = RegisterName(KEEPALIVE_REGISTER)
+    return _KEEPALIVE_REGISTER_NAME
 
 
 class ModbusKeepAlive:
