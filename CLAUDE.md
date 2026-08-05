@@ -1,7 +1,7 @@
 # CLAUDE.md — Huawei Solar Integration
 
 > **Maintained by Claude (Anthropic) on behalf of the community.**
-> Current version: **1.3.6** — see `manifest.json`.
+> Current version: **1.3.8** — see `manifest.json`.
 
 ---
 
@@ -663,6 +663,174 @@ timestamp, eliminating arithmetic errors on the power-flow card.
 - **New:** `tests/test_synchronized_power_coordinator.py` — 22 tests covering
   derived properties (all edge cases), happy path, partial failure, all-fail,
   consecutive failure counter, and telemetry recording.
+
+### v1.3.8 (2026-08-05)
+**Defect G — the config entry's own setup was blocking on real Modbus reads,
+almost certainly the cause of Home Assistant's "waiting for Huawei Solar to
+start up" banner lasting 2-3 minutes (vs the ~20 s typical of most
+integrations) on every boot AND every reload.**
+
+**The report, precisely stated.** Not the learning-gate's ~180 s window
+(that one is deliberate and unrelated — see the v1.2.2 changelog entry and
+`AdaptiveModbusController`'s learning-gate docstring; it lets polling
+continue through Home Assistant's own start-up congestion by design). This
+is Home Assistant's *own*, generic "integration is still initialising"
+notification — the one shown for every integration, normally for a few
+seconds, here for 2-3 minutes — meaning `async_setup_entry()` itself was not
+*returning* for that long. Reload calls the same function, so reload paid
+the identical cost.
+
+**Root cause — two blocking first-refresh calls on the setup critical
+path,** found by walking every `await` in `async_setup_entry` and its
+factory helpers:
+
+1. `create_optimizer_update_coordinator()` (`update_coordinator.py`) awaited
+   `coordinator.async_config_entry_first_refresh()` directly — a full,
+   real read of every optimizer's registers, once per inverter that has
+   optimizers, before setup could proceed.
+2. The `SynchronizedPowerCoordinator` setup block in `async_setup_entry`
+   (`__init__.py`) awaited its own `async_config_entry_first_refresh()`
+   directly — a full read of every instantaneous power register across up
+   to two inverters plus meter/battery, once per entry.
+
+Both are genuine, first-class Modbus round trips, stacked sequentially
+(per-device optimizer reads, then daisy-chain devices in sequence, then the
+cross-device sync read) — a natural multi-minute total, and the same total
+on every reload since nothing here was cached or skipped.
+
+**Why this connects to the reload/coordinator-dies incident audited in
+v1.3.7 (Defect F).** `configuration_update_coordinator` is constructed
+*after* the optimizer setup block in the same per-device function. If a
+slow setup were ever cancelled part-way through (by Home Assistant or a
+supervising timeout) while still working through an earlier device's
+optimizer read, whatever hadn't been reached yet — including a later
+device's config coordinator — would never be constructed at all. This is
+consistent with, and a stronger candidate for, the exact symptom v1.3.7
+addressed (§2.2/§2.3 in the 2026-08-04 handoff): one coordinator dead after
+reload while its siblings recovered. v1.3.7's fix (the double-unsub
+listener bug) remains a real, independently-verified defect and stays
+fixed; this release does not retract it, but the two together are a more
+complete account of the incident than either alone.
+
+**Fix.** Both calls now schedule the real first refresh as a background
+task (`entry.async_create_background_task`, falling back to
+`hass.async_create_task` on older cores — the exact pattern already
+established for battery-health initialisation in v1.1.7's
+`_async_setup_battery_health`) instead of awaiting it inline. Entities fed
+by these two coordinators show unavailable until the background refresh
+completes, identically to how every other coordinator in this integration
+(main data, power meter, battery, configuration) already behaves — this
+brings the two exceptions in line with the existing pattern rather than
+introducing a new one.
+
+**Trade-off, stated plainly (not hidden).** Both coordinators lose
+`ConfigEntryNotReady` propagation on a failed *first* attempt specifically —
+a failure there now behaves like any later transient failure (retried on
+the coordinator's own schedule) rather than failing the whole entry setup.
+Given the primary device connection has already succeeded by the time
+either factory runs, a first-attempt failure here is far more likely to be
+"this specific read timed out" than "the device is unreachable," so this is
+judged an acceptable, and consistent, trade-off — the same one already
+accepted for battery-health since v1.1.7.
+
+**Adversarial verification.** New `tests/test_setup_critical_path.py`: an
+AST check that walks each function's own body (explicitly *not* descending
+into nested function definitions, since the fix's whole point is that the
+real `await …first_refresh()` call only exists inside the background-task
+wrapper now) looking for a direct, blocking
+`await X.async_config_entry_first_refresh()`. Run against the pre-fix
+files, both tests **fail**, correctly reporting the exact original line
+numbers (1013 in `update_coordinator.py`, 217 in `__init__.py`). Run
+against this release, both **pass**.
+
+**What this release does NOT claim.** The causal link to the v1.3.7
+incident (above) is offered as the most complete account assembled so far,
+not as independently proven beyond the evidence available — no traceback
+from the actual incident was captured (a gap already flagged in the
+2026-08-04 handoff). See `AUDIT_1.3.8.md` §6 for the same caveat stated in
+full, and §9 for the validation this release specifically requires before
+treating either incident as closed.
+
+**Tests: 473 -> 475 passed, 1 skipped**, deterministic across 3 repeated
+runs. No production file changed other than `update_coordinator.py` and
+`__init__.py`.
+
+### v1.3.7 (2026-08-05)
+**Defect F — "Unable to remove unknown job listener" on reload; suspected
+cause of a reload leaving one coordinator dead until a full restart.**
+
+```
+ERROR [homeassistant.core] Unable to remove unknown job listener
+  (<Job onetime listen homeassistant_started
+   _async_register_learning_gates.<locals>._on_started ...>, None)
+```
+
+**Root cause.** `_async_register_learning_gates()` handed the unsub callable
+from `hass.bus.async_listen_once()` directly to `entry.async_on_unload()`.
+`async_listen_once()` already self-unsubscribes the instant its event
+fires — so if the entry unloads *after* the event already fired (the normal
+case for `EVENT_HOMEASSISTANT_STOP`, re-armed on every setup and rarely
+still pending by a later reload), the same unsub runs a second time against
+an already-empty listener slot.
+
+**Why this mattered beyond a log line.** An unhandled exception raised
+during a config entry's unload sequence can abort whatever unload/re-setup
+work for that entry had not yet completed. This is a plausible, concrete
+mechanism for a field incident (2026-08-04 overnight) where one coordinator
+(a battery-attached inverter's configuration/number-entity coordinator)
+stopped polling entirely after a reload attempt and did not resume — while
+every other coordinator on the same entry recovered normally — and only a
+full Home Assistant restart brought it back. Confirmed from the field
+capture: the affected coordinator produced zero `bus_diagnostics` records
+for the full length of a subsequent 9.25 h capture, `t=0` of that capture
+landing within minutes of the reload window; the same coordinator was
+polling normally, at its normal rate, in the capture immediately preceding
+the incident.
+
+**Fix.** `_guarded_once()` tracks whether the wrapped event already fired
+and skips the redundant removal in that case, while still cleanly
+cancelling a listener that never fired. Applied to both the
+`EVENT_HOMEASSISTANT_STARTED` and `EVENT_HOMEASSISTANT_STOP` listeners
+inside `_async_register_learning_gates()` — the only two call sites of this
+pattern in the codebase.
+
+**Adversarial verification.** New `tests/test_learning_gate_unsub.py`:
+- A fake event bus reproducing Home Assistant's real self-unsubscribe-on-fire
+  semantics (a second removal after the event fired raises, matching the
+  field error exactly) proves the OLD pattern reproduces the defect and the
+  NEW guarded pattern does not — both directions checked, not just the fix.
+- A static AST check pins that `_async_register_learning_gates` never again
+  hands `hass.bus.async_listen_once(...)` directly to
+  `entry.async_on_unload(...)` — confirmed to fail against the pre-fix
+  `__init__.py` and pass against this release.
+
+**What this release does NOT claim to fix.** The ~3-minute window of
+elevated Modbus timing instability immediately after Home Assistant starts
+is a separate, by-design characteristic (the learning gate deliberately lets
+polling continue through Home Assistant's own start-up congestion — see
+`AdaptiveModbusController`'s learning-gate docstring — it only prevents that
+congestion from poisoning the adaptive model). This release does not
+shorten or remove that window. The connection to this fix is operational:
+this week's instability forced repeated full restarts (each one re-entering
+that 3-minute window) because reload was not reliable; if this fix holds,
+reload becomes viable again and full restarts — and the congestion window
+that comes with each one — should become rare rather than routine.
+
+**Recommended deployment procedure (per project convention: one change at a
+time, clean install, don't assume recovery):**
+1. Delete `/config/custom_components/huawei_solar` entirely.
+2. Extract v1.3.7 fresh.
+3. Restart Home Assistant once (clean baseline — do not reload-test on top
+   of the outage-recovery state).
+4. **Validation this release specifically requires:** trigger a plain
+   reload of the config entry (not a restart) and confirm (a) the
+   previously-affected coordinator's entities update, and (b) the "unknown
+   job listener" error does not appear in the log. This is the actual test
+   of whether Defect F was the mechanism — a clean boot alone does not
+   exercise the reload path this fix targets.
+
+**Tests: 469 -> 473 passed, 1 skipped**, deterministic across 3 repeated
+runs. No other production file changed.
 
 ### v1.3.6 (2026-08-05)
 **HOTFIX — the shipped v1.3.5 package failed to load. Upgrade immediately by

@@ -1001,6 +1001,7 @@ async def create_optimizer_update_coordinator(
     optimizer_device_infos: dict[int, DeviceInfo],
     update_interval: timedelta | None,
     bus_endpoint: str = "",
+    entry: Any = None,
 ) -> HuaweiSolarOptimizerUpdateCoordinator:
     coordinator = HuaweiSolarOptimizerUpdateCoordinator(
         hass, _LOGGER,
@@ -1010,5 +1011,53 @@ async def create_optimizer_update_coordinator(
         update_interval=update_interval,
         bus_endpoint=bus_endpoint,
     )
-    await coordinator.async_config_entry_first_refresh()
+
+    # v1.3.8 FIX (Defect G): this used to be `await
+    # coordinator.async_config_entry_first_refresh()` -- a full, blocking,
+    # real Modbus read of every optimizer's registers, awaited on the entry
+    # setup critical path, for EVERY inverter that has optimizers, before
+    # `async_setup_entry` could return. On an installation with many
+    # optimizers this is a real contributor to multi-minute setup times (see
+    # AUDIT_1.3.8.md), and it runs again in full on every reload. No other
+    # coordinator in this codebase is awaited like this in setup; entities
+    # simply show unavailable until the coordinator's own first scheduled
+    # refresh completes, exactly as for the main/battery/power-meter/config
+    # coordinators. This brings the optimizer coordinator in line with that
+    # existing pattern instead of being the exception, using the same
+    # background-task idiom already established for battery-health init
+    # (see _async_setup_battery_health).
+    #
+    # Trade-off, stated plainly: this coordinator no longer raises
+    # ConfigEntryNotReady if the optimizer read fails on the very first
+    # attempt. Given the primary device connection has already succeeded by
+    # the time this factory runs, a failure here is far more likely to be
+    # "this specific file read timed out" than "the device is unreachable" --
+    # and the coordinator's normal retry/backoff handles that case the same
+    # way it already handles any later transient failure.
+    async def _first_refresh() -> None:
+        try:
+            await coordinator.async_config_entry_first_refresh()
+        except Exception:  # noqa: BLE001 — background task must not raise
+            _LOGGER.exception(
+                "optimizer_coordinator[%s]: first refresh failed; optimizer "
+                "sensors will report unknown until the next scheduled poll. "
+                "All other entities are unaffected",
+                device.serial_number,
+            )
+
+    try:
+        create_task = getattr(entry, "async_create_background_task", None)
+        if create_task is not None:
+            create_task(
+                hass, _first_refresh(),
+                f"optimizer_coordinator_first_refresh_{device.serial_number}",
+            )
+        else:  # pragma: no cover — older HA cores, or no entry passed
+            hass.async_create_task(_first_refresh())
+    except Exception:  # noqa: BLE001 — never break entry setup over scheduling
+        _LOGGER.exception(
+            "optimizer_coordinator[%s]: could not schedule first refresh",
+            device.serial_number,
+        )
+
     return coordinator

@@ -214,7 +214,55 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
                 if telemetry:
                     sync_coordinator.attach_telemetry(telemetry)
 
-                await sync_coordinator.async_config_entry_first_refresh()
+                # v1.3.8 FIX (Defect G): this used to be `await
+                # sync_coordinator.async_config_entry_first_refresh()` -- a
+                # full, blocking read of every instantaneous power register
+                # across up to two inverters plus meter/battery, awaited
+                # directly on the entry setup critical path. This is the
+                # single largest identified contributor to the 2-3 minute
+                # "waiting for Huawei Solar to start up" window Home
+                # Assistant shows on every boot AND every reload of this
+                # entry (see AUDIT_1.3.8.md) -- and, per the same audit, a
+                # plausible reason a slow/cancelled setup could leave a
+                # later-created coordinator (configuration_update_coordinator,
+                # created after this point in the per-device setup sequence)
+                # never constructed at all.
+                #
+                # Fixed the same way as the optimizer coordinator just above
+                # and battery-health init (_async_setup_battery_health):
+                # schedule the real first refresh as a background task
+                # instead of blocking setup on it. Entities fed by this
+                # coordinator show unavailable until it completes, exactly
+                # like every other coordinator in this integration already
+                # behaves without complaint.
+                async def _sync_first_refresh(
+                    coord: SynchronizedPowerCoordinator = sync_coordinator,
+                ) -> None:
+                    try:
+                        await coord.async_config_entry_first_refresh()
+                    except Exception:  # noqa: BLE001 — background task must not raise
+                        _LOGGER.exception(
+                            "SynchronizedPowerCoordinator: first refresh failed; "
+                            "synchronised power-flow sensors will report unknown "
+                            "until the next scheduled poll. All other entities "
+                            "are unaffected"
+                        )
+
+                try:
+                    create_task = getattr(entry, "async_create_background_task", None)
+                    if create_task is not None:
+                        create_task(
+                            hass, _sync_first_refresh(),
+                            "sync_power_coordinator_first_refresh",
+                        )
+                    else:  # pragma: no cover — older HA cores
+                        hass.async_create_task(_sync_first_refresh())
+                except Exception:  # noqa: BLE001 — never break entry setup
+                    _LOGGER.exception(
+                        "SynchronizedPowerCoordinator: could not schedule "
+                        "first refresh"
+                    )
+
                 _LOGGER.info(
                     "SynchronizedPowerCoordinator enabled: INV1=%s, INV2=%s, "
                     "meter=%s, battery=%s, interval=%ss",
@@ -377,29 +425,56 @@ def _async_register_learning_gates(
             if controller is not None:
                 controller.suppress_indefinitely(reason)
 
+    # v1.3.7 FIX (Defect F / §2.3): hass.bus.async_listen_once() already
+    # self-unsubscribes the INSTANT its event fires -- that is the whole
+    # point of "once". Handing its unsub callable straight to
+    # entry.async_on_unload() means that callable gets invoked a SECOND time
+    # whenever the entry unloads/reloads AFTER the event already fired (the
+    # common case: HA finishes starting long before most reloads, and the
+    # STOP listener below is re-armed fresh on every setup). The second
+    # removal hits an already-empty listener slot and HA logs "Unable to
+    # remove unknown job listener" -- and because this runs inside the
+    # entry's unload sequence, an unhandled exception here can abort
+    # whatever unload/setup work for this entry hadn't completed yet, which
+    # is a plausible mechanism for a partial, one-coordinator-only failure
+    # to restart on reload (see the still-open §2.2 outage investigation).
+    #
+    # Fix: track whether the event already fired and skip the redundant
+    # removal in that case. `entry.async_on_unload` still gets a callable
+    # (so unload during the OTHER case -- entry unloaded before the event
+    # ever fired -- still cleanly cancels the pending listener).
+    def _guarded_once(event_type: str, on_fire) -> None:
+        fired = False
+
+        @callback
+        def _wrapped(event) -> None:
+            nonlocal fired
+            fired = True
+            on_fire(event)
+
+        unsub = hass.bus.async_listen_once(event_type, _wrapped)
+
+        def _remove() -> None:
+            if not fired:
+                unsub()
+
+        entry.async_on_unload(_remove)
+
     if hass.state is not CoreState.running:
         # Set up during HA start-up: hold learning until HA reports ready,
         # then settle from THAT point.
         _suppress("home assistant still starting")
-
-        @callback
-        def _on_started(_event) -> None:
-            _settle("home assistant started")
-
-        entry.async_on_unload(
-            hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _on_started)
+        _guarded_once(
+            EVENT_HOMEASSISTANT_STARTED, lambda _event: _settle("home assistant started")
         )
     else:
         _settle("integration (re)loaded")
 
-    @callback
-    def _on_stop(_event) -> None:
-        # Components unload in order and Modbus can fail while the loop winds
-        # down; those failures are artefacts, not inverter behaviour.
-        _suppress("home assistant stopping")
-
-    entry.async_on_unload(
-        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _on_stop)
+    _guarded_once(
+        EVENT_HOMEASSISTANT_STOP,
+        # Components unload in order and Modbus can fail while the loop
+        # winds down; those failures are artefacts, not inverter behaviour.
+        lambda _event: _suppress("home assistant stopping"),
     )
 
 
@@ -738,6 +813,7 @@ async def _setup_inverter_device_data(
                 optimizers_device_infos,
                 OPTIMIZER_UPDATE_INTERVAL,
                 bus_endpoint=bus_endpoint,
+                entry=entry,
             )
             optimizer_update_coordinator.attach_telemetry(telemetry)
             optimizer_update_coordinator.attach_adaptive(adaptive)
