@@ -375,7 +375,10 @@ class TestSlowTierTTL(unittest.TestCase):
         self.assertGreaterEqual(RC._TIER_BASE_TTL[Tier.SLOW], 900.0)
 
     def test_fast_and_normal_unchanged(self):
-        self.assertEqual(RC._TIER_BASE_TTL[Tier.FAST], 0.0)
+        # v1.3.21 (Defect Y): FAST's base TTL was deliberately changed from
+        # 0.0 to 3.0 -- see register_cache.py's _TIER_BASE_TTL comment for
+        # the full reasoning. NORMAL is genuinely unchanged.
+        self.assertEqual(RC._TIER_BASE_TTL[Tier.FAST], 3.0)
         self.assertEqual(RC._TIER_BASE_TTL[Tier.NORMAL], 30.0)
 
     def test_ttl_override_is_clamped(self):

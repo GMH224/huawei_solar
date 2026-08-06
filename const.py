@@ -305,9 +305,45 @@ WRITE_VERIFY_RETRIES: int = 2
 # ── Optimisation 6: Priority polling during back-off ─────────────────────────
 # Tier names eligible for reduced-frequency reads during back-off.
 # FAST registers are always read; NORMAL may be polled at BACKOFF_NORMAL_DIVISOR
-# (every Nth poll cycle); SLOW/STATIC are deferred entirely until recovery.
+# (every Nth poll cycle); SLOW/STATIC are deferred entirely until recovery --
+# UNLESS a register has gone unread for longer than
+# REGISTER_STARVATION_CEILING_S past its own due-time (Defect Y, v1.3.21).
 BACKOFF_FAST_ALWAYS: bool = True
 BACKOFF_NORMAL_DIVISOR: int = 4   # read NORMAL registers every 4th back-off cycle
+
+# v1.3.21 (Defect Y): SLOW/STATIC deferral during back-off has no ceiling of
+# its own -- a register can, in principle, be deferred for as long as
+# back-off itself persists, which field evidence showed can run past 20
+# minutes under real, sustained contention (one register, BMS temperature,
+# was observed to go completely unread across a 107-minute capture). Every
+# affected register is read-only telemetry -- there is no control-loop
+# consequence to it being briefly stale, so the fix favours guaranteeing an
+# upper bound over preserving tier purity during a rough patch.
+#
+# Measured against `overdue_by()` (time PAST the register's own due-time,
+# not raw age since read -- see register_cache.py for why that distinction
+# matters), not a flat "5 minutes since last read": SLOW's own 900s base TTL
+# already means a SLOW register is >=900s old the instant it first becomes
+# due at all, so thresholding raw age at 300s would trigger on every single
+# SLOW/STATIC register the moment back-off started, defeating tier-based
+# deferral entirely rather than merely bounding it.
+#
+# 300s (5 min) chosen directly per the operator's own stated tolerance: "if
+# they haven't been updated for 5 minutes, they become more important."
+REGISTER_STARVATION_CEILING_S: float = 300.0
+
+# Caps how many starved registers get promoted into a single back-off cycle.
+# Deliberately small: several SLOW/STATIC registers read together in the same
+# original batch tend to share similar timestamps, so they can cross the
+# starvation ceiling within moments of each other. Promoting all of them at
+# once would inject a sudden burst of expensive SLOW/STATIC reads into a
+# cycle that, by definition, is already in back-off because the bus is
+# struggling -- working directly against the reason back-off exists.
+# Promoting the single most-overdue one per cycle instead guarantees forward
+# progress (every cycle drains the worst offender) without a burst, at the
+# cost of the whole starved cohort clearing gradually rather than at once --
+# an explicit, deliberate trade given every affected register is read-only.
+REGISTER_STARVATION_PROMOTIONS_PER_CYCLE: int = 1
 
 # ── Battery Health Index (v1.1.5) ─────────────────────────────────────────────
 # Options-flow keys for the tunable constants (spec §10).  Defaults live in

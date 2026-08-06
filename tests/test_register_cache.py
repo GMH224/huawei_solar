@@ -261,9 +261,19 @@ class TestFilterStale(unittest.TestCase):
         self.assertIn("storage_state_of_capacity",
             c.filter_stale(["storage_state_of_capacity"], DEFAULT_TTL))
 
-    def test_fast_always_stale(self):
+    def test_fast_not_immediately_stale(self):
+        """v1.3.21 (Defect Y): FAST's base TTL changed from 0.0 to 3.0s --
+        a register just updated is no longer considered stale again
+        instantly, only after its (small) TTL actually elapses. See
+        test_fast_stale_after_its_ttl_elapses for the other half."""
         c = RegisterCache()
         c.update({"active_power": _r(1000)})
+        self.assertNotIn("active_power", c.filter_stale(["active_power"], DEFAULT_TTL))
+
+    def test_fast_stale_after_its_ttl_elapses(self):
+        c = RegisterCache()
+        c.update({"active_power": _r(1000)})
+        c._store["active_power"].ts -= 10  # older than FAST's 3.0s base TTL
         self.assertIn("active_power", c.filter_stale(["active_power"], DEFAULT_TTL))
 
     def test_static_not_stale_after_first_read(self):

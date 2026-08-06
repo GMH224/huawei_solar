@@ -72,6 +72,8 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .adaptive_modbus import AdaptiveModbusController
 from .const import (
     BACKOFF_NORMAL_DIVISOR,
+    REGISTER_STARVATION_CEILING_S,
+    REGISTER_STARVATION_PROMOTIONS_PER_CYCLE,
     BATCH_CHUNK_SIZE,
     BATCH_INTER_CHUNK_PAUSE,
     BUSY_MAX_RETRIES,
@@ -853,16 +855,60 @@ class HuaweiSolarUpdateCoordinator(
             await asyncio.sleep(wait)
 
             # Filter stale_names by priority: FAST always, NORMAL every Nth cycle,
-            # SLOW/STATIC deferred until recovery.
+            # SLOW/STATIC deferred until recovery -- UNLESS a register has gone
+            # unread for more than REGISTER_STARVATION_CEILING_S past its own
+            # due-time (Defect Y, v1.3.21): back-off's SLOW/STATIC deferral had
+            # no ceiling of its own, and field evidence showed a register can go
+            # entirely unread for the better part of two hours under sustained
+            # contention. Every affected register is read-only telemetry, so an
+            # upper bound on staleness is worth more here than strict tier
+            # purity during a rough patch. Starved candidates are collected
+            # separately and only the single most-overdue one promoted per
+            # cycle (REGISTER_STARVATION_PROMOTIONS_PER_CYCLE) -- see const.py
+            # for why: several SLOW/STATIC registers read together originally
+            # tend to cross the ceiling within moments of each other, and
+            # promoting all of them at once would inject a burst of expensive
+            # reads into a cycle that is, by definition, already struggling.
             priority_names: list[RegisterName] = []
+            starved: list[tuple[float, RegisterName]] = []
             for n in stale_names:
-                tier = self.cache.tier_of(n)
+                # v1.3.21 (Defect Y): classify_register(n), not
+                # self.cache.tier_of(n) -- tier_of() only knows a tier for a
+                # register that's already been cached at least once. A
+                # register that has NEVER been successfully read (tier_of
+                # returns None) would otherwise fall through to the
+                # SLOW/STATIC starvation path below regardless of its real
+                # tier, meaning a brand-new FAST-tier register could be
+                # capped to one promotion per cycle instead of always being
+                # included. classify_register() is a pure, name-based
+                # classification (see register_cache.py) that works
+                # correctly whether or not the register has ever been cached.
+                tier = classify_register(n)
                 if tier == RegisterTier.FAST:
                     priority_names.append(n)
                 elif tier == RegisterTier.NORMAL:
                     if self._backoff_cycle % BACKOFF_NORMAL_DIVISOR == 0:
                         priority_names.append(n)
-                # SLOW and STATIC are skipped entirely during back-off
+                else:
+                    # SLOW/STATIC: deferred by default, but track how overdue
+                    # each one is so the worst offender(s) can still break
+                    # through the deferral below.
+                    overdue = self.cache.overdue_by(n)
+                    if overdue is None:
+                        starved.append((float("inf"), n))  # never read at all
+                    elif overdue >= REGISTER_STARVATION_CEILING_S:
+                        starved.append((overdue, n))
+            if starved:
+                starved.sort(key=lambda item: item[0], reverse=True)
+                promoted = [n for _, n in starved[:REGISTER_STARVATION_PROMOTIONS_PER_CYCLE]]
+                if promoted:
+                    _LOGGER.info(
+                        "%s: promoting %d starved SLOW/STATIC register(s) "
+                        "past back-off deferral (overdue >= %.0fs): %s",
+                        self.name, len(promoted), REGISTER_STARVATION_CEILING_S,
+                        ", ".join(promoted),
+                    )
+                priority_names.extend(promoted)
             # v1.3.17 FIX (Defect T): the same hazard as step 4 above, one
             # level down -- priority-filtering stale_names down to nothing
             # (no FAST-tier register was stale, and this wasn't an Nth

@@ -1,7 +1,7 @@
 # CLAUDE.md — Huawei Solar Integration
 
 > **Maintained by Claude (Anthropic) on behalf of the community.**
-> Current version: **1.3.20** — see `manifest.json`.
+> Current version: **1.3.21** — see `manifest.json`.
 
 ---
 
@@ -663,6 +663,99 @@ timestamp, eliminating arithmetic errors on the power-flow card.
 - **New:** `tests/test_synchronized_power_coordinator.py` — 22 tests covering
   derived properties (all edge cases), happy path, partial failure, all-fail,
   consecutive failure counter, and telemetry recording.
+
+### v1.3.21 (2026-08-06)
+**Defect Y — a register starvation ceiling, requested directly from a live
+field observation: a 107-minute capture showed battery pack temperature
+registers refreshing at a median of ~9 minutes apart (worst case ~22
+minutes), and `BMS temperature` specifically never successfully read even
+once across the whole capture. Back-off's SLOW/STATIC deferral had no
+ceiling of its own — a register could, in principle, be deferred for as
+long as back-off itself persisted. Requested with an explicit trade
+stated up front: "I rather have lower fast frequency than constant
+errors," and a specific tolerance: "if they haven't been updated for 5
+minutes, they become more important."**
+
+**The two-part fix, deliberately paired as one trade, not two independent
+changes:**
+
+1. **FAST tier's base TTL: `0.0` → `3.0` seconds** (`register_cache.py`).
+   A `0.0` TTL means "always due whenever the coordinator happens to wake
+   up" — in ordinary operation already bounded by the coordinator's own
+   ~30s interval, so `0.0` mostly mattered on the edges: back-off's own
+   accelerated retry cycling, or overlapping refresh triggers, could
+   re-request the exact same FAST-tier register only seconds apart for no
+   benefit. 3.0s is small enough that no dashboard consumer of
+   "instantaneous" power could perceive the added staleness, while
+   eliminating genuinely wasteful back-to-back re-reads — this is the
+   "give" that funds the "take" below without increasing net bus demand.
+
+2. **A starvation ceiling for SLOW/STATIC registers during back-off**
+   (`update_coordinator.py`, `register_cache.py`, `const.py`). New
+   `RegisterCache.overdue_by(name)` returns how many seconds **past its
+   own due-time** a register currently is (`age - effective_ttl`), not raw
+   age since last read — deliberately not the latter: SLOW's own 900s base
+   TTL means a SLOW register is already ≥900s old the instant it first
+   becomes due at all, so thresholding raw age at a 300s ceiling would fire
+   on every SLOW/STATIC register the moment back-off started, defeating
+   tier-based deferral entirely rather than merely bounding it. Confirmed
+   adversarially, not just reasoned about: a naive raw-age check does
+   exceed 300s the instant a SLOW register becomes due; the fixed
+   due-time-relative check does not. New `REGISTER_STARVATION_CEILING_S`
+   (300.0 — the operator's own stated number) and
+   `REGISTER_STARVATION_PROMOTIONS_PER_CYCLE` (1) in `const.py`: once a
+   SLOW/STATIC register crosses the ceiling, it's promoted into the
+   back-off priority set — but only the single most-overdue one per cycle,
+   deliberately capped rather than promoting every starved register at
+   once, since several SLOW/STATIC registers read together originally tend
+   to share similar timestamps and could cross the ceiling within moments
+   of each other; promoting all of them simultaneously would inject a
+   burst of expensive reads into a cycle that is, by definition, already
+   struggling — working directly against the reason back-off exists. A
+   register that has never been successfully read at all (`overdue_by`
+   returns `None`) is treated as maximally starved — this directly closes
+   the `BMS temperature` zero-reads case, without needing to first
+   diagnose why it specifically was never reached.
+
+**Scope, stated explicitly:** this applies only to the coordinators'
+passive polling cadence. It does not touch write-verification paths
+(`services.py`, `number.py`, `switch.py`'s status polling) — those have a
+legitimate, different need to confirm a just-issued command promptly, a
+different concern from how often we passively re-read something nobody
+is actively waiting on.
+
+**A mistake caught and corrected during development, stated plainly.** An
+early draft of the priority filter classified registers via
+`self.cache.tier_of(n)` — which returns `None` for any register that has
+never yet been cached, regardless of its real tier. A brand-new FAST-tier
+register (first poll ever, or a newly added entity) would therefore have
+been misrouted into the starvation-tracked path and capped to one
+promotion per cycle, instead of always being included as FAST tier is
+supposed to guarantee. Caught on review before any test was written
+against it; fixed by switching to `classify_register(n)` — a pure,
+name-based classification already used elsewhere in this exact file for
+the same reason, correct regardless of whether the register has ever been
+cached. Both the bug and the fix are reproduced and adversarially proven
+in the new test suite, not just described.
+
+**Adversarial verification.** New `tests/test_starvation_ceiling.py` (18
+tests): `overdue_by()`'s due-time-relative semantics proven directly,
+including the adversarial comparison against the rejected raw-age
+alternative; the starvation hazard proven real (a SLOW register deferred
+through 50 consecutive back-off cycles is never once included under the
+old logic); the fix proven to promote once — and only once per cycle even
+with many simultaneously-starved candidates — always the most-overdue
+one; the never-cached-register misclassification bug and its fix both
+reproduced directly; no regression to FAST/NORMAL's existing behaviour.
+Static (AST) checks confirm the real source. Run against the pristine
+pre-session baseline, all 4 applicable static checks fail correctly.
+
+**Tests: 615 -> 633 passed, 1 skipped**, deterministic across 3 repeated
+runs (18 new; 2 pre-existing tests in `test_register_cache.py` and
+`test_tier_separation.py` updated for the intentional FAST TTL change —
+one split into two to preserve full coverage rather than just adjusting
+the assertion). `register_cache.py`, `update_coordinator.py`, and
+`const.py` changed among production files.
 
 ### v1.3.20 (2026-08-06)
 **Defect W, X1, X2, X3, X4 — five findings from two sources: one

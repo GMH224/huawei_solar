@@ -69,7 +69,7 @@ _LOGGER = logging.getLogger(__name__)
 # ── Tier definitions ──────────────────────────────────────────────────────────
 
 class RegisterTier(IntEnum):
-    FAST   = auto()   # always polled — real-time power/grid values
+    FAST   = auto()   # near-real-time power/grid values
     NORMAL = auto()   # standard 30 s poll
     SLOW   = auto()   # 5 min base, adaptive up to 30 min
     STATIC = auto()   # read once per session
@@ -96,8 +96,20 @@ class RegisterTier(IntEnum):
 # 900 s is a deliberately moderate first step (~3x fewer expensive exchanges)
 # rather than the 1800 s cap, so the effect can be measured before going
 # further. Tunable via the options flow.
+#
+# v1.3.21 (Defect Y): FAST changed from 0.0 -> 3.0. A 0.0 TTL means "always
+# due whenever the coordinator happens to wake up" -- in ordinary operation
+# this is already bounded by the coordinator's own ~30s update_interval, so
+# 0.0 mostly mattered on the EDGE cases: back-off's own accelerated retry
+# cycling, or multiple overlapping refresh triggers, could re-request the
+# exact same FAST-tier register only seconds apart with nothing gained.
+# 3.0s is small enough that no dashboard consumer of "instantaneous" power
+# could perceive the added staleness, while eliminating genuinely wasteful
+# back-to-back re-reads -- deliberately modest, since this exists specifically
+# to fund Defect Y's starvation ceiling below without increasing net bus
+# demand, not to meaningfully throttle responsiveness on its own.
 _TIER_BASE_TTL: dict[RegisterTier, float] = {
-    RegisterTier.FAST:   0.0,
+    RegisterTier.FAST:   3.0,
     RegisterTier.NORMAL: 30.0,
     RegisterTier.SLOW:   900.0,
     RegisterTier.STATIC: 3600.0,
@@ -539,6 +551,39 @@ class RegisterCache:
         """Return the current effective TTL of a cached register in seconds."""
         entry = self._store.get(name)
         return self._effective_ttl(entry) if entry else 0.0
+
+    def overdue_by(self, name: RegisterName) -> float | None:
+        """How many seconds PAST its own due-time this register currently is.
+
+        v1.3.21 (Defect Y -- starvation ceiling, requested directly: "if
+        they haven't been updated for 5 minutes, they become more
+        important"). Deliberately NOT simply "age since last read" --
+        SLOW tier's own base TTL is already 900s, so a SLOW register is
+        by definition already >=900s old the moment it first becomes due
+        at all; thresholding raw age at a 5-minute ceiling would make
+        every SLOW/STATIC register satisfy that ceiling immediately upon
+        becoming due, defeating tier-based back-off deferral entirely
+        (see Finding on update_coordinator.py's priority filter). This
+        instead measures how far PAST its own due-time (age - effective
+        TTL) the register is -- zero the instant it becomes due, growing
+        only from there. A back-off deferral ceiling checked against THIS
+        value preserves the intended "SLOW/STATIC waits a while during
+        genuine contention" behaviour, while still guaranteeing an
+        absolute limit on how much EXTRA delay on top of that is ever
+        tolerated.
+
+        Returns None if the register has never been successfully read at
+        all -- treat as maximally overdue (never yet observed is a worse
+        state than merely stale), which also directly closes the
+        "register silently never gets read at all" failure mode found in
+        the field (a battery pack's BMS temperature going unread for an
+        entire multi-hour capture).
+        """
+        entry = self._store.get(name)
+        if entry is None:
+            return None
+        age = time.monotonic() - entry.ts
+        return age - self._effective_ttl(entry)
 
     @property
     def size(self) -> int:
