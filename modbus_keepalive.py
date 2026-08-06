@@ -114,12 +114,31 @@ def _get_keepalive_register() -> RegisterName | None:
     table rather than assuming RegisterName supports Enum-style ``[...]``
     member lookup, which it does not for the huawei_solar package this
     integration depends on.
+
+    v1.3.20 FIX (Defect W, independent ICS audit): that fix closed the
+    original failure mode but left a narrower version of the exact same
+    shape in itself -- the import of huawei_solar.registers.REGISTERS below
+    was unguarded, sitting BEFORE the intended graceful "invalid register,
+    skip and log a clear warning" fallback. If that import ever failed
+    (e.g. a future vendor-side module restructuring), the exception would
+    propagate out of this function uncaught, past _probe()'s own try block
+    -- the same shape as the original Defect S bug -- landing back in
+    _run()'s generic outer catch-all instead of the specific, actionable
+    warning this function exists to provide. Now guarded explicitly.
     """
     global _KEEPALIVE_REGISTER_NAME
     if _KEEPALIVE_REGISTER_NAME is not None:
         return _KEEPALIVE_REGISTER_NAME
 
-    from huawei_solar.registers import REGISTERS
+    try:
+        from huawei_solar.registers import REGISTERS
+    except ImportError:
+        _LOGGER.warning(
+            "ModbusKeepAlive: could not import the register table from the "
+            "huawei_solar package -- keep-alive probes will be skipped "
+            "for this session."
+        )
+        return None
 
     if KEEPALIVE_REGISTER not in REGISTERS:
         _LOGGER.warning(

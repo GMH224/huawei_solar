@@ -1766,9 +1766,31 @@ class BatteryHealthEngine:
         available = [(n, v, w) for n, v, w in terms if v is not None]
         r.attributes["contributing_terms"] = [n for n, _, _ in available]
         r.attributes["held_terms"] = held_terms
+        # v1.3.20 FIX (Defect X1, independent ICS audit): `available` being
+        # non-empty does not guarantee total_w > 0 -- a term is included
+        # whenever its VALUE is not None, regardless of its WEIGHT. The
+        # options flow lets weight_capacity/weight_efficiency/weight_balance
+        # each independently go to 0.0 with no cross-field validation
+        # (config_flow.py's vol.Range(min=0.0, max=1.0) on all three), so a
+        # user setting all three to 0 is a real, reachable configuration,
+        # not just a theoretical one. This guard is deliberately in addition
+        # to, not instead of, the exception isolation added in
+        # battery_health_manager.py's _handle_coordinator_update for the
+        # same defect -- the correct fix lives here, at the actual point of
+        # potential division; the isolation there is a second, independent
+        # line of defence should some other unforeseen path reach this
+        # method with a similarly degenerate input.
         if available:
             total_w = sum(w for _, _, w in available)
-            r.bhi = round(sum(v * w for _, v, w in available) / total_w, 1)
+            if total_w > 0:
+                r.bhi = round(sum(v * w for _, v, w in available) / total_w, 1)
+            else:
+                _LOGGER.warning(
+                    "battery_health: all configured weights are 0 -- BHI "
+                    "cannot be computed. Check weight_capacity/"
+                    "weight_efficiency/weight_balance in the integration's "
+                    "options."
+                )
 
         # Stress + forecast (informational, never in BHI)
         r.stress_ratio = self.stress.stress_ratio()

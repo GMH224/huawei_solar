@@ -255,9 +255,21 @@ class ModbusTelemetry:
         every listener registered AFTER the failing one silently stopped
         receiving updates. Each callback is now isolated so one bad
         consumer can never suppress the rest.
+
+        v1.3.20 FOLLOW-UP (Defect X2, independent ICS audit): this still
+        iterated the LIVE self._listeners list, not a snapshot -- the same
+        defect class adaptive_modbus.py's sibling implementation already
+        guards against explicitly (its own BUG-003 fix, from an earlier
+        session, snapshots via list(self._listeners) with a comment
+        explaining exactly why). If any listener removed itself, or another
+        listener, during its own callback, Python's list-mutation-during-
+        iteration semantics could skip whichever listener was next in
+        line. No currently-registered listener does this, so it wasn't
+        actively misbehaving, but it's the same lesson this codebase had
+        already learned once, in the sibling file, not carried over here.
         """
         snap = self.snapshot()
-        for cb_fn in self._listeners:
+        for cb_fn in list(self._listeners):
             try:
                 cb_fn(snap)
             except Exception:  # noqa: BLE001 — one bad listener must not break the others

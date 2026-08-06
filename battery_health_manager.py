@@ -312,7 +312,29 @@ class BatteryHealthManager:
 
         data = coordinator.data or {}
         sample = self._build_sample(data)
-        report = self.engine.update(sample)
+        # v1.3.20 FIX (Defect X1, independent ICS audit): this is the one
+        # call in this entire subsystem that was NOT fault-isolated --
+        # every other callback here (listener dispatch, the entity-level
+        # _on_health_update, async_added_to_hass) already follows this
+        # project's v1.1.7 fault-isolation convention explicitly. If
+        # engine.update() raised (the reachable weights-all-zero case is
+        # now fixed at its root in battery_health.py, but this is a second,
+        # independent line of defence against any other unforeseen input),
+        # this callback would raise every single coordinator tick from then
+        # on, and the engine would never advance again -- a silent,
+        # permanent stall with nothing but a repeating log entry as a
+        # symptom. This method already skips a tick cleanly for a read
+        # failure (above); the same "skip this tick, try again next time"
+        # response applies here.
+        try:
+            report = self.engine.update(sample)
+        except Exception:  # noqa: BLE001 — one bad tick must not stall the engine forever
+            _LOGGER.exception(
+                "battery_health[%s]: engine.update() failed; skipping this "
+                "tick, will retry on the next coordinator update",
+                self.serial_number,
+            )
+            return
 
         # Log-and-watch: does 37758 step after a Huawei SOH calibration?
         rated = _value(data, _RN_RATED_CAPACITY)

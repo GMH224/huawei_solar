@@ -1,7 +1,7 @@
 # CLAUDE.md — Huawei Solar Integration
 
 > **Maintained by Claude (Anthropic) on behalf of the community.**
-> Current version: **1.3.19** — see `manifest.json`.
+> Current version: **1.3.20** — see `manifest.json`.
 
 ---
 
@@ -663,6 +663,113 @@ timestamp, eliminating arithmetic errors on the power-flow card.
 - **New:** `tests/test_synchronized_power_coordinator.py` — 22 tests covering
   derived properties (all edge cases), happy path, partial failure, all-fail,
   consecutive failure counter, and telemetry recording.
+
+### v1.3.20 (2026-08-06)
+**Defect W, X1, X2, X3, X4 — five findings from two sources: one
+independent ICS audit (Defect W), and a full, deliberate fresh-eyes sweep
+of every runtime file that hadn't already been through this session's
+repeated scrutiny (X1-X4), explicitly requested "no rush job" and
+performed without reference to any test or audit file.**
+
+**Defect W — a gap in the Defect S fix itself.** An independent audit of
+v1.3.19 found that `modbus_keepalive.py`'s `_get_keepalive_register()`
+imported `huawei_solar.registers.REGISTERS` with no guard, sitting before
+the graceful "invalid register name, skip and warn" fallback that fix
+(v1.3.16) was built around. If that import ever failed — a future
+vendor-side module restructuring — the exception would propagate out
+uncaught, past `_probe()`'s own try block, landing back in `_run()`'s
+generic catch-all instead of the specific, actionable warning intended.
+Same shape as the original Defect S bug, narrower, and in the fix that
+closed it. Now wrapped in `try/except ImportError`.
+
+**Defect X1 — battery health engine reachable division-by-zero, with no
+fault isolation on the one call that mattered most.** The options flow
+lets `weight_capacity`/`weight_efficiency`/`weight_balance` each
+independently reach `0.0` with no cross-field validation — a real,
+UI-reachable configuration, not theoretical. If all three land at zero,
+`battery_health.py`'s composite-score division (`... / total_w`) raises.
+Worse: the call site, `battery_health_manager.py`'s
+`_handle_coordinator_update`, was the *one* callback in that entire
+subsystem not wrapped per this project's own established v1.1.7
+fault-isolation convention — every other callback there already is. An
+unguarded raise here would repeat on every single future coordinator tick,
+permanently stalling the engine with nothing but a repeating log entry as
+a symptom. Fixed at the root (`battery_health.py` now guards `total_w > 0`
+before dividing, logging a clear warning and leaving `bhi` unset instead
+of raising) *and* with a second, independent line of defence
+(`battery_health_manager.py` now wraps `engine.update()` in the same
+fault-isolation pattern already used everywhere else in this file) — the
+correct fix lives at the actual point of division; the isolation guards
+against any other unforeseen input reaching the same method.
+
+**Defect X2 — a gap in a different fix from earlier this same release
+cycle.** `modbus_telemetry.py`'s listener dispatch (fixed for exception
+isolation as Finding 6/Defect V, v1.3.19) iterated the *live*
+`self._listeners` list rather than a snapshot. `adaptive_modbus.py`'s
+sibling implementation already guards against exactly this — its own
+historical `BUG-003` fix, snapshotting via `list(self._listeners)` with a
+comment explaining why — a lesson this codebase had already learned once
+and didn't carry over when the telemetry file was touched. If a listener
+removed itself (or another listener) during its own callback, Python's
+list-mutation-during-iteration semantics could skip whichever listener was
+next in line. No currently-registered listener does this, so it wasn't
+actively misbehaving, but it's the same defect shape, confirmed
+adversarially: reproduced directly, the old pattern really does skip a
+listener removed mid-iteration; the new one doesn't.
+
+**Defect X3 — a real substring collision in the night-mode register
+lookup.** `night_mode.py`'s `_get_value()` matched register names by
+substring (`key_substr in str(rname).lower()`) rather than exact lookup.
+Checked against the real register table: `"input_power"` is itself a
+substring of `total_dc_input_power`, `sdongle_total_input_power`, and
+`smartlogger_input_power`; `"active_power"` is a substring of **61**
+different real register names — including `day_active_power_peak`, which
+this same coordinator almost certainly also polls. Depending on dict
+iteration order, the search could silently return an unrelated register's
+value, feeding the day/night threshold logic a number that wasn't what it
+thought it was. Fixed by switching to exact dict lookups against the real
+`RegisterName` constants (`rn.INPUT_POWER`, `rn.TOTAL_DC_INPUT_POWER`,
+`rn.ACTIVE_POWER`, `rn.DEVICE_STATUS`) — this eliminates the collision
+class entirely rather than narrowing it.
+
+**Defect X4 — Home Assistant's built-in diagnostics download leaked
+identifying data this project already knew how to avoid.** `diagnostics.py`
+(distinct from the opt-in `bus_diagnostics.py` capture) redacted only
+`CONF_PASSWORD`. `bus_diagnostics.py` has an entire documented history —
+including a past incident — establishing "no identifying data, serial
+numbers replaced by a stable salted pseudonym" as a hard design constraint
+for this project; that discipline never made it into the file that
+actually gets shared with the outside world, since HA diagnostics
+downloads are routinely attached to public GitHub issues. Fixed: `TO_REDACT`
+now also covers `CONF_HOST` and `CONF_USERNAME`; a new
+`_redact_serial_number()` reuses `bus_diagnostics.py`'s existing pseudonym
+scheme (so two shared captures can still be compared without exposing the
+real number); the non-inverter device branch's explicit raw
+`serial_number` field is now redacted; and a new
+`_redact_coordinator_data()` redacts any register whose name indicates it
+carries a serial number across every coordinator's raw `.data` dump (main,
+power meter, battery, config) — the register data was the actual leak in
+most cases, not just the one explicit field. Optimizer data was checked
+directly and deliberately left alone: it's keyed by numeric ID rather than
+register name and carries no serial-like field, so the redaction helper's
+register-name matching doesn't apply to it.
+
+**Adversarial verification.** New `tests/test_audit_v4_findings.py` (22
+tests) covering all five defects: behavioural reproductions for Defects
+X1 and X2 proving the old pattern genuinely fails (a bad tick really does
+stall the engine forever; a listener removed mid-iteration really is
+skipped) and the new pattern doesn't, plus a no-regression check that
+normal operation is unaffected; a behavioural reproduction for Defect X3
+showing the old substring search really can grab `day_active_power_peak`
+instead of `active_power` when both are present, and the new exact lookup
+can't; static (AST/source) checks for all five confirming the real code
+contains each fix. Run against the pristine pre-session baseline, all 9
+applicable static checks fail correctly.
+
+**Tests: 592 -> 614 passed, 1 skipped**, deterministic across 3 repeated
+runs. `modbus_keepalive.py`, `battery_health.py`, `battery_health_manager.py`,
+`modbus_telemetry.py`, `night_mode.py`, and `diagnostics.py` changed among
+production files.
 
 ### v1.3.19 (2026-08-05)
 **Defect V — the full remaining backlog from two audits closed in one

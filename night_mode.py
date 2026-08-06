@@ -34,6 +34,7 @@ from enum import Enum, auto
 from typing import Any
 
 from huawei_solar import RegisterName
+from huawei_solar import register_names as rn
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -118,7 +119,7 @@ class NightModeDetector:
             return
 
         # ── Check device status first (instant transition) ────────────────
-        status_val = self._get_value(result, "device_status")
+        status_val = self._get_value(result, rn.DEVICE_STATUS)
         if status_val is not None:
             status_str = str(status_val).lower()
             if any(sub in status_str for sub in _NIGHT_STATUS_SUBSTRINGS):
@@ -175,26 +176,42 @@ class NightModeDetector:
         )
         self._on_mode_change(new_mode)
 
-    def _get_value(self, result: dict, key_substr: str) -> Any:
-        """Find a result value by substring match on the register name."""
-        for rname, res in result.items():
-            if key_substr in str(rname).lower():
-                try:
-                    return res.value
-                except Exception:
-                    return res
-        return None
+    def _get_value(self, result: dict, register_name: RegisterName) -> Any:
+        """Look up a value by exact register name.
+
+        v1.3.20 FIX (Defect X3, independent ICS audit): this used to be a
+        substring match against stringified register names
+        (`key_substr in str(rname).lower()`). Checked against the real
+        register table: "input_power" is itself a substring of
+        total_dc_input_power, sdongle_total_input_power, and
+        smartlogger_input_power; "active_power" is a substring of 61
+        different real register names, including day_active_power_peak --
+        which this same coordinator almost certainly also polls. Depending
+        on dict iteration order (which depends on how the coordinator
+        assembled this particular result), the substring search could
+        silently return an unrelated register's value instead of the one
+        actually intended, feeding the day/night threshold logic a number
+        that isn't what it thinks it is. An exact dict lookup against the
+        real RegisterName constants cannot have this class of collision.
+        """
+        res = result.get(register_name)
+        if res is None:
+            return None
+        try:
+            return res.value
+        except Exception:
+            return res
 
     def _get_power(self, result: dict) -> float | None:
         """Extract the best available PV power reading from the result."""
         # Preference order: INPUT_POWER > TOTAL_DC_INPUT_POWER > ACTIVE_POWER
-        for candidate in ("input_power", "total_dc_input_power", "active_power"):
+        for candidate in (rn.INPUT_POWER, rn.TOTAL_DC_INPUT_POWER, rn.ACTIVE_POWER):
             val = self._get_value(result, candidate)
             if val is not None:
                 try:
                     f = float(val)
                     # ACTIVE_POWER can be negative (import from grid) — ignore
-                    if candidate == "active_power" and f < 0:
+                    if candidate == rn.ACTIVE_POWER and f < 0:
                         continue
                     return f
                 except (TypeError, ValueError):
