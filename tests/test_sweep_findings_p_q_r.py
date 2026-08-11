@@ -332,6 +332,25 @@ class TestCacheInvalidationStaticChecks(unittest.TestCase):
         assert helper is not None, "_set_and_invalidate() helper not found in services.py"
         helper_start, helper_end = helper.lineno, (helper.end_lineno or helper.lineno)
 
+        # v2.0.0b (MOD-19, external ICS audit): _set_and_invalidate_sequence()
+        # is a second, equally legitimate place raw dd.device.set() is
+        # called -- the sequence-aware counterpart to _set_and_invalidate()
+        # for multi-write logical commands (see its own docstring). Its
+        # inner _write() closure performs the same write+invalidate
+        # pairing, just under one guard hold instead of one per call.
+        seq_helper = next(
+            (
+                n for n in ast.walk(tree)
+                if isinstance(n, ast.AsyncFunctionDef)
+                and n.name == "_set_and_invalidate_sequence"
+            ),
+            None,
+        )
+        assert seq_helper is not None, (
+            "_set_and_invalidate_sequence() helper not found in services.py"
+        )
+        seq_start, seq_end = seq_helper.lineno, (seq_helper.end_lineno or seq_helper.lineno)
+
         violations = []
         for node in ast.walk(tree):
             if (
@@ -340,12 +359,15 @@ class TestCacheInvalidationStaticChecks(unittest.TestCase):
                 and isinstance(node.value, ast.Attribute)
                 and node.value.attr == "device"
             ):
-                if not (helper_start <= node.lineno <= helper_end):
+                if not (
+                    (helper_start <= node.lineno <= helper_end)
+                    or (seq_start <= node.lineno <= seq_end)
+                ):
                     violations.append(node.lineno)
         assert not violations, (
-            f"raw dd.device.set(...) called outside _set_and_invalidate() "
-            f"at line(s) {violations} -- this reintroduces Defect Q for "
-            "that call site."
+            f"raw dd.device.set(...) called outside _set_and_invalidate()/"
+            f"_set_and_invalidate_sequence() at line(s) {violations} -- this "
+            "reintroduces Defect Q for that call site."
         )
 
     def test_services_helper_uses_invalidate_cache(self):

@@ -259,6 +259,16 @@ def _fresh_guard(endpoint="e"):
     g.diagnostics = None
     g.total_wait_ms = 0.0
     g.requests_waited = 0
+    # v2.0.0a (F18) / v2.0.0b (AR-4, external ICS audit): object.__new__()
+    # bypasses __init__ entirely, so these need setting explicitly,
+    # matching __init__'s own defaults -- the same class of gap hit
+    # repeatedly this session for every object.__new__()-based test
+    # fixture, including this file's own separate copy of _fresh_guard().
+    g._priority_queue_depth = 0
+    g.priority_shed_count = 0
+    g._priority_window_start = time.monotonic()
+    g._priority_busy_s = 0.0
+    g.priority_budget_exceeded_count = 0
     return g
 
 

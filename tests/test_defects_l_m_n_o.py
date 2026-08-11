@@ -304,6 +304,41 @@ class TestOptimizerDiscoveryBound(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class TestOptimizerDiscoveryGuardRouted(unittest.TestCase):
+    """v2.0.0b (MOD-07, external ICS audit -- confirmed): being time-
+    bounded (Defect N, above) protected setup from hanging, but the
+    discovery call itself bypassed ModbusGuard entirely -- it could
+    physically collide with any other in-flight or concurrently issued
+    transaction on the same endpoint."""
+
+    def test_discovery_call_is_inside_a_guard_request_block(self):
+        source = _INIT_SRC.read_text()
+        idx = source.find("device.get_optimizer_system_information_data()")
+        assert idx != -1
+        # The guard acquisition must appear BEFORE the call, within a
+        # reasonably tight window (the same try block), not merely
+        # somewhere earlier in the file.
+        window = source[max(0, idx - 500): idx]
+        assert "ModbusGuard.get_or_create(bus_endpoint).request(" in window, (
+            "optimizer discovery is no longer routed through ModbusGuard "
+            "-- MOD-07 has regressed"
+        )
+
+    def test_uses_get_or_create_not_acquire_endpoint(self):
+        """A subtle but important distinction: this call site must use
+        get_or_create() (a plain accessor), not acquire_endpoint() (which
+        would take a SECOND, redundant reference-count on an endpoint
+        this entry's own async_setup_entry already acquired once,
+        earlier -- see F04's own reference-counting fix). Using
+        acquire_endpoint() here without a matching release would leak a
+        reference."""
+        source = _INIT_SRC.read_text()
+        idx = source.find("device.get_optimizer_system_information_data()")
+        window = source[max(0, idx - 500): idx]
+        assert "get_or_create(bus_endpoint)" in window
+        assert "acquire_endpoint(bus_endpoint)" not in window
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Defect O — MAX_STATUS_CHANGE_TIME_SECONDS mismatch
 # ═══════════════════════════════════════════════════════════════════════

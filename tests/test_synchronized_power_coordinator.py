@@ -96,6 +96,26 @@ sys.modules["huawei_solar.device.base"] = _hs_dev_base
 _const_stub = types.ModuleType("huawei_solar_const_stub")
 _const_stub.SYNC_POWER_UPDATE_INTERVAL = __import__("datetime").timedelta(seconds=10)
 _const_stub.UPDATE_TIMEOUT = __import__("datetime").timedelta(seconds=35)
+# v2.0.0 (V2_ARCHITECTURE_DESIGN.md §8.2)
+_const_stub.SYNC_POWER_CACHE_ALIGNMENT_TOLERANCE_S = 3.0
+# v2.0.0b (MOD-02/MOD-04, external ICS audit)
+_const_stub.SYNC_POWER_POLL_DEADLINE = __import__("datetime").timedelta(seconds=18)
+
+# v2.0.0: stub .register_cache -- synchronized_power_coordinator.py now
+# imports Quality from it for the cache-shortcut check
+# (_try_cache_shortcut). A minimal, dependency-free stand-in, matching how
+# .modbus_guard/.modbus_telemetry are already faked below rather than
+# loading the real modules for this isolated test.
+_register_cache_stub = types.ModuleType("huawei_solar_register_cache_stub")
+
+
+class _FakeQuality:
+    GOOD = "good"
+    UNCERTAIN = "uncertain"
+    BAD = "bad"
+
+
+_register_cache_stub.Quality = _FakeQuality
 
 # Stub .modbus_guard
 _guard_stub = types.ModuleType("huawei_solar_guard_stub")
@@ -110,7 +130,7 @@ class _FakeGuard:
     def get_or_create(serial):
         return _FakeGuard(serial)
 
-    def request(self):
+    def request(self, *, label: str = "", priority: bool = False):
         return _FakeGuard._Ctx(self)
 
     class _Ctx:
@@ -154,6 +174,7 @@ with patch.dict(
             "huawei_solar.const": _const_stub,
             "huawei_solar.modbus_guard": _guard_stub,
             "huawei_solar.modbus_telemetry": _telemetry_stub,
+            "huawei_solar.register_cache": _register_cache_stub,
         },
     ):
         try:
@@ -314,11 +335,31 @@ def _make_coordinator(inv1=None, inv2=None, has_meter=True, has_battery=True):
     coord._has_battery = has_battery
     coord._update_timeout = __import__("datetime").timedelta(seconds=35)
     coord._telemetry = None
+    # Dedicated SyncPower-specific counters -- _make_coordinator() bypasses
+    # __init__ entirely, so these need setting explicitly, matching
+    # __init__'s own defaults -- the same class of gap hit repeatedly this
+    # session for every object.__new__()-based test fixture.
+    coord.shortcut_hits = 0
+    coord.shortcut_misses = 0
+    coord.fallback_cache_hits = 0
+    coord.fallback_physical_reads = 0
     coord._primary_guard = _FakeGuard.get_or_create("SN-INV1")
     coord._secondary_guard = (
         _FakeGuard.get_or_create(inv2.serial_number) if inv2 else None
     )
     coord._consecutive_failures = 0
+    # v2.0.0 (V2_ARCHITECTURE_DESIGN.md §8.2): __new__ bypasses __init__
+    # entirely, so these need setting explicitly, matching the real
+    # constructor's own defaults. None for all four means
+    # _try_cache_shortcut() always returns None (no cache references to
+    # check), correctly falling through to the dedicated read every
+    # existing test here already exercises -- these tests predate §8.2 and
+    # aren't testing the shortcut itself; see TestCacheShortcut below for
+    # that.
+    coord._inv1_cache = None
+    coord._inv2_cache = None
+    coord._meter_cache = None
+    coord._battery_cache = None
     return coord
 
 
@@ -359,6 +400,47 @@ class TestSynchronizedPowerCoordinatorHappyPath:
         await coord._async_update_data()
 
         assert coord._consecutive_failures == 0
+
+    @pytest.mark.asyncio
+    async def test_temporally_uncertain_flag_defaults_false_when_well_aligned(self):
+        """v2.0.0a (F09/F20, external ICS audit -- confirmed): a healthy,
+        fast dedicated read must not be flagged uncertain."""
+        coord = _make_coordinator()
+        result = await coord._async_update_data()
+        assert result.is_temporally_uncertain is False
+
+    @pytest.mark.asyncio
+    async def test_temporally_uncertain_flag_set_when_span_exceeds_tolerance(self):
+        """The actual fix: a dedicated read whose four sub-reads end up
+        spread further apart than the alignment tolerance (e.g. under
+        heavy bus contention, interleaving badly with other coordinators)
+        must be explicitly flagged, not silently returned as if it were a
+        clean, well-aligned sample."""
+        inv1 = _make_device("SN1", pv_power=4000)
+        coord = _make_coordinator(inv1=inv1, has_meter=True, has_battery=True)
+
+        # Shrink the tolerance for a fast test rather than sleeping for
+        # the real multi-second default.
+        with patch.object(sync_mod, "SYNC_POWER_CACHE_ALIGNMENT_TOLERANCE_S", 0.01):
+            original_batch_update = inv1.batch_update
+
+            call_count = 0
+
+            async def _delayed_batch_update(registers):
+                nonlocal call_count
+                call_count += 1
+                if call_count > 1:
+                    # Force a real gap after the first read, comfortably
+                    # past the shrunk 10ms tolerance.
+                    await asyncio.sleep(0.05)
+                return await original_batch_update(registers)
+
+            inv1.batch_update = _delayed_batch_update
+            result = await coord._async_update_data()
+
+        assert result.is_temporally_uncertain is True
+        assert result.sample_span_ms is not None
+        assert result.sample_span_ms > 10.0
 
 
 class TestSynchronizedPowerCoordinatorPartialFailure:
@@ -462,3 +544,278 @@ class TestTelemetryRecording:
 
         telemetry.record_failure.assert_called_once()
         telemetry.record_timeout.assert_not_called()
+
+
+# ── v2.0.0 (V2_ARCHITECTURE_DESIGN.md §8.2): cache-shortcut behaviour ────────
+
+rn = sync_mod.rn  # not directly imported at test-module level; sync_mod has it
+_Q = sync_mod.Quality  # the stubbed Quality (GOOD/UNCERTAIN/BAD as strings)
+
+
+class _Res:
+    def __init__(self, v):
+        self.value = v
+
+
+class _FakeCache:
+    """Minimal stand-in for RegisterCache.quality_of()/get(), keyed by
+    register name -> (quality, reason, age, value)."""
+
+    def __init__(self):
+        self._entries = {}
+
+    def set(self, name, *, quality, age, value, reason=None):
+        self._entries[name] = (quality, reason, age, value)
+
+    def quality_of(self, name):
+        if name not in self._entries:
+            return "bad", "never_read", None
+        quality, reason, age, _value = self._entries[name]
+        return quality, reason, age
+
+    def get(self, name):
+        if name not in self._entries:
+            return None
+        _q, _r, _a, value = self._entries[name]
+        if value is None:
+            return None
+        return _Res(value)
+
+
+def _make_coordinator_with_caches(
+    inv1_cache=None, inv2_cache=None, meter_cache=None, battery_cache=None,
+    inv2=None, has_meter=True, has_battery=True,
+):
+    coord = _make_coordinator(inv2=inv2, has_meter=has_meter, has_battery=has_battery)
+    coord._inv1_cache = inv1_cache
+    coord._inv2_cache = inv2_cache
+    coord._meter_cache = meter_cache
+    coord._battery_cache = battery_cache
+    return coord
+
+
+class TestCacheShortcut:
+    """_try_cache_shortcut() -- the actual v2.0.0 addition. Every OTHER test
+    in this file already confirms the shortcut correctly does NOT engage
+    (all caches default to None); these specifically exercise it engaging,
+    and the boundary conditions that must prevent it from engaging."""
+
+    def test_engages_when_all_good_and_aligned(self):
+        cache = _FakeCache()
+        cache.set(rn.INPUT_POWER, quality=_Q.GOOD, age=1.0, value=3000)
+        coord = _make_coordinator_with_caches(
+            inv1_cache=cache, has_meter=False, has_battery=False,
+        )
+        result = coord._try_cache_shortcut()
+        assert result is not None, "shortcut must engage: single GOOD, aligned register"
+        assert result.inv1_pv_power == 3000
+        assert result.sample_span_ms == 0.0
+
+    def test_does_not_engage_when_a_cache_reference_is_missing(self):
+        coord = _make_coordinator_with_caches(
+            inv1_cache=None, has_meter=False, has_battery=False,
+        )
+        assert coord._try_cache_shortcut() is None
+
+    def test_does_not_engage_when_quality_is_uncertain(self):
+        cache = _FakeCache()
+        cache.set(rn.INPUT_POWER, quality=_Q.UNCERTAIN, age=1.0, value=3000)
+        coord = _make_coordinator_with_caches(
+            inv1_cache=cache, has_meter=False, has_battery=False,
+        )
+        assert coord._try_cache_shortcut() is None, (
+            "UNCERTAIN is servable to a normal entity, but not trustworthy "
+            "enough for the synchronized-read shortcut to substitute for a "
+            "real read"
+        )
+
+    def test_does_not_engage_when_age_spread_exceeds_tolerance(self):
+        meter_cache = _FakeCache()
+        meter_cache.set(rn.POWER_METER_ACTIVE_POWER, quality=_Q.GOOD, age=0.5, value=500)
+        inv1_cache = _FakeCache()
+        inv1_cache.set(rn.INPUT_POWER, quality=_Q.GOOD, age=10.0, value=3000)  # >3s apart
+        coord = _make_coordinator_with_caches(
+            inv1_cache=inv1_cache, meter_cache=meter_cache, has_battery=False,
+        )
+        assert coord._try_cache_shortcut() is None, (
+            "a 9.5s age-spread must exceed the 3s tolerance and refuse the shortcut"
+        )
+
+    def test_engages_at_exactly_the_boundary_of_tolerance(self):
+        meter_cache = _FakeCache()
+        meter_cache.set(rn.POWER_METER_ACTIVE_POWER, quality=_Q.GOOD, age=1.0, value=500)
+        inv1_cache = _FakeCache()
+        inv1_cache.set(rn.INPUT_POWER, quality=_Q.GOOD, age=4.0, value=3000)  # exactly 3s
+        coord = _make_coordinator_with_caches(
+            inv1_cache=inv1_cache, meter_cache=meter_cache, has_battery=False,
+        )
+        result = coord._try_cache_shortcut()
+        assert result is not None, "exactly at the tolerance boundary must still engage"
+
+    def test_reports_honest_measured_span_not_zero(self):
+        meter_cache = _FakeCache()
+        meter_cache.set(rn.POWER_METER_ACTIVE_POWER, quality=_Q.GOOD, age=0.5, value=500)
+        inv1_cache = _FakeCache()
+        inv1_cache.set(rn.INPUT_POWER, quality=_Q.GOOD, age=2.0, value=3000)
+        coord = _make_coordinator_with_caches(
+            inv1_cache=inv1_cache, meter_cache=meter_cache, has_battery=False,
+        )
+        result = coord._try_cache_shortcut()
+        assert result is not None
+        assert round(result.sample_span_ms - 1500.0, 1) == 0
+
+    def test_all_four_registers_checked_when_all_applicable(self):
+        inv1_cache = _FakeCache()
+        inv1_cache.set(rn.INPUT_POWER, quality=_Q.GOOD, age=1.0, value=3000)
+        inv2_cache = _FakeCache()
+        inv2_cache.set(rn.INPUT_POWER, quality=_Q.GOOD, age=1.2, value=1500)
+        meter_cache = _FakeCache()
+        meter_cache.set(rn.POWER_METER_ACTIVE_POWER, quality=_Q.GOOD, age=0.8, value=200)
+        battery_cache = _FakeCache()
+        battery_cache.set(rn.STORAGE_CHARGE_DISCHARGE_POWER, quality=_Q.GOOD, age=1.5, value=-400)
+
+        inv2 = MagicMock()
+        inv2.serial_number = "SN2"
+        coord = _make_coordinator_with_caches(
+            inv1_cache=inv1_cache, inv2_cache=inv2_cache,
+            meter_cache=meter_cache, battery_cache=battery_cache,
+            inv2=inv2, has_meter=True, has_battery=True,
+        )
+        result = coord._try_cache_shortcut()
+        assert result is not None
+        assert result.inv1_pv_power == 3000
+        assert result.inv2_pv_power == 1500
+        assert result.grid_power == 200
+        assert result.battery_power == -400
+
+    def test_one_bad_register_among_several_prevents_the_shortcut(self):
+        inv1_cache = _FakeCache()
+        inv1_cache.set(rn.INPUT_POWER, quality=_Q.GOOD, age=1.0, value=3000)
+        meter_cache = _FakeCache()
+        meter_cache.set(rn.POWER_METER_ACTIVE_POWER, quality=_Q.BAD, age=None, value=None)
+        coord = _make_coordinator_with_caches(
+            inv1_cache=inv1_cache, meter_cache=meter_cache, has_battery=False,
+        )
+        assert coord._try_cache_shortcut() is None
+
+    @pytest.mark.asyncio
+    async def test_async_update_data_uses_the_shortcut_and_skips_the_dedicated_read(self):
+        """End-to-end: when the shortcut is available, _async_update_data()
+        must never touch the device/guard at all."""
+        inv1_cache = _FakeCache()
+        inv1_cache.set(rn.INPUT_POWER, quality=_Q.GOOD, age=1.0, value=3000)
+        inv1 = _make_device("SN1", pv_power=99999)  # would be WRONG if the dedicated read ran
+        inv1.batch_update = AsyncMock(side_effect=AssertionError(
+            "dedicated read must not run when the cache shortcut is available"
+        ))
+        coord = _make_coordinator_with_caches(
+            inv1_cache=inv1_cache, has_meter=False, has_battery=False,
+        )
+        coord._inv1 = inv1
+        result = await coord._async_update_data()
+        assert result.inv1_pv_power == 3000
+
+    @pytest.mark.asyncio
+    async def test_shortcut_does_not_touch_consecutive_failures(self):
+        """F13, external ICS audit -- confirmed: resetting
+        _consecutive_failures and logging 'communication restored' on a
+        shortcut hit was wrong -- no I/O occurred, so nothing was actually
+        verified. The counter must be left exactly as it was."""
+        inv1_cache = _FakeCache()
+        inv1_cache.set(rn.INPUT_POWER, quality=_Q.GOOD, age=1.0, value=3000)
+        coord = _make_coordinator_with_caches(
+            inv1_cache=inv1_cache, has_meter=False, has_battery=False,
+        )
+        coord._consecutive_failures = 3  # simulate a prior run of genuine failures
+        result = await coord._async_update_data()
+        assert result.inv1_pv_power == 3000
+        assert coord._consecutive_failures == 3, (
+            "a cache-shortcut hit must not silently reset or otherwise "
+            "touch the failure counter -- it performed no I/O and learned "
+            "nothing about whether communication is actually healthy"
+        )
+
+
+# ── v2.0.0b: AR-9 -- cache-hit recording (external ICS audit) ───────────────
+
+class TestAR9CacheHitRecording:
+    """Confirmed: the shortcut's own hit rate was always the most direct
+    evidence of whether the cache-first design actually eliminates
+    physical traffic, but nothing recorded when it fired -- for either
+    the aligned shortcut (§8.2) or the MOD-01 per-value fallback."""
+
+    def test_full_shortcut_hit_records_one_hit_per_needed_register(self):
+        cache = _FakeCache()
+        cache.set(rn.INPUT_POWER, quality=_Q.GOOD, age=1.0, value=3000)
+        coord = _make_coordinator_with_caches(
+            inv1_cache=cache, has_meter=False, has_battery=False,
+        )
+        coord._telemetry = MagicMock()
+        result = coord._try_cache_shortcut()
+        assert result is not None
+        coord._telemetry.record_cache_hits.assert_called_once_with(1)
+
+    def test_full_shortcut_hit_records_all_four_when_all_present(self):
+        inv1_cache = _FakeCache()
+        inv1_cache.set(rn.INPUT_POWER, quality=_Q.GOOD, age=1.0, value=3000)
+        inv2_cache = _FakeCache()
+        inv2_cache.set(rn.INPUT_POWER, quality=_Q.GOOD, age=1.0, value=1500)
+        meter_cache = _FakeCache()
+        meter_cache.set(rn.POWER_METER_ACTIVE_POWER, quality=_Q.GOOD, age=1.0, value=200)
+        battery_cache = _FakeCache()
+        battery_cache.set(rn.STORAGE_CHARGE_DISCHARGE_POWER, quality=_Q.GOOD, age=1.0, value=-400)
+        inv2 = MagicMock()
+        inv2.serial_number = "SN2"
+        coord = _make_coordinator_with_caches(
+            inv1_cache=inv1_cache, inv2_cache=inv2_cache,
+            meter_cache=meter_cache, battery_cache=battery_cache,
+            inv2=inv2, has_meter=True, has_battery=True,
+        )
+        coord._telemetry = MagicMock()
+        result = coord._try_cache_shortcut()
+        assert result is not None
+        coord._telemetry.record_cache_hits.assert_called_once_with(4)
+
+    def test_shortcut_miss_does_not_record_a_hit(self):
+        """No cache reference at all -- the shortcut can't engage, so
+        nothing should be recorded as a hit."""
+        coord = _make_coordinator_with_caches(
+            inv1_cache=None, has_meter=False, has_battery=False,
+        )
+        coord._telemetry = MagicMock()
+        result = coord._try_cache_shortcut()
+        assert result is None
+        coord._telemetry.record_cache_hits.assert_not_called()
+
+    def test_telemetry_none_does_not_raise(self):
+        """coord._telemetry defaults to None (no telemetry attached) --
+        the recording call must be conditional, not assume a real
+        telemetry object always exists."""
+        cache = _FakeCache()
+        cache.set(rn.INPUT_POWER, quality=_Q.GOOD, age=1.0, value=3000)
+        coord = _make_coordinator_with_caches(
+            inv1_cache=cache, has_meter=False, has_battery=False,
+        )
+        assert coord._telemetry is None
+        result = coord._try_cache_shortcut()  # must not raise
+        assert result is not None
+
+    @pytest.mark.asyncio
+    async def test_mod01_fallback_cache_hit_records_one_hit(self):
+        """The other half of AR-9: a MOD-01 per-value cache hit inside the
+        dedicated-read fallback (when the full aligned shortcut misses,
+        but this specific value is still Quality.GOOD) must also be
+        recorded."""
+        inv1_cache = _FakeCache()
+        inv1_cache.set(rn.INPUT_POWER, quality=_Q.GOOD, age=1.0, value=3000)
+        coord = _make_coordinator_with_caches(
+            inv1_cache=inv1_cache, has_meter=False, has_battery=False,
+        )
+        coord._telemetry = MagicMock()
+        # Force the full shortcut to miss (age exceeds the alignment
+        # tolerance) so the dedicated-read fallback's own MOD-01 check
+        # is what actually serves this value.
+        with patch.object(sync_mod, "SYNC_POWER_CACHE_ALIGNMENT_TOLERANCE_S", -1.0):
+            result = await coord._async_update_data()
+        assert result.inv1_pv_power == 3000
+        coord._telemetry.record_cache_hit.assert_called_once_with()

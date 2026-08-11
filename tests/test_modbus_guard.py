@@ -55,6 +55,19 @@ def _fresh_guard(endpoint: str = "192.168.1.1:502") -> ModbusGuard:
     g._gap_contributions = {}      # v1.3.15 (Defect P) multi-device aggregation
     g._depth_contributions = {}
     g.shed_count = 0                    # v1.2.3 diagnostic counter
+    # v2.0.0a (F18, external ICS audit): _fresh_guard() bypasses __init__
+    # entirely, so these need setting explicitly, matching __init__'s own
+    # defaults -- same class of gap as every other object.__new__()-based
+    # test fixture hit earlier in this remediation pass.
+    g._priority_queue_depth = 0
+    g.priority_shed_count = 0
+    # v2.0.0b (AR-4, external ICS audit): _fresh_guard() bypasses __init__
+    # entirely, so these need setting explicitly, matching __init__'s own
+    # defaults -- the same class of gap hit repeatedly this session for
+    # every object.__new__()-based test fixture.
+    g._priority_window_start = time.monotonic()
+    g._priority_busy_s = 0.0
+    g.priority_budget_exceeded_count = 0
     # v1.3.0 Phase 0 instrumentation
     g._busy_s = 0.0
     g._window_start = time.monotonic()
@@ -105,6 +118,76 @@ class TestQueueDepthAccounting(unittest.TestCase):
             self.assertEqual(g.queue_depth, 0)
         _run(_go())
 
+    def test_admission_timeout_is_the_distinguishable_type(self):
+        """v2.0.0a (F08, external ICS audit -- confirmed): an admission-wait
+        timeout must raise ModbusAdmissionTimeout, not a bare TimeoutError
+        -- this is the whole point of the fix, checked directly against
+        the real exception type, not just that SOME TimeoutError fires."""
+        ModbusAdmissionTimeout = _MOD.ModbusAdmissionTimeout
+
+        async def _go():
+            g = _fresh_guard()
+            await g._lock.acquire()
+            with patch.object(_MOD, "QUEUE_WAIT_TIMEOUT", timedelta(milliseconds=10)):
+                with self.assertRaises(ModbusAdmissionTimeout):
+                    async with g.request():
+                        pass
+            g._lock.release()
+        _run(_go())
+
+    def test_admission_timeout_is_still_a_timeout_error_subclass(self):
+        """Every EXISTING `except TimeoutError` path (back-off, cache
+        fallback, entity availability) must keep working unchanged for
+        anything that doesn't specifically care about this new
+        distinction -- the same backward-compatible design already used
+        for ModbusQueueShed."""
+        ModbusAdmissionTimeout = _MOD.ModbusAdmissionTimeout
+        self.assertTrue(issubclass(ModbusAdmissionTimeout, TimeoutError))
+
+    def test_queue_full_shed_is_not_converted_to_admission_timeout(self):
+        """The other congestion path (queue full, request declined
+        immediately) must stay ModbusQueueShed -- only a genuine
+        lock-acquisition timeout becomes ModbusAdmissionTimeout."""
+        ModbusQueueShed = _MOD.ModbusQueueShed
+        ModbusAdmissionTimeout = _MOD.ModbusAdmissionTimeout
+
+        async def _go():
+            g = _fresh_guard()
+            g._max_queue_depth = 1
+            g._queue_depth = 1  # simulate queue already full
+            with self.assertRaises(ModbusQueueShed) as ctx:
+                async with g.request():  # priority=False -> shed check applies
+                    pass
+            self.assertNotIsInstance(ctx.exception, ModbusAdmissionTimeout)
+        _run(_go())
+
+    def test_admission_timeout_cleans_up_queue_depth_correctly(self):
+        """Same cleanup guarantee as the pre-existing repeated-timeout
+        test above, now verified specifically for the new exception path
+        -- the re-raise as ModbusAdmissionTimeout must not skip or
+        duplicate the BaseException cleanup block."""
+        async def _go():
+            g = _fresh_guard()
+            await g._lock.acquire()
+            with patch.object(_MOD, "QUEUE_WAIT_TIMEOUT", timedelta(milliseconds=10)):
+                with self.assertRaises(_MOD.ModbusAdmissionTimeout):
+                    async with g.request():
+                        pass
+            g._lock.release()
+            self.assertEqual(g.queue_depth, 0)
+        _run(_go())
+
+    def test_admission_timeout_does_not_fire_once_lock_is_already_held(self):
+        """A failure AFTER the lock was successfully acquired (e.g. during
+        the inter-request gap sleep) is a different situation entirely --
+        the device communication phase has effectively begun. Must not be
+        misclassified as an admission-phase timeout."""
+        async def _go():
+            g = _fresh_guard()
+            async with g.request():
+                pass  # lock acquired and released cleanly -- no exception at all
+        _run(_go())  # sanity: the happy path is unaffected by this change
+
     def test_is_busy_reflects_lock_state(self):
         async def _go():
             g = _fresh_guard()
@@ -112,6 +195,35 @@ class TestQueueDepthAccounting(unittest.TestCase):
             async with g.request():
                 self.assertTrue(g.is_busy)
             self.assertFalse(g.is_busy)
+        _run(_go())
+
+    def test_seconds_since_last_activity_before_any_request_is_infinite(self):
+        """v2.0.0b (MOD-14, external ICS audit): a guard with no request
+        history at all must report an infinite idle time, not zero or a
+        stale default -- otherwise a legitimate first probe on a freshly
+        created endpoint could be incorrectly skipped."""
+        g = _fresh_guard()
+        self.assertEqual(g.seconds_since_last_activity(), float("inf"))
+
+    def test_seconds_since_last_activity_resets_after_a_request(self):
+        async def _go():
+            g = _fresh_guard()
+            async with g.request():
+                pass
+            self.assertLess(g.seconds_since_last_activity(), 1.0)
+        _run(_go())
+
+    def test_seconds_since_last_activity_counts_a_failed_request_too(self):
+        """Deliberately not success-only: a request that raises inside the
+        guarded block still updates _last_request_end on exit (see
+        ModbusKeepAlive._should_skip_probe()'s own docstring for why this
+        is correct, not an oversight)."""
+        async def _go():
+            g = _fresh_guard()
+            with self.assertRaises(ValueError):
+                async with g.request():
+                    raise ValueError("simulated failure")
+            self.assertLess(g.seconds_since_last_activity(), 1.0)
         _run(_go())
 
 
@@ -280,6 +392,81 @@ class TestRegistry(unittest.TestCase):
         self.assertEqual(ModbusGuard._registry, {})
 
 
+# ── v2.0.0a: reference-counted endpoint lifecycle (F04, external ICS audit) ──
+
+class TestReferenceCountedLifecycle(unittest.TestCase):
+
+    def setUp(self):
+        ModbusGuard.clear_registry()
+
+    def tearDown(self):
+        ModbusGuard.clear_registry()
+
+    def test_adversarial_f04_scenario_two_entries_one_endpoint(self):
+        """The exact scenario the external audit's stress matrix names:
+        two config entries share a physical endpoint; one unloads. The
+        surviving entry must keep using the SAME guard object -- a
+        SECOND, uncoordinated guard for one physical bus is the bug F04
+        describes."""
+        entry_a_guard = ModbusGuard.acquire_endpoint("shared:502")
+        entry_b_guard = ModbusGuard.acquire_endpoint("shared:502")
+        self.assertIs(entry_a_guard, entry_b_guard, "both entries must share one guard")
+
+        # Entry A unloads.
+        ModbusGuard.release_endpoint("shared:502")
+
+        # Entry B is still loaded and reaches for its guard again (e.g. a
+        # coordinator reconstructed on reload, or simply re-fetching it).
+        still_there = ModbusGuard.get_or_create("shared:502")
+        self.assertIs(
+            still_there, entry_b_guard,
+            "the guard must still be the SAME object entry B has always "
+            "used -- if the registry had been cleared, this would silently "
+            "create a second, uncoordinated guard for the same physical bus",
+        )
+
+    def test_guard_removed_only_after_last_release(self):
+        ModbusGuard.acquire_endpoint("ep:502")
+        ModbusGuard.acquire_endpoint("ep:502")
+        ModbusGuard.release_endpoint("ep:502")
+        self.assertIn("ep:502", ModbusGuard._registry, "one reference still held")
+        ModbusGuard.release_endpoint("ep:502")
+        self.assertNotIn("ep:502", ModbusGuard._registry, "last reference released")
+
+    def test_release_without_prior_acquire_is_a_safe_no_op(self):
+        # Must not raise -- teardown code on best-effort/exception paths
+        # should never need its own separate bookkeeping to call this safely.
+        ModbusGuard.release_endpoint("never-acquired:502")
+
+    def test_extra_release_beyond_acquire_count_is_a_safe_no_op(self):
+        ModbusGuard.acquire_endpoint("ep:502")
+        ModbusGuard.release_endpoint("ep:502")
+        ModbusGuard.release_endpoint("ep:502")  # one too many
+        self.assertNotIn("ep:502", ModbusGuard._registry)
+
+    def test_get_or_create_does_not_affect_reference_count(self):
+        """get_or_create() remains the plain per-coordinator accessor --
+        only acquire_endpoint()/release_endpoint() should move the count,
+        so a coordinator merely re-fetching its guard reference (e.g. on
+        every poll) can never accidentally extend or shorten the
+        endpoint's real lifetime."""
+        ModbusGuard.acquire_endpoint("ep:502")
+        for _ in range(5):
+            ModbusGuard.get_or_create("ep:502")
+        ModbusGuard.release_endpoint("ep:502")
+        self.assertNotIn(
+            "ep:502", ModbusGuard._registry,
+            "a single acquire + single release must fully remove the guard, "
+            "regardless of how many plain get_or_create() calls happened "
+            "in between",
+        )
+
+    def test_clear_registry_also_clears_ref_counts(self):
+        ModbusGuard.acquire_endpoint("ep:502")
+        ModbusGuard.clear_registry()
+        self.assertEqual(ModbusGuard._ref_counts, {})
+
+
 class TestCancellationDoesNotDeadlock(unittest.TestCase):
     """v1.1.3 regression: cancellation during the inter-request gap must not
     leak the lock or the queue counter (former bug: `except Exception` did not
@@ -357,3 +544,128 @@ class TestShedExceptionType(unittest.TestCase):
                     pass
             return g.shed_count
         self.assertEqual(asyncio.run(run()), 1)
+
+
+# ── v2.0.0b: AR-4 -- priority-lane airtime budget (external ICS audit) ──────
+
+class TestPriorityAirtimeBudget(unittest.TestCase):
+    """AR-4, external ICS audit: priority requests get their own airtime
+    budget, distinct from MOD-18's queue-DEPTH cap -- this bounds what
+    FRACTION of the bus's own occupied time, within a rolling window,
+    priority traffic may consume."""
+
+    def test_priority_within_budget_bypasses_shedding_as_before(self):
+        """The existing, unchanged guarantee: a priority request with
+        budget still available bypasses the normal queue-depth shed
+        check entirely, exactly as before AR-4."""
+        async def _go():
+            g = _fresh_guard()
+            g._queue_depth = g._max_queue_depth  # normal queue is full
+            g._priority_window_start = time.monotonic() - 1.0
+            g._priority_busy_s = 0.0  # no priority consumption yet
+            async with g.request(priority=True):
+                pass  # must NOT raise
+        asyncio.run(_go())
+
+    def test_priority_exceeding_budget_is_shed_when_queue_is_full(self):
+        """The core new behaviour: once the priority budget is exhausted
+        within the current window, a priority request is demoted to
+        normal-lane admission for the queue-depth check -- a full normal
+        queue now sheds it too, exactly as it would a normal request."""
+        async def _go():
+            g = _fresh_guard()
+            g._queue_depth = g._max_queue_depth  # normal queue full
+            # Window is 1.0s old; busy_s = 1.0s -> fraction = 100%, well
+            # above the 20% budget.
+            g._priority_window_start = time.monotonic() - 1.0
+            g._priority_busy_s = 1.0
+            with self.assertRaises(_MOD.ModbusQueueShed):
+                async with g.request(priority=True):
+                    pass
+        asyncio.run(_go())
+
+    def test_priority_exceeding_budget_but_queue_not_full_still_admitted(self):
+        """Demotion only changes the OUTCOME when the normal queue is
+        actually full -- with room in the normal queue, a
+        budget-exceeding priority request is still admitted (just via
+        the same path a normal request would use, not bypassing it)."""
+        async def _go():
+            g = _fresh_guard()
+            g._queue_depth = 0  # normal queue has room
+            g._priority_window_start = time.monotonic() - 1.0
+            g._priority_busy_s = 1.0  # budget exhausted
+            async with g.request(priority=True):
+                pass  # must NOT raise -- queue has room regardless of lane
+        asyncio.run(_go())
+
+    def test_priority_budget_exceeded_counter_increments(self):
+        async def _go():
+            g = _fresh_guard()
+            g._queue_depth = 0
+            g._priority_window_start = time.monotonic() - 1.0
+            g._priority_busy_s = 1.0
+            async with g.request(priority=True):
+                pass
+            return g.priority_budget_exceeded_count
+        self.assertEqual(asyncio.run(_go()), 1)
+
+    def test_priority_budget_counter_not_incremented_when_within_budget(self):
+        async def _go():
+            g = _fresh_guard()
+            g._priority_window_start = time.monotonic() - 1.0
+            g._priority_busy_s = 0.0
+            async with g.request(priority=True):
+                pass
+            return g.priority_budget_exceeded_count
+        self.assertEqual(asyncio.run(_go()), 0)
+
+    def test_window_rolls_forward_and_resets_the_budget(self):
+        """An expired window (older than PRIORITY_AIRTIME_WINDOW_S) must
+        reset _priority_busy_s to 0 BEFORE the fraction is computed --
+        otherwise a window that should have rolled forward would still
+        report a stale, exhausted budget forever."""
+        async def _go():
+            g = _fresh_guard()
+            g._queue_depth = g._max_queue_depth  # would shed if still demoted
+            g._priority_window_start = (
+                time.monotonic() - (_MOD.PRIORITY_AIRTIME_WINDOW_S + 1.0)
+            )
+            g._priority_busy_s = 999.0  # would be "exhausted" if not reset
+            async with g.request(priority=True):
+                pass  # must NOT raise -- the window rolled forward first
+            self.assertLess(
+                g._priority_busy_s, 1.0,
+                "the window must have reset _priority_busy_s close to 0, "
+                "not carried the stale value forward",
+            )
+        asyncio.run(_go())
+
+    def test_priority_busy_time_accumulates_only_for_priority_requests(self):
+        """Normal (non-priority) requests must not contribute to the
+        priority lane's own airtime accounting -- otherwise ordinary bus
+        traffic could exhaust a budget that's meant to bound priority
+        traffic specifically."""
+        async def _go():
+            g = _fresh_guard()
+            async with g.request(priority=False):
+                await asyncio.sleep(0.01)
+            return g._priority_busy_s
+        self.assertEqual(asyncio.run(_go()), 0.0)
+
+    def test_priority_lane_depth_bookkeeping_still_applies_when_demoted(self):
+        """A demoted priority request is still, functionally, a priority
+        request -- MAX_PRIORITY_QUEUE_DEPTH's own accounting (unrelated
+        to AR-4) must be unaffected by the demotion."""
+        async def _go():
+            g = _fresh_guard()
+            g._queue_depth = 0  # normal queue has room, so admission succeeds
+            g._priority_window_start = time.monotonic() - 1.0
+            g._priority_busy_s = 1.0  # budget exhausted -> demoted
+            async with g.request(priority=True):
+                self.assertEqual(
+                    g._priority_queue_depth, 1,
+                    "priority-lane depth tracking must still increment "
+                    "even for a demoted request -- it is still priority "
+                    "traffic by type",
+                )
+        asyncio.run(_go())

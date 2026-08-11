@@ -66,6 +66,27 @@ class _StubGuard:  # minimal stand-in; individual tests inject their own mock
     def get_or_create(cls, *a, **k):
         return cls()
 _guard_mod.ModbusGuard = _StubGuard
+
+
+# v2.0.0a (F08, external ICS audit): modbus_keepalive.py now imports
+# ModbusAdmissionTimeout from .modbus_guard to distinguish a bus-congestion
+# admission-wait timeout from a genuine device-communication one. Must be
+# a real TimeoutError subclass here too, not just a name that exists --
+# tests raise/catch it to prove the distinction actually works.
+class _StubModbusAdmissionTimeout(TimeoutError):
+    pass
+
+
+# v2.0.1 (H-01, ICS re-audit): modbus_keepalive.py now also imports
+# ModbusQueueShed from .modbus_guard, for the same reason as
+# ModbusAdmissionTimeout above -- must be a real TimeoutError subclass
+# here too, not just a name that exists.
+class _StubModbusQueueShed(TimeoutError):
+    pass
+
+
+_guard_mod.ModbusAdmissionTimeout = _StubModbusAdmissionTimeout
+_guard_mod.ModbusQueueShed = _StubModbusQueueShed
 sys.modules["huawei_solar.modbus_guard"] = _guard_mod
 
 _SRC = pathlib.Path(__file__).parent.parent / "modbus_keepalive.py"
@@ -252,6 +273,164 @@ class TestProbe(unittest.TestCase):
         on_lost.assert_called_once()
 
 
+# ── v2.0.0a: F08 -- admission timeout vs. device timeout (external ICS audit) ─
+
+class TestAdmissionTimeoutVsDeviceTimeout(unittest.TestCase):
+    """Confirmed: a single `except TimeoutError` used to treat "the bus was
+    busy for 10+ seconds" and "the device didn't answer within its own
+    budget" identically -- both manufacturing a false connection-lost
+    event out of ordinary bus congestion."""
+
+    def _guard_that_raises_on_enter(self, exc):
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(side_effect=exc)
+        cm.__aexit__ = AsyncMock(return_value=False)
+        guard = MagicMock()
+        guard.request = MagicMock(return_value=cm)
+        return guard
+
+    def test_admission_timeout_does_not_trigger_connection_lost(self):
+        ka = _fresh()
+        on_lost = MagicMock()
+        ka._on_connection_lost = on_lost
+        ka._guard = self._guard_that_raises_on_enter(_MOD.ModbusAdmissionTimeout("busy"))
+        reg = _RegName("model_id")
+        with patch.object(_MOD, "_get_keepalive_register", return_value=reg):
+            _run(ka._probe())
+        on_lost.assert_not_called()
+        self.assertTrue(
+            ka.is_healthy,
+            "an admission timeout must not flip health state -- nothing "
+            "about the device's own responsiveness was tested this cycle",
+        )
+
+    def test_admission_timeout_does_not_touch_failure_count(self):
+        ka = _fresh()
+        ka._guard = self._guard_that_raises_on_enter(_MOD.ModbusAdmissionTimeout("busy"))
+        reg = _RegName("model_id")
+        with patch.object(_MOD, "_get_keepalive_register", return_value=reg):
+            _run(ka._probe())
+        self.assertEqual(
+            ka._failure_count, 0,
+            "bus congestion is not a probe failure -- the device was never "
+            "actually contacted",
+        )
+
+    def test_admission_timeout_while_already_unhealthy_does_not_falsely_recover(self):
+        """An admission timeout while already marked unhealthy must not be
+        mistaken for a successful probe (it isn't -- it's just a
+        DIFFERENT kind of non-result) -- health must stay unhealthy, and
+        on_connection_restored must not fire on the strength of a probe
+        that never actually reached the device."""
+        ka = _fresh()
+        ka._healthy = False
+        ka._failure_count = 3
+        on_restored = MagicMock()
+        ka._on_connection_restored = on_restored
+        ka._guard = self._guard_that_raises_on_enter(_MOD.ModbusAdmissionTimeout("busy"))
+        reg = _RegName("model_id")
+        with patch.object(_MOD, "_get_keepalive_register", return_value=reg):
+            _run(ka._probe())
+        self.assertFalse(ka.is_healthy)
+        on_restored.assert_not_called()
+
+    def test_genuine_device_timeout_still_triggers_connection_lost(self):
+        """The fix must not weaken the EXISTING, correct behaviour for a
+        real device failure -- only the admission-wait case changes."""
+        ka = _fresh()
+        on_lost = MagicMock()
+        ka._on_connection_lost = on_lost
+        ka._device.batch_update = AsyncMock(side_effect=TimeoutError("device did not answer"))
+        reg = _RegName("model_id")
+        with patch.object(_MOD, "_get_keepalive_register", return_value=reg):
+            _run(ka._probe())
+        on_lost.assert_called_once()
+        self.assertFalse(ka.is_healthy)
+
+    def test_genuine_device_timeout_still_increments_failure_count(self):
+        ka = _fresh()
+        ka._device.batch_update = AsyncMock(side_effect=TimeoutError("device did not answer"))
+        reg = _RegName("model_id")
+        with patch.object(_MOD, "_get_keepalive_register", return_value=reg):
+            _run(ka._probe())
+        self.assertEqual(ka._failure_count, 1)
+
+
+# ── v2.0.1: H-01 -- queue-shed vs. device timeout (ICS re-audit) ────────────
+
+class TestQueueShedVsDeviceTimeout(unittest.TestCase):
+    """H-01, ICS re-audit -- confirmed: ModbusQueueShed (the queue was
+    already full, this priority request was declined immediately) is
+    ALSO a TimeoutError subclass, exactly like ModbusAdmissionTimeout,
+    and needed the exact same distinct handling -- missed originally
+    because F08 only considered the admission-wait case, not the shed
+    case, for keepalive's own priority=True probe specifically."""
+
+    def _guard_that_raises_on_enter(self, exc):
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(side_effect=exc)
+        cm.__aexit__ = AsyncMock(return_value=False)
+        guard = MagicMock()
+        guard.request = MagicMock(return_value=cm)
+        return guard
+
+    def test_queue_shed_does_not_trigger_connection_lost(self):
+        ka = _fresh()
+        on_lost = MagicMock()
+        ka._on_connection_lost = on_lost
+        ka._guard = self._guard_that_raises_on_enter(_MOD.ModbusQueueShed("queue full"))
+        reg = _RegName("model_id")
+        with patch.object(_MOD, "_get_keepalive_register", return_value=reg):
+            _run(ka._probe())
+        on_lost.assert_not_called()
+        self.assertTrue(
+            ka.is_healthy,
+            "a queue shed must not flip health state -- the device was "
+            "never contacted this cycle",
+        )
+
+    def test_queue_shed_does_not_touch_failure_count(self):
+        ka = _fresh()
+        ka._guard = self._guard_that_raises_on_enter(_MOD.ModbusQueueShed("queue full"))
+        reg = _RegName("model_id")
+        with patch.object(_MOD, "_get_keepalive_register", return_value=reg):
+            _run(ka._probe())
+        self.assertEqual(
+            ka._failure_count, 0,
+            "bus congestion (shed) is not a probe failure -- the device "
+            "was never actually contacted",
+        )
+
+    def test_queue_shed_while_already_unhealthy_does_not_falsely_recover(self):
+        ka = _fresh()
+        ka._healthy = False
+        ka._failure_count = 3
+        on_restored = MagicMock()
+        ka._on_connection_restored = on_restored
+        ka._guard = self._guard_that_raises_on_enter(_MOD.ModbusQueueShed("queue full"))
+        reg = _RegName("model_id")
+        with patch.object(_MOD, "_get_keepalive_register", return_value=reg):
+            _run(ka._probe())
+        self.assertFalse(ka.is_healthy)
+        on_restored.assert_not_called()
+
+    def test_queue_shed_is_checked_before_the_generic_timeout_handler(self):
+        """Structural check: since ModbusQueueShed IS a TimeoutError
+        subclass, the except clause ordering in the real source is what
+        actually determines which handler wins -- checked directly, not
+        just inferred from the behavioural tests above."""
+        source = pathlib.Path(_MOD.__file__).read_text()
+        shed_idx = source.find("except ModbusQueueShed as exc:")
+        generic_idx = source.find("except (TimeoutError, HuaweiSolarException, OSError) as exc:")
+        self.assertGreater(shed_idx, -1, "no dedicated ModbusQueueShed handler found")
+        self.assertGreater(generic_idx, -1)
+        self.assertLess(
+            shed_idx, generic_idx,
+            "the ModbusQueueShed handler must appear BEFORE the generic "
+            "TimeoutError handler, or it would never actually be reached",
+        )
+
+
 # ── Lifecycle ─────────────────────────────────────────────────────────────────
 
 class TestLifecycle(unittest.TestCase):
@@ -316,3 +495,70 @@ class TestRegistry(unittest.TestCase):
         ModbusKeepAlive.get_or_create("X", MagicMock(), MagicMock(), MagicMock(), MagicMock())
         ModbusKeepAlive.clear_registry()
         self.assertEqual(ModbusKeepAlive._registry, {})
+
+
+# ── v2.0.0b: MOD-14 -- skip probing when the endpoint was recently active ────
+
+class TestShouldSkipProbe(unittest.TestCase):
+    """v2.0.0b (MOD-14, external ICS audit -- confirmed): the probe loop
+    used to fire unconditionally on every KEEPALIVE_INTERVAL tick,
+    regardless of how recently the endpoint was genuinely used by
+    anything else."""
+
+    def test_skips_when_endpoint_was_recently_active(self):
+        ka = _fresh()
+        ka._guard.seconds_since_last_activity = MagicMock(return_value=1.0)
+        self.assertTrue(
+            ka._should_skip_probe(),
+            "endpoint activity 1s ago (well within KEEPALIVE_INTERVAL) "
+            "must skip this probe",
+        )
+
+    def test_does_not_skip_when_endpoint_has_been_idle(self):
+        ka = _fresh()
+        # Longer ago than KEEPALIVE_INTERVAL itself.
+        ka._guard.seconds_since_last_activity = MagicMock(
+            return_value=_MOD.KEEPALIVE_INTERVAL.total_seconds() + 10.0
+        )
+        self.assertFalse(
+            ka._should_skip_probe(),
+            "genuinely idle endpoint must not have its probe skipped -- "
+            "this is exactly the case keep-alive exists to cover",
+        )
+
+    def test_boundary_at_exactly_the_interval_does_not_skip(self):
+        """Exactly at the interval must NOT be treated as 'recent' --
+        the check is strictly less-than, so a boundary value still
+        results in a genuine probe."""
+        ka = _fresh()
+        ka._guard.seconds_since_last_activity = MagicMock(
+            return_value=_MOD.KEEPALIVE_INTERVAL.total_seconds()
+        )
+        self.assertFalse(ka._should_skip_probe())
+
+    def test_never_activated_endpoint_does_not_skip(self):
+        """A guard with no request history at all (seconds_since_last_
+        activity() returning inf, per ModbusGuard's own contract) must
+        never cause a probe to be skipped -- a legitimate first probe on
+        a freshly created endpoint must always run."""
+        ka = _fresh()
+        ka._guard.seconds_since_last_activity = MagicMock(return_value=float("inf"))
+        self.assertFalse(ka._should_skip_probe())
+
+    def test_run_loop_actually_calls_should_skip_probe_before_probing(self):
+        """Confirms _run() genuinely consults this decision, not just that
+        the method exists in isolation -- checked at the source level
+        since driving _run()'s own infinite loop directly in a test is
+        exactly what this extraction was designed to avoid needing."""
+        source = pathlib.Path(_MOD.__file__).read_text()
+        idx = source.find("async def _run(self)")
+        self.assertGreater(idx, -1)
+        body = source[idx: idx + 800]
+        skip_idx = body.find("self._should_skip_probe()")
+        probe_idx = body.find("await self._probe()")
+        self.assertGreater(skip_idx, -1)
+        self.assertGreater(probe_idx, -1)
+        self.assertLess(
+            skip_idx, probe_idx,
+            "_should_skip_probe() must be checked BEFORE _probe() is called",
+        )

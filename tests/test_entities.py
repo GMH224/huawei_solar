@@ -19,12 +19,14 @@ Run directly:  python tests/test_entities.py
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib.util
 import pathlib
 import sys
 import types
 import unittest
 from dataclasses import dataclass
+from unittest.mock import MagicMock
 
 _ROOT = pathlib.Path(__file__).parent.parent
 
@@ -259,7 +261,43 @@ def _install_lib_stubs() -> None:
         def register_name(self):
             return self.key
     tps.HuaweiSolarEntityDescription = HuaweiSolarEntityDescription
-    tps.HuaweiSolarEntity = type("HuaweiSolarEntity", (), {"_attr_has_entity_name": True})
+
+    def _stub_quality_attrs(self, coordinator, register_key):
+        # v2.0.0: minimal stand-in for the real HuaweiSolarEntity._quality_attrs()
+        # (types.py) -- these tests exercise value/availability logic, not the
+        # quality feature itself, and the fake coordinators built below don't
+        # stub a .cache. Returns a fixed, harmless value rather than depending
+        # on RegisterCache.quality_of() at all.
+        return {"data_quality": "good"}
+
+    # v2.0.0b (MOD-05/MOD-06, external ICS audit): the real _guarded_write()/
+    # _guarded_write_sequence() call guard.request()/asyncio.timeout() and
+    # device.set() -- reproduced minimally here so entity write tests can
+    # exercise the real call sites in number.py/select.py/switch.py without
+    # needing the real WRITE_TIMEOUT/WRITE_SEQUENCE_TIMEOUT constants or a
+    # real ModbusGuard. Matches MockCoordinator's _FakeGuard (below), whose
+    # request() is already a no-op async context manager.
+    async def _stub_guarded_write(self, guard, device, name, value, *, label="write"):
+        async with guard.request(label=label):
+            return await device.set(name, value)
+
+    @contextlib.asynccontextmanager
+    async def _stub_guarded_write_sequence(self, guard, *, label="write_sequence"):
+        async with guard.request(label=label):
+            async def _write(device, name, value):
+                return await device.set(name, value)
+            yield _write
+
+    tps.HuaweiSolarEntity = type(
+        "HuaweiSolarEntity",
+        (),
+        {
+            "_attr_has_entity_name": True,
+            "_quality_attrs": _stub_quality_attrs,
+            "_guarded_write": _stub_guarded_write,
+            "_guarded_write_sequence": _stub_guarded_write_sequence,
+        },
+    )
     tps.HuaweiSolarEntityContext = dict
     tps.HuaweiSolarDeviceData = type("HuaweiSolarDeviceData", (), {})
     tps.HuaweiSolarInverterData = type("HuaweiSolarInverterData", (), {})
@@ -294,8 +332,22 @@ sys.modules["huawei_solar.bus_diagnostics"] = BUSDIAG
 
 BATTERY_HEALTH = _load("battery_health")
 sys.modules["huawei_solar.battery_health"] = BATTERY_HEALTH
+# v2.0.0: battery_health_manager.py now imports Quality from
+# .register_cache -- must be loaded and registered as a sibling submodule
+# here too, same as adaptive_modbus/bus_diagnostics/battery_health above.
+REGISTER_CACHE = _load("register_cache")
+sys.modules["huawei_solar.register_cache"] = REGISTER_CACHE
 BATTERY_HEALTH_MANAGER = _load("battery_health_manager")
 sys.modules["huawei_solar.battery_health_manager"] = BATTERY_HEALTH_MANAGER
+# v2.0.0b: switch.py now imports ModbusTelemetry and telemetry_capture for
+# the new telemetry-capture switch. telemetry_capture.py itself imports
+# from .bus_diagnostics (already loaded/registered above), so it must be
+# loaded after that, same reasoning as battery_health_manager needing
+# register_cache loaded first.
+MODBUS_TELEMETRY = _load("modbus_telemetry")
+sys.modules["huawei_solar.modbus_telemetry"] = MODBUS_TELEMETRY
+TELEMETRY_CAPTURE = _load("telemetry_capture")
+sys.modules["huawei_solar.telemetry_capture"] = TELEMETRY_CAPTURE
 
 NUMBER = _load("number")
 SWITCH = _load("switch")
@@ -309,18 +361,59 @@ class _Result:
         self.value = value
 
 
+class _FakeGuardCtx:
+    async def __aenter__(self):
+        pass
+
+    async def __aexit__(self, *args):
+        pass
+
+
+class _FakeGuard:
+    """v2.0.0a: minimal stand-in for ModbusGuard, needed now that write
+    paths route through it (F05, external ICS audit). Matches the same
+    pattern already used in test_synchronized_power_coordinator.py."""
+
+    def request(self, *, label: str = "", priority: bool = False):
+        return _FakeGuardCtx()
+
+
 class MockCoordinator:
     def __init__(self, data=None, success=True):
         self.data = data
         self.last_update_success = success
         self.invalidated = []
         self.refresh_calls = 0
+        self.guard = _FakeGuard()
+        # v2.0.0b (MOD-10): real coordinator writes now reference
+        # self.coordinator.name when naming background tasks.
+        self.name = "mock_coordinator"
 
     def invalidate_cache(self, name):
         self.invalidated.append(name)
 
     async def async_request_refresh(self):
         self.refresh_calls += 1
+
+    async def verify_write(self, name, expected_value):
+        # v2.0.0a (F12, external ICS audit): a minimal stand-in -- these
+        # tests check the entity's own post-write state (invalidate_cache
+        # called, refresh scheduled), not verify_write()'s own retry/log
+        # behaviour, which is tested directly against the real
+        # implementation in update_coordinator.py's own test file.
+        return True
+
+    def create_background_task(self, coro, name):
+        # v2.0.0b (MOD-10, external ICS audit): a minimal stand-in for the
+        # real entry-scoped create_background_task() -- schedules via a
+        # fake hass so the coroutine is at least consumed (avoiding an
+        # "was never awaited" warning), without needing a real HA
+        # ConfigEntry. MockCoordinator (unlike the entity) has no .hass
+        # set by _make(), so this creates one lazily on first use.
+        if not hasattr(self, "hass"):
+            self.hass = MagicMock()
+            self.hass.async_create_task = MagicMock(side_effect=lambda c: c.close())
+        self.hass.async_create_task(coro)
 
 
 class MockDevice:
@@ -343,6 +436,17 @@ def _make(entity_cls, description, coordinator, device):
     e.coordinator = coordinator
     e.device = device
     e._attr_available = True
+    # v2.0.0a (F12, external ICS audit): async_set_native_value()/
+    # async_select_option()/async_turn_on()/async_turn_off() now fire
+    # verify_write() as a background task via self.hass.async_create_task()
+    # -- a real HA entity gets self.hass set during platform setup, which
+    # this lightweight construction path (deliberately bypassing HA's
+    # heavier __init__) doesn't run. MagicMock's default async_create_task
+    # just returns a MagicMock rather than actually scheduling anything,
+    # which is fine here -- these tests check the entity's own state after
+    # a write, not verify_write()'s own behaviour (that's covered directly
+    # in update_coordinator.py's own tests).
+    e.hass = MagicMock()
     return e
 
 
@@ -510,6 +614,137 @@ class TestButtonEntity(unittest.TestCase):
         e.device = MockDevice(set_result=True)
         e._configuration_update_coordinator = None
         _run(e.async_press())  # must not raise when no config coordinator present
+
+
+class _FakeCapture:
+    """Minimal stand-in for TelemetryCapture -- these tests exercise the
+    entity's own wiring (does it call set_enabled/record_snapshot
+    correctly), not TelemetryCapture's own buffering/flush behaviour,
+    which is tested directly against the real implementation in
+    test_telemetry_capture.py."""
+
+    def __init__(self):
+        self.enabled = False
+        self.cancel_periodic = None
+        self.snapshots: list[dict] = []
+
+    def set_enabled(self, enabled: bool) -> None:
+        self.enabled = enabled
+        if not enabled and self.cancel_periodic is not None:
+            self.cancel_periodic()
+            self.cancel_periodic = None
+
+    def record_snapshot(self, snapshot: dict) -> None:
+        self.snapshots.append(snapshot)
+
+    def stats(self) -> dict:
+        return {"enabled": self.enabled, "snapshots_captured": len(self.snapshots)}
+
+
+class TestModbusTelemetryCaptureSwitchEntity(unittest.TestCase):
+    """v2.0.0b: the periodic aggregate telemetry-capture switch. Built to
+    close a real, confirmed gap -- see this session's own architecture
+    reanalysis -- in what telemetry existed to assess the Physical Demand
+    Planner question without a second deployment."""
+
+    def _make_switch(self):
+        capture = _FakeCapture()
+        device_data = types.SimpleNamespace(
+            device_info={},
+            device=types.SimpleNamespace(serial_number="SN1"),
+            update_coordinator=MagicMock(data=None),
+            power_meter_update_coordinator=None,
+            energy_storage_update_coordinator=None,
+            configuration_update_coordinator=None,
+        )
+        e = object.__new__(SWITCH.ModbusTelemetryCaptureSwitchEntity)
+        e._capture = capture
+        e._device_datas = [device_data]
+        e._sync_coordinator = None
+        e._register_overlap_captured = False
+        e.hass = MagicMock()
+        return e, capture
+
+    def test_is_on_reflects_capture_state(self):
+        e, capture = self._make_switch()
+        self.assertFalse(e.is_on)
+        capture.enabled = True
+        self.assertTrue(e.is_on)
+
+    def test_turn_on_enables_capture_and_starts_the_timer(self):
+        e, capture = self._make_switch()
+        _run(e.async_turn_on())
+        self.assertTrue(capture.enabled)
+        self.assertIsNotNone(
+            capture.cancel_periodic,
+            "turning on must store a cancel callback on the capture object, "
+            "not just start a timer nobody can stop later",
+        )
+
+    def test_turn_on_resets_the_register_overlap_flag(self):
+        """A fresh capture session should get its own fresh overlap
+        attempt, in case coordinators were not yet polled the first
+        time this ran."""
+        e, capture = self._make_switch()
+        e._register_overlap_captured = True
+        _run(e.async_turn_on())
+        self.assertFalse(e._register_overlap_captured)
+
+    def test_turn_off_disables_capture(self):
+        e, capture = self._make_switch()
+        _run(e.async_turn_on())
+        _run(e.async_turn_off())
+        self.assertFalse(capture.enabled)
+
+    def test_will_remove_from_hass_cancels_a_still_running_capture(self):
+        """The core lifecycle fix: an unload/reload while capture happens
+        to be on must not leave the timer firing against coordinators
+        that no longer exist."""
+        e, capture = self._make_switch()
+        _run(e.async_turn_on())
+        self.assertTrue(capture.enabled)
+        _run(e.async_will_remove_from_hass())
+        self.assertFalse(capture.enabled)
+
+    def test_will_remove_from_hass_is_a_no_op_when_already_off(self):
+        e, capture = self._make_switch()
+        _run(e.async_will_remove_from_hass())  # must not raise
+        self.assertFalse(capture.enabled)
+
+    def test_snapshot_tick_records_a_snapshot(self):
+        e, capture = self._make_switch()
+        _run(e._async_snapshot_tick(None))
+        self.assertEqual(len(capture.snapshots), 1)
+
+    def test_snapshot_tick_marks_overlap_captured_once_a_coordinator_exists(self):
+        """update_coordinator is present (even before its own first poll,
+        i.e. .data is still None) -- check_register_overlap() itself
+        correctly handles that by skipping that one coordinator WITHIN
+        the check (see telemetry_capture.py's own "not yet polled"
+        handling), not by omitting the whole check from the snapshot.
+        So the flag correctly becomes True after one tick here."""
+        e, capture = self._make_switch()
+        self.assertFalse(e._register_overlap_captured)
+        _run(e._async_snapshot_tick(None))
+        self.assertTrue(e._register_overlap_captured)
+        self.assertIn("register_overlap", capture.snapshots[0])
+
+    def test_snapshot_tick_overlap_flag_stays_false_with_no_coordinators_at_all(self):
+        """The genuine negative case: a device with no coordinator
+        references at all (all None) must leave the flag False, since
+        there is nothing to check yet."""
+        e, capture = self._make_switch()
+        e._device_datas[0].update_coordinator = None
+        _run(e._async_snapshot_tick(None))
+        self.assertFalse(e._register_overlap_captured)
+        self.assertNotIn("register_overlap", capture.snapshots[0])
+
+    def test_snapshot_tick_failure_does_not_raise(self):
+        """Telemetry must never break polling -- a failure gathering the
+        snapshot must be caught and logged, not propagate."""
+        e, capture = self._make_switch()
+        e._device_datas = None  # will break build_telemetry_snapshot's own iteration
+        _run(e._async_snapshot_tick(None))  # must not raise
 
 
 if __name__ == "__main__":

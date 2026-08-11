@@ -110,6 +110,11 @@ def _make_ctrl() -> AdaptiveModbusController:
     ctrl.last_batch_ms = 0.0
     ctrl.last_chunk_count = 0
     ctrl.shed_count = 0
+    # v2.0.0b (MOD-09, external ICS audit): _make_ctrl() bypasses __init__
+    # entirely, so this needs setting explicitly, matching __init__'s own
+    # default -- same class of gap hit repeatedly this session for every
+    # object.__new__()-based test fixture.
+    ctrl.admission_timeout_count = 0
     # v1.3.0 Phase 0 bus metrics
     ctrl._bus_occupancy_pct = 0.0
     ctrl._bus_wait_p95 = 0.0
@@ -1050,3 +1055,34 @@ class TestStoreLoadFaultIsolation(unittest.TestCase):
         params = ctrl.get_params()        # no stored data at all
         self.assertIsNotNone(params.poll_interval)
         self.assertGreaterEqual(params.max_queue_depth, 1)
+
+
+# ── v2.0.0a: F16 fix -- dirty flag ordering ──────────────────────────────────
+# (external ICS audit, confirmed)
+
+class TestDirtyFlagOrderingFix(unittest.IsolatedAsyncioTestCase):
+
+    async def test_dirty_stays_true_if_save_fails(self):
+        """The core fix: a failed persistence call must leave _dirty=True,
+        not silently clear it -- otherwise a later dirty-triggered save
+        (stop(), the debounce task, async_unload()) has no reason to
+        retry, and the data is lost with no indication anything went
+        wrong."""
+        ctrl = _make_ctrl()
+        ctrl._dirty = True
+        ctrl._store.async_save = AsyncMock(side_effect=OSError("disk full"))
+        with self.assertRaises(OSError):
+            await ctrl._async_save()
+        self.assertTrue(
+            ctrl._dirty,
+            "_dirty must remain True after a failed save -- clearing it "
+            "before persistence succeeds silently loses the "
+            "'still needs saving' indication",
+        )
+
+    async def test_dirty_clears_only_after_save_succeeds(self):
+        ctrl = _make_ctrl()
+        ctrl._dirty = True
+        await ctrl._async_save()
+        ctrl._store.async_save.assert_awaited_once()
+        self.assertFalse(ctrl._dirty)

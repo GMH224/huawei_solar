@@ -183,3 +183,135 @@ class TestStopForcibleCharge:
         assert "STORAGE_FORCIBLE_DISCHARGE_POWER" in attr_ids, (
             "stop_forcible_charge does not reference STORAGE_FORCIBLE_DISCHARGE_POWER."
         )
+
+
+class TestWritesRouteThroughGuard:
+    """v2.0.0a (F05, F07, external ICS audit -- confirmed): every write and
+    the power-validation read in this module used to bypass ModbusGuard
+    entirely. Source-level checks, matching this file's own established
+    pattern for services.py (a "heavy" file, not directly executed by its
+    own test suite -- see the "Could not load services.py" skip above)."""
+
+    def test_set_and_invalidate_routes_the_write_through_the_guard(self):
+        source = _SERVICES_SRC.read_text()
+        idx = source.find("async def _set_and_invalidate(")
+        end = source.find("\nasync def ", idx + 10)
+        body = source[idx: end if end > -1 else idx + 2000]
+        assert "guard.request(" in body, (
+            "_set_and_invalidate's write must be routed through "
+            "dd.update_coordinator.guard -- this is the single helper "
+            "covering all ~39 write call sites in this file; if this "
+            "regresses, every one of them silently bypasses the guard again"
+        )
+        # The write itself, not just something elsewhere in the function,
+        # must be inside the guarded block.
+        guard_idx = body.find("guard.request(")
+        write_idx = body.find("await dd.device.set(")
+        assert -1 < guard_idx < write_idx, (
+            "the guard acquisition must precede the actual write"
+        )
+
+    def test_validate_power_value_routes_the_read_through_the_guard(self):
+        source = _SERVICES_SRC.read_text()
+        idx = source.find("async def _validate_power_value(")
+        end = source.find("\nasync def ", idx + 10)
+        body = source[idx: end if end > -1 else idx + 2000]
+        assert "guard.request(" in body, (
+            "the power-validation read must be routed through the same "
+            "guard as every write in this module -- it previously bypassed "
+            "ModbusGuard entirely despite already being time-bounded"
+        )
+
+
+class TestWriteTimeoutAndSequenceAtomicity:
+    """v2.0.0b (MOD-05/MOD-19/MOD-20, external ICS audit -- confirmed):
+    being guard-routed (v2.0.0a) provided serialisation, not a deadline
+    (MOD-05), and eight multi-write service functions each acquired and
+    released the guard once per write rather than once for the whole
+    logical command (MOD-19), meaning another coordinator's poll could
+    land mid-sequence. Source-level checks, same established pattern as
+    TestWritesRouteThroughGuard above."""
+
+    _MULTI_WRITE_FUNCTIONS = [
+        "forcible_charge",
+        "forcible_discharge",
+        "stop_forcible_charge",
+        "reset_maximum_feed_grid_power",
+        "set_di_active_power_scheduling",
+        "set_zero_power_grid_connection",
+        "set_maximum_feed_grid_power",
+        "set_maximum_feed_grid_power_percentage",
+    ]
+
+    def _function_body(self, name: str) -> str:
+        source = _SERVICES_SRC.read_text()
+        idx = source.find(f"async def {name}(")
+        assert idx > -1, f"{name} not found in services.py"
+        end = source.find("\nasync def ", idx + 10)
+        return source[idx: end if end > -1 else idx + 3000]
+
+    def test_set_and_invalidate_write_has_a_timeout(self):
+        body = self._function_body("_set_and_invalidate")
+        assert "asyncio.timeout(WRITE_TIMEOUT" in body, (
+            "_set_and_invalidate's write must be bounded by WRITE_TIMEOUT, "
+            "not just routed through the guard -- a stalled write would "
+            "otherwise hold the guard indefinitely, starving every other "
+            "coordinator on the endpoint (MOD-05)"
+        )
+
+    def test_sequence_helper_exists_and_uses_the_sequence_timeout(self):
+        body = self._function_body("_set_and_invalidate_sequence")
+        assert "guard.request(" in body
+        assert "asyncio.timeout(WRITE_SEQUENCE_TIMEOUT" in body, (
+            "the sequence helper must use WRITE_SEQUENCE_TIMEOUT (a single "
+            "whole-sequence budget), not WRITE_TIMEOUT repeated -- the "
+            "latter would let total duration scale unboundedly with "
+            "sequence length"
+        )
+
+    def test_sequence_helper_invalidates_cache_per_write(self):
+        """The sequence helper's inner `write` must still perform the same
+        invalidate_cache() pairing _set_and_invalidate() does per-call --
+        otherwise converting a function to the sequence helper would
+        silently reintroduce Defect Q (stale post-write cache reads) for
+        every register in that sequence."""
+        body = self._function_body("_set_and_invalidate_sequence")
+        assert "invalidate_cache(name)" in body
+
+    def test_every_multi_write_function_uses_the_sequence_helper(self):
+        """The core MOD-19 claim, checked directly for each of the eight
+        functions the audit named: each must use
+        _set_and_invalidate_sequence(), not repeated _set_and_invalidate()
+        calls."""
+        for name in self._MULTI_WRITE_FUNCTIONS:
+            body = self._function_body(name)
+            assert "_set_and_invalidate_sequence(dd)" in body, (
+                f"{name} does not use _set_and_invalidate_sequence() -- "
+                "MOD-19 has regressed for this function"
+            )
+            # And the old per-call pattern must be genuinely gone from
+            # this function, not just the new one added alongside it.
+            assert "await _set_and_invalidate(dd," not in body, (
+                f"{name} still contains the old per-call "
+                "_set_and_invalidate(dd, ...) pattern alongside the new "
+                "sequence helper -- the guard would be acquired and "
+                "released for THOSE calls independently of the sequence, "
+                "defeating the whole-sequence atomicity the audit asked for"
+            )
+
+    def test_button_and_service_stop_forcible_charge_both_use_a_bound_sequence(self):
+        """MOD-20: the two independent 'stop forcible charge' entry points
+        (button.py's button, this module's service) must both carry the
+        same bound, guard-serialised guarantee, even though they remain
+        two separate call sites."""
+        service_body = self._function_body("stop_forcible_charge")
+        assert "_set_and_invalidate_sequence(dd)" in service_body
+
+        button_source = (
+            pathlib.Path(__file__).parent.parent / "button.py"
+        ).read_text()
+        assert "_guarded_write_sequence(guard" in button_source, (
+            "button.py's StopForcibleCharge button must also use a "
+            "bound, guard-serialised write sequence -- see its own "
+            "MOD-06 fix"
+        )

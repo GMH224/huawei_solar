@@ -176,6 +176,36 @@ class TestSensorPySourceUsesBoundedHelper(unittest.TestCase):
             "has_write_permission() call, not merely wrap it."
         )
 
+    def test_v2_0_0a_routes_through_guard(self):
+        """F06, external ICS audit -- confirmed: being time-bounded protected
+        setup from hanging, but the probe itself still bypassed ModbusGuard
+        entirely."""
+        source = _SENSOR_SRC.read_text()
+        tree = ast.parse(source)
+        func = next(
+            (
+                n for n in ast.walk(tree)
+                if isinstance(n, ast.AsyncFunctionDef)
+                and n.name == "_has_write_permission_bounded"
+            ),
+            None,
+        )
+        assert func is not None
+        uses_guard = any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "request"
+            for node in ast.walk(func)
+        )
+        assert uses_guard, (
+            "_has_write_permission_bounded() no longer routes through "
+            "guard.request() -- F06 has regressed"
+        )
+        assert "guard=ucs.configuration_update_coordinator.guard" in source, (
+            "the production call site must pass a real guard explicitly, "
+            "not leave the optional parameter at its defensive None default"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

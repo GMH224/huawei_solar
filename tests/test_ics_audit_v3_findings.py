@@ -50,6 +50,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import pathlib
+import re
 import unittest
 
 _INIT_SRC = pathlib.Path(__file__).parent.parent / "__init__.py"
@@ -111,11 +112,416 @@ class TestFinding2BridgeInitialised(unittest.TestCase):
     def test_raw_client_disconnected_when_bridge_never_created(self):
         source = _CONFIG_FLOW_SRC.read_text()
         idx = source.find("async def validate_network_setup_login")
-        window = source[idx: idx + 2500]
+        window = source[idx: idx + 8000]
         assert "client.disconnect()" in window, (
             "the raw client is never explicitly disconnected in the "
             "bridge-was-never-created case -- reintroduces part of "
             "Finding 2."
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# v2.0.0a: F01 -- config-flow routed through ModbusGuard (external ICS audit)
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestF01ConfigFlowRoutesThroughGuard(unittest.TestCase):
+    """Confirmed: config_flow.py's discovery and validation performed
+    Modbus I/O with zero references to ModbusGuard anywhere in the file.
+    A config flow running while an entry is already polling the same
+    physical endpoint could overlap its traffic with the guarded runtime
+    path entirely undetected."""
+
+    def _function_body(self, name: str) -> str:
+        source = _CONFIG_FLOW_SRC.read_text()
+        idx = source.find(f"async def {name}(")
+        assert idx > -1, f"{name} not found in config_flow.py"
+        end = source.find("\nasync def ", idx + 10)
+        # v2.0.1: 4000 was too small a fallback for validate_network_setup_
+        # login specifically -- it has no following "\nasync def " match at
+        # all (end stays -1), so it always used this fallback, and H-04's
+        # own fix added enough new comment text to push real content past
+        # the old limit. Widened generously rather than tuned to the exact
+        # current length, so the next comment added to any function this
+        # helper is used for doesn't silently reintroduce the same gap.
+        return source[idx: end if end > -1 else idx + 8000]
+
+    def test_validate_serial_setup_acquires_and_releases(self):
+        body = self._function_body("validate_serial_setup")
+        assert "ModbusGuard.acquire_endpoint(" in body
+        assert "ModbusGuard.release_endpoint(" in body
+        assert "guard.request(" in body
+
+    def test_validate_network_setup_acquires_and_releases(self):
+        body = self._function_body("validate_network_setup")
+        assert "ModbusGuard.acquire_endpoint(" in body
+        assert "ModbusGuard.release_endpoint(" in body
+        assert "guard.request(" in body
+
+    def test_validate_network_setup_login_acquires_and_releases(self):
+        body = self._function_body("validate_network_setup_login")
+        assert "ModbusGuard.acquire_endpoint(" in body
+        assert "ModbusGuard.release_endpoint(" in body
+        assert "guard.request(" in body
+
+    def test_auto_slave_discovery_accepts_and_uses_a_guard(self):
+        body = self._function_body("_auto_slave_discovery")
+        assert "guard: \"ModbusGuard | None\" = None" in body or "guard: " in body
+        assert "guard.request(" in body
+
+    def test_scan_slave_discovery_accepts_and_uses_a_guard(self):
+        body = self._function_body("_scan_slave_discovery")
+        assert "guard.request(" in body
+
+    def test_all_four_discovery_wrappers_acquire_and_release_the_endpoint(self):
+        for name in (
+            "_tcp_auto_slave_discovery", "_rtu_auto_slave_discovery",
+            "_tcp_scan_slave_discovery", "_rtu_scan_slave_discovery",
+        ):
+            body = self._function_body(name)
+            assert "ModbusGuard.acquire_endpoint(" in body, f"{name} does not acquire"
+            assert "ModbusGuard.release_endpoint(" in body, f"{name} does not release"
+
+    def test_release_is_in_a_finally_block_for_every_acquirer(self):
+        """The acquire without a guaranteed matching release is worse than
+        no reference counting at all -- it would leak permanently on any
+        exception. Checked structurally: every acquire_endpoint() call
+        must be followed, before the enclosing function ends, by a
+        release_endpoint() call that appears after a `finally:` line."""
+        for name in (
+            "validate_serial_setup", "validate_network_setup",
+            "validate_network_setup_login", "_tcp_auto_slave_discovery",
+            "_rtu_auto_slave_discovery", "_tcp_scan_slave_discovery",
+            "_rtu_scan_slave_discovery",
+        ):
+            body = self._function_body(name)
+            acquire_idx = body.find("ModbusGuard.acquire_endpoint(")
+            finally_idx = body.find("\n    finally:")
+            release_idx = body.find("ModbusGuard.release_endpoint(")
+            assert acquire_idx > -1, name
+            assert finally_idx > -1, f"{name}: no finally block found"
+            assert acquire_idx < finally_idx < release_idx, (
+                f"{name}: release_endpoint() must appear after a finally: "
+                f"block, not conditionally on the success path"
+            )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# v2.0.1: H-03 -- _connect_to_discovered_devices now guard-routed (ICS re-audit)
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestH03FinishNetworkDiscoveryGuardRouted(unittest.TestCase):
+    """H-03, ICS re-audit -- confirmed: _connect_to_discovered_devices()
+    (the "finish network" config-flow step, called when adding a device
+    to an entry whose runtime coordinators may already be actively
+    polling the same endpoint) performed every device-communication call
+    completely outside ModbusGuard -- a real gap in F01 (v2.0.0a), which
+    covered every OTHER config-flow discovery/validation function but
+    never revisited this one."""
+
+    def _function_body(self, name: str) -> str:
+        source = _CONFIG_FLOW_SRC.read_text()
+        idx = source.find(f"async def {name}(")
+        assert idx > -1, f"{name} not found in config_flow.py"
+        end = source.find("\nasync def ", idx + 10)
+        return source[idx: end if end > -1 else idx + 8000]
+
+    def test_acquires_and_releases_the_endpoint_guard(self):
+        body = self._function_body("_connect_to_discovered_devices")
+        assert "ModbusGuard.acquire_endpoint(" in body
+        assert "ModbusGuard.release_endpoint(" in body
+
+    def test_every_device_communication_call_is_guard_routed(self):
+        body = self._function_body("_connect_to_discovered_devices")
+        # create_device_instance, has_write_permission, and
+        # create_sub_device_instance must each be inside a guard.request()
+        # block -- checked by counting: at least 3 guard.request() blocks
+        # (primary device, write-permission check, sub-device) must exist.
+        assert body.count("guard.request(") >= 3, (
+            "expected at least 3 guarded operations (primary device, "
+            "write-permission check, sub-device connection) -- found "
+            f"{body.count('guard.request(')}"
+        )
+
+    def test_release_is_in_a_finally_block_not_conditional_on_success(self):
+        body = self._function_body("_connect_to_discovered_devices")
+        acquire_idx = body.find("ModbusGuard.acquire_endpoint(")
+        finally_idx = body.find("\n    finally:")
+        release_idx = body.find("ModbusGuard.release_endpoint(")
+        assert acquire_idx > -1
+        assert finally_idx > -1, "no finally: block found"
+        assert acquire_idx < finally_idx < release_idx
+
+    def test_nothing_can_raise_between_acquire_and_the_try_block(self):
+        """The specific H-04 lesson applied here from the start: the
+        guard acquisition must be immediately followed by `try:`, with
+        client construction and connect both INSIDE it -- not sitting
+        between acquire and the cleanup envelope, where an exception
+        would leak the guard reference the same way H-04 did."""
+        body = self._function_body("_connect_to_discovered_devices")
+        acquire_idx = body.find("ModbusGuard.acquire_endpoint(")
+        try_idx = body.find("\n    try:")
+        client_construct_idx = body.find("create_tcp_client(")
+        connect_idx = body.find("client.connect()")
+        assert acquire_idx < try_idx, "try: must come right after acquire"
+        assert try_idx < client_construct_idx, (
+            "client construction must be INSIDE the try:, not before it"
+        )
+        assert try_idx < connect_idx, (
+            "client.connect() must be INSIDE the try:, not before it"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# v2.0.1: H-04 -- validate_network_setup guard leak on connect() failure (ICS re-audit)
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestH04NoGuardLeakOnConnectFailure(unittest.TestCase):
+    """H-04, ICS re-audit -- confirmed: validate_network_setup() used to
+    acquire the endpoint guard, then call client.connect(), BOTH before
+    the try:/finally: that releases it -- any exception, timeout, or
+    cancellation from connect() skipped the release entirely, leaking a
+    reference to ModbusGuard's endpoint registry every time."""
+
+    def _function_body(self, name: str) -> str:
+        source = _CONFIG_FLOW_SRC.read_text()
+        idx = source.find(f"async def {name}(")
+        assert idx > -1, f"{name} not found in config_flow.py"
+        end = source.find("\nasync def ", idx + 10)
+        return source[idx: end if end > -1 else idx + 8000]
+
+    def test_nothing_can_raise_between_acquire_and_the_try_block(self):
+        body = self._function_body("validate_network_setup")
+        acquire_idx = body.find("ModbusGuard.acquire_endpoint(")
+        try_idx = body.find("\n    try:")
+        client_construct_idx = body.find("create_scan_tcp_client(")
+        # NOT a plain body.find("client.connect()") -- this function's own
+        # docstring (added by this same H-04 fix) mentions that exact
+        # string while describing the OLD, buggy behaviour, and would
+        # match before the real code usage. The real call site is unique:
+        # wrapped in asyncio.wait_for(...).
+        connect_idx = body.find("asyncio.wait_for(client.connect()")
+        assert acquire_idx > -1
+        assert try_idx > -1
+        assert acquire_idx < try_idx, (
+            "try: must come immediately after guard acquisition -- this "
+            "is the exact bug H-04 identified"
+        )
+        assert try_idx < client_construct_idx, (
+            "client construction must be INSIDE the try:, not before it"
+        )
+        assert connect_idx > -1, "real client.connect() call site not found"
+        assert try_idx < connect_idx, (
+            "client.connect() -- the specific call H-04 identified as "
+            "able to raise before the old try: began -- must be INSIDE "
+            "the try: now"
+        )
+
+    def test_client_is_initialised_to_none_before_the_try_block(self):
+        """The finally: block's cleanup (`if client is not None`) needs
+        client to exist as a name even if construction itself never
+        completes -- otherwise a failure before that point raises
+        UnboundLocalError from the finally: block itself, masking the
+        real error (the same class of bug v1.3.19/Finding 2 already
+        fixed once for validate_network_setup_login's own `bridge`)."""
+        body = self._function_body("validate_network_setup")
+        acquire_idx = body.find("ModbusGuard.acquire_endpoint(")
+        client_none_idx = body.find("client = None")
+        try_idx = body.find("\n    try:")
+        assert client_none_idx > -1
+        assert acquire_idx < client_none_idx < try_idx
+
+    def test_release_is_still_unconditional_in_finally(self):
+        body = self._function_body("validate_network_setup")
+        finally_idx = body.find("\n    finally:")
+        release_idx = body.find("ModbusGuard.release_endpoint(")
+        assert finally_idx > -1
+        assert release_idx > finally_idx
+
+    def test_client_disconnect_is_guarded_against_client_being_none(self):
+        body = self._function_body("validate_network_setup")
+        finally_idx = body.find("\n    finally:")
+        window = body[finally_idx: finally_idx + 300]
+        assert "if client is not None:" in window
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# v2.0.1: H-05 -- config-flow teardown now bounded, every site (ICS re-audit)
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestH05TeardownIsBounded(unittest.TestCase):
+    """H-05, ICS re-audit -- confirmed/borderline: config-flow cleanup
+    (client.disconnect()/bridge.stop()) was awaited with no timeout at
+    all -- a hung device-side teardown could block the configuration
+    flow indefinitely, after the actual validation had already completed
+    or failed. Applied consistently to every site with the same shape,
+    not just the one the audit's own citation pointed at -- seven more
+    occurrences of the identical pattern were found while fixing it."""
+
+    def _function_body(self, name: str) -> str:
+        source = _CONFIG_FLOW_SRC.read_text()
+        idx = source.find(f"async def {name}(")
+        assert idx > -1, f"{name} not found in config_flow.py"
+        end = source.find("\nasync def ", idx + 10)
+        return source[idx: end if end > -1 else idx + 8000]
+
+    def test_every_disconnect_call_site_is_bounded(self):
+        """The core, comprehensive check: every one of the eight
+        functions with a disconnect()-in-finally: pattern must use
+        DISCONNECT_TIMEOUT, not a bare await."""
+        for name in (
+            "validate_serial_setup",
+            "_tcp_auto_slave_discovery", "_rtu_auto_slave_discovery",
+            "_tcp_scan_slave_discovery", "_rtu_scan_slave_discovery",
+            "_connect_to_discovered_devices",
+            "validate_network_setup", "validate_network_setup_login",
+        ):
+            body = self._function_body(name)
+            assert "client.disconnect()" in body, f"{name}: no disconnect() call found"
+            assert "asyncio.wait_for(\n" in body or "asyncio.wait_for(" in body, (
+                f"{name}: no asyncio.wait_for() found at all"
+            )
+            assert "DISCONNECT_TIMEOUT.total_seconds()" in body, (
+                f"{name}: disconnect() is not bounded by DISCONNECT_TIMEOUT "
+                f"-- H-05 has regressed for this function"
+            )
+
+    def test_zero_bare_disconnect_calls_remain_anywhere_in_the_file(self):
+        """AST-level sweep, not just checked per-function: confirms no
+        `await client.disconnect()` exists anywhere as a standalone
+        statement (i.e. not as an argument to asyncio.wait_for)."""
+        source = _CONFIG_FLOW_SRC.read_text()
+        tree = ast.parse(source)
+        bare_calls = []
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Await)
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
+                and node.value.func.attr == "disconnect"
+                and isinstance(node.value.func.value, ast.Name)
+                and node.value.func.value.id == "client"
+            ):
+                bare_calls.append(node.lineno)
+        assert not bare_calls, (
+            f"bare `await client.disconnect()` (not wrapped in "
+            f"asyncio.wait_for) found at line(s) {bare_calls}"
+        )
+
+    def test_bridge_stop_in_validate_network_setup_login_is_also_bounded(self):
+        """The specific site the audit's own citation pointed at --
+        bridge.stop(), not client.disconnect() -- checked directly by
+        name, not just swept generically with the others above."""
+        body = self._function_body("validate_network_setup_login")
+        # NOT a plain body.find("bridge.stop()") -- this function's own
+        # finally: comment (added by this same H-05 fix) mentions that
+        # exact string while describing the OLD, buggy behaviour, and
+        # would match before the real call site. The real one is unique:
+        # wrapped in `await asyncio.wait_for(\n    bridge.stop(),`.
+        idx = body.find("bridge.stop(), timeout=DISCONNECT_TIMEOUT.total_seconds()")
+        assert idx > -1, "real bridge.stop() call site not found"
+        window = body[max(0, idx - 200): idx]
+        assert "asyncio.wait_for(" in window
+
+    def test_disconnect_failures_are_still_swallowed_not_propagated(self):
+        """Bounding the call must not change its fault-isolation
+        contract: a disconnect timeout or failure must still be
+        swallowed (contextlib.suppress or logged-and-continued), not
+        allowed to replace the function's own real return value or
+        exception with a cleanup-phase problem."""
+        for name in (
+            "_tcp_auto_slave_discovery", "_connect_to_discovered_devices",
+            "validate_network_setup",
+        ):
+            body = self._function_body(name)
+            idx = body.find("client.disconnect()")
+            assert idx > -1
+            window = body[max(0, idx - 250): idx]
+            assert "contextlib.suppress(Exception)" in window, (
+                f"{name}: disconnect() must still be inside a "
+                f"contextlib.suppress(Exception) block after bounding it"
+            )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# v2.0.0b: MOD-08 -- config-flow connect() calls now bounded (external ICS audit)
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestMOD08ConnectCallsAreBounded(unittest.TestCase):
+    """Confirmed: eight config_flow.py call sites did a bare
+    `await client.connect()` with no timeout of its own -- a stalled
+    TCP/serial connection attempt could hang the configuration flow
+    indefinitely. All eight verified individually below, not just
+    checked in aggregate, since a partial fix (some sites bounded, others
+    missed) would be easy to overlook with only a count-based check."""
+
+    def test_zero_bare_client_connect_calls_remain(self):
+        source = _CONFIG_FLOW_SRC.read_text()
+        tree = ast.parse(source)
+        bare_calls = []
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "connect"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "client"
+            ):
+                # A bare call is a direct `await client.connect()` --
+                # i.e. this Call node is not itself nested inside an
+                # asyncio.wait_for(...) call's arguments.
+                parents_are_wait_for = False
+                for other in ast.walk(tree):
+                    if (
+                        isinstance(other, ast.Call)
+                        and isinstance(other.func, ast.Attribute)
+                        and other.func.attr == "wait_for"
+                        and node in ast.walk(other)
+                        and node is not other
+                    ):
+                        parents_are_wait_for = True
+                        break
+                if not parents_are_wait_for:
+                    bare_calls.append(node.lineno)
+        assert not bare_calls, (
+            f"bare client.connect() (not wrapped in asyncio.wait_for) "
+            f"found at line(s) {bare_calls} -- MOD-08 has regressed for "
+            f"at least one call site"
+        )
+
+    def test_eight_wait_for_wrapped_connect_calls_exist(self):
+        """Not fewer than the eight the audit cited -- a regression that
+        accidentally consolidated or dropped a call site would still
+        pass a naive 'at least one exists' check."""
+        source = _CONFIG_FLOW_SRC.read_text()
+        count = source.count("asyncio.wait_for(client.connect()")
+        assert count == 8, (
+            f"expected exactly 8 bounded client.connect() call sites "
+            f"(matching the audit's own citation), found {count}"
+        )
+
+    def test_uses_a_dedicated_shorter_timeout_not_device_connect_timeout(self):
+        """MOD-08's own reasoning: connection establishment and device
+        identification are different operations -- this must use its own
+        constant, not be folded into DEVICE_CONNECT_TIMEOUT (which exists
+        for the heavier identification phase)."""
+        source = _CONFIG_FLOW_SRC.read_text()
+        assert "MODBUS_CONNECT_TIMEOUT" in source
+        # Every wrapped call must use the dedicated constant specifically.
+        assert "asyncio.wait_for(client.connect(), timeout=DEVICE_CONNECT_TIMEOUT" not in source
+
+    def test_modbus_connect_timeout_is_shorter_than_device_connect_timeout(self):
+        """The actual numeric claim, not just that both constants exist."""
+        const_source = pathlib.Path(__file__).parent.parent.joinpath("const.py").read_text()
+        modbus_connect = float(re.search(
+            r"MODBUS_CONNECT_TIMEOUT\s*=\s*timedelta\(seconds=(\d+)\)", const_source
+        ).group(1))
+        device_connect = float(re.search(
+            r"DEVICE_CONNECT_TIMEOUT\s*=\s*timedelta\(seconds=(\d+)\)", const_source
+        ).group(1))
+        assert modbus_connect < device_connect, (
+            "MODBUS_CONNECT_TIMEOUT must be shorter than "
+            "DEVICE_CONNECT_TIMEOUT -- connection establishment should be "
+            "much faster than full device identification"
         )
 
 

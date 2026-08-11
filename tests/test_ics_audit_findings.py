@@ -236,6 +236,46 @@ class TestNumberPySourceUsesBoundedHelper(unittest.TestCase):
         )
         assert uses_wait_for, "_read_static_bound() does not bound its read with asyncio.wait_for()"
 
+    def test_v2_0_0a_routes_through_guard(self):
+        """F06, external ICS audit -- confirmed: being time-bounded protected
+        setup from hanging, but the read itself still bypassed ModbusGuard
+        entirely."""
+        source = _NUMBER_SRC.read_text()
+        tree = ast.parse(source)
+        func = next(
+            (
+                n for n in ast.walk(tree)
+                if isinstance(n, ast.AsyncFunctionDef) and n.name == "_read_static_bound"
+            ),
+            None,
+        )
+        assert func is not None
+        uses_guard = any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "request"
+            for node in ast.walk(func)
+        )
+        assert uses_guard, (
+            "_read_static_bound() no longer routes through guard.request() -- "
+            "F06 has regressed"
+        )
+        # And the call sites must actually pass a real guard, not leave the
+        # optional parameter at its defensive None default.
+        create_func = next(
+            (
+                n for n in ast.walk(tree)
+                if isinstance(n, ast.AsyncFunctionDef) and n.name == "create"
+            ),
+            None,
+        )
+        assert create_func is not None
+        create_src = ast.get_source_segment(source, create_func) or ""
+        assert "guard=coordinator.guard" in create_src, (
+            "create()'s calls to _read_static_bound() must pass "
+            "coordinator.guard explicitly"
+        )
+
 
 # ── J3: stale dynamic bounds ────────────────────────────────────────────────
 

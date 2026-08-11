@@ -40,6 +40,8 @@ _COORDINATOR_START_DELAYS = {
     "power_meter":   timedelta(seconds=7),
     "energy_storage": timedelta(seconds=14),
     "configuration": timedelta(seconds=10),
+    # v2.0.0b (MOD-03, external ICS audit)
+    "sync_power":    timedelta(seconds=16),
 }
 _MULTI_DEVICE_STAGGER_STRIDE = timedelta(seconds=5)
 
@@ -79,6 +81,106 @@ class TestStaggeredStartDelay(unittest.TestCase):
         field capture; the stride must comfortably exceed that with margin,
         or the fix wouldn't actually separate the bursts in practice."""
         self.assertGreaterEqual(_MULTI_DEVICE_STAGGER_STRIDE.total_seconds(), 2.0)
+
+    def test_sync_power_slot_comes_after_every_other_coordinator(self):
+        """v2.0.0b (MOD-03, external ICS audit -- confirmed): SyncPower
+        must be positioned AFTER the other four coordinators' slots, not
+        merely present -- the whole point is giving their first polls a
+        real chance to populate the regular caches before SyncPower's own
+        (now cache-first, MOD-01) reads run."""
+        other_kinds = [k for k in _COORDINATOR_START_DELAYS if k != "sync_power"]
+        sync_power_delay = _staggered_start_delay("sync_power", 0)
+        for kind in other_kinds:
+            self.assertGreaterEqual(
+                sync_power_delay, _staggered_start_delay(kind, 0),
+                f"sync_power's stagger slot must not be earlier than "
+                f"'{kind}''s",
+            )
+
+
+# ── 3. MOD-03: SyncPower's first refresh actually sleeps before firing ─────
+
+class TestSyncPowerFirstRefreshIsStaggered(unittest.TestCase):
+    """v2.0.0b (MOD-03, external ICS audit -- confirmed): _sync_first_
+    refresh() used to fire immediately, with no stagger delay of its own
+    -- exactly when the regular per-device caches are coldest."""
+
+    def test_sync_first_refresh_sleeps_before_the_actual_refresh(self):
+        source = _INIT_SRC.read_text()
+        idx = source.find("async def _sync_first_refresh(")
+        assert idx > -1, "_sync_first_refresh not found in __init__.py"
+        end = source.find("\n                try:", idx)
+        body = source[idx: end if end > -1 else idx + 1500]
+        sleep_idx = body.find("await asyncio.sleep(")
+        refresh_idx = body.find("await coord.async_config_entry_first_refresh()")
+        self.assertGreater(sleep_idx, -1, "no asyncio.sleep() found -- MOD-03 has regressed")
+        self.assertGreater(refresh_idx, -1)
+        self.assertLess(
+            sleep_idx, refresh_idx,
+            "the stagger sleep must happen BEFORE the actual first refresh",
+        )
+        self.assertIn(
+            '_staggered_start_delay("sync_power", 0)', body[sleep_idx: refresh_idx],
+            "must sleep for the staggered sync_power delay specifically, "
+            "not an arbitrary or hardcoded duration",
+        )
+
+
+# ── 4. MOD-16: setup-failure device.stop() calls are now bounded ──────────
+
+class TestSetupFailureStopIsBounded(unittest.TestCase):
+    """v2.0.0b (MOD-16, external ICS audit -- confirmed): five setup-
+    failure exception handlers called `await primary_device.stop()`
+    directly, with no timeout -- unlike the normal unload path, which was
+    already correctly bounded (Defect U/Finding 3). A wedged transport
+    during a failed setup could hang cleanup indefinitely, delaying Home
+    Assistant's own retry."""
+
+    def test_bounded_helper_exists_and_uses_disconnect_timeout(self):
+        source = _INIT_SRC.read_text()
+        idx = source.find("async def _bounded_device_stop(")
+        self.assertGreater(idx, -1, "_bounded_device_stop() not found in __init__.py")
+        end = source.find("\nasync def ", idx + 10)
+        body = source[idx: end if end > -1 else idx + 1500]
+        self.assertIn("asyncio.wait_for(", body)
+        self.assertIn("DISCONNECT_TIMEOUT.total_seconds()", body)
+        self.assertIn(
+            "except Exception", body,
+            "a failed/timed-out stop() must be caught and logged, not "
+            "left to propagate and block the rest of setup-failure cleanup",
+        )
+
+    def test_zero_bare_primary_device_stop_calls_remain(self):
+        """The core check: every one of the five original call sites must
+        now go through the bounded helper, not a bare device.stop()."""
+        source = _INIT_SRC.read_text()
+        tree = ast.parse(source)
+        bare_calls = []
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "stop"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "primary_device"
+            ):
+                bare_calls.append(node.lineno)
+        self.assertEqual(
+            bare_calls, [],
+            f"bare primary_device.stop() (not routed through "
+            f"_bounded_device_stop()) found at line(s) {bare_calls} -- "
+            f"MOD-16 has regressed for at least one call site",
+        )
+
+    def test_five_call_sites_use_the_bounded_helper(self):
+        source = _INIT_SRC.read_text()
+        count = source.count("await _bounded_device_stop(primary_device)")
+        self.assertEqual(
+            count, 5,
+            f"expected exactly 5 call sites routed through "
+            f"_bounded_device_stop() (matching the audit's own citation), "
+            f"found {count}",
+        )
 
 
 # ── 2. Static: the real call sites must use the staggered helper ──────────
@@ -135,6 +237,98 @@ class TestInitPyUsesStaggeredHelper(unittest.TestCase):
         assert "device_index" in arg_names, (
             "_setup_inverter_device_data no longer accepts device_index -- "
             "without it, per-device staggering cannot be computed."
+        )
+
+
+# ── v2.0.1: H-02 -- keepalive connection-loss propagates to ALL coordinators ─
+
+class TestKeepaliveConnectionLossPropagation(unittest.TestCase):
+    """H-02, ICS re-audit -- confirmed: keepalive's on_connection_lost/
+    on_connection_restored were wired only to the main coordinator at
+    creation time -- power_meter/energy_storage/configuration's own
+    separate RegisterCache instances never learned about a keepalive-
+    detected outage, so they could keep serving stale, pre-outage values
+    as Quality.GOOD indefinitely (which MOD-01's SyncPower fallback would
+    then actively reuse)."""
+
+    def _init_source(self) -> str:
+        return _INIT_SRC.read_text()
+
+    def test_rewiring_helper_functions_exist(self):
+        source = self._init_source()
+        self.assertIn("def _on_connection_lost_all() -> None:", source)
+        self.assertIn("def _on_connection_restored_all() -> None:", source)
+
+    def test_coordinators_list_includes_all_four_and_filters_none(self):
+        source = self._init_source()
+        idx = source.find("_coordinators_for_keepalive = [")
+        self.assertGreater(idx, -1)
+        window = source[idx: idx + 400]
+        for coordinator_var in (
+            "update_coordinator", "power_meter_update_coordinator",
+            "energy_storage_update_coordinator", "configuration_update_coordinator",
+        ):
+            self.assertIn(coordinator_var, window)
+        self.assertIn(
+            "if c is not None", window,
+            "the list must filter out coordinators that don't exist for "
+            "this device (e.g. no battery configured), not call "
+            "on_connection_lost() on None",
+        )
+
+    def test_optimizer_coordinator_is_deliberately_excluded(self):
+        """optimizer_update_coordinator is a different class with no
+        on_connection_lost/on_connection_restored method -- including it
+        would crash the callback with AttributeError the first time a
+        keepalive outage was actually detected."""
+        source = self._init_source()
+        idx = source.find("_coordinators_for_keepalive = [")
+        end = source.find("]", idx)
+        window = source[idx:end]
+        self.assertNotIn("optimizer_update_coordinator", window)
+
+    def test_each_coordinators_callback_is_individually_exception_guarded(self):
+        """One coordinator's own on_connection_lost() raising must not
+        prevent the OTHER coordinators in the list from still being
+        notified -- checked directly, not just assumed from a try/except
+        existing somewhere in the function."""
+        source = self._init_source()
+        for fn_name in ("_on_connection_lost_all", "_on_connection_restored_all"):
+            idx = source.find(f"def {fn_name}() -> None:")
+            self.assertGreater(idx, -1)
+            end = source.find("\n    def ", idx + 10)
+            if end == -1:
+                end = source.find("\n    keepalive._on_connection_lost", idx)
+            body = source[idx: end if end > idx else idx + 500]
+            self.assertIn("for c in _coordinators_for_keepalive:", body)
+            self.assertIn("try:", body)
+            self.assertIn("except Exception", body)
+
+    def test_rewiring_happens_after_all_four_coordinators_are_created(self):
+        """The re-wiring must be positioned AFTER every coordinator
+        creation block, not interleaved with or before them -- otherwise
+        a later-created coordinator would be missing from the list."""
+        source = self._init_source()
+        rewire_idx = source.find("_coordinators_for_keepalive = [")
+        self.assertGreater(rewire_idx, -1)
+        for creation_marker in (
+            'name=f"{device.serial_number}_power_meter_data_update_coordinator"',
+            'name=f"{device.serial_number}_battery_data_update_coordinator"',
+            'name=f"{device.serial_number}_config_data_update_coordinator"',
+        ):
+            marker_idx = source.find(creation_marker)
+            self.assertGreater(marker_idx, -1, f"{creation_marker} not found")
+            self.assertLess(
+                marker_idx, rewire_idx,
+                f"coordinator creation ({creation_marker}) must happen "
+                f"before the keepalive re-wiring, not after",
+            )
+
+    def test_keepalive_callbacks_are_reassigned_not_left_as_the_original_binding(self):
+        source = self._init_source()
+        self.assertIn("keepalive._on_connection_lost = _on_connection_lost_all", source)
+        self.assertIn(
+            "keepalive._on_connection_restored = _on_connection_restored_all", source,
         )
 
 

@@ -38,6 +38,8 @@ _SPEC.loader.exec_module(_MOD)
 
 RegisterCache  = _MOD.RegisterCache
 RegisterTier   = _MOD.RegisterTier
+Quality        = _MOD.Quality
+Reason         = _MOD.Reason
 _classify      = _MOD._classify
 is_energy_counter = _MOD.is_energy_counter
 ADAPTIVE_FACTOR   = _MOD.ADAPTIVE_FACTOR
@@ -214,11 +216,27 @@ class TestBasicOps(unittest.TestCase):
         RegisterCache().invalidate("nonexistent")  # must not raise
 
     def test_invalidate_all_skips_static(self):
+        # v2.0.0: invalidate_all() marks non-STATIC entries UNCERTAIN, not
+        # unservable -- this IS the fix (V2_ARCHITECTURE_DESIGN.md §1/§10.4's
+        # root defect). get() now correctly SERVES an UNCERTAIN value; the
+        # degradation is visible via quality_of(), not by the value vanishing.
         c = RegisterCache()
         c.update({"inverter_serial_number": _r("SN1"), "soc": _r(80)})
         c.invalidate_all()
+
         self.assertIsNotNone(c.get("inverter_serial_number"), "STATIC must survive")
-        self.assertIsNone(c.get("soc"), "NORMAL must be invalidated")
+        static_q, static_r, _ = c.quality_of("inverter_serial_number")
+        self.assertEqual(static_q, Quality.GOOD, "STATIC must be fully unaffected")
+
+        self.assertIsNotNone(
+            c.get("soc"),
+            "NORMAL must still be SERVED (the whole point of the v2.0.0 fix) "
+            "-- it should be degraded, not dropped",
+        )
+        soc_q, soc_r, soc_age = c.quality_of("soc")
+        self.assertEqual(soc_q, Quality.UNCERTAIN, "NORMAL must be degraded to UNCERTAIN")
+        self.assertEqual(soc_r, Reason.LINK_DOWN)
+        self.assertIsNotNone(soc_age)
 
     def test_invalidate_all_including_static(self):
         c = RegisterCache()

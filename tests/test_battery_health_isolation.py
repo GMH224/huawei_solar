@@ -97,10 +97,36 @@ def _load(modname: str):
     return m
 
 
+# v2.0.0: battery_health_manager.py now imports Quality from
+# .register_cache, which does `from huawei_solar import RegisterName,
+# Result`. Neither battery_health.py nor battery_health_manager.py import
+# anything from huawei_solar directly (confirmed) -- register_cache.py is
+# the only reason this test needs huawei_solar to exist at all, and it
+# only needs these two names, not the real package's full device/
+# modbus_client/register_client chain (which needs the real vendor
+# huawei_solar.const, not this project's own const.py this file
+# substitutes below for its own relative-import trick -- pulling in that
+# real chain here caused exactly that collision, and is unnecessary).
+# setdefault, matching register_cache.py's own test file's established
+# pattern: only installs the stub if nothing (real or another test's
+# stub) is already there, never clobbering a working sys.modules entry.
+if "huawei_solar" not in sys.modules:
+    _hs = types.ModuleType("huawei_solar")
+    _hs.RegisterName = str  # type: ignore[attr-defined]
+
+    class _Result:
+        def __init__(self, v):
+            self.value = v
+
+    _hs.Result = _Result  # type: ignore[attr-defined]
+    sys.modules["huawei_solar"] = _hs
+
 BH = _load("battery_health")
 sys.modules["huawei_solar.battery_health"] = BH
 CONST = _load("const")
 sys.modules["huawei_solar.const"] = CONST
+RC = _load("register_cache")
+sys.modules["huawei_solar.register_cache"] = RC
 MGR = _load("battery_health_manager")
 
 
@@ -317,6 +343,87 @@ class TestReadOnlyGuarantee(unittest.TestCase):  # T19.6
                     "homeassistant", (mod_name or ""),
                     "battery_health.py must remain HA-free",
                 )
+
+
+class TestQualityGatedValueExtraction(unittest.TestCase):  # v2.0.0
+    """MGR._value()'s quality-gating -- the specific vulnerability that
+    motivated this entire rebuild (V2_ARCHITECTURE_DESIGN.md §1's opening
+    paragraph, §10.4's deliberate exception). Uses the REAL RegisterCache
+    (RC, already loaded above), not a fake -- this is exactly the
+    integration point where a fake could hide a real mismatch.
+    """
+
+    def _cache_with(self, name, value, quality):
+        cache = RC.RegisterCache()
+        cache.update({name: RC.Result(value)})
+        if quality != RC.Quality.GOOD:
+            cache.record_attempt([name], quality, RC.Reason.LINK_DOWN)
+        return cache
+
+    def test_good_quality_value_is_returned(self):
+        cache = self._cache_with("soc", 80, RC.Quality.GOOD)
+        data = {"soc": cache.get("soc")}
+        self.assertEqual(MGR._value(cache, data, "soc"), 80)
+
+    def test_uncertain_quality_value_is_treated_as_none(self):
+        """The core fix: a stale-served UNCERTAIN value must NOT be
+        silently trusted as current by this consumer -- unlike a display
+        entity, where serving UNCERTAIN is correct and intended."""
+        cache = self._cache_with("soc", 80, RC.Quality.UNCERTAIN)
+        data = {"soc": cache.get("soc")}
+        self.assertIsNotNone(
+            data["soc"], "sanity: merge()/get() must still serve UNCERTAIN "
+            "to a normal consumer -- this is the v2.0.0 fix working as intended"
+        )
+        self.assertIsNone(
+            MGR._value(cache, data, "soc"),
+            "but THIS consumer must treat a stale-served UNCERTAIN reading "
+            "as None, not silently trust it as current -- it builds deltas "
+            "from sequential readings, unlike a display entity",
+        )
+
+    def test_bad_quality_value_is_treated_as_none(self):
+        cache = RC.RegisterCache()  # never read at all -- NEVER_READ, BAD
+        self.assertIsNone(MGR._value(cache, {}, "soc"))
+
+    def test_missing_from_data_is_none_regardless_of_cache_quality(self):
+        # Existing behaviour, unaffected by the quality gate: if the
+        # register simply isn't in `data` this cycle, None regardless of
+        # what quality_of() would separately say.
+        cache = self._cache_with("soc", 80, RC.Quality.GOOD)
+        self.assertIsNone(MGR._value(cache, {}, "soc"))
+
+    def test_adversarial_old_unguarded_extraction_would_have_trusted_the_stale_value(self):
+        """Proves the vulnerability was real, not hypothetical: reproduces
+        the OLD (pre-v2.0.0) _value(data, name) signature -- no quality
+        check at all -- and shows it WOULD have returned the stale value
+        as if it were current, unlike the fixed version."""
+        def _old_value(data, name):
+            result = data.get(name)
+            if result is None:
+                return None
+            return getattr(result, "value", result)
+
+        cache = self._cache_with("soc", 80, RC.Quality.UNCERTAIN)
+        data = {"soc": cache.get("soc")}
+        old_result = _old_value(data, "soc")
+        new_result = MGR._value(cache, data, "soc")
+        self.assertEqual(old_result, 80, "sanity: the old, unguarded extraction trusted it")
+        self.assertIsNone(new_result, "the new, quality-gated extraction correctly does not")
+
+    def test_rated_capacity_diagnostic_check_is_also_quality_gated(self):
+        """The second call site fixed alongside _build_sample()'s 14 --
+        the log-and-watch check for a Huawei SOH calibration step. Checked
+        at the source level: confirms it was updated to pass the cache
+        through, not just the more heavily-tested segment-building path."""
+        src = _source("battery_health_manager.py")
+        idx = src.find("Log-and-watch")
+        window = src[idx: idx + 500]
+        self.assertIn(
+            "_value(coordinator.cache", window,
+            "the rated-capacity diagnostic read must also be quality-gated, "
+            "not just the segment-building fields",
+        )
 
 
 if __name__ == "__main__":
