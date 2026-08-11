@@ -11,6 +11,8 @@ from homeassistant.helpers import entity_registry as er
 
 from .bus_diagnostics import pseudonym
 from .const import DATA_DEVICE_DATAS
+from .adaptive_modbus import AdaptiveModbusController
+from .modbus_telemetry import ModbusTelemetry
 from .types import (
     HuaweiSolarConfigEntry,
     HuaweiSolarDeviceData,
@@ -138,6 +140,37 @@ async def async_get_config_entry_diagnostics(
         diagnostics_data[f"device_{dd.device.client.unit_id}_data"] = (
             _redact_coordinator_data(dd.update_coordinator.data)
         )
+
+        # v2.0.0b (AR-9, external ICS audit -- confirmed): occupancy(),
+        # wait_service_split(), and the shed/admission-timeout counters
+        # (AR-9, MOD-09) already existed on AdaptiveModbusController's own
+        # snapshot(); the cache-hit counters already existed separately on
+        # ModbusTelemetry's own snapshot() -- but nothing in this file --
+        # Home Assistant's own "download diagnostics" feature -- ever
+        # surfaced either. Not identifying data (occupancy percentages,
+        # millisecond timings, and hit counts carry no serial/host
+        # information), so no redaction is needed here, unlike the
+        # coordinator data above.
+        adaptive = AdaptiveModbusController.get(dd.device.serial_number)
+        telemetry = ModbusTelemetry.get(dd.device.serial_number)
+        bus_metrics: dict[str, Any] = {}
+        if adaptive is not None:
+            snap = adaptive.snapshot()
+            bus_metrics.update({
+                "bus_occupancy_pct": snap.get("bus_occupancy_pct"),
+                "bus_wait_p95_ms": snap.get("bus_wait_p95_ms"),
+                "bus_service_p95_ms": snap.get("bus_service_p95_ms"),
+                "shed_count": snap.get("shed_count"),
+                "admission_timeout_count": snap.get("admission_timeout_count"),
+            })
+        if telemetry is not None:
+            tsnap = telemetry.snapshot()
+            bus_metrics.update({
+                "total_cache_hits": tsnap.get("total_cache_hits"),
+                "cache_hits_per_hour": tsnap.get("cache_hits_per_hour"),
+            })
+        if bus_metrics:
+            diagnostics_data[f"device_{dd.device.client.unit_id}_bus_metrics"] = bus_metrics
 
         if dd.configuration_update_coordinator:
             diagnostics_data[f"device_{dd.device.client.unit_id}_config_data"] = (

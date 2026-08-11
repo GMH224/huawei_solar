@@ -5,6 +5,7 @@ from collections.abc import Callable
 import inspect
 import logging
 from datetime import timedelta
+from typing import Any
 
 from huawei_solar import (
     ConnectionException,
@@ -65,6 +66,7 @@ from .modbus_guard import ModbusGuard
 from .register_cache import set_slow_tier_ttl
 from .modbus_keepalive import ModbusKeepAlive
 from .modbus_telemetry import ModbusTelemetry
+from .number import clear_static_bound_cache
 from .services import async_setup_services
 from .synchronized_power_coordinator import SynchronizedPowerCoordinator
 from .types import (
@@ -92,6 +94,21 @@ _COORDINATOR_START_DELAYS = {
     "power_meter":   timedelta(seconds=7),
     "energy_storage": timedelta(seconds=14),
     "configuration": timedelta(seconds=10),
+    # v2.0.0b (MOD-03, external ICS audit -- confirmed): SyncPower's first
+    # refresh used to fire immediately, with no stagger slot of its own --
+    # exactly when the regular per-device caches are coldest, guaranteeing
+    # its cache-shortcut (§8.2) misses and triggering the dedicated-read
+    # fallback at the worst possible moment, adding uncoordinated traffic
+    # on top of an already carefully sequenced startup. Positioned after
+    # energy_storage's 14s slot (the latest of the other four) rather than
+    # picking an earlier one: by 16s, every regular coordinator has had a
+    # real chance to complete its own first poll (typically well under 1s
+    # per-exchange when healthy, per this dict's own established
+    # reasoning), so SyncPower's now-cache-first reads (MOD-01) are far
+    # more likely to find the regular caches already populated -- turning
+    # even its "fallback" path into mostly cache hits, not fresh physical
+    # reads, rather than merely delaying the same worst-case traffic.
+    "sync_power":    timedelta(seconds=16),
 }
 
 # v1.3.10 FIX (Defect I): the offsets above stagger the FOUR COORDINATOR
@@ -254,6 +271,29 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
         bus_endpoint = ModbusGuard.endpoint_for(dict(entry.data))
         _LOGGER.debug("Bus endpoint: %s", bus_endpoint)
 
+        # v2.0.0a (F04, external ICS audit): acquire this entry's reference
+        # to the endpoint's guard HERE, once, before any coordinator is
+        # constructed -- not implicitly via each coordinator's own
+        # get_or_create() call, which does not affect the reference count.
+        # Every coordinator below shares this SAME acquired guard for the
+        # duration of this entry's lifetime; the matching release_endpoint()
+        # call happens exactly once, in async_unload_entry, regardless of
+        # how many coordinators this entry created on this endpoint.
+        ModbusGuard.acquire_endpoint(bus_endpoint)
+        # Registered via the SAME cleanup mechanism Defect U already built
+        # for exactly this situation: HA does not guarantee
+        # async_unload_entry() runs after a failed async_setup_entry(), so
+        # a setup attempt that acquires the endpoint and then fails partway
+        # through (e.g. a second daisy-chained device timing out) must still
+        # release its reference, or the count leaks permanently and the
+        # guard for this endpoint can never be cleaned up even after every
+        # real entry using it is gone. Registered FIRST, immediately after
+        # the acquire -- _run_cleanup_callbacks tears down in REVERSE
+        # registration order, so this correctly runs LAST, after every
+        # other cleanup (e.g. stopping keep-alive tasks) that might still
+        # need the guard to exist while it does its own teardown.
+        cleanup_callbacks.append(lambda: ModbusGuard.release_endpoint(bus_endpoint))
+
         if entry.data.get(CONF_ENABLE_PARAMETER_CONFIGURATION):
             if (
                 isinstance(primary_device, HuaweiSolarDeviceWithLogin)
@@ -369,6 +409,27 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
                     has_battery=has_battery,
                     update_interval=SYNC_POWER_UPDATE_INTERVAL,
                     bus_endpoint=bus_endpoint,
+                    # v2.0.0 (V2_ARCHITECTURE_DESIGN.md §8.2): the regular
+                    # per-device coordinators' own caches, checked for a
+                    # cheap shortcut before this coordinator's dedicated
+                    # read. Each is None when not applicable (e.g. no
+                    # second inverter, no meter, no battery) -- handled the
+                    # same as "not aligned, do the dedicated read".
+                    inv1_cache=inv1_data.update_coordinator.cache,
+                    inv2_cache=(
+                        inv2_data.update_coordinator.cache
+                        if inv2_data is not None else None
+                    ),
+                    meter_cache=(
+                        inv1_data.power_meter_update_coordinator.cache
+                        if inv1_data.power_meter_update_coordinator is not None
+                        else None
+                    ),
+                    battery_cache=(
+                        inv1_data.energy_storage_update_coordinator.cache
+                        if inv1_data.energy_storage_update_coordinator is not None
+                        else None
+                    ),
                 )
                 # Attach INV1's telemetry so sync-coordinator reads are counted
                 # in the same Modbus traffic dashboard as the other coordinators.
@@ -400,6 +461,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
                 async def _sync_first_refresh(
                     coord: SynchronizedPowerCoordinator = sync_coordinator,
                 ) -> None:
+                    # v2.0.0b (MOD-03, external ICS audit -- confirmed):
+                    # stagger this the same way every other coordinator's
+                    # first poll already is -- see
+                    # _COORDINATOR_START_DELAYS["sync_power"]'s own comment
+                    # for why 16s specifically.
+                    await asyncio.sleep(
+                        _staggered_start_delay("sync_power", 0).total_seconds()
+                    )
                     try:
                         await coord.async_config_entry_first_refresh()
                     except Exception:  # noqa: BLE001 — background task must not raise
@@ -474,7 +543,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
     except ConnectionInterruptedException as err:
         await _run_cleanup_callbacks(cleanup_callbacks)
         if primary_device is not None:
-            await primary_device.stop()
+            # v2.0.0b (MOD-16, external ICS audit -- confirmed): bounded,
+            # not a bare await primary_device.stop() -- see
+            # _bounded_device_stop's own docstring.
+            await _bounded_device_stop(primary_device)
         host = entry.data.get(CONF_HOST) or entry.data.get(CONF_PORT)
         _LOGGER.warning(
             "Connection to the inverter at %s was interrupted during setup. "
@@ -489,7 +561,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
     except ConnectionException as err:
         await _run_cleanup_callbacks(cleanup_callbacks)
         if primary_device is not None:
-            await primary_device.stop()
+            # v2.0.0b (MOD-16): see the ConnectionInterruptedException
+            # handler's own note above on this same fix.
+            await _bounded_device_stop(primary_device)
         host = entry.data.get(CONF_HOST) or entry.data.get(CONF_PORT)
         _LOGGER.warning(
             "Cannot connect to the inverter at %s. "
@@ -506,7 +580,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
     except TimeoutError as err:
         await _run_cleanup_callbacks(cleanup_callbacks)
         if primary_device is not None:
-            await primary_device.stop()
+            # v2.0.0b (MOD-16): see the ConnectionInterruptedException
+            # handler's own note above on this same fix.
+            await _bounded_device_stop(primary_device)
         _LOGGER.warning(
             "The inverter is not responding to requests. "
             "The connection was established but no data was received. "
@@ -520,7 +596,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
     except HuaweiSolarException as err:
         await _run_cleanup_callbacks(cleanup_callbacks)
         if primary_device is not None:
-            await primary_device.stop()
+            # v2.0.0b (MOD-16): see the ConnectionInterruptedException
+            # handler's own note above on this same fix.
+            await _bounded_device_stop(primary_device)
         _LOGGER.warning(
             "Failed to communicate with the inverter during setup: %s. ",
             err,
@@ -538,7 +616,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
         # earlier in this same, now-failed, setup attempt.
         await _run_cleanup_callbacks(cleanup_callbacks)
         if primary_device is not None:
-            await primary_device.stop()
+            # v2.0.0b (MOD-16): see the ConnectionInterruptedException
+            # handler's own note above on this same fix.
+            await _bounded_device_stop(primary_device)
         raise
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -730,6 +810,32 @@ def _async_setup_battery_health(
             )
 
 
+async def _bounded_device_stop(device: Any) -> None:
+    """Stop *device* with the same bounded, fault-isolated pattern
+    async_unload_entry's own normal disconnect already uses (see its own
+    comment on that call, just below) -- extracted here rather than
+    repeated at every call site, so the bound only has to be gotten right
+    once.
+
+    v2.0.0b FIX (MOD-16, external ICS audit -- confirmed): five setup-
+    failure exception handlers each called `await primary_device.stop()`
+    directly, with no timeout of its own -- unlike the NORMAL unload path
+    (async_unload_entry, below), which was already correctly bounded
+    (Defect U/Finding 3). A wedged or half-dead transport during a
+    FAILED setup could therefore hang cleanup indefinitely, delaying
+    Home Assistant's own retry of the failed entry -- turning a setup-
+    time transport problem into a stuck retry loop, exactly the failure
+    mode Defect U's own fix already prevents for the unload path.
+    """
+    try:
+        await asyncio.wait_for(device.stop(), timeout=DISCONNECT_TIMEOUT.total_seconds())
+    except Exception:  # noqa: BLE001 — never let a stuck stop() block setup-failure cleanup
+        _LOGGER.exception(
+            "Error stopping the inverter device during setup-failure "
+            "cleanup; continuing regardless"
+        )
+
+
 async def async_unload_entry(
     hass: HomeAssistant, entry: HuaweiSolarConfigEntry
 ) -> bool:
@@ -737,6 +843,23 @@ async def async_unload_entry(
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         device_datas: list[HuaweiSolarDeviceData] = entry.runtime_data[DATA_DEVICE_DATAS]
         primary_device = device_datas[0].device
+
+        # v2.0.0a FIX (F21, external ICS audit -- confirmed): keepalive is
+        # the only ACTIVE TRAFFIC PRODUCER among everything torn down in
+        # this function -- telemetry/adaptive/battery-health only persist
+        # local state, they don't independently talk to the device. The
+        # keep-alive loop is cancellation-aware (not a confirmed deadlock),
+        # but there was still a real window where it could be mid-probe --
+        # having already acquired the guard, awaiting batch_update() --
+        # exactly when the transport got disconnected out from under it.
+        # Stopped for EVERY device on this entry FIRST, in its own pass,
+        # before the single shared-transport disconnect below (not
+        # interleaved with the rest of per-device teardown, which doesn't
+        # produce new traffic and is safe to run after).
+        for device_data in device_datas:
+            keepalive = ModbusKeepAlive.get(device_data.device.serial_number)
+            if keepalive:
+                keepalive.stop()
 
         # v1.3.18 FIX (Defect U/Finding 3, independent ICS audit of
         # v1.3.17): this used to be a bare `await
@@ -775,6 +898,15 @@ async def async_unload_entry(
                 telemetry.stop()
             ModbusTelemetry.remove(serial)
 
+            # v2.0.0b (MOD-13, external ICS audit): clear this device's
+            # cached static number-entity bounds -- a reload can follow a
+            # firmware update or hardware swap, and a stale cached bound
+            # surviving that would be a correctness regression for the
+            # sake of an efficiency win that only needs to last one
+            # session anyway. See number.py's own _STATIC_BOUND_CACHE
+            # comment for the full reasoning.
+            clear_static_bound_cache(serial)
+
             # v1.3.19 FIX (Defect V/Finding 10, independent ICS audit): the
             # old sync stop() only ever scheduled the dirty-state flush as
             # a fire-and-forget background task, which could be cancelled
@@ -795,9 +927,10 @@ async def async_unload_entry(
                     controller.stop()
             AdaptiveModbusController.remove(serial)
 
-            keepalive = ModbusKeepAlive.get(serial)
-            if keepalive:
-                keepalive.stop()
+            # v2.0.0a (F21): keepalive.stop() itself already moved to its
+            # own pass above, before the transport disconnect -- only the
+            # registry cleanup (removing this entry's reference) remains
+            # here, alongside the rest of per-device teardown.
             ModbusKeepAlive.remove(serial)
 
             # Fault isolation (v1.1.7): a failed state flush must never
@@ -817,7 +950,14 @@ async def async_unload_entry(
 
         # The ModbusGuard is keyed on the connection endpoint shared by all
         # sub-devices of this entry; remove just that endpoint's guard.
-        ModbusGuard.remove(ModbusGuard.endpoint_for(entry.data))
+        # v2.0.0a (F04, external ICS audit): release_endpoint(), not the old
+        # unconditional remove() -- this only actually removes the guard
+        # from the registry once every entry/flow that acquired a reference
+        # to this endpoint (this one included) has released it. A second
+        # entry sharing this same physical endpoint keeps working
+        # uninterrupted; the guard is torn down only when the last such
+        # user is gone.
+        ModbusGuard.release_endpoint(ModbusGuard.endpoint_for(entry.data))
 
         # The SynchronizedPowerCoordinator has no background tasks of its own —
         # HA cancels its scheduled refresh when the config entry is unloaded.
@@ -920,9 +1060,18 @@ async def _setup_inverter_device_data(
         register_cleanup(adaptive.async_unload)
 
     # Create the keep-alive / connection health probe.
-    # The callbacks wire directly into the main coordinator so that a
-    # dead-connection detection immediately invalidates the cache and
-    # resets failure counters on all coordinators for this inverter.
+    # v2.0.1 (H-02, ICS re-audit): this comment used to claim the
+    # callbacks below "reset failure counters on all coordinators for
+    # this inverter" -- they did not; at the time this call is made, only
+    # update_coordinator (the main coordinator) exists yet, and these
+    # callbacks are bound to ITS OWN on_connection_lost/on_connection_
+    # restored specifically. The callbacks are re-wired further below,
+    # once every coordinator for this device is known, to actually reach
+    # all of them -- see that re-wiring's own comment for the full
+    # reasoning. The wiring here is deliberately kept as the initial
+    # value (not left unset), so the main coordinator is still correctly
+    # covered even in the unlikely case the re-wiring below is never
+    # reached (e.g. a later step in this same function raising first).
     keepalive = ModbusKeepAlive.get_or_create(
         serial_number=device.serial_number,
         device=device,
@@ -1032,10 +1181,26 @@ async def _setup_inverter_device_data(
             # v1.3.14 FIX (Defect N): bounded so a slow/still-reconnecting
             # device can't hold entry setup open indefinitely on this one
             # discovery scan (see const.OPTIMIZER_DISCOVERY_TIMEOUT).
-            optimizer_system_infos = await asyncio.wait_for(
-                device.get_optimizer_system_information_data(),
-                timeout=OPTIMIZER_DISCOVERY_TIMEOUT.total_seconds(),
-            )
+            #
+            # v2.0.0b FIX (MOD-07, external ICS audit -- confirmed): being
+            # time-bounded protected setup from hanging, but this call
+            # bypassed ModbusGuard entirely -- it could physically collide
+            # with any other in-flight or concurrently issued transaction
+            # on the same endpoint (main/meter/battery coordinators, or
+            # another entry's config-flow discovery). Routed through the
+            # same guard every other transaction now goes through;
+            # get_or_create() (not acquire_endpoint()) is correct here --
+            # this entry's own reference to the endpoint was already
+            # acquired once, earlier in async_setup_entry (F04), so this
+            # is just fetching the existing guard object, not creating a
+            # new reference to its lifecycle.
+            async with ModbusGuard.get_or_create(bus_endpoint).request(
+                label="optimizer_discovery"
+            ):
+                optimizer_system_infos = await asyncio.wait_for(
+                    device.get_optimizer_system_information_data(),
+                    timeout=OPTIMIZER_DISCOVERY_TIMEOUT.total_seconds(),
+                )
 
             optimizers_device_infos = {
                 optimizer_id: DeviceInfo(
@@ -1093,6 +1258,59 @@ async def _setup_inverter_device_data(
         configuration_update_coordinator.attach_adaptive(adaptive)
     else:
         configuration_update_coordinator = None
+
+    # v2.0.1 FIX (H-02, ICS re-audit -- confirmed): keepalive's
+    # on_connection_lost/on_connection_restored were wired only to
+    # update_coordinator (the main coordinator) at creation time, above --
+    # before power_meter/energy_storage/configuration's own coordinators
+    # (each with their own separate RegisterCache) existed yet. The
+    # comment at that creation site claimed this "resets failure counters
+    # on all coordinators for this inverter" -- it did not; only the main
+    # coordinator's own cache/counters were ever touched. A keepalive-
+    # detected outage therefore invalidated only the main coordinator's
+    # cache; the others kept whatever pre-outage values they had as
+    # Quality.GOOD, which MOD-01's SyncPower fallback (this same
+    # project's own earlier fix) would then actively serve as if nothing
+    # had happened. Re-wired here, once every coordinator for this device
+    # is known, rather than at each coordinator's own scattered creation
+    # site above -- keepalive is created before most of them exist, and
+    # _on_connection_lost/_on_connection_restored are plain, reassignable
+    # attributes (not fixed permanently at ModbusKeepAlive construction).
+    # The optimizer coordinator is deliberately excluded: it is a
+    # separate class (HuaweiSolarOptimizerUpdateCoordinator, a sibling,
+    # not a subclass) with its own dict-based data model, not a
+    # RegisterCache -- it has no on_connection_lost/on_connection_restored
+    # method to call, and H-02's concern (stale RegisterCache values)
+    # does not apply to it.
+    _coordinators_for_keepalive = [
+        c for c in (
+            update_coordinator,
+            power_meter_update_coordinator,
+            energy_storage_update_coordinator,
+            configuration_update_coordinator,
+        ) if c is not None
+    ]
+
+    def _on_connection_lost_all() -> None:
+        for c in _coordinators_for_keepalive:
+            try:
+                c.on_connection_lost()
+            except Exception:  # noqa: BLE001 -- one coordinator's failure must not skip the rest
+                _LOGGER.exception(
+                    "%s: on_connection_lost callback failed", c.name
+                )
+
+    def _on_connection_restored_all() -> None:
+        for c in _coordinators_for_keepalive:
+            try:
+                c.on_connection_restored()
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception(
+                    "%s: on_connection_restored callback failed", c.name
+                )
+
+    keepalive._on_connection_lost = _on_connection_lost_all
+    keepalive._on_connection_restored = _on_connection_restored_all
 
     return HuaweiSolarInverterData(
         device=device,

@@ -54,7 +54,10 @@ from .const import (
 if TYPE_CHECKING:
     from homeassistant.helpers.device_registry import DeviceInfo
 
+    from .register_cache import RegisterCache
     from .update_coordinator import HuaweiSolarUpdateCoordinator
+
+from .register_cache import Quality
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -151,10 +154,34 @@ def config_from_options(options: dict[str, Any] | None) -> BatteryHealthConfig:
     return cfg
 
 
-def _value(data: dict[str, Any], name: str) -> Any:
-    """Extract a Result.value from coordinator data, tolerating absence."""
+def _value(cache: "RegisterCache", data: dict[str, Any], name: str) -> Any:
+    """Extract a Result.value from coordinator data -- but ONLY if its
+    quality is GOOD, not merely present.
+
+    v2.0.0 (V2_ARCHITECTURE_DESIGN.md §10.4's deliberate exception, and the
+    specific vulnerability that motivated this entire rebuild -- see §1
+    there and PHASE1_BATTERY_HEALTH_DESIGN.md's opening paragraph). Unlike
+    a display entity, this consumer builds STATEFUL DELTAS from sequential
+    readings (SOC drop across a segment, energy accumulated between
+    anchors). RegisterCache.merge() now correctly serves a register whose
+    quality is UNCERTAIN (link down, shed, back-off-deferred, ...) rather
+    than dropping it -- the right behaviour for a display entity showing a
+    probably-still-accurate value, but silently treating that same
+    stale-served value as fresh here could corrupt the segment tracker's
+    internal state in a way that persists and compounds, not just look
+    briefly wrong for one tick.
+
+    A quality-degraded register is therefore treated exactly like a
+    genuinely missing one here (returns None) -- the engine's existing
+    tolerance for None, already built and adversarially tested against
+    real Modbus-saturation conditions this session, handles this
+    correctly without any change to battery_health.py's engine internals.
+    """
     result = data.get(name)
     if result is None:
+        return None
+    quality, _reason, _age = cache.quality_of(name)
+    if quality != Quality.GOOD:
         return None
     return getattr(result, "value", result)
 
@@ -337,7 +364,11 @@ class BatteryHealthManager:
             return
 
         # Log-and-watch: does 37758 step after a Huawei SOH calibration?
-        rated = _value(data, _RN_RATED_CAPACITY)
+        # v2.0.0: quality-gated for the same reason as _build_sample's
+        # fields -- a stale-served value could otherwise trigger a
+        # misleading "possible SOH calibration step" log line when nothing
+        # actually changed.
+        rated = _value(coordinator.cache, data, _RN_RATED_CAPACITY)
         if rated is not None:
             try:
                 rated_f = float(rated)
@@ -368,9 +399,14 @@ class BatteryHealthManager:
         self._maybe_save()
 
     def _build_sample(self, data: dict[str, Any]) -> HealthSample:
+        # v2.0.0: single reference for every _value() call below to check
+        # quality against -- see _value()'s own docstring for why this
+        # consumer specifically needs quality-gating, unlike a display
+        # entity.
+        cache = self.coordinator.cache
         packs: list[PackSample] = []
         for i in range(PACK_COUNT):
-            status = _value(data, _RN_PACK_STATUS[i])
+            status = _value(cache, data, _RN_PACK_STATUS[i])
             try:
                 # int() handles both plain ints and IntEnum register values.
                 online = int(status) == PACK_WORKING_STATUS_RUNNING
@@ -378,15 +414,15 @@ class BatteryHealthManager:
                 online = False
             packs.append(
                 PackSample(
-                    voltage=_value(data, _RN_PACK_VOLTAGE[i]),
-                    temp_max=_value(data, _RN_PACK_TMAX[i]),
-                    temp_min=_value(data, _RN_PACK_TMIN[i]),
+                    voltage=_value(cache, data, _RN_PACK_VOLTAGE[i]),
+                    temp_max=_value(cache, data, _RN_PACK_TMAX[i]),
+                    temp_min=_value(cache, data, _RN_PACK_TMIN[i]),
                     online=online,
                 )
             )
 
-        calib_values = [_value(data, _RN_UNIT_CALIBRATION)] + [
-            _value(data, name) for name in _RN_PACK_CALIBRATION
+        calib_values = [_value(cache, data, _RN_UNIT_CALIBRATION)] + [
+            _value(cache, data, name) for name in _RN_PACK_CALIBRATION
         ]
         calibration_active = False
         for cv in calib_values:
@@ -402,14 +438,14 @@ class BatteryHealthManager:
 
         return HealthSample(
             timestamp=time.time(),
-            soc=_value(data, _RN_SOC),
-            power_w=_value(data, _RN_POWER),
-            battery_temp_c=_value(data, _RN_TEMP),
-            lifetime_charge_kwh=_value(data, _RN_TOTAL_CHARGE),
-            lifetime_discharge_kwh=_value(data, _RN_TOTAL_DISCHARGE),
+            soc=_value(cache, data, _RN_SOC),
+            power_w=_value(cache, data, _RN_POWER),
+            battery_temp_c=_value(cache, data, _RN_TEMP),
+            lifetime_charge_kwh=_value(cache, data, _RN_TOTAL_CHARGE),
+            lifetime_discharge_kwh=_value(cache, data, _RN_TOTAL_DISCHARGE),
             packs=packs,
             soh_calibration_active=calibration_active,
-            charge_ceiling_soc=_value(data, _RN_END_OF_CHARGE_SOC),
+            charge_ceiling_soc=_value(cache, data, _RN_END_OF_CHARGE_SOC),
             ambient_temp_c=self._read_ambient(),
         )
 

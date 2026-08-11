@@ -16,12 +16,20 @@ from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .adaptive_modbus import AdaptiveModbusController
 from .battery_health_manager import BatteryHealthManager
 from .bus_diagnostics import BusDiagnostics
-from .const import CONF_ENABLE_PARAMETER_CONFIGURATION, DATA_DEVICE_DATAS
+from .const import (
+    CONF_ENABLE_PARAMETER_CONFIGURATION,
+    DATA_DEVICE_DATAS,
+    DATA_SYNC_POWER_COORDINATOR,
+    TELEMETRY_CAPTURE_INTERVAL,
+)
+from .modbus_telemetry import ModbusTelemetry
+from .telemetry_capture import TelemetryCapture, build_telemetry_snapshot
 from .types import (
     HuaweiSolarConfigEntry,
     HuaweiSolarDeviceData,
@@ -135,6 +143,21 @@ async def async_setup_entry(
                 guard.diagnostics = diagnostics
                 learning_switches.append(
                     ModbusDiagnosticsSwitchEntity(diagnostics, ucs)
+                )
+                # v2.0.0b: same "one per bus" scoping as the diagnostics
+                # switch immediately above -- periodic aggregate capture
+                # is also a property of the shared physical connection,
+                # not any one inverter. device_data (the full list, not
+                # just `ucs`) and the entry's SyncPower coordinator (if
+                # this entry has one) are threaded through so one snapshot
+                # tick can gather every coordinator on the entry, not just
+                # this one device's own.
+                telemetry_capture = TelemetryCapture.get_or_create(hass, guard.endpoint)
+                learning_switches.append(
+                    ModbusTelemetryCaptureSwitchEntity(
+                        telemetry_capture, ucs, device_data,
+                        entry.runtime_data.get(DATA_SYNC_POWER_COORDINATOR),
+                    )
                 )
         if learning_switches:
             async_add_entities(learning_switches)
@@ -256,6 +279,12 @@ class HuaweiSolarSwitchEntity(
                 )
             else:
                 self._attr_available = True
+
+            # v2.0.0: quality/reason/age attributes -- see _quality_attrs()'s
+            # own docstring. Custom availability logic above is untouched.
+            self._attr_extra_state_attributes = self._quality_attrs(
+                self.coordinator, self.entity_description.register_name
+            )
         else:
             self._attr_is_on = None
             self._attr_available = False
@@ -264,17 +293,46 @@ class HuaweiSolarSwitchEntity(
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the setting on."""
-        if await self.device.set(self.entity_description.register_name, True):
+        # v2.0.0b (MOD-05, external ICS audit -- confirmed): now uses the
+        # shared _guarded_write() helper (types.py), pairing the guard
+        # with WRITE_TIMEOUT -- see number.py's own note on this pattern.
+        wrote = await self._guarded_write(
+            self.coordinator.guard, self.device,
+            self.entity_description.register_name, True,
+            label="switch_write",
+        )
+        if wrote:
             self._attr_is_on = True
             self.coordinator.invalidate_cache(self.entity_description.register_name)
+            # v2.0.0a (F12, external ICS audit -- confirmed): verify_write()
+            # existed, fully built and already guarded, but had zero
+            # production callers. Fired as a background task, not awaited --
+            # see number.py's own note on this same pattern for the full
+            # reasoning (~3-9s to confirm, whole value is a warning log on
+            # silent failure, not worth blocking the toggle on).
+            # v2.0.0b (MOD-10): entry-scoped via the coordinator now, not a
+            # bare self.hass.async_create_task().
+            self.coordinator.create_background_task(
+                self.coordinator.verify_write(self.entity_description.register_name, True),
+                f"{self.coordinator.name}_verify_write_{self.entity_description.register_name}",
+            )
 
         await self.coordinator.async_request_refresh()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the setting off."""
-        if await self.device.set(self.entity_description.register_name, False):
+        wrote = await self._guarded_write(
+            self.coordinator.guard, self.device,
+            self.entity_description.register_name, False,
+            label="switch_write",
+        )
+        if wrote:
             self._attr_is_on = False
             self.coordinator.invalidate_cache(self.entity_description.register_name)
+            self.coordinator.create_background_task(
+                self.coordinator.verify_write(self.entity_description.register_name, False),
+                f"{self.coordinator.name}_verify_write_{self.entity_description.register_name}",
+            )
 
         await self.coordinator.async_request_refresh()
 
@@ -358,6 +416,9 @@ class HuaweiSolarOnOffSwitchEntity(
 
             self._attr_is_on = not self._is_off(device_status)
             self._attr_available = True
+            self._attr_extra_state_attributes = self._quality_attrs(
+                self.coordinator, rn.DEVICE_STATUS
+            )
         else:
             self._attr_available = False
 
@@ -427,8 +488,18 @@ class HuaweiSolarOnOffSwitchEntity(
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the setting on."""
+        # v2.0.0b (MOD-05, external ICS audit -- confirmed): now uses the
+        # shared _guarded_write() helper (types.py), pairing the guard
+        # with WRITE_TIMEOUT -- see number.py's own note on this pattern.
+        # Unrelated to and unaffected by the SEPARATE, already-bounded
+        # _wait_for_status() polling loop below (which has its own real
+        # monotonic deadline, MAX_STATUS_CHANGE_TIME_SECONDS) -- this
+        # timeout covers only the write itself.
         async with self._change_lock:
-            await self.device.set(rn.STARTUP, 0)
+            await self._guarded_write(
+                self.coordinator.guard, self.device, rn.STARTUP, 0,
+                label="switch_write",
+            )
 
             # Turning on can take up to 5 minutes... We'll poll every 15 seconds
             if await self._wait_for_status(lambda status: not self._is_off(status)):
@@ -439,7 +510,10 @@ class HuaweiSolarOnOffSwitchEntity(
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the setting off."""
         async with self._change_lock:
-            await self.device.set(rn.SHUTDOWN, 0)
+            await self._guarded_write(
+                self.coordinator.guard, self.device, rn.SHUTDOWN, 0,
+                label="switch_write",
+            )
 
             # Turning off can take up to 5 minutes... We'll poll every 15 seconds
             if await self._wait_for_status(self._is_off):
@@ -588,3 +662,130 @@ class ModbusDiagnosticsSwitchEntity(SwitchEntity):
         """Stop capturing and flush anything pending."""
         self._diagnostics.set_enabled(False)
         self.async_write_ha_state()
+
+
+class ModbusTelemetryCaptureSwitchEntity(SwitchEntity):
+    """Periodic aggregate Modbus telemetry snapshot capture for one
+    physical bus.
+
+    Complements ModbusDiagnosticsSwitchEntity above: where that switch
+    records EVERY individual request's wait/service split, this one
+    periodically snapshots the AGGREGATE metrics already computed
+    elsewhere (per-device adaptive/telemetry counters, and
+    SynchronizedPowerCoordinator's own dedicated cache-hit/physical-read
+    counters) into a real time series -- the data needed to directly
+    assess the external ICS audit's Physical Demand Planner
+    recommendation without a second deployment purely to add more
+    telemetry.
+
+    Default OFF, and deliberately NOT restored across restarts -- same
+    reasoning as the diagnostics switch: a capture must never be silently
+    left running forever.
+
+    Records go to ``config/huawei_solar_diagnostics/telemetry_<tag>.jsonl``
+    -- same directory and same salted-hash tag as the per-request capture
+    above (so the two files for one physical bus are easy to find
+    together), different filename. Runs on its own periodic timer
+    (TELEMETRY_CAPTURE_INTERVAL), independent of any single coordinator's
+    own poll cadence, so one snapshot always reflects the same moment for
+    every coordinator on the entry.
+
+    Writes no inverter registers, and never blocks the event loop.
+    """
+
+    _attr_has_entity_name = True
+    _attr_should_poll = False
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_entity_registry_enabled_default = False
+    _attr_name = "Modbus telemetry capture"
+    _attr_icon = "mdi:chart-line"
+
+    def __init__(
+        self,
+        capture: TelemetryCapture,
+        device_data: Any,
+        device_datas: list[Any],
+        sync_coordinator: Any | None,
+    ) -> None:
+        """Initialize the telemetry capture switch."""
+        self._capture = capture
+        self._device_datas = device_datas
+        self._sync_coordinator = sync_coordinator
+        # The register-overlap structural check is genuinely one-time
+        # (see check_register_overlap()'s own docstring) -- tracked here
+        # so it is attempted on the first tick after being enabled and
+        # then left out of every subsequent one, not recomputed forever.
+        # Reset on every re-enable: a fresh capture session should get
+        # its own fresh attempt, in case coordinators were not yet polled
+        # the first time this ran.
+        self._register_overlap_captured = False
+        self._attr_device_info = device_data.device_info
+        self._attr_unique_id = (
+            f"{device_data.device.serial_number}_modbus_telemetry_capture"
+        )
+
+    @property
+    def is_on(self) -> bool:
+        """Return True while capture is running."""
+        return self._capture.enabled
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Expose capture health, including dropped snapshots."""
+        return self._capture.stats()
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        """Start periodic aggregate snapshot capture."""
+        self._capture.set_enabled(True)
+        self._register_overlap_captured = False
+        # Stored on the capture object itself (not just a local variable)
+        # so TelemetryCapture.set_enabled(False) -- called both from
+        # async_turn_off() below AND anywhere else this capture might be
+        # disabled -- can always cancel it, not only this specific code
+        # path.
+        self._capture.cancel_periodic = async_track_time_interval(
+            self.hass, self._async_snapshot_tick, TELEMETRY_CAPTURE_INTERVAL,
+        )
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        """Stop capturing and flush anything pending."""
+        self._capture.set_enabled(False)  # also cancels the periodic timer
+        self.async_write_ha_state()
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Ensure the periodic timer is cancelled if this entity is torn
+        down (unload/reload) while capture is still running.
+
+        BusDiagnostics has no equivalent concern -- it has no timer of
+        its own, only a buffer. This switch owns a genuinely new kind of
+        resource (a recurring callback holding references to this
+        entry's coordinators), and turning the switch off is not the
+        only way this entity's lifecycle can end -- an unload/reload
+        while capture happens to be on must not leave that timer firing
+        against coordinators that no longer exist.
+        """
+        if self._capture.enabled:
+            self._capture.set_enabled(False)
+
+    async def _async_snapshot_tick(self, now: Any) -> None:
+        """Gather and record one telemetry snapshot. Runs on the timer.
+
+        Exception-guarded end to end: a telemetry fault must cost
+        telemetry, never the coordinators' own polling -- the same
+        discipline bus_diagnostics.py's own module docstring states for
+        its per-request capture.
+        """
+        try:
+            snapshot = build_telemetry_snapshot(
+                self._device_datas,
+                self._sync_coordinator,
+                include_register_overlap=not self._register_overlap_captured,
+                adaptive_controller_cls=AdaptiveModbusController,
+                modbus_telemetry_cls=ModbusTelemetry,
+            )
+            if "register_overlap" in snapshot:
+                self._register_overlap_captured = True
+            self._capture.record_snapshot(snapshot)
+        except Exception:  # noqa: BLE001 — telemetry must never break polling
+            _LOGGER.exception("Modbus telemetry capture: snapshot tick failed")

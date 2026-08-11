@@ -77,7 +77,58 @@ class ModbusQueueShed(asyncio.TimeoutError):
     ``except asyncio.TimeoutError`` path (back-off, cache fallback, entity
     availability); only the adaptive-learning bookkeeping treats it specially.
     """
+
+
+class ModbusAdmissionTimeout(asyncio.TimeoutError):
+    """Raised when a request waited for the bus (past QUEUE_WAIT_TIMEOUT)
+    but never got the chance to actually talk to the device.
+
+    v2.0.0a (F08, external ICS audit -- confirmed). Same reasoning as
+    ModbusQueueShed above, for the OTHER congestion outcome: a request that
+    doesn't get shed immediately (queue wasn't full) can still wait long
+    enough for the lock/inter-request-gap acquisition itself to time out --
+    this used to raise a bare ``asyncio.TimeoutError``, indistinguishable
+    by type from the device itself failing to respond. The distinction
+    matters most for ModbusKeepAlive: a single ``except TimeoutError``
+    there previously treated "the bus was busy for 10+ seconds" and "the
+    device didn't answer within its own 20s budget" identically, both
+    triggering on_connection_lost() -- meaning ordinary bus congestion
+    (exactly the condition the rest of this integration's back-off/guard
+    machinery is built to handle gracefully) could manufacture a false
+    "connection lost" event and an unnecessary full cache invalidation.
+
+    Subclassing ``asyncio.TimeoutError`` for the same reason as
+    ModbusQueueShed: every existing ``except TimeoutError`` path keeps
+    working exactly as before for anything that doesn't specifically care
+    about this distinction; only ModbusKeepAlive's own handling needs to
+    (and now does) treat it specially.
+    """
 MAX_QUEUE_DEPTH = 3
+
+# v2.0.0a (F18, external ICS audit -- confirmed): the priority lane's own
+# bound, independent of MAX_QUEUE_DEPTH above. Deliberately small --
+# realistically at most a handful of independent keep-alive tasks could
+# ever share one physical endpoint (one per device on that bus, and most
+# installations have one or two devices total), so this is not meant to
+# accommodate genuine concurrent load the way the normal queue depth is;
+# it exists purely so priority admission has SOME ceiling rather than
+# none, catching a genuinely pathological pile-up (e.g. a bug elsewhere
+# repeatedly spawning priority requests) rather than tuning for expected
+# normal operation.
+MAX_PRIORITY_QUEUE_DEPTH = 2
+
+# v2.0.0b (AR-4, external ICS audit): the priority lane's own airtime
+# budget -- see _priority_window_start/_priority_busy_s's own comment in
+# __init__ for why this is a distinct mechanism from MAX_PRIORITY_QUEUE_
+# DEPTH above. Both values are the report's own explicitly-stated
+# starting point ("P = 20%, T = 10 seconds, both field-tunable"), not
+# independently re-derived here -- only one priority producer (keep-alive)
+# exists in this codebase today, so there is no field data yet showing
+# these specific numbers need to be different; they exist as a genuine,
+# working ceiling from day one rather than an unbounded right, with room
+# to be tuned later against real multi-producer field data.
+PRIORITY_AIRTIME_BUDGET_FRACTION: float = 0.20
+PRIORITY_AIRTIME_WINDOW_S: float = 10.0
 
 
 class ModbusGuard:
@@ -85,6 +136,31 @@ class ModbusGuard:
 
     # Key: connection_endpoint string → ModbusGuard instance
     _registry: dict[str, "ModbusGuard"] = {}
+
+    # v2.0.0a (F04, external ICS audit -- confirmed): the registry used to
+    # be removed unconditionally on a single config entry's unload, with no
+    # awareness of whether other entries (or, from this release, config-flow
+    # sessions) still shared the same physical endpoint. A surviving entry
+    # keeps working fine immediately after (it already holds its own
+    # reference to the old guard object) -- the real failure surfaces
+    # LATER, the next time anything on that endpoint calls acquire_endpoint()
+    # again (e.g. a third entry loading, or a reload): finding nothing in
+    # the registry, it creates a SECOND, independent ModbusGuard for one
+    # physical bus, silently breaking the serialisation guarantee between
+    # whichever coordinators ended up on each of the two objects.
+    #
+    # Fixed with entry-level (not coordinator-level) reference counting.
+    # The unit is deliberately the ENTRY (or config-flow session), not each
+    # individual coordinator -- multiple coordinators within one entry
+    # (main, power_meter, energy_storage, configuration, sync-power) all
+    # share one endpoint and are constructed/torn down together as a unit,
+    # so counting at that finer grain would be needless bookkeeping for no
+    # extra correctness. acquire_endpoint()/release_endpoint() are the
+    # entry/flow-level lifecycle calls; get_or_create() remains available
+    # as the plain "get me the object" accessor coordinators already use --
+    # by the time any coordinator calls it, its entry has already called
+    # acquire_endpoint() first, so the object is guaranteed to exist.
+    _ref_counts: dict[str, int] = {}
 
     # ── class helpers ─────────────────────────────────────────────────────────
 
@@ -106,22 +182,63 @@ class ModbusGuard:
 
     @classmethod
     def get_or_create(cls, endpoint: str) -> "ModbusGuard":
+        """Return the guard object for *endpoint*, creating it if absent.
+
+        Does NOT itself affect the reference count -- callers that own the
+        endpoint's lifecycle (a config entry's setup, or a config-flow
+        session) must bracket their own usage with
+        acquire_endpoint()/release_endpoint() instead. Individual
+        coordinators within an already-acquired entry can keep calling this
+        as a plain accessor, exactly as before.
+        """
         if endpoint not in cls._registry:
             cls._registry[endpoint] = cls(endpoint)
         return cls._registry[endpoint]
 
     @classmethod
+    def acquire_endpoint(cls, endpoint: str) -> "ModbusGuard":
+        """Entry/flow-level acquire: creates the guard if needed and
+        increments its reference count by one. Must be paired with exactly
+        one later acquire_endpoint()-matching release_endpoint() call for
+        the same endpoint.
+        """
+        guard = cls.get_or_create(endpoint)
+        cls._ref_counts[endpoint] = cls._ref_counts.get(endpoint, 0) + 1
+        return guard
+
+    @classmethod
+    def release_endpoint(cls, endpoint: str) -> None:
+        """Entry/flow-level release: decrements the endpoint's reference
+        count, removing the guard from the registry only once the count
+        reaches zero -- i.e. once every entry/flow that acquired it has
+        released it. A release with no matching prior acquire (count
+        already absent or at zero) is a safe no-op, not an error -- this
+        keeps teardown code that runs on best-effort/exception paths from
+        needing its own separate bookkeeping.
+        """
+        if endpoint not in cls._ref_counts:
+            return
+        cls._ref_counts[endpoint] -= 1
+        if cls._ref_counts[endpoint] <= 0:
+            cls._ref_counts.pop(endpoint, None)
+            cls._registry.pop(endpoint, None)
+
+    @classmethod
     def clear_registry(cls) -> None:
         cls._registry.clear()
+        cls._ref_counts.clear()
 
     @classmethod
     def remove(cls, endpoint: str) -> None:
-        """Remove a single guard from the registry (per-entry unload).
-
-        Unlike clear_registry(), this does not disturb guards belonging to
-        other still-loaded config entries that share the registry.
+        """DEPRECATED (v2.0.0a, F04): unconditional removal, ignoring
+        reference count. Retained only so any external/legacy caller does
+        not hard-fail; production code should use release_endpoint()
+        instead, which is reference-count-aware. Calling this directly
+        will remove the guard even if other entries/flows still hold a
+        reference to it -- exactly the bug F04 describes.
         """
         cls._registry.pop(endpoint, None)
+        cls._ref_counts.pop(endpoint, None)
 
     # ── instance ──────────────────────────────────────────────────────────────
 
@@ -160,6 +277,47 @@ class ModbusGuard:
         #: Exposed so internal contention is observable rather than silently
         #: mixed into the inverter's failure statistics.
         self.shed_count: int = 0
+        # v2.0.0a (F18, external ICS audit -- confirmed): priority=True
+        # requests (keep-alive) bypass the normal queue-depth shedding
+        # check entirely -- correct, that's the whole point of priority --
+        # but that ALSO meant they had NO upper bound of their own. The
+        # normal queue-depth limit is not a true hard ceiling once
+        # priority producers exist: multiple priority requests could pile
+        # up waiting, unbounded, even while the normal queue is already at
+        # its own limit. Only one priority producer (keep-alive) exists in
+        # this codebase today, but a bus shared by multiple devices means
+        # multiple independent keep-alive tasks CAN legitimately overlap
+        # on one endpoint -- this is a real, reachable case, not a
+        # hypothetical one. Tracked as a SEPARATE counter from
+        # _queue_depth (which priority requests still increment/decrement,
+        # for occupancy/diagnostics purposes) -- this one exists purely to
+        # give priority admission its own, independent, bounded lane.
+        self._priority_queue_depth: int = 0
+        #: Diagnostic counter, mirroring shed_count but for the priority
+        #: lane specifically -- a priority shed is a materially different
+        #: signal (keep-alive itself is being starved) from a normal one.
+        self.priority_shed_count: int = 0
+        # v2.0.0b (AR-4, external ICS audit): the priority lane's own
+        # AIRTIME budget, distinct from MOD-18's queue-DEPTH bound above.
+        # Depth bounds how many priority requests can be simultaneously
+        # admitted/waiting; this bounds what FRACTION of the bus's own
+        # occupied time, within a rolling window, priority traffic may
+        # consume -- closing the report's own framing: "priority should
+        # mean gets admitted ahead of ordinary work, not can consume
+        # arbitrary bus capacity whenever it wants." A self-contained
+        # rolling window, deliberately not sharing occupancy()'s own
+        # _busy_s/_window_start pair above -- that window's reset cadence
+        # is controlled by whatever external caller passes reset=True to
+        # occupancy(), which may not roll forward on any particular
+        # schedule; this budget needs a predictable, self-managed window
+        # to mean anything as a genuine per-window cap.
+        self._priority_window_start: float = time.monotonic()
+        self._priority_busy_s: float = 0.0
+        #: Diagnostic counter: how many priority requests were admitted
+        #: under NORMAL-lane fairness rules (i.e. subject to the ordinary
+        #: queue-depth shed check) because the priority airtime budget for
+        #: the current window was already exhausted.
+        self.priority_budget_exceeded_count: int = 0
         # ── v1.3.0 Phase 0 instrumentation ───────────────────────────────────
         #: Wall-clock time this guard has spent holding the line, and the
         #: window it was measured over. Occupancy = busy / elapsed is the
@@ -269,7 +427,39 @@ class ModbusGuard:
             guard = self._guard
             self._t_submit = time.monotonic()
 
-            if not self._priority and guard._queue_depth >= guard._max_queue_depth:
+            # v2.0.0b (AR-4, external ICS audit): the priority lane's own
+            # airtime budget. Rolls the self-contained rolling window
+            # forward if it has expired, then checks whether THIS
+            # request, if it claims priority, still has budget within the
+            # current window. If not, it is demoted to normal-lane
+            # fairness for the queue-depth check immediately below --
+            # deliberately ONLY for that one check, not for anything else
+            # (the priority-lane depth check further below, and the
+            # priority-queue-depth bookkeeping, still treat this as the
+            # priority request it actually is; only its ability to
+            # unconditionally bypass ordinary shedding is what the
+            # exhausted budget takes away for this one admission).
+            if self._t_submit - guard._priority_window_start > PRIORITY_AIRTIME_WINDOW_S:
+                guard._priority_window_start = self._t_submit
+                guard._priority_busy_s = 0.0
+            window_elapsed = self._t_submit - guard._priority_window_start
+            priority_fraction = (
+                guard._priority_busy_s / window_elapsed if window_elapsed > 0 else 0.0
+            )
+            self._demoted_for_admission = False
+            effective_priority = self._priority
+            if self._priority and priority_fraction >= PRIORITY_AIRTIME_BUDGET_FRACTION:
+                guard.priority_budget_exceeded_count += 1
+                effective_priority = False
+                self._demoted_for_admission = True
+                _LOGGER.debug(
+                    "ModbusGuard[%s]: priority airtime budget exhausted "
+                    "(%.0f%% of last %.0fs) -- this priority request is "
+                    "subject to normal-lane admission for this cycle",
+                    guard.endpoint, priority_fraction * 100, PRIORITY_AIRTIME_WINDOW_S,
+                )
+
+            if not effective_priority and guard._queue_depth >= guard._max_queue_depth:
                 _LOGGER.debug(
                     "ModbusGuard[%s]: queue full (%d/%d) — shedding request",
                     guard.endpoint, guard._queue_depth, guard._max_queue_depth,
@@ -280,7 +470,30 @@ class ModbusGuard:
                     f"({guard._queue_depth}/{guard._max_queue_depth})"
                 )
 
+            # v2.0.0a (F18, external ICS audit -- confirmed): priority
+            # requests bypass the check above by design, but that used to
+            # mean they had NO upper bound of their own -- the normal
+            # queue-depth limit was not a true hard ceiling once a priority
+            # producer existed. This is the priority lane's OWN, separate,
+            # deliberately small bound (MAX_PRIORITY_QUEUE_DEPTH) -- it
+            # does not interact with or reduce the normal queue-depth
+            # check above at all, it only catches a genuinely pathological
+            # pile-up of priority requests specifically.
+            if self._priority and guard._priority_queue_depth >= MAX_PRIORITY_QUEUE_DEPTH:
+                _LOGGER.debug(
+                    "ModbusGuard[%s]: priority lane full (%d/%d) — "
+                    "shedding priority request",
+                    guard.endpoint, guard._priority_queue_depth, MAX_PRIORITY_QUEUE_DEPTH,
+                )
+                guard.priority_shed_count += 1
+                raise ModbusQueueShed(
+                    f"ModbusGuard[{guard.endpoint}] priority lane full "
+                    f"({guard._priority_queue_depth}/{MAX_PRIORITY_QUEUE_DEPTH})"
+                )
+
             guard._queue_depth += 1
+            if self._priority:
+                guard._priority_queue_depth += 1
             lock_acquired = False
             try:
                 async with asyncio.timeout(QUEUE_WAIT_TIMEOUT.total_seconds()):
@@ -304,15 +517,41 @@ class ModbusGuard:
                 if self.wait_ms > 1000.0:
                     guard.requests_waited += 1
 
-            except BaseException:
+            except BaseException as exc:
                 # MUST be BaseException, not Exception: asyncio.CancelledError is a
                 # BaseException.  A cancellation during lock.acquire() or during the
                 # inter-request gap sleep (after the lock was granted) would
                 # otherwise leak both the queue counter and — fatally — the lock,
                 # deadlocking the entire Modbus bus until HA is restarted.
                 guard._queue_depth -= 1
+                if self._priority:
+                    # v2.0.0a (F18): mirrors _queue_depth's own cleanup here --
+                    # the priority lane counter must never leak on this path
+                    # either, or it would eventually shed every future
+                    # priority request permanently.
+                    guard._priority_queue_depth -= 1
                 if lock_acquired:
                     guard._lock.release()
+                # v2.0.0a (F08, external ICS audit -- confirmed): if we're
+                # still waiting for the lock (lock_acquired is still False)
+                # and this is specifically a plain TimeoutError, it can only
+                # have come from the admission-wait asyncio.timeout() above
+                # -- the device was never contacted at all. Re-raised as a
+                # distinguishable type so ModbusKeepAlive (and anything else
+                # that cares) can tell "bus was busy" apart from "device
+                # didn't answer", instead of both surfacing as the same
+                # bare TimeoutError. Anything else (a genuine external
+                # CancelledError, or a failure once the lock WAS already
+                # held) passes through unchanged.
+                if (
+                    not lock_acquired
+                    and isinstance(exc, TimeoutError)
+                    and not isinstance(exc, (ModbusQueueShed, ModbusAdmissionTimeout))
+                ):
+                    raise ModbusAdmissionTimeout(
+                        f"ModbusGuard[{guard.endpoint}] admission wait exceeded "
+                        f"{QUEUE_WAIT_TIMEOUT.total_seconds():.0f}s"
+                    ) from exc
                 raise
             return self
 
@@ -322,12 +561,24 @@ class ModbusGuard:
             service_ms = (now - self._t_admitted) * 1000 if self._t_admitted else 0.0
             guard._last_request_end = now
             guard._queue_depth -= 1
+            if self._priority:
+                # v2.0.0a (F18): mirrors _queue_depth's own decrement here --
+                # the normal, successful-completion exit path.
+                guard._priority_queue_depth -= 1
             guard._lock.release()
 
             # Occupancy accounting: only time actually holding the line counts.
             if self._t_admitted:
                 guard._busy_s += (now - self._t_admitted)
                 guard._service_samples.append(service_ms)
+                # v2.0.0b (AR-4): priority traffic's own airtime, tracked
+                # separately from -- and regardless of whether this
+                # specific request was demoted to normal-lane admission
+                # above -- it is still functionally priority traffic that
+                # consumed bus time, and the budget needs to see that
+                # accurately to mean anything.
+                if self._priority:
+                    guard._priority_busy_s += (now - self._t_admitted)
 
             sink = guard.diagnostics
             if sink is not None:
@@ -373,6 +624,29 @@ class ModbusGuard:
             self._busy_s = 0.0
             self._window_start = now
         return value
+
+    def seconds_since_last_activity(self) -> float:
+        """Wall-clock seconds since ANY request on this endpoint last
+        completed -- from any source (any coordinator, a write, another
+        entry's config-flow discovery, or keep-alive's own prior probe).
+
+        v2.0.0b (MOD-14, external ICS audit -- confirmed): distinct from
+        ModbusKeepAlive.seconds_since_last_ok(), which only tracks
+        keep-alive's OWN probe history and is therefore always
+        approximately KEEPALIVE_INTERVAL (it resets on every keep-alive
+        success, regardless of what else has happened on the bus) --
+        not a useful signal for "has the endpoint genuinely been idle".
+        This tracks the SAME `_last_request_end` timestamp every guarded
+        request already updates on exit (see the request context
+        manager's own __aexit__), giving a true whole-endpoint activity
+        signal keep-alive can gate its own probing on.
+        """
+        if self._last_request_end <= 0:
+            # No request has ever completed on this endpoint -- treat as
+            # "idle for a very long time" so a legitimate first probe is
+            # never suppressed by this check.
+            return float("inf")
+        return time.monotonic() - self._last_request_end
 
     def wait_service_split(self) -> tuple[float, float]:
         """Return (p95 wait ms, p95 service ms) over the rolling window.

@@ -23,6 +23,19 @@ from .update_coordinator import HuaweiSolarUpdateCoordinator
 _LOGGER = logging.getLogger(__name__)
 
 
+class _NullContext:
+    """v2.0.0a (F05): no-op async context manager -- the defensive fallback
+    when a guard reference genuinely isn't available (see async_press()'s
+    own comment). Reproduces today's existing unguarded behaviour exactly,
+    rather than crashing on a None coordinator reference."""
+
+    async def __aenter__(self):
+        return None
+
+    async def __aexit__(self, *args):
+        return False
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: HuaweiSolarConfigEntry,
@@ -99,19 +112,58 @@ class StopForcibleChargeButtonEntity(HuaweiSolarEntity, ButtonEntity):
 
     async def async_press(self) -> None:
         """Stop the forcible charge or discharge."""
-        await self.device.set(
-            rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_WRITE,
-            rv.StorageForcibleChargeDischarge.STOP,
+        # v2.0.0b (MOD-06, external ICS audit -- confirmed): these four
+        # writes already held ONE continuous guard acquisition (a single
+        # logical "stop forcible charge" operation, avoiding another
+        # coordinator's poll interleaving partway through the sequence --
+        # v2.0.0a/F05's own fix), but placed no bound on how long that
+        # exclusive hold could last. Now uses _guarded_write_sequence()
+        # (types.py), which adds WRITE_SEQUENCE_TIMEOUT as a single
+        # whole-sequence deadline on top of the same guard-holding
+        # guarantee, rather than four independent unbounded writes.
+        # Falls back to unguarded, untimed (today's existing defensive
+        # behaviour, not a new risk) only when this entity has no
+        # coordinator reference at all -- this entity is not a
+        # CoordinatorEntity; it holds an explicitly Optional coordinator
+        # reference, unlike switch/select/number.
+        guard = (
+            self._configuration_update_coordinator.guard
+            if self._configuration_update_coordinator is not None
+            else None
         )
-        await self.device.set(rn.STORAGE_FORCIBLE_DISCHARGE_POWER, 0)
-        await self.device.set(
-            rn.STORAGE_FORCED_CHARGING_AND_DISCHARGING_PERIOD,
-            0,
-        )
-        await self.device.set(
-            rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SETTING_MODE,
-            rv.StorageForcibleChargeDischargeTargetMode.TIME,
-        )
+        if guard is not None:
+            async with self._guarded_write_sequence(guard, label="button_write") as write:
+                await write(
+                    self.device,
+                    rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_WRITE,
+                    rv.StorageForcibleChargeDischarge.STOP,
+                )
+                await write(self.device, rn.STORAGE_FORCIBLE_DISCHARGE_POWER, 0)
+                await write(
+                    self.device,
+                    rn.STORAGE_FORCED_CHARGING_AND_DISCHARGING_PERIOD,
+                    0,
+                )
+                await write(
+                    self.device,
+                    rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SETTING_MODE,
+                    rv.StorageForcibleChargeDischargeTargetMode.TIME,
+                )
+        else:
+            async with _NullContext():
+                await self.device.set(
+                    rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_WRITE,
+                    rv.StorageForcibleChargeDischarge.STOP,
+                )
+                await self.device.set(rn.STORAGE_FORCIBLE_DISCHARGE_POWER, 0)
+                await self.device.set(
+                    rn.STORAGE_FORCED_CHARGING_AND_DISCHARGING_PERIOD,
+                    0,
+                )
+                await self.device.set(
+                    rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SETTING_MODE,
+                    rv.StorageForcibleChargeDischargeTargetMode.TIME,
+                )
 
         if self._configuration_update_coordinator:
             # v1.3.15 FIX (Defect Q, part 2): none of the four writes above

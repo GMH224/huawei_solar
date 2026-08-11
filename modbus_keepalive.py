@@ -83,7 +83,7 @@ from huawei_solar import HuaweiSolarException, RegisterName
 from huawei_solar.device.base import HuaweiSolarDevice
 
 from .const import KEEPALIVE_INTERVAL, KEEPALIVE_REGISTER
-from .modbus_guard import ModbusGuard
+from .modbus_guard import ModbusAdmissionTimeout, ModbusGuard, ModbusQueueShed
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -235,11 +235,50 @@ class ModbusKeepAlive:
 
     # ── background task ───────────────────────────────────────────────────────
 
+    def _should_skip_probe(self) -> bool:
+        """v2.0.0b (MOD-14, external ICS audit -- confirmed, with a
+        correction found during implementation): the audit's own
+        recommendation pointed at seconds_since_last_ok() as the signal
+        to gate on, but that method only tracks THIS keep-alive's own
+        probe history (it resets on every keep-alive success
+        specifically) -- not a useful signal for "has the endpoint
+        genuinely been idle from ANY source". Uses
+        ModbusGuard.seconds_since_last_activity() instead, which tracks
+        the shared endpoint's actual last request completion regardless
+        of source.
+
+        Deliberately counts a recently-FAILED request the same as a
+        recently-successful one, not just successes: if another
+        coordinator attempted (and even failed) a request recently, that
+        coordinator's OWN failure-handling (backoff, _record_timeout())
+        is already actively monitoring this exact connection --
+        keep-alive's specific value is catching a dead connection during
+        periods when NOTHING else is watching it, which this correctly
+        preserves regardless of whether recent activity succeeded or
+        failed.
+
+        Extracted as its own method (rather than inlined in _run()'s
+        loop) specifically so this decision can be tested directly,
+        without needing to drive _run()'s own infinite loop in a test.
+        """
+        idle_s = self._guard.seconds_since_last_activity()
+        if idle_s < KEEPALIVE_INTERVAL.total_seconds():
+            _LOGGER.debug(
+                "ModbusKeepAlive[%s]: endpoint was active %.1fs ago "
+                "(within the %ds interval) -- skipping this probe, "
+                "already have recent evidence of connection state",
+                self.serial_number, idle_s, KEEPALIVE_INTERVAL.total_seconds(),
+            )
+            return True
+        return False
+
     async def _run(self) -> None:
         """Main loop: sleep → probe → sleep → probe …"""
         while True:
             try:
                 await asyncio.sleep(KEEPALIVE_INTERVAL.total_seconds())
+                if self._should_skip_probe():
+                    continue
                 await self._probe()
             except asyncio.CancelledError:
                 _LOGGER.debug("ModbusKeepAlive[%s]: stopped", self.serial_number)
@@ -287,6 +326,61 @@ class ModbusKeepAlive:
                     "ModbusKeepAlive[%s]: connection healthy (RTT %.0f ms)",
                     self.serial_number, rtt_ms,  # BUG-1 FIX: use measured rtt_ms
                 )
+
+        # v2.0.0a FIX (F08, external ICS audit -- confirmed): ModbusAdmissionTimeout
+        # (a guard admission wait exceeding QUEUE_WAIT_TIMEOUT -- the bus was
+        # busy, the device was never even contacted) used to be
+        # indistinguishable from a genuine device-communication timeout,
+        # both caught by the same `except TimeoutError` below and both
+        # treated identically as "connection appears dead". A guard that
+        # simply couldn't get a turn for 10+ seconds under normal, healthy
+        # contention is not evidence the device stopped answering -- local
+        # bus congestion should never manufacture a false connection-lost
+        # event (and the full cache invalidation on_connection_lost()
+        # triggers), especially given how much of the REST of this
+        # integration's own design exists specifically to make that kind
+        # of congestion a normal, expected, gracefully-handled condition.
+        # Caught FIRST (before the general TimeoutError handler, since
+        # ModbusAdmissionTimeout IS a TimeoutError subclass and would
+        # otherwise be caught there instead) -- logged, failure count left
+        # untouched, connection health left untouched. Not even counted as
+        # a "probe failure" for _failure_count purposes: nothing about the
+        # device's own responsiveness was tested this cycle.
+        except ModbusAdmissionTimeout as exc:
+            _LOGGER.debug(
+                "ModbusKeepAlive[%s]: probe could not get a bus turn (%s) — "
+                "bus congestion, not a device failure; connection health "
+                "unchanged", self.serial_number, exc,
+            )
+
+        # v2.0.1 FIX (H-01, ICS re-audit -- confirmed): ModbusQueueShed
+        # (the queue was already full, this request was declined
+        # immediately) is ALSO a TimeoutError subclass, exactly like
+        # ModbusAdmissionTimeout above, and needed the exact same
+        # distinct handling this priority-lane probe already has for the
+        # admission-wait case. Missed originally because F08 (this
+        # session's earlier fix) only checked whether keepalive's own
+        # priority=True request could be admission-timed-out; it never
+        # considered that the SAME probe could instead be shed outright
+        # -- via either the priority-lane's own depth cap
+        # (MAX_PRIORITY_QUEUE_DEPTH, F18) or AR-4's airtime-budget
+        # demotion path, both added later in this same project's history
+        # without this file being revisited. The main coordinator's own
+        # _classify_failure()/outer handler (MOD-09) already makes this
+        # exact distinction for ModbusQueueShed; this probe never did.
+        # Caught FIRST, before the general TimeoutError handler, for the
+        # same reason ModbusAdmissionTimeout is: it IS a TimeoutError
+        # subclass and would otherwise be swallowed by that handler
+        # instead. Same treatment as ModbusAdmissionTimeout: logged,
+        # failure count and connection health left untouched -- the
+        # device was never contacted, this is bus congestion, not
+        # evidence the device is unreachable.
+        except ModbusQueueShed as exc:
+            _LOGGER.debug(
+                "ModbusKeepAlive[%s]: probe was shed by the bus guard (%s) — "
+                "bus congestion, not a device failure; connection health "
+                "unchanged", self.serial_number, exc,
+            )
 
         except (TimeoutError, HuaweiSolarException, OSError) as exc:
             self._failure_count += 1

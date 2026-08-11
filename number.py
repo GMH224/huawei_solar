@@ -3,6 +3,7 @@
 import asyncio
 from dataclasses import dataclass
 import logging
+from typing import TYPE_CHECKING
 
 from huawei_solar import (
     EMMADevice,
@@ -33,6 +34,9 @@ from .types import (
     HuaweiSolarInverterData,
 )
 from .update_coordinator import HuaweiSolarUpdateCoordinator
+
+if TYPE_CHECKING:
+    from .modbus_guard import ModbusGuard
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -337,8 +341,66 @@ async def async_setup_entry(
     async_add_entities(entities_to_add)
 
 
+#: v2.0.0b (MOD-13, external ICS audit -- confirmed): each number entity
+#: independently read its own static min/max register during platform
+#: setup, so startup traffic scaled with entity count even though these
+#: are genuinely static device metadata (by definition of the STATIC
+#: tier itself, RegisterTier's own model) that cannot change within a
+#: session. Keyed by (device serial, register name) -- the same static
+#: register could in principle be shared by more than one entity
+#: description, and multiple devices on one entry each have their own
+#: independent values for the "same-named" register. Deliberately a
+#: module-level dict, not per-coordinator: entity platform setup
+#: (create(), below) does not have a natural longer-lived object to
+#: attach this to, and every real caller already goes through this one
+#: module. Cleared on unload (see clear_static_bound_cache()) rather
+#: than kept for the life of the Home Assistant process -- a reload can
+#: follow a firmware update or hardware swap, and a genuinely stale
+#: bound surviving that would be a correctness regression for the sake
+#: of an efficiency win that only needs to last one session anyway.
+_STATIC_BOUND_CACHE: dict[tuple[str, RegisterName], float | None] = {}
+
+
+def clear_static_bound_cache(serial_number: str | None = None) -> None:
+    """Clear cached static bounds for one device, or all of them.
+
+    v2.0.0b (MOD-13): called from __init__.py's unload path so a reload
+    always re-reads static bounds fresh, rather than trusting a value
+    that could predate a firmware update or hardware swap.
+    """
+    if serial_number is None:
+        _STATIC_BOUND_CACHE.clear()
+        return
+    for key in [k for k in _STATIC_BOUND_CACHE if k[0] == serial_number]:
+        del _STATIC_BOUND_CACHE[key]
+
+
+async def _read_static_bound_cached(
+    device: HuaweiSolarDevice, key: RegisterName, kind: str,
+    guard: "ModbusGuard | None" = None,
+) -> float | None:
+    """Cached wrapper around _read_static_bound() -- see
+    _STATIC_BOUND_CACHE's own module-level comment for the full
+    reasoning. A cached ``None`` (a prior read that timed out or failed)
+    is deliberately also treated as a valid cache hit, not re-attempted
+    per entity -- a device that failed to answer once during setup is
+    unlikely to answer a second, third, or fortieth immediately-repeated
+    attempt any differently, and retrying it once per entity would
+    itself reintroduce the exact traffic-scaling problem this fix exists
+    to remove. The next reload gets a fresh attempt regardless (see
+    clear_static_bound_cache()).
+    """
+    cache_key = (device.serial_number, key)
+    if cache_key in _STATIC_BOUND_CACHE:
+        return _STATIC_BOUND_CACHE[cache_key]
+    value = await _read_static_bound(device, key, kind, guard=guard)
+    _STATIC_BOUND_CACHE[cache_key] = value
+    return value
+
+
 async def _read_static_bound(
-    device: HuaweiSolarDevice, key: RegisterName, kind: str
+    device: HuaweiSolarDevice, key: RegisterName, kind: str,
+    guard: "ModbusGuard | None" = None,
 ) -> float | None:
     """Bounded, isolated read of a static min/max register.
 
@@ -354,11 +416,26 @@ async def _read_static_bound(
     entry, not just this one bound. On timeout or failure the bound is
     simply left unset (identical in effect to the entity's own existing
     "no static key configured" case) rather than blocking or crashing.
+
+    v2.0.0a FIX (F06, external ICS audit -- confirmed): being time-bounded
+    protected platform setup from hanging, but the read itself still
+    bypassed ModbusGuard entirely -- several number entities each doing
+    their own unguarded read during setup could inject frames that collide
+    with each other or with a coordinator's own guarded polling. `guard`
+    is optional (defaults to None, reproducing the old unguarded read)
+    only for callers that genuinely have no coordinator reference yet;
+    every production call site in this file has one and passes it.
     """
     try:
-        result = await asyncio.wait_for(
-            device.client.get(key), timeout=STATIC_BOUND_READ_TIMEOUT.total_seconds()
-        )
+        if guard is not None:
+            async with guard.request(label="number_static_bound_read"):
+                result = await asyncio.wait_for(
+                    device.client.get(key), timeout=STATIC_BOUND_READ_TIMEOUT.total_seconds()
+                )
+        else:
+            result = await asyncio.wait_for(
+                device.client.get(key), timeout=STATIC_BOUND_READ_TIMEOUT.total_seconds()
+            )
         return result.value
     except TimeoutError:
         _LOGGER.warning(
@@ -432,14 +509,19 @@ class HuaweiSolarNumberEntity(
 
         static_max_value = None
         if description.static_maximum_key:
-            static_max_value = await _read_static_bound(
-                device, description.static_maximum_key, "maximum"
+            # v2.0.0b (MOD-13, external ICS audit -- confirmed): cached,
+            # not a fresh read per entity -- see _STATIC_BOUND_CACHE's own
+            # module-level comment.
+            static_max_value = await _read_static_bound_cached(
+                device, description.static_maximum_key, "maximum",
+                guard=coordinator.guard,
             )
 
         static_min_value = None
         if description.static_minimum_key:
-            static_min_value = await _read_static_bound(
-                device, description.static_minimum_key, "minimum"
+            static_min_value = await _read_static_bound_cached(
+                device, description.static_minimum_key, "minimum",
+                guard=coordinator.guard,
             )
 
         return cls(
@@ -478,6 +560,14 @@ class HuaweiSolarNumberEntity(
                     self.entity_description.dynamic_maximum_key
                 )
                 self._dynamic_max_value = max_register.value if max_register else None
+
+            # v2.0.0: quality/reason/age attributes -- see _quality_attrs()'s
+            # own docstring. Availability (the default CoordinatorEntity
+            # behaviour for the success case here, explicitly overridden to
+            # False below only when this register is absent) is untouched.
+            self._attr_extra_state_attributes = self._quality_attrs(
+                self.coordinator, self.entity_description.register_name
+            )
         else:
             self._attr_available = False
             self._attr_native_value = None
@@ -486,10 +576,50 @@ class HuaweiSolarNumberEntity(
 
     async def async_set_native_value(self, value: float) -> None:
         """Set a new value."""
-        if await self.device.set(self.entity_description.register_name, float(value)):
+        # v2.0.0b (MOD-05, external ICS audit -- confirmed): v2.0.0a's F05
+        # fix routed this write through ModbusGuard but never bounded the
+        # underlying device.set() call itself -- a stalled write held the
+        # guard indefinitely. Now uses the shared _guarded_write() helper
+        # (types.py), which pairs the guard with WRITE_TIMEOUT.
+        wrote = await self._guarded_write(
+            self.coordinator.guard, self.device,
+            self.entity_description.register_name, float(value),
+            label="number_write",
+        )
+        if wrote:
             self._attr_native_value = float(value)
             # Invalidate the cached register so the next poll fetches a fresh value
+            # regardless of what verify_write() below finds -- its own failure
+            # path (the write was silently ignored) does not touch the cache at
+            # all, so this immediate invalidation is still needed as the
+            # baseline guarantee; verify_write() adds an earlier, explicit
+            # confirmation/warning on top of it, not a replacement for it.
             self.coordinator.invalidate_cache(self.entity_description.register_name)
+            # v2.0.0a (F12, external ICS audit -- confirmed): verify_write()
+            # existed, fully built and already guarded, but had zero
+            # production callers -- its own docstring says it was designed
+            # for exactly this (number/select/switch, after a write), so
+            # production semantics never matched what was documented.
+            # Fired as a background task, not awaited directly: it takes
+            # WRITE_VERIFY_DELAY plus up to WRITE_VERIFY_RETRIES more
+            # (~3-9s) to confirm the inverter actually applied the value,
+            # and its whole value is a warning log if it silently didn't
+            # (an inverter mid state-transition can accept a write and
+            # then ignore it) -- not a check worth making the user's
+            # slider interaction visibly wait on.
+            #
+            # v2.0.0b (MOD-10, external ICS audit -- confirmed): this used
+            # to be a bare self.hass.async_create_task(...) -- a task that
+            # could survive an entry reload and perform a delayed Modbus
+            # read against stale lifecycle state. Now entry-scoped via the
+            # coordinator's own create_background_task(), the same pattern
+            # already used for the deferred first-poll task.
+            self.coordinator.create_background_task(
+                self.coordinator.verify_write(
+                    self.entity_description.register_name, float(value)
+                ),
+                f"{self.coordinator.name}_verify_write_{self.entity_description.register_name}",
+            )
 
         await self.coordinator.async_request_refresh()
 

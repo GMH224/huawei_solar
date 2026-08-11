@@ -17,6 +17,44 @@ POWER_METER_UPDATE_INTERVAL = timedelta(seconds=30)
 ENERGY_STORAGE_UPDATE_INTERVAL = timedelta(seconds=30)
 SYNC_POWER_UPDATE_INTERVAL = timedelta(seconds=10)
 
+# v2.0.0 (V2_ARCHITECTURE_DESIGN.md §8.2) — how many seconds of age-spread
+# across the four power-flow registers in the REGULAR cache is acceptable
+# before SynchronizedPowerCoordinator's dedicated read is skipped in favour
+# of the cache. Derived directly from the operator's real hardware
+# constraints, not picked arbitrarily:
+#   - the device's own Modbus register only refreshes at 1 Hz -- readings
+#     within about a second aren't merely close, they're the same
+#     underlying value, so this tolerance is comfortably above that floor.
+#   - the four devices are not phase-locked (no PTP), but each device's own
+#     internal sampling loop runs ~40-50 Hz -- the resulting cross-device
+#     jitter this could add is on the order of 20-25 ms, negligible here.
+#   - sensor accuracy is Class 1.0 (+/-1%) for power on three of the four
+#     channels -- a few seconds of age-spread is well inside what the
+#     sensors themselves could resolve as materially different moments.
+#   - cross-checked against the dedicated read's own measured performance
+#     (sample_span_ms, Defect V/Finding 9): a healthy dedicated read
+#     typically already achieves sub-second spread, so this tolerance
+#     never accepts materially worse alignment than what it replaces.
+SYNC_POWER_CACHE_ALIGNMENT_TOLERANCE_S: float = 3.0
+
+# v2.0.0b (MOD-02/MOD-04, external ICS audit -- confirmed): the
+# whole-operation deadline for SynchronizedPowerCoordinator's dedicated-
+# read fallback (up to 4 sequential reads, each individually bounded by
+# UPDATE_TIMEOUT/35s, but with no bound on the SUM). Worst case before
+# this fix: 4 x 35s = 140s for one update against a nominal 10s cadence.
+# 18s chosen from the report's own recommended 15-20s range: comfortably
+# above what 4 healthy sequential reads actually take (each typically
+# well under a second per the dedicated read's own measured
+# sample_span_ms), while bounding the pathological case to a small
+# multiple of the 10s cadence rather than 14x it. Enforced as an explicit
+# deadline CHECKED BEFORE STARTING each read, not a single outer
+# asyncio.timeout() wrapping the whole sequence -- the latter would
+# deliver cancellation through whichever read happens to be in flight
+# when the deadline fires, discarding any already-collected partial
+# results (an explicit per-read check preserves them, matching the
+# report's own "no further read may start" framing).
+SYNC_POWER_POLL_DEADLINE = timedelta(seconds=18)
+
 # UPDATE_TIMEOUT is intentionally shorter than the update intervals so that
 # a hung request is cancelled before the next poll cycle begins.
 # Raised from 29s → 35s to give slow/busy inverters a bit more breathing room
@@ -91,6 +129,44 @@ WRITE_PERMISSION_CHECK_TIMEOUT = timedelta(seconds=5)
 # cancellation was observed to fire for the entry's setup as a whole.
 DEVICE_CONNECT_TIMEOUT = timedelta(seconds=45)
 
+# v2.0.0b (MOD-08, external ICS audit -- confirmed): eight config-flow
+# call sites did `await client.connect()` with no timeout of their own --
+# a stalled TCP/serial connection attempt could hang the configuration
+# flow indefinitely. Deliberately a SEPARATE, SHORTER constant from
+# DEVICE_CONNECT_TIMEOUT above, not a reuse of it: connection
+# establishment (opening the socket/port) and device identification
+# (the read exchanges DEVICE_CONNECT_TIMEOUT already bounds) are
+# different operations with different expected durations -- a healthy
+# connect() completes in well under a second; DEVICE_CONNECT_TIMEOUT's
+# 45s budget exists for the heavier, multi-exchange identification phase
+# that follows it, not the connection itself. 20s chosen generously above
+# a healthy connect (which should be near-instant) while still bounding
+# the pathological case (an unreachable host/port hanging on TCP's own
+# retry behaviour) well short of DEVICE_CONNECT_TIMEOUT's 45s.
+MODBUS_CONNECT_TIMEOUT = timedelta(seconds=20)
+
+# v2.0.0a (F02, external ICS audit -- confirmed): slave discovery iterates
+# up to 18 unit IDs ([0, 100, 1..16]) with no per-probe bound of its own --
+# duration was governed entirely by whatever the underlying vendor
+# library's own timeout happened to be, not an integration-owned budget.
+# 5s per probe: this is connectivity discovery, not a full data poll -- a
+# genuinely present device answers a single get_device_infos/
+# detect_device_type call in well under a second on a healthy bus; a
+# non-responsive unit ID should not be allowed to hold up the scan
+# anywhere near as long as DEVICE_CONNECT_TIMEOUT (which covers a much
+# heavier full device-instance construction, not one discovery probe).
+DISCOVERY_PROBE_TIMEOUT = timedelta(seconds=5)
+
+# v2.0.0a (F02): the whole-scan deadline. Without this, a silent/
+# non-responsive bus could make discovery consume up to
+# 18 * DISCOVERY_PROBE_TIMEOUT = 90s even with the per-probe bound above --
+# still a very long, uninterruptible stretch of config-flow UI with no
+# feedback. Set equal to that worst case rather than shorter: the
+# per-probe timeout is already the real defence against any single probe
+# misbehaving; this is the backstop against the sum across all of them,
+# not a tighter budget layered on top for its own sake.
+DISCOVERY_TOTAL_TIMEOUT = timedelta(seconds=90)
+
 # v1.3.18 (Defect U/Finding 3, independent ICS audit of v1.3.17): bound for
 # primary_device.client.disconnect() during async_unload_entry. This runs
 # BEFORE every teardown loop that follows it (telemetry, the adaptive
@@ -141,6 +217,22 @@ MAX_CONSECUTIVE_TIMEOUTS = 3
 # bursts double the wait up to MODBUS_RETRY_MAX_WAIT.
 MODBUS_RETRY_BASE_WAIT = timedelta(seconds=10)
 MODBUS_RETRY_MAX_WAIT = timedelta(seconds=120)
+
+# v2.0.0a (F11, external ICS audit -- confirmed, refined during
+# verification): the backoff delay's jitter used to be purely
+# proportional (±10% of the delay), which is weakest exactly where a
+# common-failure scenario needs it most -- at the FIRST retry
+# (consecutive=1, delay=MODBUS_RETRY_BASE_WAIT=10s), proportional jitter
+# is only ±1s, so several coordinators hitting the same shared bus/device
+# failure simultaneously would all wake up and retry within a ~2-second
+# window of each other. This floor guarantees a meaningful absolute
+# spread even at the shortest delays; deep backoff's proportional jitter
+# already exceeds this floor on its own (±12s at the 120s cap) and is
+# left untouched. 2.0s chosen as a reasoned, deliberately moderate
+# doubling of the previous effective jitter at the base delay (±1s ->
+# ±2s) -- wide enough to meaningfully de-cluster simultaneous first
+# retries, not so wide it delays legitimate recovery for its own sake.
+MIN_BACKOFF_JITTER_S: float = 2.0
 
 # ── Service names ────────────────────────────────────────────────────────────
 SERVICE_FORCIBLE_CHARGE = "forcible_charge"
@@ -281,6 +373,28 @@ BUSY_MAX_RETRIES: int = 2
 # read fails the task triggers a reconnect before the next poll cycle hits a
 # dead socket.
 KEEPALIVE_INTERVAL = timedelta(seconds=45)
+
+# Periodic aggregate telemetry snapshot cadence (telemetry_capture.py's
+# TelemetryCapture, opt-in via its own switch). Tied to roughly the main
+# coordinator's own poll cadence (30s) so each snapshot reflects genuinely
+# new data, not a repeat of the same numbers -- a much finer interval
+# would just write duplicate-looking snapshots between real polls; a much
+# coarser one would blur short-lived spikes the whole point of this
+# capture is to see. At 10GB of available log space (per the operator's
+# own stated budget) even a multi-day capture at this cadence is
+# trivial -- this was chosen for signal resolution, not to conserve disk.
+TELEMETRY_CAPTURE_INTERVAL = timedelta(seconds=30)
+
+# Cadence for the periodic aggregate telemetry-capture switch
+# (telemetry_capture.py). Chosen deliberately fine-grained rather than
+# coarse: the whole point is a real time series to assess the Physical
+# Demand Planner question without a second deployment, and resolution
+# cannot be recovered after the fact if a coarser interval missed a
+# short-lived spike. Not tied to any single coordinator's own poll
+# interval -- this captures ACROSS all of them on one shared timer, so a
+# combined snapshot always reflects the same moment for every coordinator
+# on the entry, not whichever one happened to poll most recently.
+TELEMETRY_CAPTURE_INTERVAL = timedelta(seconds=30)
 # Register used for the keep-alive read (must be STATIC and single-word).
 # Model ID is 1 register, always readable, never causes side effects.
 KEEPALIVE_REGISTER = "model_id"
@@ -294,6 +408,27 @@ BATCH_CHUNK_SIZE: int = 40
 # Pause inserted between chunks (inside the guard lock — gap enforced by guard).
 BATCH_INTER_CHUNK_PAUSE = timedelta(milliseconds=80)
 
+# v2.0.0a (F03, external ICS audit -- confirmed): the whole-poll deadline.
+# Each chunk already has its own timeout (effective_timeout, adaptive,
+# 15-60s) and BUSY retries add further delay on top -- but nothing bounded
+# the SUM across every chunk in one poll. A cold-start or post-reconnect
+# poll (every register simultaneously stale after invalidate_all()) can
+# realistically produce 15-25+ chunks, given the register map's scattered
+# address layout (see Defect E) -- the audit's own worked example (20
+# chunks at a 30s effective timeout = ~10 minutes before the first
+# failure is even reported) is a realistic worst case, not a strawman,
+# confirmed by checking BATCH_CHUNK_SIZE and the real chunk count this
+# session's own field captures have shown.
+#
+# 120s (2 minutes) chosen deliberately: generous enough that a legitimate
+# multi-chunk cold-start poll (fast per-chunk pace under normal, healthy
+# conditions) can complete without ever approaching it, while preventing
+# the pathological case (every chunk genuinely timing out for its full
+# adaptive budget) from consuming many multiples of the coordinator's own
+# ~30s update_interval -- which would otherwise risk overlapping into the
+# NEXT poll cycle before this one even finishes.
+BATCH_POLL_DEADLINE = timedelta(seconds=120)
+
 # ── Optimisation 5: Write-back verification ───────────────────────────────────
 # Delay before the post-write verification read is issued.  Long enough for the
 # inverter to apply the setting, short enough to catch a missed write quickly.
@@ -301,6 +436,31 @@ WRITE_VERIFY_DELAY = timedelta(seconds=3)
 # Maximum number of re-read retries if the first verification read still shows
 # the old value (covers slow-applying settings like working-mode changes).
 WRITE_VERIFY_RETRIES: int = 2
+
+# v2.0.0b (MOD-05, external ICS audit -- confirmed): every write call site
+# routed writes through ModbusGuard (v2.0.0a, F05) but never bounded the
+# underlying device.set() call itself with a timeout of its own -- the
+# guard provides serialisation, not a deadline. A stalled write held the
+# guard indefinitely, starving every other coordinator on the endpoint.
+# 15s chosen deliberately at the LOWER end of the adaptive read timeout
+# range (15-60s, effective_timeout) rather than reusing that range
+# directly: a write is a single-register set, a structurally simpler and
+# faster operation than a full batch read, so it doesn't need the same
+# generous adaptive ceiling a multi-register read does.
+WRITE_TIMEOUT = timedelta(seconds=15)
+
+# v2.0.0b (MOD-06/MOD-19, external ICS audit -- confirmed): the
+# whole-sequence deadline for a multi-register logical write command
+# (e.g. "start forcible charge": 4 sequential writes that must apply
+# together or not at all). Holding the guard across a sequence already
+# guarantees atomicity against other bus traffic (per Defect P's
+# fairness reasoning, unchanged); this bounds how long that exclusive
+# hold may last. Deliberately NOT simply len(writes) * WRITE_TIMEOUT --
+# that would scale unboundedly with sequence length and defeat its own
+# purpose as a genuine ceiling. A fixed, generous budget covering the
+# longest real sequence in this codebase (5 writes, stop_forcible_charge)
+# with headroom, not a per-write multiple.
+WRITE_SEQUENCE_TIMEOUT = timedelta(seconds=30)
 
 # ── Optimisation 6: Priority polling during back-off ─────────────────────────
 # Tier names eligible for reduced-frequency reads during back-off.
@@ -331,6 +491,36 @@ BACKOFF_NORMAL_DIVISOR: int = 4   # read NORMAL registers every 4th back-off cyc
 # 300s (5 min) chosen directly per the operator's own stated tolerance: "if
 # they haven't been updated for 5 minutes, they become more important."
 REGISTER_STARVATION_CEILING_S: float = 300.0
+
+# v2.0.0 (V2_ARCHITECTURE_DESIGN.md §8.1) — energy counters get their own,
+# TIGHTER promotion ceiling than REGISTER_STARVATION_CEILING_S above,
+# extending the same starvation-promotion mechanism with a shorter fuse
+# specifically for energy-relevant registers. First line of defence: try
+# harder to get a fresh read quietly, before anything is ever visible to a
+# user, given how time-sensitive energy data is for the Energy Dashboard's
+# hourly rollup (a hard operator constraint: a missing reading breaks the
+# calculation outright; a delayed one doesn't). 90s is roughly 2-3x the
+# base NORMAL-tier TTL (30s) -- aggressive enough to resolve most
+# contention well within the availability ceiling below, not so aggressive
+# it fights unnecessarily with legitimate back-off pacing.
+ENERGY_PROMOTION_CEILING_S: float = 90.0
+
+# v2.0.0 (V2_ARCHITECTURE_DESIGN.md §8.1) — the SECOND stage: how long an
+# energy counter can stay UNCERTAIN (served, not unavailable) before it
+# lazily becomes BAD/EXPIRED. Deliberately LONGER than
+# REGISTER_STARVATION_CEILING_S, not shorter -- reasoned directly against
+# how HA's statistics engine actually works (checked, not assumed): the
+# sum delta is value-to-value, not time-weighted, so a late-but-genuine
+# reading still lands on the correct total regardless of how long the gap
+# was; the real risk is short-term-statistics snapshot misattribution
+# (a fixed 5-minute clock sampling whatever the current state happens to
+# be), which scales with gap LENGTH. 600s = two snapshot windows, bounding
+# the worst case to "the two most recent windows absorb the eventual
+# jump" rather than one window absorbing an hour's growth. This should
+# rarely be reached in practice -- ENERGY_PROMOTION_CEILING_S above is
+# designed to resolve the great majority of contention well before this
+# fires at all.
+ENERGY_AVAILABILITY_CEILING_S: float = 600.0
 
 # Caps how many starved registers get promoted into a single back-off cycle.
 # Deliberately small: several SLOW/STATIC registers read together in the same

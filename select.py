@@ -236,6 +236,14 @@ class HuaweiSolarSelectEntity(
                 )
             else:
                 self._attr_available = True
+
+            # v2.0.0: quality/reason/age attributes -- see _quality_attrs()'s
+            # own docstring. The custom availability logic above (and its
+            # combination with the default CoordinatorEntity behaviour via
+            # the available property override below) is untouched.
+            self._attr_extra_state_attributes = self._quality_attrs(
+                self.coordinator, self.entity_description.register_name
+            )
         else:
             self._attr_current_option = None
             self._attr_available = False
@@ -244,11 +252,32 @@ class HuaweiSolarSelectEntity(
 
     async def async_select_option(self, option: str) -> None:
         """Change the selected option."""
-        await self.device.set(
-            self.entity_description.register_name, self._to_enum(option)
+        # v2.0.0b (MOD-05, external ICS audit -- confirmed): v2.0.0a's F05
+        # fix routed this write through ModbusGuard but never bounded the
+        # underlying device.set() call itself. Now uses the shared
+        # _guarded_write() helper (types.py), which pairs the guard with
+        # WRITE_TIMEOUT.
+        expected = self._to_enum(option)
+        await self._guarded_write(
+            self.coordinator.guard, self.device,
+            self.entity_description.register_name, expected,
+            label="select_write",
         )
         self._attr_current_option = option
+        # v2.0.0a (F12): immediate invalidation is the baseline guarantee
+        # regardless of verify_write()'s own outcome (its failure path does
+        # not touch the cache at all -- see number.py's own note on this
+        # same pattern); verify_write() adds an earlier, explicit
+        # confirmation/warning on top of it, fired as a background task so
+        # the user's selection doesn't visibly wait on it.
         self.coordinator.invalidate_cache(self.entity_description.register_name)
+        # v2.0.0b (MOD-10, external ICS audit -- confirmed): entry-scoped
+        # via the coordinator, not a bare self.hass.async_create_task() --
+        # see number.py's own note on this same pattern.
+        self.coordinator.create_background_task(
+            self.coordinator.verify_write(self.entity_description.register_name, expected),
+            f"{self.coordinator.name}_verify_write_{self.entity_description.register_name}",
+        )
 
         await self.coordinator.async_request_refresh()
 
@@ -321,6 +350,9 @@ class StorageModeSelectEntity(
                 self.entity_description.register_name
             ].value.name.lower()
             self._attr_available = True
+            self._attr_extra_state_attributes = self._quality_attrs(
+                self.coordinator, self.entity_description.register_name
+            )
         else:
             self._attr_current_option = None
             self._attr_available = False
@@ -328,9 +360,14 @@ class StorageModeSelectEntity(
 
     async def async_select_option(self, option: str) -> None:
         """Change the selected option."""
-        await self.device.set(
-            rn.STORAGE_WORKING_MODE_SETTINGS,
-            getattr(rv.StorageWorkingModesC, option.upper()),
+        # v2.0.0b (MOD-05, external ICS audit -- confirmed): now uses the
+        # shared _guarded_write() helper (types.py), pairing the guard
+        # with WRITE_TIMEOUT -- see number.py's own note on this pattern.
+        expected = getattr(rv.StorageWorkingModesC, option.upper())
+        await self._guarded_write(
+            self.coordinator.guard, self.device,
+            rn.STORAGE_WORKING_MODE_SETTINGS, expected,
+            label="select_write",
         )
         self._attr_current_option = option
 
@@ -340,5 +377,15 @@ class StorageModeSelectEntity(
         # hadn't naturally expired yet -- the entity would then continue
         # showing outdated data despite the write having succeeded.
         self.coordinator.invalidate_cache(rn.STORAGE_WORKING_MODE_SETTINGS)
+        # v2.0.0a (F12, external ICS audit -- confirmed): verify_write()
+        # existed, fully built and already guarded, but had zero production
+        # callers. Fired as a background task, not awaited -- see number.py's
+        # own note on this same pattern for the full reasoning.
+        # v2.0.0b (MOD-10): entry-scoped via the coordinator now, not a bare
+        # self.hass.async_create_task().
+        self.coordinator.create_background_task(
+            self.coordinator.verify_write(rn.STORAGE_WORKING_MODE_SETTINGS, expected),
+            f"{self.coordinator.name}_verify_write_{rn.STORAGE_WORKING_MODE_SETTINGS}",
+        )
 
         await self.coordinator.async_request_refresh()

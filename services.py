@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from functools import partial
 import logging
 import re
@@ -50,6 +51,8 @@ from .const import (
     SERVICE_SET_ZERO_POWER_GRID_CONNECTION,
     SERVICE_STOP_FORCIBLE_CHARGE,
     SERVICE_VALIDATION_READ_TIMEOUT,
+    WRITE_SEQUENCE_TIMEOUT,
+    WRITE_TIMEOUT,
 )
 from .types import (
     HuaweiSolarConfigEntry,
@@ -339,13 +342,23 @@ async def _validate_power_value(
     # whole service call. An unbounded read here doesn't just risk hanging
     # this one call, it blocks every OTHER write action for the same
     # device too, for as long as it takes.
+    #
+    # v2.0.0a FIX (F07, external ICS audit -- confirmed): the bounded read
+    # still bypassed ModbusGuard entirely, meaning it could physically
+    # collide with a coordinator's own guarded polling exchange on the
+    # same bus even though it was correctly time-bounded. Routed through
+    # the same guard every write in this module now uses (see
+    # _set_and_invalidate's own v2.0.0a note) -- the logical per-device
+    # write lock above is unrelated and unaffected; this only adds
+    # physical bus serialisation underneath it.
     try:
-        maximum_active_power = (
-            await asyncio.wait_for(
-                dd.device.get(max_value_key),
-                timeout=SERVICE_VALIDATION_READ_TIMEOUT.total_seconds(),
-            )
-        ).value
+        async with dd.update_coordinator.guard.request(label="service_validation_read"):
+            maximum_active_power = (
+                await asyncio.wait_for(
+                    dd.device.get(max_value_key),
+                    timeout=SERVICE_VALIDATION_READ_TIMEOUT.total_seconds(),
+                )
+            ).value
     except TimeoutError as err:
         raise ValueError(
             f"Timed out reading the maximum allowed power ({max_value_key}) "
@@ -387,11 +400,82 @@ async def _set_and_invalidate(
     file individually, both because it is less error-prone (nothing to
     remember at each new call site) and because every write in this module
     is read back through the same `configuration_update_coordinator`.
+
+    v2.0.0a FIX (F05, external ICS audit -- confirmed): the write itself
+    used to call `dd.device.set(...)` directly, bypassing ModbusGuard
+    entirely -- meaning a service-triggered write could physically overlap
+    a coordinator's own guarded polling exchange on the same bus, or land
+    between two halves of an in-progress guarded read. Centralising this
+    write path here (the same reasoning as the invalidation fix above)
+    means routing it through the guard fixes all ~39 call sites in this
+    file at once. `dd.update_coordinator` is always present (non-optional
+    on HuaweiSolarDeviceData) and shares the same ModbusGuard instance as
+    every other coordinator on this device's endpoint.
+
+    v2.0.0b FIX (MOD-05, external ICS audit -- confirmed): being routed
+    through the guard provided serialisation, not a deadline -- the
+    underlying device.set() call still had no timeout of its own, so a
+    stalled write held the guard indefinitely, starving every other
+    coordinator on the endpoint. WRITE_TIMEOUT (const.py) added here,
+    fixing the same gap at all ~39 call sites at once, the same way the
+    guard-routing fix above did.
     """
-    result = await dd.device.set(name, value)
+    async with dd.update_coordinator.guard.request(label="service_write"):
+        async with asyncio.timeout(WRITE_TIMEOUT.total_seconds()):
+            result = await dd.device.set(name, value)
     if dd.configuration_update_coordinator is not None:
         dd.configuration_update_coordinator.invalidate_cache(name)
     return result
+
+
+@contextlib.asynccontextmanager
+async def _set_and_invalidate_sequence(dd: HuaweiSolarDeviceData):
+    """Hold the guard continuously across a multi-register logical write
+    command, bounded by ONE whole-sequence deadline.
+
+    v2.0.0b FIX (MOD-19/MOD-20, external ICS audit -- confirmed): eight
+    service functions in this module each perform several sequential
+    writes via `_set_and_invalidate()`, which acquires and releases the
+    guard PER CALL -- meaning another coordinator's poll could be
+    admitted to the bus between any two steps of what is logically one
+    atomic command (e.g. "start forcible charge": mode, power, and
+    duration registers that only make sense applied together). The
+    per-device `_get_device_write_lock()` (below) does not close this
+    gap: it is a logical asyncio.Lock keyed by serial number, preventing
+    two service calls from interleaving with EACH OTHER, but it never
+    touches ModbusGuard, so it does nothing to stop a coordinator's poll
+    from interleaving with a service write sequence.
+
+    This is services.py's equivalent of types.py's
+    `HuaweiSolarEntity._guarded_write_sequence()` -- module-level rather
+    than a mixin method, since these are service-call functions, not
+    entities. MOD-20 (two independent write paths for "stop forcible
+    charge" -- this module's service and button.py's button -- using
+    mutually unaware locks) is closed as a direct consequence: both now
+    hold the SAME kind of bound, guard-serialised sequence, even though
+    they remain two separate call sites (unifying them into one shared
+    code path is a further, separable simplification, not required for
+    either to be individually correct).
+
+    Usage:
+        async with _set_and_invalidate_sequence(dd) as write:
+            await write(rn.SOME_REGISTER, value)
+            await write(rn.OTHER_REGISTER, value)
+
+    The yielded `write` callable performs the same guard-free
+    device.set() + invalidate_cache() pairing `_set_and_invalidate()`
+    does per-call -- do not call `_set_and_invalidate()` or
+    `dd.device.set()` directly inside this block, or the sequence loses
+    its single guard hold and bound.
+    """
+    async with dd.update_coordinator.guard.request(label="service_write_sequence"):
+        async with asyncio.timeout(WRITE_SEQUENCE_TIMEOUT.total_seconds()):
+            async def _write(name: rn.RegisterName, value: Any) -> bool:
+                result = await dd.device.set(name, value)
+                if dd.configuration_update_coordinator is not None:
+                    dd.configuration_update_coordinator.invalidate_cache(name)
+                return result
+            yield _write
 
 
 # v1.3.15 FIX (Defect R): per-device lock preventing two concurrent service
@@ -487,22 +571,22 @@ async def forcible_charge(service_call: ServiceCall) -> None:
         if duration > 1440:
             raise ValueError("Maximum duration is 1440 minutes")
 
-        await _set_and_invalidate(dd, rn.STORAGE_FORCIBLE_CHARGE_POWER, power)
-        await _set_and_invalidate(
-            dd,
-            rn.STORAGE_FORCED_CHARGING_AND_DISCHARGING_PERIOD,
-            duration,
-        )
-        await _set_and_invalidate(
-            dd,
-            rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SETTING_MODE,
-            rv.StorageForcibleChargeDischargeTargetMode.TIME,
-        )
-        await _set_and_invalidate(
-            dd,
-            rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_WRITE,
-            rv.StorageForcibleChargeDischarge.CHARGE,
-        )
+        # v2.0.0b (MOD-19, external ICS audit -- confirmed): these four
+        # writes are one logical "start forcible charge" command -- held
+        # under one continuous guard acquisition + one whole-sequence
+        # deadline now, not four separately-guarded, unbounded writes
+        # another coordinator's poll could interleave between.
+        async with _set_and_invalidate_sequence(dd) as write:
+            await write(rn.STORAGE_FORCIBLE_CHARGE_POWER, power)
+            await write(rn.STORAGE_FORCED_CHARGING_AND_DISCHARGING_PERIOD, duration)
+            await write(
+                rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SETTING_MODE,
+                rv.StorageForcibleChargeDischargeTargetMode.TIME,
+            )
+            await write(
+                rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_WRITE,
+                rv.StorageForcibleChargeDischarge.CHARGE,
+            )
 
         assert dd.configuration_update_coordinator
         await dd.configuration_update_coordinator.async_refresh()
@@ -520,22 +604,19 @@ async def forcible_discharge(service_call: ServiceCall) -> None:
         if duration > 1440:
             raise ValueError("Maximum duration is 1440 minutes")
 
-        await _set_and_invalidate(dd, rn.STORAGE_FORCIBLE_DISCHARGE_POWER, power)
-        await _set_and_invalidate(
-            dd,
-            rn.STORAGE_FORCED_CHARGING_AND_DISCHARGING_PERIOD,
-            duration,
-        )
-        await _set_and_invalidate(
-            dd,
-            rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SETTING_MODE,
-            rv.StorageForcibleChargeDischargeTargetMode.TIME,
-        )
-        await _set_and_invalidate(
-            dd,
-            rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_WRITE,
-            rv.StorageForcibleChargeDischarge.DISCHARGE,
-        )
+        # v2.0.0b (MOD-19, external ICS audit -- confirmed): see
+        # forcible_charge()'s own note on this same pattern above.
+        async with _set_and_invalidate_sequence(dd) as write:
+            await write(rn.STORAGE_FORCIBLE_DISCHARGE_POWER, power)
+            await write(rn.STORAGE_FORCED_CHARGING_AND_DISCHARGING_PERIOD, duration)
+            await write(
+                rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SETTING_MODE,
+                rv.StorageForcibleChargeDischargeTargetMode.TIME,
+            )
+            await write(
+                rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_WRITE,
+                rv.StorageForcibleChargeDischarge.DISCHARGE,
+            )
         assert dd.configuration_update_coordinator
         await dd.configuration_update_coordinator.async_refresh()
 
@@ -594,25 +675,28 @@ async def stop_forcible_charge(service_call: ServiceCall) -> None:
     """Stop a forcible charge or discharge."""
     dd = get_battery_device_data(service_call)
     async with _get_device_write_lock(dd.device.serial_number):
-        await _set_and_invalidate(
-            dd,
-            rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_WRITE,
-            rv.StorageForcibleChargeDischarge.STOP,
-        )
-        # Reset both charge and discharge power registers so no stale power value
-        # remains on the inverter after the operation is cancelled.
-        await _set_and_invalidate(dd, rn.STORAGE_FORCIBLE_CHARGE_POWER, 0)
-        await _set_and_invalidate(dd, rn.STORAGE_FORCIBLE_DISCHARGE_POWER, 0)
-        await _set_and_invalidate(
-            dd,
-            rn.STORAGE_FORCED_CHARGING_AND_DISCHARGING_PERIOD,
-            0,
-        )
-        await _set_and_invalidate(
-            dd,
-            rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SETTING_MODE,
-            rv.StorageForcibleChargeDischargeTargetMode.TIME,
-        )
+        # v2.0.0b (MOD-19/MOD-20, external ICS audit -- confirmed): five
+        # writes, one logical "stop forcible charge" command -- see
+        # forcible_charge()'s own note above. MOD-20 specifically: this is
+        # the service-layer equivalent of button.py's StopForcibleCharge
+        # button, which already used one guard hold (v2.0.0a) and now
+        # also has a whole-sequence deadline (v2.0.0b) -- both entry
+        # points for the same physical command now carry the same bound,
+        # guard-serialised guarantee.
+        async with _set_and_invalidate_sequence(dd) as write:
+            await write(
+                rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_WRITE,
+                rv.StorageForcibleChargeDischarge.STOP,
+            )
+            # Reset both charge and discharge power registers so no stale power value
+            # remains on the inverter after the operation is cancelled.
+            await write(rn.STORAGE_FORCIBLE_CHARGE_POWER, 0)
+            await write(rn.STORAGE_FORCIBLE_DISCHARGE_POWER, 0)
+            await write(rn.STORAGE_FORCED_CHARGING_AND_DISCHARGING_PERIOD, 0)
+            await write(
+                rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SETTING_MODE,
+                rv.StorageForcibleChargeDischargeTargetMode.TIME,
+            )
 
         assert dd.configuration_update_coordinator
         await dd.configuration_update_coordinator.async_refresh()
@@ -657,17 +741,15 @@ async def reset_maximum_feed_grid_power(
     dd = _get_power_control_device_data(manager_type, service_call)
 
     async with _get_device_write_lock(dd.device.serial_number):
-        await _set_and_invalidate(
-            dd,
-            POWER_CONTROL_REGISTERS[manager_type]["MODE_REGISTER"],
-            rv.ActivePowerControlMode.UNLIMITED,
-        )
-        await _set_and_invalidate(dd, POWER_CONTROL_REGISTERS[manager_type]["POWER_WATT_REGISTER"], 0)
-        await _set_and_invalidate(
-            dd,
-            POWER_CONTROL_REGISTERS[manager_type]["POWER_PERCENT_REGISTER"],
-            0,
-        )
+        # v2.0.0b (MOD-19, external ICS audit -- confirmed): see
+        # forcible_charge()'s own note on this pattern.
+        async with _set_and_invalidate_sequence(dd) as write:
+            await write(
+                POWER_CONTROL_REGISTERS[manager_type]["MODE_REGISTER"],
+                rv.ActivePowerControlMode.UNLIMITED,
+            )
+            await write(POWER_CONTROL_REGISTERS[manager_type]["POWER_WATT_REGISTER"], 0)
+            await write(POWER_CONTROL_REGISTERS[manager_type]["POWER_PERCENT_REGISTER"], 0)
 
         assert dd.configuration_update_coordinator
         await dd.configuration_update_coordinator.async_refresh()
@@ -678,17 +760,13 @@ async def set_di_active_power_scheduling(service_call: ServiceCall) -> None:
     """Set Active Power Control to 'DI active scheduling'."""
     dd = get_inverter_data(service_call)
     async with _get_device_write_lock(dd.device.serial_number):
-        await _set_and_invalidate(
-            dd,
-            rn.ACTIVE_POWER_CONTROL_MODE,
-            rv.ActivePowerControlMode.DI_ACTIVE_SCHEDULING,
-        )
-        await _set_and_invalidate(dd, rn.MAXIMUM_FEED_GRID_POWER_WATT, 0)
-        await _set_and_invalidate(
-            dd,
-            rn.MAXIMUM_FEED_GRID_POWER_PERCENT,
-            0,
-        )
+        async with _set_and_invalidate_sequence(dd) as write:
+            await write(
+                rn.ACTIVE_POWER_CONTROL_MODE,
+                rv.ActivePowerControlMode.DI_ACTIVE_SCHEDULING,
+            )
+            await write(rn.MAXIMUM_FEED_GRID_POWER_WATT, 0)
+            await write(rn.MAXIMUM_FEED_GRID_POWER_PERCENT, 0)
 
         assert dd.configuration_update_coordinator
         await dd.configuration_update_coordinator.async_refresh()
@@ -701,17 +779,13 @@ async def set_zero_power_grid_connection(
     """Set Active Power Control to 'Zero-Power Grid Connection'."""
     dd = _get_power_control_device_data(manager_type, service_call)
     async with _get_device_write_lock(dd.device.serial_number):
-        await _set_and_invalidate(
-            dd,
-            POWER_CONTROL_REGISTERS[manager_type]["MODE_REGISTER"],
-            rv.ActivePowerControlMode.ZERO_POWER_GRID_CONNECTION,
-        )
-        await _set_and_invalidate(dd, POWER_CONTROL_REGISTERS[manager_type]["POWER_WATT_REGISTER"], 0)
-        await _set_and_invalidate(
-            dd,
-            POWER_CONTROL_REGISTERS[manager_type]["POWER_PERCENT_REGISTER"],
-            0,
-        )
+        async with _set_and_invalidate_sequence(dd) as write:
+            await write(
+                POWER_CONTROL_REGISTERS[manager_type]["MODE_REGISTER"],
+                rv.ActivePowerControlMode.ZERO_POWER_GRID_CONNECTION,
+            )
+            await write(POWER_CONTROL_REGISTERS[manager_type]["POWER_WATT_REGISTER"], 0)
+            await write(POWER_CONTROL_REGISTERS[manager_type]["POWER_PERCENT_REGISTER"], 0)
 
         assert dd.configuration_update_coordinator
         await dd.configuration_update_coordinator.async_refresh()
@@ -726,15 +800,12 @@ async def set_maximum_feed_grid_power(
     async with _get_device_write_lock(dd.device.serial_number):
         power = await _validate_power_value(service_call.data[DATA_POWER], dd, rn.P_MAX)
 
-        await _set_and_invalidate(
-            dd,
-            POWER_CONTROL_REGISTERS[manager_type]["POWER_WATT_REGISTER"], power
-        )
-        await _set_and_invalidate(
-            dd,
-            POWER_CONTROL_REGISTERS[manager_type]["MODE_REGISTER"],
-            rv.ActivePowerControlMode.POWER_LIMITED_GRID_CONNECTION_WATT,
-        )
+        async with _set_and_invalidate_sequence(dd) as write:
+            await write(POWER_CONTROL_REGISTERS[manager_type]["POWER_WATT_REGISTER"], power)
+            await write(
+                POWER_CONTROL_REGISTERS[manager_type]["MODE_REGISTER"],
+                rv.ActivePowerControlMode.POWER_LIMITED_GRID_CONNECTION_WATT,
+            )
 
         assert dd.configuration_update_coordinator
         await dd.configuration_update_coordinator.async_refresh()
@@ -749,16 +820,15 @@ async def set_maximum_feed_grid_power_percentage(
     async with _get_device_write_lock(dd.device.serial_number):
         power_percentage = service_call.data[DATA_POWER_PERCENTAGE]
 
-        await _set_and_invalidate(
-            dd,
-            POWER_CONTROL_REGISTERS[manager_type]["POWER_PERCENT_REGISTER"],
-            power_percentage,
-        )
-        await _set_and_invalidate(
-            dd,
-            POWER_CONTROL_REGISTERS[manager_type]["MODE_REGISTER"],
-            rv.ActivePowerControlMode.POWER_LIMITED_GRID_CONNECTION_PERCENT,
-        )
+        async with _set_and_invalidate_sequence(dd) as write:
+            await write(
+                POWER_CONTROL_REGISTERS[manager_type]["POWER_PERCENT_REGISTER"],
+                power_percentage,
+            )
+            await write(
+                POWER_CONTROL_REGISTERS[manager_type]["MODE_REGISTER"],
+                rv.ActivePowerControlMode.POWER_LIMITED_GRID_CONNECTION_PERCENT,
+            )
 
         assert dd.configuration_update_coordinator
         await dd.configuration_update_coordinator.async_refresh()

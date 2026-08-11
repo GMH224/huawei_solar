@@ -75,6 +75,61 @@ class RegisterTier(IntEnum):
     STATIC = auto()   # read once per session
 
 
+# ── Quality model (v2.0.0) ─────────────────────────────────────────────────────
+#
+# See V2_ARCHITECTURE_DESIGN.md for the full design record; this is the
+# implementation of that design, not a new decision.
+#
+# v1.3.21 and earlier conflated transport/link health with sensor/payload
+# health via a single `dirty` boolean, used for two genuinely different
+# situations: "we wrote to this, we KNOW it's now wrong" and "the link
+# dropped, we don't know if this changed." `merge()` treated both
+# identically, silently dropping a register from `coordinator.data`
+# entirely whenever either was true and a refresh hadn't yet succeeded —
+# the root cause of registers going `Unknown` after routine bus
+# contention, independent of and in addition to genuine data loss.
+#
+# Vocabulary deliberately borrows from OPC UA's Good/Uncertain/Bad
+# StatusCode severity model (verified against the real OPC UA spec, not
+# assumed) but scoped down to exactly this integration's real failure
+# modes -- not the full StatusCode taxonomy, and deliberately NOT OPC UA's
+# dual SourceTimestamp/ServerTimestamp model either (this integration's
+# polling architecture cannot honestly populate a distinct source
+# timestamp; inventing one would be false precision).
+class Quality(IntEnum):
+    GOOD = auto()        # read succeeded within its tier's current cadence
+    UNCERTAIN = auto()   # a real value exists; cannot currently verify it
+    BAD = auto()         # no usable value -- never read, known-wrong, or expired
+
+
+class Reason(IntEnum):
+    """Only meaningful when quality != GOOD. Each value exists because it
+    tells a consumer something genuinely different from the others -- see
+    V2_ARCHITECTURE_DESIGN.md §5 for the full reasoning behind each one.
+    """
+    # UNCERTAIN
+    SHED = auto()               # our own guard declined to admit the request
+    # v2.0.0b (MOD-09, external ICS audit -- confirmed): distinct from
+    # SHED (declined immediately, queue was full) and from TIMEOUT
+    # (request sent, device never answered) -- this is "waited for the
+    # bus, but the wait itself exceeded QUEUE_WAIT_TIMEOUT; the device
+    # was never contacted". Conflating this with TIMEOUT (the original
+    # bug this Reason exists to fix) taught the adaptive learner that
+    # internal bus contention was device misbehaviour, exactly the
+    # mistake SHED already exists to avoid for the sibling congestion
+    # case -- see modbus_guard.py's ModbusAdmissionTimeout for the full
+    # reasoning.
+    ADMISSION_TIMEOUT = auto()
+    BACKOFF_DEFERRED = auto()   # tier-based deferral during back-off, by design
+    TIMEOUT = auto()            # request sent, no response within budget
+    LINK_DOWN = auto()          # keep-alive-detected connection loss
+    DEVICE_BUSY = auto()        # device explicitly responded busy (Modbus 0x06)
+    # BAD
+    NEVER_READ = auto()         # no cache entry exists at all
+    WRITE_PENDING = auto()      # invalidated by our own write, not yet reread
+    EXPIRED = auto()            # was UNCERTAIN, aged past the starvation ceiling
+
+
 # Base TTLs (seconds)
 #
 # v1.3.3 — SLOW raised 300 s -> 900 s on field evidence.
@@ -339,13 +394,20 @@ def _classify(name: RegisterName) -> RegisterTier:
 # ── Cache entry ───────────────────────────────────────────────────────────────
 
 class _CacheEntry:
-    __slots__ = ("value", "raw", "ts", "dirty", "tier", "effective_ttl")
+    __slots__ = ("value", "raw", "ts", "quality", "reason", "tier", "effective_ttl")
 
     def __init__(self, value: Any, raw: Any, ts: float, tier: RegisterTier) -> None:
         self.value = value                          # full Result object
         self.raw = raw                              # comparable raw value for change detection
-        self.ts = ts
-        self.dirty = False
+        self.ts = ts                                # single timestamp -- see Quality docstring above
+        # v2.0.0: `dirty` (bool) replaced by `quality`/`reason`. A fresh
+        # successful read is always GOOD with no reason; degradation
+        # (UNCERTAIN/BAD, with a specific reason) is applied in place by
+        # record_attempt() without touching value/ts, so the entry always
+        # retains its last known-good reading even while its quality says
+        # that reading can no longer be fully trusted.
+        self.quality: "Quality" = Quality.GOOD
+        self.reason: "Reason | None" = None
         self.tier = tier
         self.effective_ttl: float = _TIER_BASE_TTL[tier]
 
@@ -371,12 +433,43 @@ class RegisterCache:
     night_mode:
         When True, non-FAST TTLs are multiplied by NIGHT_TTL_MULTIPLIER.
         Set via set_night_mode(); controlled by the coordinator.
+    starvation_ceiling_s:
+        v2.0.0. How many seconds past an UNCERTAIN entry's due-time before
+        it lazily becomes BAD/EXPIRED (see _live_quality). Deliberately a
+        constructor parameter, not a module-level import of
+        const.REGISTER_STARVATION_CEILING_S -- this file is kept
+        dependency-light by design (unlike the "heavy" coordinator/setup
+        files, it's imported and executed directly, not just AST-checked,
+        by its own test suite), so the real constant is injected by
+        whoever constructs the cache rather than imported here. The
+        default below matches const.REGISTER_STARVATION_CEILING_S
+        (Defect Y, v1.3.21) exactly; construction sites should still pass
+        it explicitly so the two never silently drift apart.
+    energy_availability_ceiling_s:
+        v2.0.0 (V2_ARCHITECTURE_DESIGN.md §8.1). Energy counters get a
+        LONGER availability window than starvation_ceiling_s, not a
+        shorter one -- a delayed energy reading is less harmful than a
+        gap in it (breaks the Energy Dashboard's hourly rollup outright),
+        per the operator's own hard hardware/UX constraint, and HA's
+        statistics sum delta is value-to-value, not time-weighted, so a
+        late-but-genuine reading still lands on the correct total. Must
+        stay larger than starvation_ceiling_s -- see _live_quality(), which
+        would otherwise never reach this longer ceiling at all, since the
+        generic EXPIRED transition would already have fired first. Same
+        injection reasoning as starvation_ceiling_s above.
     """
 
-    def __init__(self, telemetry: "ModbusTelemetry | None" = None) -> None:
+    def __init__(
+        self,
+        telemetry: "ModbusTelemetry | None" = None,
+        starvation_ceiling_s: float = 300.0,
+        energy_availability_ceiling_s: float = 600.0,
+    ) -> None:
         self._store: dict[RegisterName, _CacheEntry] = {}
         self._telemetry = telemetry
         self._night_mode: bool = False
+        self._starvation_ceiling_s = starvation_ceiling_s
+        self._energy_availability_ceiling_s = energy_availability_ceiling_s
 
     # ── night-mode control ────────────────────────────────────────────────────
 
@@ -416,6 +509,44 @@ class RegisterCache:
 
     # ── public API ────────────────────────────────────────────────────────────
 
+    def _live_quality(
+        self, name: RegisterName, entry: "_CacheEntry", now: float
+    ) -> tuple["Quality", "Reason | None"]:
+        """Quality/reason as of `now`, applying the lazy EXPIRED transition.
+
+        EXPIRED is a pure function of elapsed time (an UNCERTAIN entry aged
+        past its applicable ceiling becomes BAD) -- computed here, on read,
+        rather than by any writer, so no background sweep task is needed;
+        it reuses the same constant already shipped and field-validated
+        for Defect Y (v1.3.21).
+
+        STATIC tier is exempt (V2_ARCHITECTURE_DESIGN.md §10.3): its whole
+        purpose is registers that are genuinely immutable within a session
+        (serial number, model name). Treating "hasn't needed re-reading"
+        as "no longer trustworthy" is semantically wrong for data that, by
+        definition, is not expected to change at all -- unlike FAST/NORMAL/
+        SLOW tiers, where genuine change over time is real and staleness
+        represents real risk.
+
+        Energy counters get a LONGER ceiling, not an exemption
+        (V2_ARCHITECTURE_DESIGN.md §8.1): a delayed reading is less harmful
+        than a gap for the Energy Dashboard's hourly rollup, and HA's
+        statistics sum delta is value-to-value, not time-weighted, so a
+        late-but-genuine reading still lands on the correct total. Checked
+        by name (is_energy_counter), not tier -- energy counters span more
+        than one tier.
+        """
+        if entry.quality != Quality.UNCERTAIN or entry.tier == RegisterTier.STATIC:
+            return entry.quality, entry.reason
+        ceiling = (
+            self._energy_availability_ceiling_s
+            if is_energy_counter(name)
+            else self._starvation_ceiling_s
+        )
+        if now - entry.ts > ceiling:
+            return Quality.BAD, Reason.EXPIRED
+        return entry.quality, entry.reason
+
     def filter_stale(
         self,
         names: list[RegisterName],
@@ -438,7 +569,10 @@ class RegisterCache:
 
         for name in names:
             entry = self._store.get(name)
-            if entry is None or entry.dirty:
+            # v2.0.0: not GOOD (rather than the old `dirty`) -- a register
+            # currently UNCERTAIN or BAD needs a fresh attempt just as much
+            # as one that was never cached at all.
+            if entry is None or self._live_quality(name, entry, now)[0] != Quality.GOOD:
                 stale.append(name)
                 continue
 
@@ -467,14 +601,25 @@ class RegisterCache:
         return stale
 
     def update(self, results: dict[RegisterName, "Result[Any]"]) -> None:
-        """Store fresh results, update adaptive TTLs, and clear dirty flags."""
+        """Store fresh, successfully-read results. Always ends GOOD.
+
+        v2.0.0: this is exclusively the SUCCESS path now -- see
+        record_attempt() for recording a failed/deferred outcome. Adaptive
+        TTL stretching compares against the entry's previous raw value,
+        UNLESS that previous value was WRITE_PENDING (known-wrong, per our
+        own write, not merely unverified) -- comparing a fresh read against
+        a value we already knew was wrong would risk concluding "unchanged"
+        when the write may well have changed it. Any other prior reason
+        (LINK_DOWN, TIMEOUT, SHED, BACKOFF_DEFERRED, EXPIRED) still has a
+        meaningful old raw value to compare against.
+        """
         now = time.monotonic()
         for name, result in results.items():
             raw_new = _raw(result)
             existing = self._store.get(name)
             tier = existing.tier if existing else _classify(name)
 
-            if existing is not None and not existing.dirty:
+            if existing is not None and existing.reason != Reason.WRITE_PENDING:
                 # Adaptive TTL: stretch if value unchanged, reset if changed
                 if raw_new == existing.raw:
                     new_ttl = min(
@@ -489,56 +634,154 @@ class RegisterCache:
                     existing.raw = raw_new
                     existing.value = result
                     existing.ts = now
-                existing.dirty = False
+                existing.quality = Quality.GOOD
+                existing.reason = None
             else:
                 self._store[name] = _CacheEntry(result, raw_new, now, tier)
+
+    def record_attempt(
+        self,
+        names: list[RegisterName],
+        quality: "Quality",
+        reason: "Reason | None",
+        now: float | None = None,
+    ) -> None:
+        """Record the OUTCOME of an attempt (or deliberate non-attempt) to
+        refresh one or more registers, for anything other than a fresh
+        success (use update() for that).
+
+        v2.0.0. Called by the coordinator once per chunk outcome (a Modbus
+        read succeeds or fails atomically for the whole register range
+        requested together -- see V2_ARCHITECTURE_DESIGN.md §5.2), and
+        explicitly for BACKOFF_DEFERRED even though nothing was sent (§5.1
+        -- silently leaving an entry unchanged and explicitly recording
+        "deliberately skipped, here's why" look identical in the stored
+        VALUE but materially different in what a consumer sees in
+        reason/age).
+
+        Degrades an existing entry's quality/reason IN PLACE -- value/ts
+        are never touched here, so the entry always retains its last
+        known-good reading even while reporting that the reading can no
+        longer be fully trusted. A register with no existing entry and a
+        non-GOOD outcome has nothing to degrade; get()/quality_of() already
+        report NEVER_READ correctly for an absent entry.
+        """
+        if now is None:
+            now = time.monotonic()
+        for name in names:
+            entry = self._store.get(name)
+            if entry is not None:
+                entry.quality = quality
+                entry.reason = reason
+
+    def quality_of(self, name: RegisterName) -> tuple["Quality", "Reason | None", float | None]:
+        """(quality, reason, age_seconds) for a register -- the quality-model
+        accessor, deliberately separate from get()/merge() (which stay on
+        the unchanged, bare-value interface every existing consumer already
+        uses -- see V2_ARCHITECTURE_DESIGN.md §10.4). Called only by
+        consumers that specifically need quality: the entity layer's
+        data_quality/data_quality_reason/data_age_seconds attributes, and
+        battery_health_manager.py (§10.4's deliberate exception -- it builds
+        stateful deltas from sequential readings, not display state).
+        """
+        now = time.monotonic()
+        entry = self._store.get(name)
+        if entry is None:
+            return Quality.BAD, Reason.NEVER_READ, None
+        quality, reason = self._live_quality(name, entry, now)
+        return quality, reason, now - entry.ts
 
     def merge(
         self,
         fresh: dict[RegisterName, "Result[Any]"],
         requested: list[RegisterName],
     ) -> dict[RegisterName, "Result[Any]"]:
-        """Merge fresh results with cached values to produce a complete response."""
+        """Merge fresh results with cached values to produce a complete response.
+
+        v2.0.0 FIX (the root defect this whole rebuild exists to close):
+        a cached value is served whenever its live quality is NOT BAD --
+        i.e. GOOD or UNCERTAIN both serve. Previously this checked `not
+        dirty`, which conflated write-invalidation (BAD: we KNOW the old
+        value is wrong) with reconnect-invalidation (should be UNCERTAIN:
+        the value is probably still true, we just can't currently verify
+        it) -- a register invalidated by any connection blip and not
+        immediately re-read was silently dropped from coordinator.data
+        entirely, going `Unknown` in Home Assistant even though a recent,
+        probably-still-accurate reading existed. This is the fix.
+        """
+        now = time.monotonic()
         merged: dict[RegisterName, "Result[Any]"] = {}
         for name in requested:
             if name in fresh:
                 merged[name] = fresh[name]
-            elif name in self._store and not self._store[name].dirty:
-                merged[name] = self._store[name].value
+                continue
+            entry = self._store.get(name)
+            if entry is not None and self._live_quality(name, entry, now)[0] != Quality.BAD:
+                merged[name] = entry.value
         return merged
 
     def invalidate(self, name: RegisterName) -> None:
-        """Mark a single register dirty (after a write)."""
+        """Mark a single register BAD/WRITE_PENDING after a write.
+
+        v2.0.0: this is the "we KNOW the old value is now wrong" case --
+        stays BAD, not UNCERTAIN. See invalidate_all() for the genuinely
+        different reconnect case.
+        """
         if name in self._store:
-            self._store[name].dirty = True
-            _LOGGER.debug("Cache invalidated: %s", name)
+            self._store[name].quality = Quality.BAD
+            self._store[name].reason = Reason.WRITE_PENDING
+            _LOGGER.debug("Cache invalidated (write pending): %s", name)
 
     def invalidate_all(self) -> None:
-        """Mark every non-STATIC cached register dirty after reconnect.
+        """Mark every non-STATIC cached register UNCERTAIN/LINK_DOWN after
+        reconnect.
 
-        STATIC registers (serial numbers, firmware versions, rated power, etc.)
-        are hardware constants that cannot change between connection attempts.
-        Skipping them saves one batch read of ~10-15 registers on every
-        reconnect / outage recovery, reducing the initial post-outage burst.
+        v2.0.0: UNCERTAIN, not the old dirty=True (which merge() treated as
+        unservable). We don't know the value changed during the outage --
+        we just can't currently verify it -- so it should still be served,
+        with its quality honestly reported as degraded, until either a
+        fresh read confirms it or REGISTER_STARVATION_CEILING_S elapses and
+        it lazily becomes BAD/EXPIRED (_live_quality). This is the direct
+        fix for the root defect this rebuild exists to close.
+
+        STATIC registers (serial numbers, firmware versions, rated power,
+        etc.) are hardware constants that cannot change between connection
+        attempts. Skipping them saves one batch read of ~10-15 registers on
+        every reconnect / outage recovery, reducing the initial post-outage
+        burst.
         """
         for entry in self._store.values():
             if entry.tier != RegisterTier.STATIC:
-                entry.dirty = True
+                entry.quality = Quality.UNCERTAIN
+                entry.reason = Reason.LINK_DOWN
 
     def invalidate_all_including_static(self) -> None:
-        """Mark every cached register dirty, including STATIC tier.
+        """Mark every cached register untrustworthy, including STATIC tier.
 
         Use only when the device itself may have changed (firmware update,
         hardware replacement).  Normal outage recovery should call
         invalidate_all() instead.
+
+        v2.0.0: currently unused anywhere in this codebase (reserved for a
+        hypothetical future caller). Marked BAD/WRITE_PENDING -- an
+        imperfect semantic fit (nothing was written) reused deliberately
+        rather than adding a dedicated Reason value for a zero-caller
+        method; revisit if this ever gains a real caller.
         """
         for entry in self._store.values():
-            entry.dirty = True
+            entry.quality = Quality.BAD
+            entry.reason = Reason.WRITE_PENDING
 
     def get(self, name: RegisterName) -> "Result[Any] | None":
-        """Return a cached value or None."""
+        """Return a cached value or None.
+
+        v2.0.0: serves whenever live quality is NOT BAD (GOOD or
+        UNCERTAIN) -- see merge()'s docstring for the full reasoning; this
+        is the same fix, for the other call pattern that reads single
+        registers directly.
+        """
         entry = self._store.get(name)
-        if entry and not entry.dirty:
+        if entry is not None and self._live_quality(name, entry, time.monotonic())[0] != Quality.BAD:
             return entry.value
         return None
 

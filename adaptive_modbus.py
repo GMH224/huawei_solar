@@ -259,9 +259,35 @@ class AdaptiveModbusController:
     1. ``AdaptiveModbusController(hass, serial_number, device_info)``
     2. ``await controller.async_load()``  — must be called before first poll
     3. Coordinator calls ``get_params()`` at the start of each poll cycle.
-    4. Coordinator calls ``record_request(rtt_ms, success, timeout)`` after each poll.
+    4. Coordinator calls ``record_request(rtt_ms, success, timeout)`` per
+       CHUNK now (v2.0.0a, F15, external ICS audit -- confirmed;
+       record_request()'s own docstring says "one completed Modbus
+       request", which is per-transaction, not per-poll -- the old
+       call-once-per-poll-with-the-worst-chunk's-RTT usage was the actual
+       misuse of this function). ``note_batch()`` stays genuinely
+       poll-level (n, failures, confidence, decay tuned against a
+       per-poll rate) and is unaffected.
     5. Coordinator calls ``notify_transition()`` on detected state changes.
     6. ``controller.stop()`` on integration unload.
+
+    v2.0.0a (F14, external ICS audit -- DELIBERATELY DEFERRED, not fixed
+    in this pass): this learner is fed from the main coordinator's own
+    polling only. Writes, config-flow discovery/validation, static
+    startup reads, and keep-alive probes all now route through the same
+    ModbusGuard (v2.0.0a's F01/F05/F06/F08 fixes) but do NOT feed this
+    learner -- the audit's own framing is correct that a shared bus
+    policy is therefore tuned from a partial view of the bus, not the
+    complete one. Not fixed here because it is a materially different,
+    larger scope than everything else in this remediation pass: it would
+    mean touching every one of those newly-guarded call sites again to
+    also report into this learner, deciding how to weight fundamentally
+    different traffic types (a write's RTT characteristics are not
+    obviously comparable to a read's), and doing so without destabilising
+    a learning model that has been tuned and field-validated against real
+    data across many prior sessions. Deserves its own dedicated design
+    pass, the same treatment already given to other deliberately deferred
+    items this session (battery-health polling cadence, §8.3;
+    synchronized-power cadence realignment, F10).
     """
 
     _registry: dict[str, "AdaptiveModbusController"] = {}
@@ -365,6 +391,10 @@ class AdaptiveModbusController:
         self.last_batch_ms: float = 0.0
         self.last_chunk_count: int = 0
         self.shed_count: int = 0
+        # v2.0.0b (MOD-09, external ICS audit): a separate diagnostic
+        # counter from shed_count above -- see note_admission_timeout()'s
+        # own docstring for why these are deliberately not conflated.
+        self.admission_timeout_count: int = 0
         # Bus-level metrics pushed in by the coordinator (the guard owns them;
         # it is shared per endpoint, while this controller is per serial).
         self._bus_occupancy_pct: float = 0.0
@@ -589,6 +619,21 @@ class AdaptiveModbusController:
         """Diagnostics only — a request shed by the shared bus guard."""
         self.shed_count += 1
 
+    def note_admission_timeout(self) -> None:
+        """Diagnostics only — a request that waited for the bus but the
+        wait itself exceeded QUEUE_WAIT_TIMEOUT before the device was
+        ever contacted.
+
+        v2.0.0b (MOD-09, external ICS audit -- confirmed). Deliberately a
+        separate counter from shed_count above, not a reuse of it: SHED
+        (declined immediately, queue was already full) and
+        ADMISSION_TIMEOUT (admitted to wait, but the wait itself timed
+        out) are genuinely different signals about bus behaviour under
+        load, and the audit's own recommendation was to give this its own
+        telemetry reason rather than collapse it into an existing one.
+        """
+        self.admission_timeout_count += 1
+
     def record_request(
         self, rtt_ms: float, success: bool, timeout: bool
     ) -> None:
@@ -683,6 +728,9 @@ class AdaptiveModbusController:
             "last_batch_ms": round(self.last_batch_ms, 1),
             "last_chunk_count": self.last_chunk_count,
             "shed_count": self.shed_count,
+            # v2.0.0b (MOD-09, external ICS audit): exposed alongside
+            # shed_count for the same diagnostic-visibility reason.
+            "admission_timeout_count": self.admission_timeout_count,
             "bus_occupancy_pct": round(self._bus_occupancy_pct, 1),
             "bus_wait_p95_ms": round(self._bus_wait_p95, 1),
             "bus_service_p95_ms": round(self._bus_service_p95, 1),
@@ -857,10 +905,19 @@ class AdaptiveModbusController:
             await self._async_save()
 
     async def _async_save(self) -> None:
+        # v2.0.0a (F16, external ICS audit -- confirmed): _dirty used to be
+        # cleared BEFORE the actual persistence call, so a failed save
+        # (storage backend error, disk full, etc.) would leave _dirty=False
+        # even though nothing was actually written -- silently losing the
+        # "this still needs saving" indication. Cleared only after
+        # async_save() has genuinely succeeded; a raised exception now
+        # leaves _dirty=True, exactly as it should, and propagates to the
+        # caller (already handled at the async_unload() call site in
+        # __init__.py's own teardown sequence).
         if self._first_data_date is None:
             self._first_data_date = date.today()
-        self._dirty = False
         await self._store.async_save(self._serialize())
+        self._dirty = False
         _LOGGER.debug(
             "AdaptiveModbus[%s]: statistics persisted (%d days of data)",
             self.serial_number,

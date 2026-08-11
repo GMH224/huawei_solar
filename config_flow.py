@@ -59,8 +59,13 @@ from .const import (
     DEFAULT_PORT,
     DEFAULT_USERNAME,
     DEVICE_CONNECT_TIMEOUT,
+    DISCONNECT_TIMEOUT,
+    MODBUS_CONNECT_TIMEOUT,
+    DISCOVERY_PROBE_TIMEOUT,
+    DISCOVERY_TOTAL_TIMEOUT,
     DOMAIN,
 )
+from .modbus_guard import ModbusGuard
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -68,21 +73,40 @@ CONF_MANUAL_PATH = "Enter Manually"
 
 
 async def validate_serial_setup(port: str, unit_ids: list[int]) -> dict[str, Any]:
-    """Validate the serial device that was passed by the user."""
+    """Validate the serial device that was passed by the user.
+
+    v2.0.0a FIX (F01, external ICS audit -- confirmed): this whole
+    validation used to bypass ModbusGuard entirely. create_device_instance()/
+    create_sub_device_instance() are vendor-library calls that may perform
+    several internal Modbus exchanges each -- there's no visibility into
+    exactly which from here, so (matching the same pattern already used for
+    sensor.py's _has_write_permission_bounded) the WHOLE validation is
+    treated as one logical guarded operation, not sub-divided per internal
+    exchange. Acquired once for the whole function, released in the same
+    `finally` that already handles client cleanup, so it's covered on every
+    exit path.
+    """
+    endpoint = ModbusGuard.endpoint_for({"port": port})
+    guard = ModbusGuard.acquire_endpoint(endpoint)
     client = create_rtu_client(
         port=port,
         unit_id=unit_ids[0],
     )
     try:
-        await client.connect()
+        # v2.0.0b (MOD-08, external ICS audit -- confirmed): connection
+        # establishment itself had no timeout -- see MODBUS_CONNECT_TIMEOUT's
+        # own comment in const.py for why this is a separate, shorter bound
+        # from DEVICE_CONNECT_TIMEOUT below.
+        await asyncio.wait_for(client.connect(), timeout=MODBUS_CONNECT_TIMEOUT.total_seconds())
         # v1.3.19 FIX (Defect V/Finding 3): same unbounded pattern as
         # validate_network_setup, found by sweeping for it here too --
         # not explicitly named by either audit's evidence lines, but the
         # identical shape of the same defect.
-        device = await asyncio.wait_for(
-            create_device_instance(client),
-            timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
-        )
+        async with guard.request(label="config_flow_validation"):
+            device = await asyncio.wait_for(
+                create_device_instance(client),
+                timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
+            )
 
         _LOGGER.info(
             "Successfully connected to device %s %s with SN %s",
@@ -99,10 +123,11 @@ async def validate_serial_setup(port: str, unit_ids: list[int]) -> dict[str, Any
         # Also validate the other slave-ids
         for slave_id in unit_ids[1:]:
             try:
-                slave_bridge = await asyncio.wait_for(
-                    create_sub_device_instance(device, slave_id),
-                    timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
-                )
+                async with guard.request(label="config_flow_validation"):
+                    slave_bridge = await asyncio.wait_for(
+                        create_sub_device_instance(device, slave_id),
+                        timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
+                    )
 
                 _LOGGER.info(
                     "Successfully connected to sub device %s with ID %s: %s with SN %s",
@@ -119,26 +144,60 @@ async def validate_serial_setup(port: str, unit_ids: list[int]) -> dict[str, Any
         return result
     finally:
         # Cleanup this device object explicitly to prevent it from trying to maintain a modbus connection
+        # v2.0.1 (H-05, ICS re-audit -- confirmed/borderline): bounded,
+        # same DISCONNECT_TIMEOUT/reasoning as validate_network_setup_login's
+        # own H-05 fix -- an unbounded disconnect() here could block the
+        # configuration flow indefinitely after the actual operation above
+        # already completed or failed.
         with contextlib.suppress(Exception):
-            await client.disconnect()
+            await asyncio.wait_for(
+                client.disconnect(), timeout=DISCONNECT_TIMEOUT.total_seconds(),
+            )
+        ModbusGuard.release_endpoint(endpoint)
 
 
 async def _auto_slave_discovery(
     client: Any,
     *,
     on_progress: Callable[[float], None] | None = None,
+    guard: "ModbusGuard | None" = None,
 ) -> tuple[int, list[int]] | None:
     """Probe unit_ids 0-16 and 100 sequentially via Huawei get_device_infos messages.
 
     Returns (primary_unit_id, sub_unit_ids) if a device responds, or None if not.
     The caller owns ``client`` and is responsible for connecting/disconnecting it.
+
+    v2.0.0a FIX (F01/F02, external ICS audit -- confirmed): each probe used
+    to have no timeout of its own (duration was governed by whatever the
+    vendor library's internal timeout happened to be) and bypassed
+    ModbusGuard entirely, so config-flow discovery could physically
+    overlap a coordinator's own guarded polling on the same endpoint if a
+    flow ran while an entry was already loaded. Fixed with a per-probe
+    timeout (DISCOVERY_PROBE_TIMEOUT), a whole-scan deadline
+    (DISCOVERY_TOTAL_TIMEOUT) around the entire loop, and routing each
+    probe through `guard` when the caller provides one (always does, in
+    production -- see _tcp_auto_slave_discovery/_rtu_auto_slave_discovery,
+    which acquire it for the duration of the whole discovery session).
+    `guard=None` remains a defensive fallback for any caller without one,
+    reproducing the previous unguarded (but now still timeout-bounded)
+    behaviour rather than crashing.
     """
     unit_ids_to_scan = [0, 100, *list(range(1, 17))]
 
     async def _probe(unit_id: int):
         _LOGGER.debug("AUTO: probing unit_id %s via get_device_infos", unit_id)
         try:
-            device_infos = await get_device_infos(client.for_unit_id(unit_id))
+            if guard is not None:
+                async with guard.request(label="config_flow_discovery"):
+                    device_infos = await asyncio.wait_for(
+                        get_device_infos(client.for_unit_id(unit_id)),
+                        timeout=DISCOVERY_PROBE_TIMEOUT.total_seconds(),
+                    )
+            else:
+                device_infos = await asyncio.wait_for(
+                    get_device_infos(client.for_unit_id(unit_id)),
+                    timeout=DISCOVERY_PROBE_TIMEOUT.total_seconds(),
+                )
         except (HuaweiSolarException, ReadException, TimeoutError) as err:
             _LOGGER.debug("AUTO: unit_id %s did not respond: %s", unit_id, err)
             raise
@@ -155,45 +214,46 @@ async def _auto_slave_discovery(
         return unit_id, device_infos
 
     _LOGGER.debug("AUTO: scanning unit_ids %s sequentially", unit_ids_to_scan)
-    for i, unit_id in enumerate(unit_ids_to_scan):
-        try:
-            primary_unit_id, found_device_infos = await _probe(unit_id)
-            _LOGGER.info(
-                "AUTO: found device at unit_id %s: type=%s, model=%s, software_version=%s",
-                primary_unit_id,
-                found_device_infos[0].product_type,
-                found_device_infos[0].model,
-                found_device_infos[0].software_version,
-            )
-            sub_unit_ids = [
-                di.device_id
-                for di in found_device_infos[1:]
-                if di.device_id is not None
-            ]
-            for di in found_device_infos[1:]:
-                if di.device_id is None:
-                    _LOGGER.warning(
-                        "AUTO: device with no device_id found. Skipping. "
-                        "Product type: %s, model: %s, software version: %s",
-                        di.product_type,
-                        di.model,
-                        di.software_version,
-                    )
+    async with asyncio.timeout(DISCOVERY_TOTAL_TIMEOUT.total_seconds()):
+        for i, unit_id in enumerate(unit_ids_to_scan):
+            try:
+                primary_unit_id, found_device_infos = await _probe(unit_id)
+                _LOGGER.info(
+                    "AUTO: found device at unit_id %s: type=%s, model=%s, software_version=%s",
+                    primary_unit_id,
+                    found_device_infos[0].product_type,
+                    found_device_infos[0].model,
+                    found_device_infos[0].software_version,
+                )
+                sub_unit_ids = [
+                    di.device_id
+                    for di in found_device_infos[1:]
+                    if di.device_id is not None
+                ]
+                for di in found_device_infos[1:]:
+                    if di.device_id is None:
+                        _LOGGER.warning(
+                            "AUTO: device with no device_id found. Skipping. "
+                            "Product type: %s, model: %s, software version: %s",
+                            di.product_type,
+                            di.model,
+                            di.software_version,
+                        )
+                if on_progress:
+                    on_progress(1.0)
+            except (
+                HuaweiSolarException,
+                ReadException,
+                DeviceException,
+                TimeoutError,
+            ):
+                pass
+            else:
+                return primary_unit_id, sub_unit_ids
             if on_progress:
-                on_progress(1.0)
-        except (
-            HuaweiSolarException,
-            ReadException,
-            DeviceException,
-            TimeoutError,
-        ):
-            pass
-        else:
-            return primary_unit_id, sub_unit_ids
-        if on_progress:
-            on_progress((i + 1) / len(unit_ids_to_scan))
+                on_progress((i + 1) / len(unit_ids_to_scan))
 
-    return None
+        return None
 
 
 async def _tcp_auto_slave_discovery(
@@ -202,14 +262,34 @@ async def _tcp_auto_slave_discovery(
     port: int,
     on_progress: Callable[[float], None] | None = None,
 ) -> tuple[int, list[int]] | None:
-    """Auto-discovery over TCP. Opens/closes its own connection."""
+    """Auto-discovery over TCP. Opens/closes its own connection.
+
+    v2.0.0a FIX (F01, external ICS audit -- confirmed): acquires this
+    endpoint's guard for the duration of discovery, same
+    acquire_endpoint()/release_endpoint() lifecycle a config entry uses
+    (see __init__.py) -- a config flow has no loaded entry yet, but the
+    physical bus is the same one an already-loaded entry might be actively
+    polling, so it needs the same serialisation.
+    """
+    endpoint = ModbusGuard.endpoint_for({"host": host, "port": port})
+    guard = ModbusGuard.acquire_endpoint(endpoint)
     client = create_scan_tcp_client(host=host, port=port, unit_id=0)
     try:
-        await client.connect()
-        return await _auto_slave_discovery(client, on_progress=on_progress)
+        # v2.0.0b (MOD-08, external ICS audit -- confirmed): see the first
+        # call site's own note on this same fix.
+        await asyncio.wait_for(client.connect(), timeout=MODBUS_CONNECT_TIMEOUT.total_seconds())
+        return await _auto_slave_discovery(client, on_progress=on_progress, guard=guard)
     finally:
+        # v2.0.1 (H-05, ICS re-audit -- confirmed/borderline): bounded,
+        # same DISCONNECT_TIMEOUT/reasoning as validate_network_setup_login's
+        # own H-05 fix -- an unbounded disconnect() here could block the
+        # configuration flow indefinitely after the actual operation above
+        # already completed or failed.
         with contextlib.suppress(Exception):
-            await client.disconnect()
+            await asyncio.wait_for(
+                client.disconnect(), timeout=DISCONNECT_TIMEOUT.total_seconds(),
+            )
+        ModbusGuard.release_endpoint(endpoint)
 
 
 async def _rtu_auto_slave_discovery(
@@ -217,20 +297,37 @@ async def _rtu_auto_slave_discovery(
     serial_port: str,
     on_progress: Callable[[float], None] | None = None,
 ) -> tuple[int, list[int]] | None:
-    """Auto-discovery over RTU (serial). Opens/closes its own connection."""
+    """Auto-discovery over RTU (serial). Opens/closes its own connection.
+
+    v2.0.0a FIX (F01, external ICS audit -- confirmed): same endpoint-guard
+    lifecycle as _tcp_auto_slave_discovery's own note.
+    """
+    endpoint = ModbusGuard.endpoint_for({"port": serial_port})
+    guard = ModbusGuard.acquire_endpoint(endpoint)
     client = create_scan_rtu_client(serial_port, unit_id=0)
     try:
-        await client.connect()
-        return await _auto_slave_discovery(client, on_progress=on_progress)
+        # v2.0.0b (MOD-08, external ICS audit -- confirmed): see the first
+        # call site's own note on this same fix.
+        await asyncio.wait_for(client.connect(), timeout=MODBUS_CONNECT_TIMEOUT.total_seconds())
+        return await _auto_slave_discovery(client, on_progress=on_progress, guard=guard)
     finally:
+        # v2.0.1 (H-05, ICS re-audit -- confirmed/borderline): bounded,
+        # same DISCONNECT_TIMEOUT/reasoning as validate_network_setup_login's
+        # own H-05 fix -- an unbounded disconnect() here could block the
+        # configuration flow indefinitely after the actual operation above
+        # already completed or failed.
         with contextlib.suppress(Exception):
-            await client.disconnect()
+            await asyncio.wait_for(
+                client.disconnect(), timeout=DISCONNECT_TIMEOUT.total_seconds(),
+            )
+        ModbusGuard.release_endpoint(endpoint)
 
 
 async def _scan_slave_discovery(
     client: Any,
     *,
     on_progress: Callable[[float], None] | None = None,
+    guard: "ModbusGuard | None" = None,
 ) -> tuple[int, list[int]]:
     """Probe unit_ids 0-16 and 100 sequentially via detect_device_type.
 
@@ -239,13 +336,27 @@ async def _scan_slave_discovery(
     The caller owns ``client`` and is responsible for connecting/disconnecting it.
     Does not use Huawei device-discovery Modbus messages, making it compatible
     with modbus proxies.
+
+    v2.0.0a FIX (F01/F02, external ICS audit -- confirmed): same fix as
+    _auto_slave_discovery's own note -- per-probe timeout, a whole-scan
+    deadline, and guard routing.
     """
     unit_ids_to_scan = [0, 100, *list(range(1, 17))]
 
     async def _probe(unit_id: int) -> tuple[int, str] | None:
         _LOGGER.debug("SCAN: probing unit_id %s via detect_device_type", unit_id)
         try:
-            _, model_name = await detect_device_type(client.for_unit_id(unit_id))
+            if guard is not None:
+                async with guard.request(label="config_flow_discovery"):
+                    _, model_name = await asyncio.wait_for(
+                        detect_device_type(client.for_unit_id(unit_id)),
+                        timeout=DISCOVERY_PROBE_TIMEOUT.total_seconds(),
+                    )
+            else:
+                _, model_name = await asyncio.wait_for(
+                    detect_device_type(client.for_unit_id(unit_id)),
+                    timeout=DISCOVERY_PROBE_TIMEOUT.total_seconds(),
+                )
             _LOGGER.debug(
                 "SCAN: unit_id %s identified as model=%s", unit_id, model_name
             )
@@ -261,12 +372,13 @@ async def _scan_slave_discovery(
 
     found: list[tuple[int, str]] = []
     _LOGGER.debug("SCAN: scanning unit_ids %s sequentially", unit_ids_to_scan)
-    for i, unit_id in enumerate(unit_ids_to_scan):
-        result = await _probe(unit_id)
-        if result is not None:
-            found.append(result)
-        if on_progress:
-            on_progress((i + 1) / len(unit_ids_to_scan))
+    async with asyncio.timeout(DISCOVERY_TOTAL_TIMEOUT.total_seconds()):
+        for i, unit_id in enumerate(unit_ids_to_scan):
+            result = await _probe(unit_id)
+            if result is not None:
+                found.append(result)
+            if on_progress:
+                on_progress((i + 1) / len(unit_ids_to_scan))
 
     if not found:
         _LOGGER.warning(
@@ -287,14 +399,30 @@ async def _tcp_scan_slave_discovery(
     port: int,
     on_progress: Callable[[float], None] | None = None,
 ) -> tuple[int, list[int]]:
-    """Scan-discovery over TCP. Opens/closes its own connection."""
+    """Scan-discovery over TCP. Opens/closes its own connection.
+
+    v2.0.0a FIX (F01, external ICS audit -- confirmed): same endpoint-guard
+    lifecycle as _tcp_auto_slave_discovery's own note.
+    """
+    endpoint = ModbusGuard.endpoint_for({"host": host, "port": port})
+    guard = ModbusGuard.acquire_endpoint(endpoint)
     client = create_scan_tcp_client(host=host, port=port, unit_id=0)
     try:
-        await client.connect()
-        return await _scan_slave_discovery(client, on_progress=on_progress)
+        # v2.0.0b (MOD-08, external ICS audit -- confirmed): see the first
+        # call site's own note on this same fix.
+        await asyncio.wait_for(client.connect(), timeout=MODBUS_CONNECT_TIMEOUT.total_seconds())
+        return await _scan_slave_discovery(client, on_progress=on_progress, guard=guard)
     finally:
+        # v2.0.1 (H-05, ICS re-audit -- confirmed/borderline): bounded,
+        # same DISCONNECT_TIMEOUT/reasoning as validate_network_setup_login's
+        # own H-05 fix -- an unbounded disconnect() here could block the
+        # configuration flow indefinitely after the actual operation above
+        # already completed or failed.
         with contextlib.suppress(Exception):
-            await client.disconnect()
+            await asyncio.wait_for(
+                client.disconnect(), timeout=DISCONNECT_TIMEOUT.total_seconds(),
+            )
+        ModbusGuard.release_endpoint(endpoint)
 
 
 async def _rtu_scan_slave_discovery(
@@ -302,14 +430,30 @@ async def _rtu_scan_slave_discovery(
     serial_port: str,
     on_progress: Callable[[float], None] | None = None,
 ) -> tuple[int, list[int]]:
-    """Scan-discovery over RTU (serial). Opens/closes its own connection."""
+    """Scan-discovery over RTU (serial). Opens/closes its own connection.
+
+    v2.0.0a FIX (F01, external ICS audit -- confirmed): same endpoint-guard
+    lifecycle as _tcp_auto_slave_discovery's own note.
+    """
+    endpoint = ModbusGuard.endpoint_for({"port": serial_port})
+    guard = ModbusGuard.acquire_endpoint(endpoint)
     client = create_scan_rtu_client(serial_port, unit_id=0)
     try:
-        await client.connect()
-        return await _scan_slave_discovery(client, on_progress=on_progress)
+        # v2.0.0b (MOD-08, external ICS audit -- confirmed): see the first
+        # call site's own note on this same fix.
+        await asyncio.wait_for(client.connect(), timeout=MODBUS_CONNECT_TIMEOUT.total_seconds())
+        return await _scan_slave_discovery(client, on_progress=on_progress, guard=guard)
     finally:
+        # v2.0.1 (H-05, ICS re-audit -- confirmed/borderline): bounded,
+        # same DISCONNECT_TIMEOUT/reasoning as validate_network_setup_login's
+        # own H-05 fix -- an unbounded disconnect() here could block the
+        # configuration flow indefinitely after the actual operation above
+        # already completed or failed.
         with contextlib.suppress(Exception):
-            await client.disconnect()
+            await asyncio.wait_for(
+                client.disconnect(), timeout=DISCONNECT_TIMEOUT.total_seconds(),
+            )
+        ModbusGuard.release_endpoint(endpoint)
 
 
 async def _connect_to_discovered_devices(
@@ -323,10 +467,36 @@ async def _connect_to_discovered_devices(
     """Connect to the primary device and verify all sub-devices.
 
     Returns a dict with slave_ids, model_name, serial_number and has_write_permission.
+
+    v2.0.1 FIX (H-03, ICS re-audit -- confirmed): this whole function used
+    to perform every device-communication call completely outside
+    ModbusGuard -- the same class of gap F01 (v2.0.0a) already closed for
+    validate_network_setup()/validate_serial_setup(), but this function
+    (the "finish network" config-flow step, called when adding a device
+    to an entry whose runtime coordinators may already be actively
+    polling the same physical endpoint) was never revisited when that fix
+    was made. create_device_instance()/has_write_permission()/
+    create_sub_device_instance() may each perform several internal Modbus
+    exchanges -- treated as one logical guarded operation each, matching
+    the same pattern already used everywhere else in this file, not
+    sub-divided per internal exchange (no visibility into exactly which
+    from here).
+
+    v2.0.1 (H-04's own lesson, applied here from the start rather than
+    repeating it): the guard is acquired, then a try: begins IMMEDIATELY
+    -- client construction, connect, and every device-communication call
+    all happen inside it, with nothing able to raise in between the
+    acquire and the try:. The one release is in the finally:, guaranteed
+    to run regardless of where a failure occurs.
     """
-    client = create_tcp_client(host=host, port=port, unit_id=primary_unit_id)
+    endpoint = ModbusGuard.endpoint_for({"host": host, "port": port})
+    guard = ModbusGuard.acquire_endpoint(endpoint)
+    client = None
     try:
-        await client.connect()
+        client = create_tcp_client(host=host, port=port, unit_id=primary_unit_id)
+        # v2.0.0b (MOD-08, external ICS audit -- confirmed): see
+        # validate_serial_setup's own note on this same fix.
+        await asyncio.wait_for(client.connect(), timeout=MODBUS_CONNECT_TIMEOUT.total_seconds())
         # v1.3.19 FIX (Defect V/Finding 3, reported independently by two
         # separate ICS audits): create_device_instance had no bound of its
         # own in this config-flow path -- the same risk already closed for
@@ -337,10 +507,11 @@ async def _connect_to_discovered_devices(
         # caller of this function already catches TimeoutError alongside
         # ConnectionException/ModbusConnectionError as an expected,
         # user-facing "could not connect" case.
-        device = await asyncio.wait_for(
-            create_device_instance(client),
-            timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
-        )
+        async with guard.request(label="config_flow_finish_network"):
+            device = await asyncio.wait_for(
+                create_device_instance(client),
+                timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
+            )
 
         _LOGGER.info(
             "Successfully connected to primary device with unit_id %s: %s %s with SN %s",
@@ -350,21 +521,25 @@ async def _connect_to_discovered_devices(
             device.serial_number,
         )
 
-        has_write_permission = elevated_permissions and (
-            not isinstance(device, HuaweiSolarDeviceWithLogin)
-            or await asyncio.wait_for(
-                device.has_write_permission(),
-                timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
-            )
-        )
+        # v2.0.1 (H-03): matches the same inline guard pattern
+        # validate_network_setup already uses for this identical call.
+        if elevated_permissions and isinstance(device, HuaweiSolarDeviceWithLogin):
+            async with guard.request(label="config_flow_finish_network"):
+                has_write_permission = await asyncio.wait_for(
+                    device.has_write_permission(),
+                    timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
+                )
+        else:
+            has_write_permission = elevated_permissions
 
         unit_ids = [primary_unit_id]
         for sub_unit_id in sub_unit_ids:
             try:
-                sub_device = await asyncio.wait_for(
-                    create_sub_device_instance(device, sub_unit_id),
-                    timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
-                )
+                async with guard.request(label="config_flow_finish_network"):
+                    sub_device = await asyncio.wait_for(
+                        create_sub_device_instance(device, sub_unit_id),
+                        timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
+                    )
                 _LOGGER.info(
                     "Successfully connected to sub device with unit_id %s. %s: %s with SN %s",
                     sub_unit_id,
@@ -386,8 +561,14 @@ async def _connect_to_discovered_devices(
             "has_write_permission": has_write_permission,
         }
     finally:
-        with contextlib.suppress(Exception):
-            await client.disconnect()
+        if client is not None:
+            # v2.0.1 (H-05, ICS re-audit -- confirmed/borderline): see the
+            # top-level disconnect() sites' own note on this same fix.
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(
+                    client.disconnect(), timeout=DISCONNECT_TIMEOUT.total_seconds(),
+                )
+        ModbusGuard.release_endpoint(endpoint)
 
 
 async def validate_network_setup(
@@ -404,24 +585,50 @@ async def validate_network_setup(
         ConnectionException / ModbusConnectionError: if the TCP connection cannot be established.
         DeviceException: if the TCP connection was established but the device rejected the
             slave ID (connection closed by remote), or a sub-device could not be reached.
-    """
-    client = create_scan_tcp_client(
-        host=host,
-        port=port,
-        unit_id=unit_ids[0],
-    )
-    # Separate the TCP connect from the device communication so callers can
-    # distinguish "host unreachable" from "wrong slave ID".
-    await client.connect()
 
+    v2.0.0a FIX (F01, external ICS audit -- confirmed): this whole
+    validation used to bypass ModbusGuard entirely. create_device_instance()/
+    create_sub_device_instance()/has_write_permission() are calls into the
+    core huawei_solar package that may perform several internal Modbus
+    exchanges each -- there's no visibility into exactly which from here,
+    so (matching the same pattern already used for
+    _has_write_permission_bounded and validate_serial_setup) each is
+    treated as one logical guarded operation, not sub-divided per internal
+    exchange.
+
+    v2.0.1 FIX (H-04, ICS re-audit -- confirmed): the guard used to be
+    acquired, then client.connect() called, BOTH before the try:/finally:
+    that releases it -- any exception, timeout, or cancellation from
+    connect() skipped the release entirely, leaking a reference to
+    ModbusGuard's endpoint registry every time. Restructured the same way
+    H-03's fix to _connect_to_discovered_devices() was: the guard is
+    acquired, then a try: begins IMMEDIATELY, with client construction,
+    connect, and every device-communication call all inside it -- nothing
+    able to raise in the gap between acquire and the cleanup envelope.
+    """
+    endpoint = ModbusGuard.endpoint_for({"host": host, "port": port})
+    guard = ModbusGuard.acquire_endpoint(endpoint)
+    client = None
     try:
+        client = create_scan_tcp_client(
+            host=host,
+            port=port,
+            unit_id=unit_ids[0],
+        )
+        # Separate the TCP connect from the device communication so callers can
+        # distinguish "host unreachable" from "wrong slave ID".
+        # v2.0.0b (MOD-08, external ICS audit -- confirmed): see
+        # validate_serial_setup's own note on this same fix.
+        await asyncio.wait_for(client.connect(), timeout=MODBUS_CONNECT_TIMEOUT.total_seconds())
+
         try:
             # v1.3.19 FIX (Defect V/Finding 3): bounded, same reasoning as
             # _connect_to_discovered_devices above.
-            device = await asyncio.wait_for(
-                create_device_instance(client),
-                timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
-            )
+            async with guard.request(label="config_flow_validation"):
+                device = await asyncio.wait_for(
+                    create_device_instance(client),
+                    timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
+                )
         except (ConnectionException, ModbusConnectionError, TimeoutError) as err:
             # TCP connected but device closed the connection → wrong slave ID.
             raise DeviceException(
@@ -436,20 +643,22 @@ async def validate_network_setup(
             device.serial_number,
         )
 
-        has_write_permission = elevated_permissions and (
-            not isinstance(device, HuaweiSolarDeviceWithLogin)
-            or await asyncio.wait_for(
-                device.has_write_permission(),
-                timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
-            )
-        )
+        if elevated_permissions and isinstance(device, HuaweiSolarDeviceWithLogin):
+            async with guard.request(label="config_flow_validation"):
+                has_write_permission = await asyncio.wait_for(
+                    device.has_write_permission(),
+                    timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
+                )
+        else:
+            has_write_permission = elevated_permissions
 
         for unit_id in unit_ids[1:]:
             try:
-                sub_device = await asyncio.wait_for(
-                    create_sub_device_instance(device, unit_id),
-                    timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
-                )
+                async with guard.request(label="config_flow_validation"):
+                    sub_device = await asyncio.wait_for(
+                        create_sub_device_instance(device, unit_id),
+                        timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
+                    )
 
                 _LOGGER.info(
                     "Successfully connected to sub device %s %s: %s with SN %s",
@@ -476,8 +685,14 @@ async def validate_network_setup(
             "has_write_permission": has_write_permission,
         }
     finally:
-        with contextlib.suppress(Exception):
-            await client.disconnect()
+        if client is not None:
+            # v2.0.1 (H-05, ICS re-audit -- confirmed/borderline): see the
+            # top-level disconnect() sites' own note on this same fix.
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(
+                    client.disconnect(), timeout=DISCONNECT_TIMEOUT.total_seconds(),
+                )
+        ModbusGuard.release_endpoint(endpoint)
 
 
 async def validate_network_setup_login(
@@ -488,12 +703,14 @@ async def validate_network_setup_login(
     username: str,
     password: str,
 ) -> bool:
-    """Verify the installer username/password and test if it can perform a write-operation."""
-    client = create_tcp_client(
-        host=host,
-        port=port,
-        unit_id=unit_id,
-    )
+    """Verify the installer username/password and test if it can perform a write-operation.
+
+    v2.0.0a FIX (F01, external ICS audit -- confirmed): this whole
+    validation used to bypass ModbusGuard entirely -- same reasoning as
+    validate_network_setup's own note.
+    """
+    endpoint = ModbusGuard.endpoint_for({"host": host, "port": port})
+    guard = ModbusGuard.acquire_endpoint(endpoint)
     # v1.3.19 FIX (Defect V/Finding 2, independent ICS audit): `bridge` used
     # to be referenced in `finally` without being initialised beforehand.
     # If create_device_instance(client) failed before `bridge` was ever
@@ -505,40 +722,85 @@ async def validate_network_setup_login(
     # `bridge` was never created, makes cleanup independent of exactly how
     # far setup got before failing.
     bridge = None
+    # v2.0.1 (H-04, ICS re-audit): client construction moved inside the
+    # try: too, alongside `client = None` here -- this function's own
+    # client.connect() was already correctly inside try:/finally: (unlike
+    # validate_network_setup's own H-04 bug), but client construction
+    # itself was still technically between the guard acquire and the
+    # cleanup envelope. Low risk (create_tcp_client() is object
+    # construction, not a network call) but hardened for the same
+    # nothing-can-raise-before-the-envelope standard H-04's actual fix
+    # established elsewhere in this file.
+    client = None
     try:
+        client = create_tcp_client(
+            host=host,
+            port=port,
+            unit_id=unit_id,
+        )
         # these parameters have already been tested in validate_input, so this should work fine!
-        await client.connect()
+        # v2.0.0b (MOD-08, external ICS audit -- confirmed): see
+        # validate_serial_setup's own note on this same fix.
+        await asyncio.wait_for(client.connect(), timeout=MODBUS_CONNECT_TIMEOUT.total_seconds())
         # v1.3.19 FIX (Defect V/Finding 3): bounded, same reasoning as
         # validate_network_setup / _connect_to_discovered_devices above.
-        bridge = await asyncio.wait_for(
-            create_device_instance(client),
-            timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
-        )
+        async with guard.request(label="config_flow_validation"):
+            bridge = await asyncio.wait_for(
+                create_device_instance(client),
+                timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
+            )
 
         assert isinstance(bridge, HuaweiSolarDeviceWithLogin)
 
-        await asyncio.wait_for(
-            bridge.login(username, password),
-            timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
-        )
+        async with guard.request(label="config_flow_validation"):
+            await asyncio.wait_for(
+                bridge.login(username, password),
+                timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
+            )
 
         # verify that we have write-permission now
 
-        return await asyncio.wait_for(
-            bridge.has_write_permission(),
-            timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
-        )
+        async with guard.request(label="config_flow_validation"):
+            return await asyncio.wait_for(
+                bridge.has_write_permission(),
+                timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
+            )
     except InvalidCredentials:
         return False
     finally:
+        # v2.0.1 FIX (H-05, ICS re-audit -- confirmed/borderline): this
+        # cleanup used to await bridge.stop()/client.disconnect() with no
+        # timeout at all -- a hung device-side teardown could block the
+        # configuration flow indefinitely, after the actual validation
+        # had already succeeded or failed. Bounded with DISCONNECT_TIMEOUT,
+        # the same constant and reasoning already established for the
+        # normal unload path (Defect U, v1.3.18) and setup-failure cleanup
+        # (_bounded_device_stop(), MOD-16, v2.0.0b) -- failures logged and
+        # swallowed so this function's own return/exception is never
+        # replaced by a cleanup-phase problem.
         if bridge is not None:
             # Cleanup this inverter object explicitly to prevent it from trying to maintain a modbus connection
-            await bridge.stop()
-        else:
+            try:
+                await asyncio.wait_for(
+                    bridge.stop(), timeout=DISCONNECT_TIMEOUT.total_seconds(),
+                )
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception(
+                    "Error stopping the inverter device during config-flow "
+                    "cleanup; continuing regardless"
+                )
+        elif client is not None:
             # bridge was never created (connect() or create_device_instance()
             # failed first) -- the raw client still needs disconnecting.
+            # v2.0.1 (H-04): client can now also be None (create_tcp_client()
+            # itself failing, before ever being assigned) -- guarded
+            # explicitly rather than relying on contextlib.suppress(Exception)
+            # to silently swallow the resulting AttributeError.
             with contextlib.suppress(Exception):
-                await client.disconnect()
+                await asyncio.wait_for(
+                    client.disconnect(), timeout=DISCONNECT_TIMEOUT.total_seconds(),
+                )
+        ModbusGuard.release_endpoint(endpoint)
 
 
 def parse_unit_ids(unit_ids: str) -> list[int]:

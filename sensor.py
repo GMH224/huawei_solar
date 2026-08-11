@@ -4,7 +4,7 @@ import asyncio
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from huawei_solar import (
     EMMADevice,
@@ -66,6 +66,9 @@ from .update_coordinator import (
     HuaweiSolarOptimizerUpdateCoordinator,
     HuaweiSolarUpdateCoordinator,
 )
+
+if TYPE_CHECKING:
+    from .modbus_guard import ModbusGuard
 
 PARALLEL_UPDATES = 1
 
@@ -1132,7 +1135,9 @@ BATTERY_TEMPLATE_SENSOR_DESCRIPTIONS: tuple[BatteryTemplateEntityDescription, ..
 )
 
 
-async def _has_write_permission_bounded(device: Any, serial_number: str) -> bool:
+async def _has_write_permission_bounded(
+    device: Any, serial_number: str, guard: "ModbusGuard | None" = None,
+) -> bool:
     """Bounded, isolated wrapper around ``device.has_write_permission()``.
 
     v1.3.9 FIX (Defect H). This used to be called with no timeout and no
@@ -1161,8 +1166,26 @@ async def _has_write_permission_bounded(device: Any, serial_number: str) -> bool
     one optional one (the same class of blast radius already guarded
     against for battery-health and adaptive-diagnostic entities elsewhere
     in this file).
+
+    v2.0.0a FIX (F06, external ICS audit -- confirmed): being time-bounded
+    protected platform setup from hanging, but the probe itself -- which
+    the vendor library implements as a read-then-write-back sequence --
+    still bypassed ModbusGuard entirely. The whole probe is wrapped in ONE
+    guard acquisition (not separately for whatever internal read/write the
+    vendor library performs, which this code has no visibility into), so
+    it cannot physically interleave with a coordinator's own guarded
+    exchange. `guard` is optional only for the defensive case of no
+    coordinator reference being available; the production call site always
+    has one by the time this runs (already checked truthy via the calling
+    `and` chain's short-circuit evaluation).
     """
     try:
+        if guard is not None:
+            async with guard.request(label="write_permission_probe"):
+                return await asyncio.wait_for(
+                    device.has_write_permission(),
+                    timeout=WRITE_PERMISSION_CHECK_TIMEOUT.total_seconds(),
+                )
         return await asyncio.wait_for(
             device.has_write_permission(),
             timeout=WRITE_PERMISSION_CHECK_TIMEOUT.total_seconds(),
@@ -1257,7 +1280,10 @@ async def create_sun2000_entities(ucs: HuaweiSolarInverterData) -> list[SensorEn
     if (
         not isinstance(ucs.device.primary_device, (EMMADevice, SmartLoggerDevice))
         and ucs.configuration_update_coordinator
-        and await _has_write_permission_bounded(ucs.device, ucs.device.serial_number)
+        and await _has_write_permission_bounded(
+            ucs.device, ucs.device.serial_number,
+            guard=ucs.configuration_update_coordinator.guard,
+        )
     ):
         entities_to_add.append(
             HuaweiSolarActivePowerControlModeEntity(
@@ -2422,6 +2448,12 @@ class HuaweiSolarSensorEntity(
             self._attr_available = False
             self._attr_native_value = None
 
+        # v2.0.0: quality/reason/age attributes -- see _quality_attrs()'s
+        # own docstring. Availability above is untouched by this addition.
+        self._attr_extra_state_attributes = self._quality_attrs(
+            self.coordinator, self._register_key
+        )
+
         self.async_write_ha_state()
 
 
@@ -2452,6 +2484,13 @@ class HuaweiSolarAlarmSensorEntity(HuaweiSolarSensorEntity):
             {"register_names": HuaweiSolarAlarmSensorEntity.ALARM_REGISTERS},
         )
 
+    # v2.0.0 (V2_ARCHITECTURE_DESIGN.md §10.4): deliberately NOT given
+    # data_quality/data_quality_reason/data_age_seconds attributes in this
+    # pass -- this sensor derives its value from MULTIPLE registers
+    # combined, and _quality_attrs() is a single-register accessor. A
+    # multi-register aggregation policy (worst quality wins? report only
+    # the primary register's?) was not specified in the design and isn't
+    # guessed at here; revisit as a deliberate follow-up if needed.
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
@@ -2511,6 +2550,13 @@ class SmartLoggerAlarmSensorEntity(HuaweiSolarSensorEntity):
             {"register_names": SmartLoggerAlarmSensorEntity.ALARM_REGISTERS},
         )
 
+    # v2.0.0 (V2_ARCHITECTURE_DESIGN.md §10.4): deliberately NOT given
+    # data_quality/data_quality_reason/data_age_seconds attributes in this
+    # pass -- this sensor derives its value from MULTIPLE registers
+    # combined, and _quality_attrs() is a single-register accessor. A
+    # multi-register aggregation policy (worst quality wins? report only
+    # the primary register's?) was not specified in the design and isn't
+    # guessed at here; revisit as a deliberate follow-up if needed.
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
@@ -2613,7 +2659,7 @@ class HuaweiSolarTOUSensorEntity(
             self._attr_extra_state_attributes = {
                 f"Period {idx + 1}": self._huawei_luna2000_period_to_text(period)
                 for idx, period in enumerate(data)
-            }
+            } | self._quality_attrs(self.coordinator, self.entity_description.register_name)
         else:
             self._attr_available = False
             self._attr_native_value = None
@@ -2681,7 +2727,7 @@ class HuaweiSolarPricePeriodsSensorEntity(
             self._attr_extra_state_attributes = {
                 f"Period {idx + 1}": _lg_resu_period_to_text(period)
                 for idx, period in enumerate(data)
-            }
+            } | self._quality_attrs(self.coordinator, self.entity_description.register_name)
         else:
             self._attr_available = False
             self._attr_native_value = None
@@ -2745,7 +2791,7 @@ class HuaweiSolarCapacityControlPeriodsSensorEntity(
             self._attr_extra_state_attributes = {
                 f"Period {idx + 1}": self._period_to_text(period)
                 for idx, period in enumerate(data)
-            }
+            } | self._quality_attrs(self.coordinator, self.entity_description.register_name)
         else:
             self._attr_available = False
             self._attr_native_value = None
@@ -2791,6 +2837,13 @@ class HuaweiSolarForcibleChargeEntity(
         self._attr_device_info = device_info
         self._attr_unique_id = f"{device.serial_number}_{self.entity_description.key}"
 
+    # v2.0.0 (V2_ARCHITECTURE_DESIGN.md §10.4): deliberately NOT given
+    # data_quality/data_quality_reason/data_age_seconds attributes in this
+    # pass -- this sensor derives its value from MULTIPLE registers
+    # combined, and _quality_attrs() is a single-register accessor. A
+    # multi-register aggregation policy (worst quality wins? report only
+    # the primary register's?) was not specified in the design and isn't
+    # guessed at here; revisit as a deliberate follow-up if needed.
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
@@ -2882,6 +2935,13 @@ class HuaweiSolarActivePowerControlModeEntity(
         self._attr_device_info = device_info
         self._attr_unique_id = f"{device.serial_number}_{self.entity_description.key}"
 
+    # v2.0.0 (V2_ARCHITECTURE_DESIGN.md §10.4): deliberately NOT given
+    # data_quality/data_quality_reason/data_age_seconds attributes in this
+    # pass -- this sensor derives its value from MULTIPLE registers
+    # combined, and _quality_attrs() is a single-register accessor. A
+    # multi-register aggregation policy (worst quality wins? report only
+    # the primary register's?) was not specified in the design and isn't
+    # guessed at here; revisit as a deliberate follow-up if needed.
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
