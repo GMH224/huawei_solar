@@ -172,11 +172,29 @@ class TestSyncPowerFirstRefreshIsStaggered(unittest.TestCase):
         idx = source.find("async def _sync_first_refresh(")
         assert idx > -1, "_sync_first_refresh not found in __init__.py"
         end = source.find("\n                try:", idx)
-        body = source[idx: end if end > -1 else idx + 1500]
+        body = source[idx: end if end > -1 else idx + 2200]
         sleep_idx = body.find("await asyncio.sleep(")
-        refresh_idx = body.find("await coord.async_config_entry_first_refresh()")
+        # v2.0.3 (F-02, external ICS audit -- confirmed): the actual call
+        # changed from async_config_entry_first_refresh() (setup-only,
+        # confirmed via a real production ConfigEntryError to always fail
+        # here, since this coroutine only ever runs after the entry has
+        # already left SETUP_IN_PROGRESS) to async_request_refresh() (the
+        # ordinary, valid-post-setup refresh mechanism).
+        refresh_idx = body.find("await coord.async_request_refresh()")
         self.assertGreater(sleep_idx, -1, "no asyncio.sleep() found -- MOD-03 has regressed")
-        self.assertGreater(refresh_idx, -1)
+        self.assertGreater(
+            refresh_idx, -1,
+            "async_request_refresh() not found -- F-02 has regressed back "
+            "to the setup-only API that is guaranteed to fail here",
+        )
+        self.assertNotIn(
+            "await coord.async_config_entry_first_refresh()", body,
+            "the setup-only API must not be called from this background "
+            "task at all -- see F-02's own fix reasoning. (Checked as the "
+            "exact call pattern, not the bare method name -- this "
+            "function's own comment mentions that name too, describing "
+            "the old, now-fixed behaviour for context.)",
+        )
         self.assertLess(
             sleep_idx, refresh_idx,
             "the stagger sleep must happen BEFORE the actual first refresh",

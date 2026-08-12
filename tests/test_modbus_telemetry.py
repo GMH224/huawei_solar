@@ -138,3 +138,90 @@ class TestLifetimeTotals(unittest.TestCase):
         t.record_skipped_poll()
         t.record_skipped_poll()
         self.assertEqual(t.total_skipped_polls, 2)
+
+
+# ── v2.0.3: F-03 -- failure-rate metric blind to timeout-only failures ──────
+
+class TestF03TimeoutInclusiveRates(unittest.TestCase):
+    """F-03, external ICS audit -- confirmed with exact numbers matched
+    against a real telemetry capture: a device with 24 timeouts and zero
+    non-timeout failures reported failure_rate_percent: 0.0, completely
+    masking a real, ongoing timeout problem. record_timeout() always
+    increments total_failures (the lifetime counter) but only ever
+    appends to self._timeouts, never self._failures -- the rolling,
+    windowed failure_rate_percent (computed from self._failures alone)
+    was blind to any failure pattern that happened to be all timeouts."""
+
+    def test_timeout_only_failures_reproduce_the_real_capture_scenario(self):
+        """Reproduces the exact real-world numbers from the telemetry
+        capture that surfaced this finding: 24 requests, 24 timeouts,
+        zero non-timeout failures."""
+        t = _make()
+        for _ in range(24):
+            t.record_request()
+            t.record_timeout()
+        snap = t.snapshot()
+        self.assertEqual(snap["total_failures"], 24)
+        self.assertEqual(snap["total_timeouts"], 24)
+        self.assertEqual(
+            snap["failure_rate_percent"], 0.0,
+            "failure_rate_percent's EXISTING meaning (non-timeout "
+            "failures only) is deliberately preserved, not silently "
+            "redefined -- see this fix's own reasoning for why",
+        )
+        self.assertEqual(
+            snap["timeout_rate_percent"], 100.0,
+            "the new field must show the timeout problem the old, "
+            "sole metric completely masked",
+        )
+        self.assertEqual(snap["overall_failed_attempt_rate_percent"], 100.0)
+
+    def test_failure_rate_percent_keeps_its_existing_meaning(self):
+        """Negative case, protecting backward compatibility: a device
+        with ONLY non-timeout failures (no timeouts at all) must show
+        the identical failure_rate_percent behaviour as before this fix
+        -- confirms the existing field's semantics were not changed."""
+        t = _make()
+        for _ in range(10):
+            t.record_request()
+        for _ in range(3):
+            t.record_failure()
+        snap = t.snapshot()
+        self.assertEqual(snap["failure_rate_percent"], 30.0)
+        self.assertEqual(snap["timeout_rate_percent"], 0.0)
+        self.assertEqual(snap["overall_failed_attempt_rate_percent"], 30.0)
+
+    def test_mixed_timeout_and_non_timeout_failures(self):
+        t = _make()
+        for _ in range(20):
+            t.record_request()
+        for _ in range(2):
+            t.record_failure()
+        for _ in range(3):
+            t.record_timeout()
+        snap = t.snapshot()
+        self.assertEqual(snap["failure_rate_percent"], 10.0)   # 2/20
+        self.assertEqual(snap["timeout_rate_percent"], 15.0)   # 3/20
+        self.assertEqual(
+            snap["overall_failed_attempt_rate_percent"], 25.0,  # (2+3)/20
+            "the combined rate must reflect BOTH failure types together "
+            "-- this is the number that would have caught the masking "
+            "the original single metric could not",
+        )
+
+    def test_zero_requests_does_not_divide_by_zero(self):
+        t = _make()
+        snap = t.snapshot()
+        self.assertEqual(snap["failure_rate_percent"], 0.0)
+        self.assertEqual(snap["timeout_rate_percent"], 0.0)
+        self.assertEqual(snap["overall_failed_attempt_rate_percent"], 0.0)
+
+    def test_total_failures_lifetime_counter_is_unaffected(self):
+        """This fix only changes the windowed-rate calculations -- the
+        lifetime total_failures counter (which already correctly
+        included timeouts) must be completely unchanged."""
+        t = _make()
+        t.record_timeout()
+        t.record_failure()
+        snap = t.snapshot()
+        self.assertEqual(snap["total_failures"], 2)
