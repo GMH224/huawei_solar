@@ -689,7 +689,7 @@ class AdaptiveModbusController:
 
     @callback
     def _push_to_listeners(self, _now: Any) -> None:
-        snap = self._snapshot()
+        snap = self.snapshot()
         # BUG-003 FIX: snapshot the list before iteration so that a listener
         # calling remove_listener() during its own callback does not cause
         # subsequent listeners to be skipped (Python list mutation semantics).
@@ -705,8 +705,48 @@ class AdaptiveModbusController:
                     cb_fn,
                 )
 
-    def _snapshot(self) -> dict[str, Any]:
-        """Produce a point-in-time diagnostic snapshot for sensor entities."""
+    def snapshot(self) -> dict[str, Any]:
+        """Produce a point-in-time diagnostic snapshot for sensor entities.
+
+        v2.0.1 FIX (confirmed via a genuine production traceback, not a
+        static audit finding this time -- the operator's own deployment
+        surfaced this directly): this method was defined with a leading
+        underscore, but its two INTERNAL callers (_push_to_listeners(),
+        this class's own sensor-push mechanism, and the diagnostic
+        sensor entity's async_added_to_hass(), both in this same file)
+        correctly used that private name, while its EXTERNAL callers
+        (diagnostics.py, telemetry_capture.py) called it as `.snapshot()`
+        -- the public name every sibling class (ModbusTelemetry,
+        SynchronizedPowerCoordinator) already uses for the equivalent
+        method. The external callers' assumption was the correct one:
+        this method exists specifically to be consumed by other modules,
+        the same public role its siblings play. Renamed here to match
+        what those external callers already, correctly, expected, with
+        both internal call sites updated to the same public name for
+        consistency -- not a partial fix that left two different names
+        for the same method depending on which side of a module boundary
+        called it.
+
+        Impact before this fix: every external caller raised
+        AttributeError on every single call -- in production, every ~30
+        seconds once the telemetry capture switch was enabled, and on
+        every attempt to use Home Assistant's own "Download Diagnostics"
+        feature for this integration (diagnostics.py's own call had no
+        exception guard around it at all, so this would have crashed
+        that entire, unrelated, core HA feature too, not just the
+        opt-in telemetry switch).
+
+        Why the existing test suite never caught this: build_telemetry_
+        snapshot() looks up the controller via
+        `adaptive_controller_cls.get(serial)` (telemetry_capture.py),
+        and no test in test_entities.py ever registered a real
+        AdaptiveModbusController instance for its test serial via
+        get_or_create() -- so that lookup always returned None, and the
+        line calling .snapshot() was never reached by any test at all.
+        A genuine test-coverage gap, not a mock silently swallowing a
+        real failure. Closed by adding a test that actually registers a
+        controller and exercises this exact path end to end.
+        """
         params = self.get_params()
         slot = self._slots[params.slot_index]
         return {
@@ -1095,7 +1135,7 @@ class HuaweiSolarAdaptiveSensorEntity(SensorEntity):
     async def async_added_to_hass(self) -> None:
         self._controller.add_listener(self._on_update)
         # Populate immediately
-        snap = self._controller._snapshot()
+        snap = self._controller.snapshot()
         self._attr_native_value = snap.get(self._attr_key)
 
     async def async_will_remove_from_hass(self) -> None:

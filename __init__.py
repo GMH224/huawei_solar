@@ -66,7 +66,9 @@ from .modbus_guard import ModbusGuard
 from .register_cache import set_slow_tier_ttl
 from .modbus_keepalive import ModbusKeepAlive
 from .modbus_telemetry import ModbusTelemetry
+from .bus_diagnostics import BusDiagnostics
 from .number import clear_static_bound_cache
+from .telemetry_capture import TelemetryCapture
 from .services import async_setup_services
 from .synchronized_power_coordinator import SynchronizedPowerCoordinator
 from .types import (
@@ -890,6 +892,7 @@ async def async_unload_entry(
         # separate entry).  clear_registry() would wipe those too — breaking
         # bus serialisation for the surviving entry and orphaning its
         # keep-alive tasks.  Remove per-serial / per-endpoint instead.
+        seen_endpoints: set[str] = set()
         for device_data in device_datas:
             serial = device_data.device.serial_number
 
@@ -897,6 +900,27 @@ async def async_unload_entry(
             if telemetry:
                 telemetry.stop()
             ModbusTelemetry.remove(serial)
+
+            # v2.0.2 (TEL-004, external ICS/IQS audit -- confirmed): both
+            # BusDiagnostics and TelemetryCapture are per-ENDPOINT
+            # registries (not per-serial, like everything else in this
+            # loop) -- get_or_create() was the only production call
+            # either one ever had; remove() existed on both but was never
+            # called anywhere. Every endpoint ever captured stayed
+            # referenced forever, together with its hass object, buffers,
+            # and counters. Fixed for both together, not just
+            # TelemetryCapture specifically -- BusDiagnostics had the
+            # identical gap, found while checking whether this was a
+            # one-off or a systemic pattern; it was the latter.
+            # seen_endpoints avoids a redundant (harmless, but noisy)
+            # second remove() call for a second device sharing the same
+            # physical bus on this same entry.
+            guard = getattr(device_data.update_coordinator, "guard", None)
+            endpoint = getattr(guard, "endpoint", None)
+            if endpoint is not None and endpoint not in seen_endpoints:
+                seen_endpoints.add(endpoint)
+                BusDiagnostics.remove(endpoint)
+                TelemetryCapture.remove(endpoint)
 
             # v2.0.0b (MOD-13, external ICS audit): clear this device's
             # cached static number-entity bounds -- a reload can follow a

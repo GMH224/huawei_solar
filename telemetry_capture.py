@@ -43,6 +43,7 @@ one invented for this module:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -73,6 +74,28 @@ MIN_FLUSH_INTERVAL_S = 30.0
 MAX_FILE_BYTES = 5 * 1024 * 1024
 KEEP_ROTATIONS = 2
 
+# v2.0.2 (TEL-001/TEL-007, external ICS/IQS audit -- confirmed): a batch
+# that fails to write is retried, not silently discarded -- but bounded,
+# not indefinitely: a permanently broken write path (e.g. the config
+# directory becoming unwritable) must eventually give up and report the
+# loss explicitly, rather than accumulating an ever-growing unwritable
+# batch forever. 3 attempts, not tuned against any specific failure mode
+# -- chosen as a small, defensible number that tolerates a single
+# transient failure (the common case: a momentary disk/FS hiccup)
+# without treating every failure as instantly permanent.
+MAX_RETRY_ATTEMPTS = 3
+
+# v2.0.2 (TEL-002, external ICS/IQS audit -- confirmed): the bounded wait
+# for a pending flush to complete during disable/unload -- the same
+# "never block indefinitely" discipline already established project-wide
+# (DISCONNECT_TIMEOUT and its own siblings, const.py) applied here for
+# the first time to this module. A hung executor job must not hang HA's
+# own unload/shutdown sequence; if the timeout is hit, the attempt is
+# logged and teardown proceeds regardless -- the same fault-isolation
+# contract every other bounded-cleanup site in this project already
+# follows.
+DISABLE_FLUSH_TIMEOUT_S = 10.0
+
 _SUBDIR = "huawei_solar_diagnostics"
 
 
@@ -94,7 +117,6 @@ class TelemetryCapture:
         self.enabled: bool = False
         self._buffer: deque[dict[str, Any]] = deque(maxlen=MAX_BUFFERED_SNAPSHOTS)
         self._last_flush: float | None = None
-        self._flush_in_progress: bool = False
         self.snapshots_captured: int = 0
         self.snapshots_dropped: int = 0
         self.write_errors: int = 0
@@ -105,6 +127,53 @@ class TelemetryCapture:
         #: full set of coordinators to snapshot, neither of which belongs
         #: here.
         self.cancel_periodic: Any = None
+        # v2.0.2 (TEL-001/TEL-002/TEL-007/TEL-010, external ICS/IQS audit
+        # -- confirmed): the whole flush/persistence lifecycle redesigned
+        # together, since these four findings were all really the same
+        # underlying gap (no tracked, awaitable, retryable flush
+        # operation) surfacing in four different ways.
+        #
+        # _pending_write: the currently in-flight flush, if any -- a
+        # tracked asyncio.Task, not a fire-and-forget
+        # hass.async_add_executor_job() call with its return value
+        # discarded (the original TEL-001/TEL-002 defect). Lets a caller
+        # (async_disable(), below) actually await completion, and lets
+        # _schedule_flush() itself detect an already-in-flight write
+        # rather than risk two overlapping ones.
+        self._pending_write: Any = None
+        # _retry_batch/_retry_attempts: a batch that failed to write is
+        # retained here for a bounded number of retries (TEL-007), NOT
+        # merged back into _buffer -- keeping it separate preserves
+        # in-order delivery (this batch must be retried and written
+        # before anything newer) without needing to reason about
+        # deque.maxlen eviction interacting with a partially-failed batch.
+        self._retry_batch: list[dict[str, Any]] | None = None
+        self._retry_attempts: int = 0
+        #: Diagnostic counter: snapshots permanently discarded after
+        #: MAX_RETRY_ATTEMPTS failures -- distinct from write_errors
+        #: (every individual failed attempt) and snapshots_dropped (the
+        #: in-memory buffer overflowing) -- three different failure
+        #: modes worth being able to tell apart.
+        self.snapshots_lost_write_failure: int = 0
+        # v2.0.2 (TEL-006, external ICS/IQS audit -- confirmed): forces
+        # an immediate flush for the very first snapshot after enabling,
+        # bypassing FLUSH_THRESHOLD -- without this, the normal 20-
+        # snapshot/30s-cadence batching meant no file could appear for
+        # roughly 10 minutes after enabling, which is difficult to
+        # distinguish from the feature being broken (the operator's own
+        # experience deploying this switch, independent of the actual
+        # crash bug found separately). Only the first snapshot forces an
+        # early write; every flush after that still respects the normal
+        # threshold/interval, so this does not change steady-state
+        # batching behaviour or write frequency.
+        self._first_snapshot_pending: bool = True
+        #: TEL-006's other half: last_snapshot_at/last_write_at, surfaced
+        #: via stats() (switch.py's own extra_state_attributes), so
+        #: "is this actually working" is answerable directly from the
+        #: entity's own attributes without needing to inspect the
+        #: filesystem or logs at all.
+        self.last_snapshot_at: float | None = None
+        self.last_write_at: float | None = None
 
     # ── registry ────────────────────────────────────────────────────────────
     @classmethod
@@ -129,11 +198,15 @@ class TelemetryCapture:
 
     # ── control ─────────────────────────────────────────────────────────────
     def set_enabled(self, enabled: bool) -> None:
-        """Enable or disable capture. Disabling flushes whatever is pending."""
+        """Enable capture. For disabling, use async_disable() instead --
+        see its own docstring for why disable specifically needs to be
+        awaitable (TEL-002).
+        """
         if enabled == self.enabled:
             return
         self.enabled = enabled
         if enabled:
+            self._first_snapshot_pending = True
             _LOGGER.warning(
                 "Modbus telemetry capture ENABLED for bus %s. Periodic "
                 "aggregate snapshots will be written to config/%s/. "
@@ -141,11 +214,60 @@ class TelemetryCapture:
                 self.tag, _SUBDIR,
             )
         else:
+            # v2.0.2 (TEL-002): the synchronous path is kept ONLY as a
+            # defensive fallback for a caller that (incorrectly) still
+            # calls set_enabled(False) directly instead of
+            # async_disable() -- it still cancels the timer and attempts
+            # a fire-and-forget flush, but cannot await it. Every
+            # production caller in this codebase uses async_disable()
+            # now; nothing should reach this branch in practice.
             _LOGGER.info("Modbus telemetry capture disabled for bus %s", self.tag)
             self._schedule_flush(force=True)
             if self.cancel_periodic is not None:
                 self.cancel_periodic()
                 self.cancel_periodic = None
+
+    async def async_disable(self) -> None:
+        """Disable capture and deterministically persist whatever was
+        pending before returning -- the actual TEL-002 fix.
+
+        Cancels the periodic timer FIRST (so nothing new can be added to
+        the buffer while this waits), then awaits the final flush,
+        bounded by DISABLE_FLUSH_TIMEOUT_S so a hung executor job cannot
+        hang HA's own unload/shutdown sequence -- the same "never block
+        indefinitely" contract every other bounded-cleanup site in this
+        project already follows. A timeout here is logged and swallowed;
+        teardown must proceed regardless of whether the final write
+        actually completed in time.
+        """
+        if not self.enabled:
+            return
+        self.enabled = False
+        _LOGGER.info("Modbus telemetry capture disabled for bus %s", self.tag)
+        if self.cancel_periodic is not None:
+            self.cancel_periodic()
+            self.cancel_periodic = None
+        task = self._schedule_flush(force=True)
+        if task is None:
+            task = self._pending_write
+        if task is not None:
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(task), timeout=DISABLE_FLUSH_TIMEOUT_S,
+                )
+            except TimeoutError:
+                _LOGGER.warning(
+                    "Modbus telemetry capture: final flush for bus %s did "
+                    "not complete within %.0fs; proceeding with teardown "
+                    "regardless -- some pending telemetry may not have "
+                    "been written",
+                    self.tag, DISABLE_FLUSH_TIMEOUT_S,
+                )
+            except Exception:  # noqa: BLE001 — teardown must never raise
+                _LOGGER.exception(
+                    "Modbus telemetry capture: final flush for bus %s failed",
+                    self.tag,
+                )
 
     # ── capture ─────────────────────────────────────────────────────────────
     def record_snapshot(self, snapshot: dict[str, Any]) -> None:
@@ -157,54 +279,144 @@ class TelemetryCapture:
         record = {"t": round(time.time(), 3), "bus": self.tag, **snapshot}
         self._buffer.append(record)
         self.snapshots_captured += 1
-        if len(self._buffer) >= FLUSH_THRESHOLD:
+        self.last_snapshot_at = time.time()
+        if self._first_snapshot_pending:
+            # v2.0.2 (TEL-006): force an early flush for the very first
+            # snapshot only -- see this flag's own comment in __init__
+            # for the full reasoning.
+            self._first_snapshot_pending = False
+            self._schedule_flush(force=True)
+        elif len(self._buffer) >= FLUSH_THRESHOLD:
             self._schedule_flush()
 
     # ── flushing ────────────────────────────────────────────────────────────
-    def _schedule_flush(self, force: bool = False) -> None:
+    def _schedule_flush(self, force: bool = False) -> Any:
+        """Schedule a flush if one isn't already in flight and there's
+        something to write. Returns the tracked task if one was
+        (newly or already) scheduled, else None.
+
+        v2.0.2 (TEL-001/TEL-002/TEL-010, external ICS/IQS audit --
+        confirmed): the batch is no longer cleared from self._buffer
+        until the write has genuinely succeeded (see _flush_batch()
+        below) -- this method's own job is now just deciding WHAT to
+        send for writing and tracking the resulting task, not owning
+        the buffer's own lifecycle directly.
+        """
         now = time.monotonic()
-        if self._flush_in_progress:
-            return
+        if self._pending_write is not None and not self._pending_write.done():
+            return self._pending_write
         if (
             not force
             and self._last_flush is not None
             and (now - self._last_flush) < MIN_FLUSH_INTERVAL_S
         ):
-            return
-        if not self._buffer:
-            return
+            return None
+        # A failed batch awaiting retry takes priority over newly buffered
+        # snapshots -- preserves in-order delivery rather than writing
+        # newer data ahead of older data that hasn't been persisted yet.
+        if self._retry_batch is not None:
+            batch = self._retry_batch
+        elif self._buffer:
+            batch = list(self._buffer)
+        else:
+            return None
         self._last_flush = now
-        batch = list(self._buffer)
-        self._buffer.clear()
-        self._flush_in_progress = True
+        self._pending_write = self.hass.async_create_task(
+            self._flush_batch(batch)
+        )
+        return self._pending_write
+
+    async def _flush_batch(self, batch: list[dict[str, Any]]) -> None:
+        """Write one batch, with bounded retry on failure.
+
+        v2.0.2 (TEL-001/TEL-007/TEL-010, external ICS/IQS audit --
+        confirmed): this is the actual fix for the core defect -- a
+        batch is only removed from self._buffer once this coroutine
+        confirms the write genuinely succeeded, not before scheduling it
+        (the original bug). On failure, the batch is retained
+        (self._retry_batch) for up to MAX_RETRY_ATTEMPTS, not silently
+        discarded; only after exhausting those does it count as
+        permanently lost, explicitly (snapshots_lost_write_failure), not
+        just another write_errors increment indistinguishable from a
+        transient, later-recovered failure.
+        """
+        came_from_buffer = batch is not self._retry_batch
         try:
-            self.hass.async_add_executor_job(self._write, batch)
-        except Exception:  # noqa: BLE001
-            self._flush_in_progress = False
-            self.write_errors += 1
-            _LOGGER.exception("Modbus telemetry capture: could not schedule flush")
-
-    def _write(self, batch: list[dict[str, Any]]) -> None:
-        """Append snapshots as JSON lines. Runs in an executor thread."""
-        try:
-            directory = self.hass.config.path(_SUBDIR)
-            os.makedirs(directory, exist_ok=True)
-            # Different filename from bus_diagnostics.py's bus_<tag>.jsonl,
-            # same directory, same tag -- deliberately, so the two files
-            # for one physical bus are easy to find together.
-            path = os.path.join(directory, f"telemetry_{self.tag}.jsonl")
-
-            if os.path.exists(path) and os.path.getsize(path) >= MAX_FILE_BYTES:
-                self._rotate(path)
-
-            with open(path, "a", encoding="utf-8") as handle:
-                for record in batch:
-                    handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+            await self.hass.async_add_executor_job(self._write, batch)
+            self.last_write_at = time.time()
+            if came_from_buffer:
+                # Only now -- write confirmed successful -- remove exactly
+                # the records that were actually written. New snapshots
+                # recorded while this write was in flight (via
+                # record_snapshot() appending to the same deque) must be
+                # preserved, not discarded along with what just succeeded.
+                for _ in range(len(batch)):
+                    if self._buffer:
+                        self._buffer.popleft()
+            self._retry_batch = None
+            self._retry_attempts = 0
         except Exception:  # noqa: BLE001 — telemetry must never break anything
             self.write_errors += 1
-            _LOGGER.exception("Modbus telemetry capture: write failed")
+            self._retry_attempts += 1
+            if self._retry_attempts >= MAX_RETRY_ATTEMPTS:
+                self.snapshots_lost_write_failure += len(batch)
+                self._retry_batch = None
+                self._retry_attempts = 0
+                _LOGGER.error(
+                    "Modbus telemetry capture: write failed %d times for "
+                    "bus %s; giving up on this batch of %d snapshot(s) -- "
+                    "they are permanently lost",
+                    MAX_RETRY_ATTEMPTS, self.tag, len(batch),
+                )
+            else:
+                self._retry_batch = batch
+                _LOGGER.warning(
+                    "Modbus telemetry capture: write failed for bus %s "
+                    "(attempt %d/%d); will retry",
+                    self.tag, self._retry_attempts, MAX_RETRY_ATTEMPTS,
+                )
         finally:
-            self._flush_in_progress = False
+            self._pending_write = None
+            # v2.0.2 (TEL-010): if a retry is pending, or enough new data
+            # has accumulated while this write was in flight, schedule
+            # the next flush immediately rather than waiting for a later
+            # snapshot tick or a forced disable to notice.
+            if self._retry_batch is not None:
+                self._schedule_flush(force=True)
+            elif len(self._buffer) >= FLUSH_THRESHOLD:
+                self._schedule_flush()
+
+    def _write(self, batch: list[dict[str, Any]]) -> None:
+        """Append snapshots as JSON lines. Runs in an executor thread.
+
+        v2.0.2 (TEL-001/TEL-007): now RAISES on failure instead of
+        catching internally -- _flush_batch() (the caller, now async)
+        owns the retry/give-up decision, which needs to see the actual
+        exception, not just a side-effect counter increment.
+        """
+        directory = self.hass.config.path(_SUBDIR)
+        os.makedirs(directory, exist_ok=True)
+        # Different filename from bus_diagnostics.py's bus_<tag>.jsonl,
+        # same directory, same tag -- deliberately, so the two files
+        # for one physical bus are easy to find together.
+        path = os.path.join(directory, f"telemetry_{self.tag}.jsonl")
+
+        # v2.0.2 (TEL-008, external ICS/IQS audit -- confirmed): this
+        # check alone is a PRE-write rotation threshold, not a hard
+        # post-write cap -- a large batch can still push the active file
+        # above MAX_FILE_BYTES after this check passes. Documented
+        # explicitly here (matching the audit's own suggested remediation
+        # of clarifying rather than changing the behaviour) rather than
+        # computing exact encoded batch size up front: this capture's
+        # batches are small and bounded (at most MAX_BUFFERED_SNAPSHOTS
+        # records), so the actual overshoot in practice is a few KB past
+        # the nominal cap at most, not a meaningful risk on its own.
+        if os.path.exists(path) and os.path.getsize(path) >= MAX_FILE_BYTES:
+            self._rotate(path)
+
+        with open(path, "a", encoding="utf-8") as handle:
+            for record in batch:
+                handle.write(json.dumps(record, separators=(",", ":")) + "\n")
 
     def _rotate(self, path: str) -> None:
         oldest = f"{path}.{KEEP_ROTATIONS}"
@@ -225,6 +437,18 @@ class TelemetryCapture:
             "snapshots_dropped": self.snapshots_dropped,
             "write_errors": self.write_errors,
             "buffered": len(self._buffer),
+            # v2.0.2 (TEL-004/TEL-006/TEL-007, external ICS/IQS audit):
+            # last_snapshot_at/last_write_at directly answer "is this
+            # working" from the entity's own attributes, without needing
+            # to inspect the filesystem or logs. snapshots_lost_write_
+            # failure and pending_retry surface the new bounded-retry
+            # semantics (TEL-007) -- distinct from write_errors, which
+            # counts every individual failed attempt, including ones
+            # later recovered by a successful retry.
+            "last_snapshot_at": self.last_snapshot_at,
+            "last_write_at": self.last_write_at,
+            "snapshots_lost_write_failure": self.snapshots_lost_write_failure,
+            "pending_retry": self._retry_batch is not None,
         }
 
 

@@ -687,8 +687,25 @@ class ModbusTelemetryCaptureSwitchEntity(SwitchEntity):
     above (so the two files for one physical bus are easy to find
     together), different filename. Runs on its own periodic timer
     (TELEMETRY_CAPTURE_INTERVAL), independent of any single coordinator's
-    own poll cadence, so one snapshot always reflects the same moment for
-    every coordinator on the entry.
+    own poll cadence, so one snapshot's contents all come from the same
+    capture tick, not staggered across separate ticks each coordinator
+    triggers on its own.
+
+    v2.0.2 FIX (TEL-009, external ICS/IQS audit -- confirmed): this
+    docstring previously claimed one snapshot "always reflects the same
+    moment" for every coordinator -- an overstatement of what actually
+    happens. build_telemetry_snapshot() (telemetry_capture.py) reads
+    each coordinator's own already-computed, in-memory snapshot() dict
+    in sequence, not concurrently or atomically -- there is no shared
+    barrier or lock making every read land at one identical instant. In
+    practice this is a same-tick, near-coincident sample (the reads
+    themselves are cheap in-memory dict lookups, not physical I/O, so the
+    actual spread between the first and last read within one tick is
+    small), not a literal single instant across every coordinator. The
+    outer record's own "t" timestamp (telemetry_capture.py's
+    record_snapshot()) is assigned once, after all of this tick's reads
+    complete -- it marks when the snapshot was recorded, not exactly when
+    each individual value inside it was itself sampled.
 
     Writes no inverter registers, and never blocks the event loop.
     """
@@ -735,11 +752,27 @@ class ModbusTelemetryCaptureSwitchEntity(SwitchEntity):
         return self._capture.stats()
 
     async def async_turn_on(self, **kwargs: Any) -> None:
-        """Start periodic aggregate snapshot capture."""
+        """Start periodic aggregate snapshot capture.
+
+        v2.0.2 FIX (TEL-003, external ICS/IQS audit -- confirmed): this
+        used to install a new periodic timer unconditionally, even if
+        one was already running -- TelemetryCapture.set_enabled(True)
+        itself correctly no-ops if already enabled, but this method
+        never checked that before installing a second timer anyway. Two
+        consecutive turn-on calls (a double UI click, or a service call
+        racing a UI action) would silently orphan the first timer's own
+        cancel handle -- both would keep firing independently, doubling
+        the write volume with no way to cancel the orphaned one. Made
+        idempotent: a second turn-on while a timer is already registered
+        is now a no-op for the timer specifically, matching
+        TelemetryCapture's own already-idempotent enabled-state handling.
+        """
         self._capture.set_enabled(True)
         self._register_overlap_captured = False
+        if self._capture.cancel_periodic is not None:
+            return
         # Stored on the capture object itself (not just a local variable)
-        # so TelemetryCapture.set_enabled(False) -- called both from
+        # so TelemetryCapture.async_disable() -- called both from
         # async_turn_off() below AND anywhere else this capture might be
         # disabled -- can always cancel it, not only this specific code
         # path.
@@ -749,12 +782,22 @@ class ModbusTelemetryCaptureSwitchEntity(SwitchEntity):
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        """Stop capturing and flush anything pending."""
-        self._capture.set_enabled(False)  # also cancels the periodic timer
+        """Stop capturing and deterministically flush anything pending
+        before returning.
+
+        v2.0.2 (TEL-002, external ICS/IQS audit -- confirmed): now
+        awaits async_disable() (telemetry_capture.py) instead of calling
+        the synchronous set_enabled(False) -- the actual fix. Turning
+        this switch off now genuinely guarantees the final batch was
+        persisted (or explicitly failed/timed out, logged) before this
+        method returns, not a fire-and-forget best effort.
+        """
+        await self._capture.async_disable()  # also cancels the periodic timer
         self.async_write_ha_state()
 
     async def async_will_remove_from_hass(self) -> None:
-        """Ensure the periodic timer is cancelled if this entity is torn
+        """Ensure the periodic timer is cancelled -- and any pending
+        capture deterministically flushed -- if this entity is torn
         down (unload/reload) while capture is still running.
 
         BusDiagnostics has no equivalent concern -- it has no timer of
@@ -763,10 +806,12 @@ class ModbusTelemetryCaptureSwitchEntity(SwitchEntity):
         entry's coordinators), and turning the switch off is not the
         only way this entity's lifecycle can end -- an unload/reload
         while capture happens to be on must not leave that timer firing
-        against coordinators that no longer exist.
+        against coordinators that no longer exist, and (v2.0.2, TEL-002)
+        must not silently drop whatever was still pending at that moment
+        either.
         """
         if self._capture.enabled:
-            self._capture.set_enabled(False)
+            await self._capture.async_disable()
 
     async def _async_snapshot_tick(self, now: Any) -> None:
         """Gather and record one telemetry snapshot. Runs on the timer.
