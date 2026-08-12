@@ -36,6 +36,7 @@ DESIGN CONSTRAINTS
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -61,6 +62,16 @@ MIN_FLUSH_INTERVAL_S = 30.0
 #: Hard cap per file before rotation, and how many rotations to keep.
 MAX_FILE_BYTES = 5 * 1024 * 1024
 KEEP_ROTATIONS = 2
+
+# v2.0.3 (ICS-08, external ICS audit -- confirmed): the exact same defect
+# TEL-001/002/007 already closed in telemetry_capture.py -- this module
+# never got the same fix. Same values as that module's own
+# MAX_RETRY_ATTEMPTS/DISABLE_FLUSH_TIMEOUT_S, for the same reason
+# MAX_FILE_BYTES/KEEP_ROTATIONS above are already shared: no reasoned
+# basis yet for these needing to differ between the two capture modules,
+# and keeping them identical means one mental model covers both.
+MAX_RETRY_ATTEMPTS = 3
+DISABLE_FLUSH_TIMEOUT_S = 10.0
 
 _SUBDIR = "huawei_solar_diagnostics"
 
@@ -113,7 +124,16 @@ class BusDiagnostics:
         self.endpoint = endpoint
         self.tag = pseudonym(endpoint)
         self.enabled: bool = False
-        self._buffer: deque[dict[str, Any]] = deque(maxlen=MAX_BUFFERED_RECORDS)
+        # v2.0.3 (ICS-08/ICS-03, external ICS audit -- confirmed): each
+        # record now carries its own stable sequence number, and removal
+        # (in _flush_batch(), below) matches by that number specifically,
+        # not by position -- see telemetry_capture.py's own
+        # TelemetryCapture._flush_batch() docstring for the full
+        # reasoning (the identical defect, already closed there).
+        self._buffer: deque[tuple[int, dict[str, Any]]] = deque(
+            maxlen=MAX_BUFFERED_RECORDS
+        )
+        self._next_seq: int = 0
         #: None = never flushed. Initialising to 0.0 was a latent bug: the
         #: rate-limit check reads it as "flushed at monotonic time 0", so on a
         #: host where time.monotonic() is still below MIN_FLUSH_INTERVAL_S
@@ -122,10 +142,18 @@ class BusDiagnostics:
         #: surfaced as an intermittent test failure rather than a wrong value,
         #: which is exactly how it would have behaved in the field.
         self._last_flush: float | None = None
-        self._flush_in_progress: bool = False
         self.records_captured: int = 0
         self.records_dropped: int = 0
         self.write_errors: int = 0
+        # v2.0.3 (ICS-08): the whole flush/persistence lifecycle rebuilt
+        # to match telemetry_capture.py's own TelemetryCapture -- see
+        # that class's own __init__ comment for the full reasoning
+        # behind each of these fields.
+        self._pending_write: Any = None
+        self._retry_batch: list[tuple[int, dict[str, Any]]] | None = None
+        self._retry_attempts: int = 0
+        self.records_lost_write_failure: int = 0
+        self.last_write_at: float | None = None
 
     # ── registry ────────────────────────────────────────────────────────────
     @classmethod
@@ -150,7 +178,11 @@ class BusDiagnostics:
 
     # ── control ─────────────────────────────────────────────────────────────
     def set_enabled(self, enabled: bool) -> None:
-        """Enable or disable capture. Disabling flushes whatever is pending."""
+        """Enable capture. For disabling, use async_disable() instead --
+        see TelemetryCapture.async_disable()'s own docstring for why
+        disable specifically needs to be awaitable (ICS-08, the same
+        defect as TEL-002).
+        """
         if enabled == self.enabled:
             return
         self.enabled = enabled
@@ -161,8 +193,45 @@ class BusDiagnostics:
                 self.tag, _SUBDIR,
             )
         else:
+            # v2.0.3 (ICS-08): kept ONLY as a defensive fallback for a
+            # caller that (incorrectly) still calls set_enabled(False)
+            # directly instead of async_disable() -- see
+            # TelemetryCapture.set_enabled()'s own comment on this same
+            # pattern. Every production caller uses async_disable() now.
             _LOGGER.info("Modbus diagnostics disabled for bus %s", self.tag)
             self._schedule_flush(force=True)
+
+    async def async_disable(self) -> None:
+        """Disable capture and deterministically persist whatever was
+        pending before returning -- the ICS-08 fix, identical in shape
+        to TelemetryCapture.async_disable() (TEL-002). See that method's
+        own docstring for the full reasoning.
+        """
+        if not self.enabled:
+            return
+        self.enabled = False
+        _LOGGER.info("Modbus diagnostics disabled for bus %s", self.tag)
+        task = self._schedule_flush(force=True)
+        if task is None:
+            task = self._pending_write
+        if task is not None:
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(task), timeout=DISABLE_FLUSH_TIMEOUT_S,
+                )
+            except TimeoutError:
+                _LOGGER.warning(
+                    "Modbus diagnostics: final flush for bus %s did not "
+                    "complete within %.0fs; proceeding with teardown "
+                    "regardless -- some pending records may not have "
+                    "been written",
+                    self.tag, DISABLE_FLUSH_TIMEOUT_S,
+                )
+            except Exception:  # noqa: BLE001 — teardown must never raise
+                _LOGGER.exception(
+                    "Modbus diagnostics: final flush for bus %s failed",
+                    self.tag,
+                )
 
     # ── capture ─────────────────────────────────────────────────────────────
     def record(
@@ -183,67 +252,118 @@ class BusDiagnostics:
         if len(self._buffer) == self._buffer.maxlen:
             # deque discards silently; count it so the gap is visible in the file.
             self.records_dropped += 1
-        self._buffer.append(
-            {
-                "t": round(time.time(), 3),
-                "bus": self.tag,
-                        "src": sanitise_label(label),
-                "wait_ms": round(wait_ms, 1),
-                "service_ms": round(service_ms, 1),
-                "qd": queue_depth,
-                "out": outcome,
-                "regs": registers,
-                "prio": priority,
-            }
-        )
+        record = {
+            "t": round(time.time(), 3),
+            "bus": self.tag,
+            "src": sanitise_label(label),
+            "wait_ms": round(wait_ms, 1),
+            "service_ms": round(service_ms, 1),
+            "qd": queue_depth,
+            "out": outcome,
+            "regs": registers,
+            "prio": priority,
+        }
+        self._buffer.append((self._next_seq, record))
+        self._next_seq += 1
         self.records_captured += 1
         if len(self._buffer) >= FLUSH_THRESHOLD:
             self._schedule_flush()
 
     # ── flushing ────────────────────────────────────────────────────────────
-    def _schedule_flush(self, force: bool = False) -> None:
+    def _schedule_flush(self, force: bool = False) -> Any:
+        """Schedule a flush if one isn't already in flight and there's
+        something to write. Returns the tracked task if one was (newly
+        or already) scheduled, else None. See TelemetryCapture.
+        _schedule_flush()'s own docstring for the full reasoning --
+        identical in shape here.
+        """
         now = time.monotonic()
-        if self._flush_in_progress:
-            return
+        if self._pending_write is not None and not self._pending_write.done():
+            return self._pending_write
         if (
             not force
             and self._last_flush is not None
             and (now - self._last_flush) < MIN_FLUSH_INTERVAL_S
         ):
-            return
-        if not self._buffer:
-            return
+            return None
+        if self._retry_batch is not None:
+            batch = self._retry_batch
+        elif self._buffer:
+            batch = list(self._buffer)
+        else:
+            return None
         self._last_flush = now
-        batch = list(self._buffer)
-        self._buffer.clear()
-        self._flush_in_progress = True
+        self._pending_write = self.hass.async_create_task(
+            self._flush_batch(batch)
+        )
+        return self._pending_write
+
+    async def _flush_batch(self, batch: list[tuple[int, dict[str, Any]]]) -> None:
+        """Write one batch, with bounded retry on failure. See
+        TelemetryCapture._flush_batch()'s own docstring for the full
+        ICS-03/TEL-001/007/010 reasoning -- this is the identical defect
+        (ICS-08), closed the identical way.
+        """
         try:
-            # Executor, never the event loop: inline disk I/O would inflate the
-            # service times this module exists to measure.
-            self.hass.async_add_executor_job(self._write, batch)
-        except Exception:  # noqa: BLE001
-            self._flush_in_progress = False
-            self.write_errors += 1
-            _LOGGER.exception("Modbus diagnostics: could not schedule flush")
-
-    def _write(self, batch: list[dict[str, Any]]) -> None:
-        """Append records as JSON lines. Runs in an executor thread."""
-        try:
-            directory = self.hass.config.path(_SUBDIR)
-            os.makedirs(directory, exist_ok=True)
-            path = os.path.join(directory, f"bus_{self.tag}.jsonl")
-
-            if os.path.exists(path) and os.path.getsize(path) >= MAX_FILE_BYTES:
-                self._rotate(path)
-
-            with open(path, "a", encoding="utf-8") as handle:
-                for record in batch:
-                    handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+            await self.hass.async_add_executor_job(self._write, batch)
+            self.last_write_at = time.time()
+            self._remove_from_buffer_by_seq(batch)
+            self._retry_batch = None
+            self._retry_attempts = 0
         except Exception:  # noqa: BLE001 — diagnostics must never break anything
             self.write_errors += 1
-            _LOGGER.exception("Modbus diagnostics: write failed")
+            self._retry_attempts += 1
+            if self._retry_attempts >= MAX_RETRY_ATTEMPTS:
+                self.records_lost_write_failure += len(batch)
+                self._remove_from_buffer_by_seq(batch)
+                self._retry_batch = None
+                self._retry_attempts = 0
+                _LOGGER.error(
+                    "Modbus diagnostics: write failed %d times for bus "
+                    "%s; giving up on this batch of %d record(s) -- they "
+                    "are permanently lost",
+                    MAX_RETRY_ATTEMPTS, self.tag, len(batch),
+                )
+            else:
+                self._retry_batch = batch
+                _LOGGER.warning(
+                    "Modbus diagnostics: write failed for bus %s "
+                    "(attempt %d/%d); will retry",
+                    self.tag, self._retry_attempts, MAX_RETRY_ATTEMPTS,
+                )
         finally:
-            self._flush_in_progress = False
+            self._pending_write = None
+            if self._retry_batch is not None:
+                self._schedule_flush(force=True)
+            elif len(self._buffer) >= FLUSH_THRESHOLD:
+                self._schedule_flush()
+
+    def _remove_from_buffer_by_seq(self, batch: list[tuple[int, dict[str, Any]]]) -> None:
+        """Remove exactly the records in `batch`, matched by their own
+        stable sequence number -- not by position."""
+        written_seqs = {seq for seq, _ in batch}
+        self._buffer = deque(
+            (item for item in self._buffer if item[0] not in written_seqs),
+            maxlen=MAX_BUFFERED_RECORDS,
+        )
+
+    def _write(self, batch: list[tuple[int, dict[str, Any]]]) -> None:
+        """Append records as JSON lines. Runs in an executor thread.
+
+        v2.0.3 (ICS-08): now RAISES on failure instead of catching
+        internally -- _flush_batch() (the caller, now async) owns the
+        retry/give-up decision.
+        """
+        directory = self.hass.config.path(_SUBDIR)
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, f"bus_{self.tag}.jsonl")
+
+        if os.path.exists(path) and os.path.getsize(path) >= MAX_FILE_BYTES:
+            self._rotate(path)
+
+        with open(path, "a", encoding="utf-8") as handle:
+            for _seq, record in batch:
+                handle.write(json.dumps(record, separators=(",", ":")) + "\n")
 
     def _rotate(self, path: str) -> None:
         oldest = f"{path}.{KEEP_ROTATIONS}"
@@ -264,4 +384,7 @@ class BusDiagnostics:
             "records_dropped": self.records_dropped,
             "write_errors": self.write_errors,
             "buffered": len(self._buffer),
+            "last_write_at": self.last_write_at,
+            "records_lost_write_failure": self.records_lost_write_failure,
+            "pending_retry": self._retry_batch is not None,
         }

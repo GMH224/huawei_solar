@@ -115,7 +115,25 @@ class TelemetryCapture:
         self.endpoint = endpoint
         self.tag = pseudonym(endpoint)
         self.enabled: bool = False
-        self._buffer: deque[dict[str, Any]] = deque(maxlen=MAX_BUFFERED_SNAPSHOTS)
+        # v2.0.3 FIX (ICS-03, external ICS audit -- confirmed): the
+        # buffer used to hold bare record dicts, and records were
+        # removed from it BY POSITION (popleft() N times) rather than by
+        # identity. That was fragile in a specific, real way: if the
+        # buffer filled to MAX_BUFFERED_SNAPSHOTS while a write was
+        # pending, the deque's own maxlen eviction could ALREADY have
+        # dropped some of the pending batch's records from the front to
+        # make room for newly-appended ones -- meaning the position-based
+        # popleft() loop, unaware of that, would end up popping newer
+        # records instead of the ones it actually meant to remove. Each
+        # record now carries its own stable, monotonically increasing
+        # sequence number, and removal (_flush_batch(), below) matches
+        # by that number specifically, not by position -- correct
+        # regardless of what maxlen eviction may have already done to
+        # the buffer in the meantime.
+        self._buffer: deque[tuple[int, dict[str, Any]]] = deque(
+            maxlen=MAX_BUFFERED_SNAPSHOTS
+        )
+        self._next_seq: int = 0
         self._last_flush: float | None = None
         self.snapshots_captured: int = 0
         self.snapshots_dropped: int = 0
@@ -277,7 +295,10 @@ class TelemetryCapture:
         if len(self._buffer) == self._buffer.maxlen:
             self.snapshots_dropped += 1
         record = {"t": round(time.time(), 3), "bus": self.tag, **snapshot}
-        self._buffer.append(record)
+        # v2.0.3 (ICS-03): tagged with its own stable sequence number --
+        # see self._buffer's own comment in __init__ for why.
+        self._buffer.append((self._next_seq, record))
+        self._next_seq += 1
         self.snapshots_captured += 1
         self.last_snapshot_at = time.time()
         if self._first_snapshot_pending:
@@ -326,40 +347,67 @@ class TelemetryCapture:
         )
         return self._pending_write
 
-    async def _flush_batch(self, batch: list[dict[str, Any]]) -> None:
+    async def _flush_batch(self, batch: list[tuple[int, dict[str, Any]]]) -> None:
         """Write one batch, with bounded retry on failure.
 
         v2.0.2 (TEL-001/TEL-007/TEL-010, external ICS/IQS audit --
-        confirmed): this is the actual fix for the core defect -- a
-        batch is only removed from self._buffer once this coroutine
-        confirms the write genuinely succeeded, not before scheduling it
-        (the original bug). On failure, the batch is retained
-        (self._retry_batch) for up to MAX_RETRY_ATTEMPTS, not silently
-        discarded; only after exhausting those does it count as
+        confirmed): a batch is only removed from self._buffer once this
+        coroutine confirms the write genuinely succeeded, not before
+        scheduling it (the original bug). On failure, the batch is
+        retained (self._retry_batch) for up to MAX_RETRY_ATTEMPTS, not
+        silently discarded; only after exhausting those does it count as
         permanently lost, explicitly (snapshots_lost_write_failure), not
         just another write_errors increment indistinguishable from a
         transient, later-recovered failure.
+
+        v2.0.3 FIX (ICS-03, external ICS audit -- confirmed): two
+        distinct bugs closed together, since they were both really the
+        same root cause -- removal keyed on the wrong thing.
+
+        (1) This method used to gate buffer removal on `batch is not
+        self._retry_batch` ("came_from_buffer"), reasoning that a retry
+        batch had "already" been removed once. That reasoning was wrong:
+        removal only ever happened on SUCCESS, so a batch that failed
+        its first attempt was NEVER removed from self._buffer -- it was
+        only copied into self._retry_batch for safekeeping. A successful
+        retry therefore still needed to remove it, and the old code
+        skipped exactly that step, leaving the original records sitting
+        in self._buffer to be written again on the next flush -- a
+        genuine duplicate-write bug, confirmed, not theoretical.
+
+        (2) Separately, removal used to pop `len(batch)` items by
+        POSITION from the front of self._buffer, assuming the batch's
+        own records were still exactly the oldest ones there. If
+        self._buffer filled to MAX_BUFFERED_SNAPSHOTS while this write
+        was in flight, the deque's own maxlen eviction could already
+        have dropped some of THIS batch's records to make room for newly
+        appended ones -- meaning the position-based pop would end up
+        removing newer records instead of the ones actually written.
+
+        Both are fixed by giving every record a stable sequence number
+        (record_snapshot(), self._next_seq) and removing by matching
+        that number specifically -- correct regardless of retry history
+        or what maxlen eviction may have already done to the buffer.
         """
-        came_from_buffer = batch is not self._retry_batch
         try:
             await self.hass.async_add_executor_job(self._write, batch)
             self.last_write_at = time.time()
-            if came_from_buffer:
-                # Only now -- write confirmed successful -- remove exactly
-                # the records that were actually written. New snapshots
-                # recorded while this write was in flight (via
-                # record_snapshot() appending to the same deque) must be
-                # preserved, not discarded along with what just succeeded.
-                for _ in range(len(batch)):
-                    if self._buffer:
-                        self._buffer.popleft()
+            self._remove_from_buffer_by_seq(batch)
             self._retry_batch = None
             self._retry_attempts = 0
         except Exception:  # noqa: BLE001 — telemetry must never break anything
             self.write_errors += 1
             self._retry_attempts += 1
             if self._retry_attempts >= MAX_RETRY_ATTEMPTS:
+                # v2.0.3 (ICS-03): the give-up path used to leave these
+                # records sitting in self._buffer despite counting them
+                # as permanently lost -- a later flush could then write
+                # a batch the code had already told the operator was
+                # gone. Removed here too, for the same reason removal
+                # happens on success: once a batch is declared lost, it
+                # must not still be sitting there to be written anyway.
                 self.snapshots_lost_write_failure += len(batch)
+                self._remove_from_buffer_by_seq(batch)
                 self._retry_batch = None
                 self._retry_attempts = 0
                 _LOGGER.error(
@@ -386,7 +434,18 @@ class TelemetryCapture:
             elif len(self._buffer) >= FLUSH_THRESHOLD:
                 self._schedule_flush()
 
-    def _write(self, batch: list[dict[str, Any]]) -> None:
+    def _remove_from_buffer_by_seq(self, batch: list[tuple[int, dict[str, Any]]]) -> None:
+        """Remove exactly the records in `batch`, matched by their own
+        stable sequence number -- not by position. See _flush_batch()'s
+        own docstring (ICS-03) for why position-based removal was wrong.
+        """
+        written_seqs = {seq for seq, _ in batch}
+        self._buffer = deque(
+            (item for item in self._buffer if item[0] not in written_seqs),
+            maxlen=MAX_BUFFERED_SNAPSHOTS,
+        )
+
+    def _write(self, batch: list[tuple[int, dict[str, Any]]]) -> None:
         """Append snapshots as JSON lines. Runs in an executor thread.
 
         v2.0.2 (TEL-001/TEL-007): now RAISES on failure instead of
@@ -415,7 +474,11 @@ class TelemetryCapture:
             self._rotate(path)
 
         with open(path, "a", encoding="utf-8") as handle:
-            for record in batch:
+            # v2.0.3 (ICS-03): batch entries are (seq, record) pairs now
+            # -- only the record itself is written; the sequence number
+            # is purely an internal buffer-bookkeeping detail, not part
+            # of the on-disk format.
+            for _seq, record in batch:
                 handle.write(json.dumps(record, separators=(",", ":")) + "\n")
 
     def _rotate(self, path: str) -> None:

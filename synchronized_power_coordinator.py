@@ -554,16 +554,34 @@ class SynchronizedPowerCoordinator(DataUpdateCoordinator[SynchronizedPowerData])
             return shortcut
 
         any_success = False
-        first_success_at: float | None = None
-        last_success_at: float | None = None
+        first_capture_at: float | None = None
+        last_capture_at: float | None = None
 
-        def _mark_success() -> None:
-            nonlocal any_success, first_success_at, last_success_at
+        # v2.0.3 FIX (ICS-01, external ICS audit -- confirmed): renamed
+        # from first/last_success_at and changed from "when did
+        # _mark_success() get CALLED" to "when was this specific value
+        # actually CAPTURED" -- these are not the same thing for a cache
+        # hit. The old version timestamped every value (cache hit or
+        # physical read alike) at the moment _read_one() happened to run,
+        # which for a cache hit is irrelevant -- the value itself may
+        # have been captured seconds earlier. sample_span_ms computed
+        # from those call-time timestamps could look tight (all four
+        # calls executing within milliseconds of each other) while
+        # silently combining, say, a physical read from just now with a
+        # cache value that is genuinely 2.9 seconds old -- exactly the
+        # composite ICS-01 describes, invisible to the old metric.
+        # Tracked as min/max across ALL captures, not first-call/last-call
+        # order: a cache hit's own effective capture time can be earlier
+        # than an earlier physical read's, even though the cache check
+        # happens later in this sequence -- call order is not time order
+        # once cache ages are involved.
+        def _mark_success(capture_time: float) -> None:
+            nonlocal any_success, first_capture_at, last_capture_at
             any_success = True
-            now = time.monotonic()
-            if first_success_at is None:
-                first_success_at = now
-            last_success_at = now
+            if first_capture_at is None or capture_time < first_capture_at:
+                first_capture_at = capture_time
+            if last_capture_at is None or capture_time > last_capture_at:
+                last_capture_at = capture_time
 
         timeout = self._update_timeout.total_seconds()
         deadline = time.monotonic() + SYNC_POWER_POLL_DEADLINE.total_seconds()
@@ -591,19 +609,28 @@ class SynchronizedPowerCoordinator(DataUpdateCoordinator[SynchronizedPowerData])
             # merely "not BAD"), since we're about to substitute this for
             # a physical read and want the same freshness bar the
             # cache-shortcut itself uses.
-            if cache is not None and cache.quality_of(register)[0] == Quality.GOOD:
-                cached_value = _cache_value_w(cache, register)
-                if cached_value is not None:
-                    _mark_success()
-                    # v2.0.0b (AR-9, external ICS audit): this is the OTHER
-                    # half of the same missing measurement fixed in
-                    # _try_cache_shortcut() above -- every register served
-                    # from cache here is one fewer physical read the
-                    # pre-MOD-01 fallback would unconditionally have done.
-                    if self._telemetry:
-                        self._telemetry.record_cache_hit()
-                    self.fallback_cache_hits += 1
-                    return cached_value
+            if cache is not None:
+                quality, _reason, age = cache.quality_of(register)
+                if quality == Quality.GOOD:
+                    cached_value = _cache_value_w(cache, register)
+                    if cached_value is not None:
+                        # v2.0.3 (ICS-01): the cached value's own age is
+                        # now what determines its effective capture time
+                        # -- NOT the moment this check happened to run.
+                        # age is None only if quality_of() itself has no
+                        # age information (defensive fallback: treat as
+                        # captured right now rather than crash or silently
+                        # skip the alignment computation for this value).
+                        _mark_success(time.monotonic() - (age or 0.0))
+                        # v2.0.0b (AR-9, external ICS audit): this is the OTHER
+                        # half of the same missing measurement fixed in
+                        # _try_cache_shortcut() above -- every register served
+                        # from cache here is one fewer physical read the
+                        # pre-MOD-01 fallback would unconditionally have done.
+                        if self._telemetry:
+                            self._telemetry.record_cache_hit()
+                        self.fallback_cache_hits += 1
+                        return cached_value
             # MOD-02: don't start a new physical read once the
             # whole-operation deadline has passed.
             if _deadline_exceeded():
@@ -619,7 +646,10 @@ class SynchronizedPowerCoordinator(DataUpdateCoordinator[SynchronizedPowerData])
                     async with asyncio.timeout(timeout):
                         result = await device.batch_update([register])
                         value = _extract_w(result, register)
-                        _mark_success()
+                        # A physical read's effective capture time IS
+                        # simply when it completed -- no age adjustment
+                        # needed, unlike the cache-hit branch above.
+                        _mark_success(time.monotonic())
                         if self._telemetry:
                             self._telemetry.record_request(1)
                         self.fallback_physical_reads += 1
@@ -676,11 +706,16 @@ class SynchronizedPowerCoordinator(DataUpdateCoordinator[SynchronizedPowerData])
         self._consecutive_failures = 0
 
         sample_span_ms = (
-            (last_success_at - first_success_at) * 1000.0
-            if first_success_at is not None and last_success_at is not None
+            (last_capture_at - first_capture_at) * 1000.0
+            if first_capture_at is not None and last_capture_at is not None
             else None
         )
         # v2.0.0a (F09/F20): explicit quality gate, not just instrumentation.
+        # v2.0.3 (ICS-01): now computed from each value's own effective
+        # capture time (age-adjusted for cache hits), not from when
+        # _read_one() happened to be called for it -- see
+        # first_capture_at/last_capture_at's own comment above for the
+        # full reasoning on why that distinction matters.
         is_temporally_uncertain = (
             sample_span_ms is not None
             and sample_span_ms > SYNC_POWER_CACHE_ALIGNMENT_TOLERANCE_S * 1000.0

@@ -69,7 +69,7 @@ from .modbus_telemetry import ModbusTelemetry
 from .bus_diagnostics import BusDiagnostics
 from .number import clear_static_bound_cache
 from .telemetry_capture import TelemetryCapture
-from .services import async_setup_services
+from .services import async_setup_services, async_unload_services
 from .synchronized_power_coordinator import SynchronizedPowerCoordinator
 from .types import (
     HuaweiSolarConfigEntry,
@@ -138,10 +138,29 @@ _COORDINATOR_START_DELAYS = {
 #
 # Fixed instead by adding a per-device offset on top of the per-type one,
 # so each additional device sharing a bus gets its own, non-overlapping
-# stagger window. 5s chosen to comfortably clear a single coordinator's
-# first-poll exchange (observed well under 1s when healthy) while keeping
-# the total spread modest even with several daisy-chained devices.
-_MULTI_DEVICE_STAGGER_STRIDE = timedelta(seconds=5)
+# stagger window.
+#
+# v2.0.3 FIX (ICS-04, external ICS audit -- confirmed): this stride was
+# 5s -- comfortably clearing a SINGLE coordinator's own first-poll
+# exchange, but smaller than the 16s SPAN the five coordinator-type
+# offsets above already occupy (0s to 16s). That meant a per-device
+# offset of N*5s could land inside an EARLIER device's own 0-16s window
+# rather than strictly after it -- e.g. device 2's "main" (0+2*5=10s)
+# landing exactly on device 0's own "configuration" (10s). The audit's
+# own recommendation was a full bus-wide scheduler; a much smaller
+# change closes the same defect just as completely here: this stride
+# only needs to be strictly greater than the maximum offset in
+# _COORDINATOR_START_DELAYS (16s) for every device's entire 5-slot
+# window to be non-overlapping with every other device's, for ANY
+# number of devices -- not just "not too small for one coordinator",
+# but "not too small for one device's WHOLE set of coordinators". 20s
+# was chosen as a round number with a few seconds of margin above that
+# 16s minimum, not tuned to any specific number of devices -- the
+# guarantee holds regardless. This invariant (stride > max offset) is
+# checked directly in tests/test_multi_device_stagger.py, not just
+# assumed here, so a future change to either value that reopens this
+# same class of collision is caught rather than silently reintroduced.
+_MULTI_DEVICE_STAGGER_STRIDE = timedelta(seconds=20)
 
 
 def _staggered_start_delay(kind: str, device_index: int) -> timedelta:
@@ -845,6 +864,18 @@ async def async_unload_entry(
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         device_datas: list[HuaweiSolarDeviceData] = entry.runtime_data[DATA_DEVICE_DATAS]
         primary_device = device_datas[0].device
+
+        # v2.0.3 FIX (ICS-10, external ICS audit -- confirmed): services
+        # used to be registered on every setup and never unregistered
+        # anywhere -- staying registered in Home Assistant's own service
+        # registry indefinitely, even with zero huawei_solar entries
+        # left loaded. Unregisters here (once this was confirmed to be
+        # the LAST entry still needing them -- see async_unload_
+        # services()'s own reference-counting) as the very first step,
+        # since it doesn't depend on any of the per-device teardown
+        # below and is safe to run regardless of whether the rest of it
+        # succeeds.
+        await async_unload_services(hass, entry)
 
         # v2.0.0a FIX (F21, external ICS audit -- confirmed): keepalive is
         # the only ACTIVE TRAFFIC PRODUCER among everything torn down in

@@ -255,7 +255,38 @@ class BatteryHealthManager:
                 self.serial_number,
             )
             data = None
-        self.engine.restore(data)
+        # v2.0.3 FIX (ICS-06, external ICS audit -- confirmed): restore()
+        # used to sit OUTSIDE the try/except above -- a store that loaded
+        # successfully (syntactically valid) but was structurally corrupt
+        # (invalid numeric conversions, malformed segment/nested records,
+        # unexpected container types anywhere in the tree restore() walks)
+        # could make it raise, bypassing the "corrupt store must not
+        # block setup" guarantee the load-failure branch above already
+        # provides, and aborting initialization entirely -- silently
+        # disabling battery-health tracking for this device (no listener
+        # ever gets subscribed) rather than gracefully starting fresh.
+        #
+        # A bare try/except around the existing self.engine.restore(data)
+        # call would not be enough on its own: restore() mutates several
+        # of self.engine's own fields directly, in sequence (see
+        # BatteryHealthEngine.restore()'s own body) -- if it raises
+        # partway through, some fields would already reflect the corrupt
+        # data while others do not, leaving self.engine in a genuinely
+        # inconsistent mix, neither fully restored nor fully fresh.
+        # Discarding that engine entirely and constructing a brand new
+        # one (reusing its own already-resolved .cfg, not requiring the
+        # original `options` this manager was constructed with) is the
+        # only way to guarantee a REALLY clean, fully-fresh state after
+        # a partial-restore failure, not just a partially-recovered one.
+        try:
+            self.engine.restore(data)
+        except Exception:  # noqa: BLE001 — corrupt store must not block setup
+            _LOGGER.exception(
+                "battery_health[%s]: persisted state loaded but was "
+                "structurally corrupt (restore() failed) — starting fresh",
+                self.serial_number,
+            )
+            self.engine = BatteryHealthEngine(self.engine.cfg)
         # v1.2.1: after any (re)start, registers may briefly report stale or
         # default values.  Measurement resumes immediately; irreversible
         # learning waits out the settling period.

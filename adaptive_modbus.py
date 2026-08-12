@@ -404,6 +404,19 @@ class AdaptiveModbusController:
         self._bus_total_wait_s: float = 0.0
         self._first_data_date: date | None = None
         self._dirty: bool = False
+        # v2.0.3 FIX (ICS-02, external ICS audit -- confirmed): a
+        # generation counter closing a genuine async lost-update race in
+        # _async_save() (below) -- see that method's own docstring for
+        # the full mechanism. Incremented at every one of this class's
+        # own _dirty=True mutation sites, alongside it -- not derived
+        # automatically (e.g. via a property on _dirty itself), since
+        # this project's own test fixtures widely bypass __init__ via
+        # object.__new__() and then set ._dirty directly; an automatic
+        # property would need _generation to already exist before that
+        # direct assignment runs, which is not guaranteed for those
+        # fixtures. Direct, explicit increments at each real mutation
+        # site are the safer choice here.
+        self._generation: int = 0
         self._save_task: asyncio.Task | None = None
 
         # HA sensor push
@@ -553,6 +566,7 @@ class AdaptiveModbusController:
             return
         self.learning_enabled = enabled
         self._dirty = True
+        self._generation += 1  # v2.0.3 (ICS-02): see this field's own comment in __init__
         if enabled:
             self.mark_recovery("learning re-enabled")
         else:
@@ -925,8 +939,19 @@ class AdaptiveModbusController:
         The fix always sets _dirty=True so that when the in-flight task wakes up
         it will still see the flag and persist the latest state.  If no task is
         running, a new one is created as before.
+
+        v2.0.3 (ICS-02): this is the primary, most-used entry point most
+        mutations actually go through -- also bumps _generation, closing
+        a DIFFERENT, later race than BUG-010 above solved: even with
+        _dirty correctly seen as True when a save wakes, _async_save()
+        itself used to unconditionally clear _dirty back to False once
+        its own already-in-flight save completed, silently discarding
+        any mutation that arrived specifically DURING that save's own
+        await window (see _async_save()'s own docstring for the full
+        mechanism this counter closes).
         """
         self._dirty = True          # mark dirty unconditionally
+        self._generation += 1
         if self._save_task and not self._save_task.done():
             # A debounce task is already sleeping; it will see _dirty=True when
             # it wakes and will persist the latest state.  No new task needed.
@@ -954,10 +979,49 @@ class AdaptiveModbusController:
         # leaves _dirty=True, exactly as it should, and propagates to the
         # caller (already handled at the async_unload() call site in
         # __init__.py's own teardown sequence).
+        #
+        # v2.0.3 FIX (ICS-02, external ICS audit -- confirmed): a
+        # SEPARATE, later race from F16's above -- this one happens even
+        # when the save itself succeeds. self._serialize() snapshots
+        # state synchronously, before the `await` below suspends; while
+        # suspended, another poll can mutate state and call
+        # _schedule_save() (setting _dirty=True again, correctly, per
+        # BUG-010). The old code then unconditionally set _dirty=False
+        # once ITS OWN already-in-flight save completed -- silently
+        # overwriting that fresh True with False, even though the new
+        # mutation was never included in the snapshot just written. The
+        # new state stayed correct in memory, but was never marked as
+        # needing to be saved -- if no FURTHER mutation happened before
+        # the next restart, it would simply be lost from disk with no
+        # exception, no log line, nothing to indicate anything went
+        # wrong.
+        #
+        # Fixed with a generation counter (self._generation, bumped
+        # alongside every self._dirty=True mutation site in this class --
+        # see that field's own comment in __init__): captured here
+        # before the await, and only treated as clean if the generation
+        # is still the same one this specific save's snapshot reflects.
+        # If a new mutation raced in during the await, loop and save
+        # again immediately -- rather than calling self._schedule_save()
+        # (which would silently no-op here: this coroutine IS the
+        # in-flight save _schedule_save() checks for, and it is not yet
+        # "done" from its own perspective while still running) -- so the
+        # newest state is captured without waiting on some unrelated
+        # future mutation to eventually trigger a save cycle that
+        # includes it.
         if self._first_data_date is None:
             self._first_data_date = date.today()
-        await self._store.async_save(self._serialize())
-        self._dirty = False
+        while True:
+            save_generation = self._generation
+            await self._store.async_save(self._serialize())
+            if self._generation == save_generation:
+                self._dirty = False
+                break
+            _LOGGER.debug(
+                "AdaptiveModbus[%s]: state mutated during save (generation "
+                "%d -> %d); saving again immediately to capture it",
+                self.serial_number, save_generation, self._generation,
+            )
         _LOGGER.debug(
             "AdaptiveModbus[%s]: statistics persisted (%d days of data)",
             self.serial_number,
@@ -1022,6 +1086,7 @@ class AdaptiveModbusController:
             slot.rtt_samples = []
             slot.rtt_p95_ms = 0.0
         self._dirty = True
+        self._generation += 1  # v2.0.3 (ICS-02): see this field's own comment in __init__
         _LOGGER.warning(
             "AdaptiveModbus[%s]: storage upgraded v1 -> v2. Cleared RTT "
             "samples from %d time slots because they were recorded on the "
@@ -1053,6 +1118,7 @@ class AdaptiveModbusController:
         )
         self._last_decay_date = today
         self._dirty = True
+        self._generation += 1  # v2.0.3 (ICS-02): see this field's own comment in __init__
 
 
 # ── HA Sensor entities ─────────────────────────────────────────────────────────

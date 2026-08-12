@@ -659,9 +659,31 @@ class ModbusDiagnosticsSwitchEntity(SwitchEntity):
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        """Stop capturing and flush anything pending."""
-        self._diagnostics.set_enabled(False)
+        """Stop capturing and deterministically flush anything pending
+        before returning.
+
+        v2.0.3 FIX (ICS-08, external ICS audit -- confirmed, the same
+        defect as TEL-002): now awaits async_disable()
+        (bus_diagnostics.py) instead of calling the synchronous
+        set_enabled(False) -- turning this switch off now genuinely
+        guarantees the final batch was persisted (or explicitly
+        failed/timed out, logged) before this method returns.
+        """
+        await self._diagnostics.async_disable()
         self.async_write_ha_state()
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Deterministically flush any pending capture if this entity is
+        torn down (unload/reload) while capture is still running.
+
+        v2.0.3 (ICS-08): BusDiagnostics owns no periodic timer (unlike
+        ModbusTelemetryCaptureSwitchEntity's own equivalent method, which
+        also has a timer to cancel) -- but it does now own a genuine
+        async flush that must be awaited, not left as a fire-and-forget
+        best effort, for the same reason turning the switch off does.
+        """
+        if self._diagnostics.enabled:
+            await self._diagnostics.async_disable()
 
 
 class ModbusTelemetryCaptureSwitchEntity(SwitchEntity):

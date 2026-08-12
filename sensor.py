@@ -3120,10 +3120,41 @@ class SynchronizedPowerSensorEntity(
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        """Extract the relevant field from the shared SynchronizedPowerData."""
+        """Extract the relevant field from the shared SynchronizedPowerData.
+
+        v2.0.3 FIX (ICS-05, external ICS audit -- confirmed): `data.
+        is_temporally_uncertain` was computed by the coordinator (and
+        ICS-01's own fix corrected HOW it's computed, from each value's
+        real effective capture time rather than call-time), but nothing
+        here ever consulted it -- a temporally misaligned reading (a
+        composite of a stale cached value and a fresh physical read,
+        exactly ICS-01's own scenario) could still be exposed as an
+        ordinary, seemingly-valid power-flow value with no indication
+        anything was wrong.
+
+        The explicit contract chosen: unavailable, not silently wrong.
+        This matches how the rest of this project already treats
+        quality problems elsewhere (e.g. Quality.BAD means an entity
+        goes unavailable, not that a guessed value gets shown) --
+        picked over the alternative of exposing an extra "uncertain"
+        attribute alongside a still-displayed value, since a power-flow
+        number a user might act on (checking whether the battery is
+        genuinely charging or discharging right now) is exactly the
+        kind of value where showing a wrong-looking-right number is
+        worse than briefly showing unavailable.
+        """
         data: SynchronizedPowerData | None = self.coordinator.data
         self._attr_native_value = self._get_value(data)
-        self._attr_available = self._attr_native_value is not None
+        uncertain = data is not None and data.is_temporally_uncertain
+        self._attr_available = self._attr_native_value is not None and not uncertain
+        self._attr_extra_state_attributes = (
+            {
+                "temporally_uncertain": True,
+                "sample_span_ms": data.sample_span_ms,
+            }
+            if uncertain
+            else {}
+        )
         self.async_write_ha_state()
 
     def _get_value(self, data: SynchronizedPowerData | None) -> float | None:

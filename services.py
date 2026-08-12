@@ -515,6 +515,61 @@ def _get_device_write_lock(serial_number: str) -> asyncio.Lock:
     return _device_write_locks[serial_number]
 
 
+# v2.0.3 (ICS-10, external ICS audit -- confirmed): tracks which config
+# entries currently have parameter-configuration services registered, so
+# async_unload_services() (below) can tell whether the entry being
+# unloaded was the LAST one needing them, and only then actually
+# unregister from Home Assistant -- see async_setup_services()'s own
+# comment on this same fix for why this is reference-counted removal,
+# not also a guard against re-registration.
+_entries_with_services: set[str] = set()
+
+# Every service name this integration can register -- used by
+# async_unload_services() to unregister all of them once the last
+# relevant entry unloads. hass.services.async_remove() is safe to call
+# for a service that was never registered by this process (a no-op, not
+# an exception), so this list is intentionally unconditional rather than
+# tracking exactly which subset a given setup actually registered.
+_ALL_SERVICE_NAMES: tuple[str, ...] = (
+    SERVICE_FORCIBLE_CHARGE,
+    SERVICE_FORCIBLE_DISCHARGE,
+    SERVICE_FORCIBLE_CHARGE_SOC,
+    SERVICE_FORCIBLE_DISCHARGE_SOC,
+    SERVICE_STOP_FORCIBLE_CHARGE,
+    SERVICE_RESET_MAXIMUM_FEED_GRID_POWER,
+    SERVICE_SET_DI_ACTIVE_POWER_SCHEDULING,
+    SERVICE_SET_ZERO_POWER_GRID_CONNECTION,
+    SERVICE_SET_MAXIMUM_FEED_GRID_POWER,
+    SERVICE_SET_MAXIMUM_FEED_GRID_POWER_PERCENT,
+    SERVICE_SET_TOU_PERIODS,
+    SERVICE_SET_CAPACITY_CONTROL_PERIODS,
+    SERVICE_SET_FIXED_CHARGE_PERIODS,
+)
+
+
+async def async_unload_services(
+    hass: HomeAssistant,
+    entry: HuaweiSolarConfigEntry,
+) -> None:
+    """Unregister this integration's services once the LAST config entry
+    that needed them has unloaded.
+
+    v2.0.3 FIX (ICS-10, external ICS audit -- confirmed): services used
+    to be registered on every async_setup_entry() call and never
+    unregistered anywhere -- not on entry unload, not when the last
+    huawei_solar entry was removed entirely. They stayed registered in
+    Home Assistant's own service registry indefinitely, callable (and
+    appearing in the UI/service-call autocomplete) even with zero
+    huawei_solar entries left loaded, and even after the integration
+    itself was uninstalled from a running instance.
+    """
+    _entries_with_services.discard(entry.entry_id)
+    if _entries_with_services:
+        return  # other entries still need these services registered
+    for service_name in _ALL_SERVICE_NAMES:
+        hass.services.async_remove(DOMAIN, service_name)
+
+
 def _parse_huawei_luna2000_periods(text: str) -> list[HUAWEI_LUNA2000_TimeOfUsePeriod]:
     result = []
     for line in text.split("\n"):
@@ -630,18 +685,26 @@ async def forcible_charge_soc(service_call: ServiceCall) -> None:
             service_call.data[DATA_POWER], dd, rn.STORAGE_MAXIMUM_CHARGE_POWER
         )
 
-        await _set_and_invalidate(dd, rn.STORAGE_FORCIBLE_CHARGE_POWER, power)
-        await _set_and_invalidate(dd, rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SOC, target_soc)
-        await _set_and_invalidate(
-            dd,
-            rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SETTING_MODE,
-            rv.StorageForcibleChargeDischargeTargetMode.SOC,
-        )
-        await _set_and_invalidate(
-            dd,
-            rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_WRITE,
-            rv.StorageForcibleChargeDischarge.CHARGE,
-        )
+        # v2.0.3 FIX (ICS-11, external ICS audit -- confirmed): this
+        # SOC-targeted variant used to perform four separately-guarded
+        # _set_and_invalidate() calls -- exactly the MOD-19 pattern
+        # already closed for the time-based forcible_charge()/
+        # forcible_discharge() below, but missed for these two SOC
+        # variants when that fix was made. Now uses the same atomic
+        # sequence helper: one continuous guard hold across all four
+        # writes, bounded by one whole-sequence deadline, so another
+        # coordinator's poll cannot be admitted between any two of them.
+        async with _set_and_invalidate_sequence(dd) as write:
+            await write(rn.STORAGE_FORCIBLE_CHARGE_POWER, power)
+            await write(rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SOC, target_soc)
+            await write(
+                rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SETTING_MODE,
+                rv.StorageForcibleChargeDischargeTargetMode.SOC,
+            )
+            await write(
+                rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_WRITE,
+                rv.StorageForcibleChargeDischarge.CHARGE,
+            )
         assert dd.configuration_update_coordinator
         await dd.configuration_update_coordinator.async_refresh()
 
@@ -655,18 +718,19 @@ async def forcible_discharge_soc(service_call: ServiceCall) -> None:
             service_call.data[DATA_POWER], dd, rn.STORAGE_MAXIMUM_DISCHARGE_POWER
         )
 
-        await _set_and_invalidate(dd, rn.STORAGE_FORCIBLE_DISCHARGE_POWER, power)
-        await _set_and_invalidate(dd, rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SOC, target_soc)
-        await _set_and_invalidate(
-            dd,
-            rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SETTING_MODE,
-            rv.StorageForcibleChargeDischargeTargetMode.SOC,
-        )
-        await _set_and_invalidate(
-            dd,
-            rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_WRITE,
-            rv.StorageForcibleChargeDischarge.DISCHARGE,
-        )
+        # v2.0.3 FIX (ICS-11): see forcible_charge_soc()'s own note on
+        # this same fix, immediately above.
+        async with _set_and_invalidate_sequence(dd) as write:
+            await write(rn.STORAGE_FORCIBLE_DISCHARGE_POWER, power)
+            await write(rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SOC, target_soc)
+            await write(
+                rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SETTING_MODE,
+                rv.StorageForcibleChargeDischargeTargetMode.SOC,
+            )
+            await write(
+                rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_WRITE,
+                rv.StorageForcibleChargeDischarge.DISCHARGE,
+            )
         assert dd.configuration_update_coordinator
         await dd.configuration_update_coordinator.async_refresh()
 
@@ -951,6 +1015,54 @@ def _parse_fixed_charge_periods(text: str) -> list[ChargeDischargePeriod]:
     return result
 
 
+def _validate_fixed_charge_periods(periods: list[ChargeDischargePeriod]) -> None:
+    """Reject syntactically-valid but semantically-invalid period sets
+    before they ever reach the write path.
+
+    v2.0.3 FIX (ICS-07, external ICS audit -- confirmed): the regex this
+    function's own caller applies validates only character-level syntax
+    (HH:MM format, integer wattage, line count) -- it says nothing about
+    whether the resulting periods actually make sense together.
+    ChargeDischargePeriodRegisters.encode() (the vendor huawei_solar
+    package) does not validate this either -- checked directly against
+    that source before writing this fix, not assumed -- it only checks
+    the maximum period COUNT, nothing about ordering or overlap. Nothing
+    upstream of the device itself would have caught a schedule like
+    "09:00-08:00" (end before start) or two periods that overlap.
+
+    Deliberately mirrors the exact algorithm the SAME vendor package
+    already uses for the sibling TOU-period register types (register_
+    definitions/periods.py's own encoder-side validation) rather than
+    inventing a new one -- same "start must be strictly before end, no
+    wraparound past midnight" rule, same sort-then-check-adjacent-pairs
+    overlap test. Consistent with how this vendor's own devices are
+    already known to validate this exact family of period types
+    elsewhere, not a judgment call made from scratch here.
+    """
+    for period in periods:
+        if period.start_time >= period.end_time:
+            raise ValueError(
+                f"Invalid period {period.start_time // 60:02d}:"
+                f"{period.start_time % 60:02d}-{period.end_time // 60:02d}:"
+                f"{period.end_time % 60:02d}: start must be strictly "
+                f"before end (periods wrapping past midnight are not "
+                f"supported)"
+            )
+    sorted_periods = sorted(periods, key=lambda p: p.start_time)
+    for prev, current in zip(sorted_periods, sorted_periods[1:]):
+        if (
+            prev.start_time <= current.start_time < prev.end_time
+            or prev.start_time < current.end_time <= prev.end_time
+        ):
+            raise ValueError(
+                f"Overlapping periods: "
+                f"{prev.start_time // 60:02d}:{prev.start_time % 60:02d}-"
+                f"{prev.end_time // 60:02d}:{prev.end_time % 60:02d} and "
+                f"{current.start_time // 60:02d}:{current.start_time % 60:02d}-"
+                f"{current.end_time // 60:02d}:{current.end_time % 60:02d}"
+            )
+
+
 async def set_fixed_charge_periods(service_call: ServiceCall) -> None:
     """Set the fixed charging periods of the battery."""
     dd = get_battery_device_data(service_call)
@@ -961,10 +1073,15 @@ async def set_fixed_charge_periods(service_call: ServiceCall) -> None:
                 f"Invalid periods: could not validate '{service_call.data[DATA_PERIODS]}' as fixed charging periods"
             )
 
+        periods = _parse_fixed_charge_periods(service_call.data[DATA_PERIODS])
+        # v2.0.3 (ICS-07): semantic validation, on top of the syntax
+        # check above -- before this device is ever touched.
+        _validate_fixed_charge_periods(periods)
+
         await _set_and_invalidate(
             dd,
             rn.STORAGE_FIXED_CHARGING_AND_DISCHARGING_PERIODS,
-            _parse_fixed_charge_periods(service_call.data[DATA_PERIODS]),
+            periods,
         )
 
         assert dd.configuration_update_coordinator
@@ -978,6 +1095,27 @@ async def async_setup_services(
     """Huawei Solar Services Setup."""
     if not entry.data.get(CONF_ENABLE_PARAMETER_CONFIGURATION, False):
         return
+
+    # v2.0.3 FIX (ICS-10, external ICS audit -- confirmed): tracked here
+    # so async_unload_services() (below) knows whether THIS was the last
+    # entry with parameter-configuration services enabled, and can
+    # unregister them from Home Assistant entirely once nothing needs
+    # them any more -- previously, services registered by any entry
+    # stayed registered globally forever, even after every relevant
+    # entry was removed.
+    #
+    # Deliberately NOT also guarded against re-registration on this same
+    # entry_id already being present: several of the handlers below are
+    # bound via functools.partial() to a device-kind argument ("emma" vs
+    # "inverter") resolved from THIS entry's own devices (has_emma,
+    # below) -- skipping re-registration when multiple entries with
+    # different device kinds coexist would freeze the global handler to
+    # whichever entry happened to register first, silently leaving the
+    # wrong device-kind variant bound for every other entry's own calls
+    # of that service. Re-registration (last setup wins) is the
+    # correct, existing behaviour for that reason; only the "never
+    # unregistered at all" half of ICS-10 is fixed here.
+    _entries_with_services.add(entry.entry_id)
 
     hsucs: list[HuaweiSolarDeviceData] = entry.runtime_data[DATA_DEVICE_DATAS]
 

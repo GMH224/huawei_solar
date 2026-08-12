@@ -228,9 +228,26 @@ class HuaweiSolarSelectEntity(
 
             if self.entity_description.check_is_available_func:
                 assert self.entity_description.is_available_key
-                is_available_register = self.coordinator.data[
+                # v2.0.3 FIX (ICS-17, external ICS audit -- confirmed via a
+                # real production traceback: KeyError: 'storage_charge_
+                # from_grid_function'): this used to index
+                # self.coordinator.data[...] directly, raising KeyError
+                # whenever the availability register's own cache entry
+                # was temporarily missing -- a legitimate, expected state
+                # for a partial/degraded coordinator payload (bounded,
+                # best-effort per-chunk reads are an explicit design
+                # choice elsewhere in this project, not a bug). The
+                # sibling module switch.py already handles this identical
+                # pattern correctly with .get(...); select.py was simply
+                # inconsistent with its own sibling. A missing
+                # availability register now means "cannot yet determine
+                # availability from it" (None passed to
+                # check_is_available_func, matching switch.py's own
+                # established behaviour), not an uncaught exception that
+                # crashes the whole coordinator-update listener callback.
+                is_available_register = self.coordinator.data.get(
                     self.entity_description.is_available_key
-                ]
+                )
                 self._attr_available = self.entity_description.check_is_available_func(
                     is_available_register.value if is_available_register else None
                 )

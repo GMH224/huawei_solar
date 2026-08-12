@@ -409,7 +409,13 @@ class ModbusGuard:
             label: str = "",
         ) -> None:
             self._guard = guard
-            self._priority = priority  # keep-alive uses priority=True, bypasses shedding
+            self._priority = priority
+            # v2.0.3 (ICS-09): admission exemption, not lock-acquisition
+            # priority -- see ModbusGuard.request()'s own docstring for
+            # the full distinction. Bypasses shedding at admission time;
+            # does not change this request's position once it reaches
+            # guard._lock, a plain FIFO asyncio.Lock every request
+            # (priority or not) waits on identically.
             self._label = label        # who asked, for diagnostics attribution
             #: Per-request detail filled in by the CALLER after admission
             #: (v1.3.0 fix). The first field capture wrote these as null
@@ -601,6 +607,32 @@ class ModbusGuard:
         self, priority: bool = False, label: str = ""
     ) -> "_RequestContext":
         """Return an async context manager that serialises Modbus access.
+
+        v2.0.3 (ICS-09, external ICS audit -- confirmed): this docstring
+        used to say only what priority=True DOES ("bypass queue-depth
+        shedding"); it did not say what it does NOT do, which is exactly
+        the gap the audit's own confidence in this area came from. Made
+        explicit here rather than left implicit: priority=True is
+        admission exemption -- it changes whether a request gets shed at
+        the queue-depth check (this file's own MAX_QUEUE_DEPTH/
+        MAX_PRIORITY_QUEUE_DEPTH/AR-4's own airtime-budget checks), and
+        which of two separate queue-depth budgets it's weighed against.
+        It is NOT lock-acquisition priority: every admitted request,
+        priority or not, ultimately waits on the same guard._lock, which
+        is a plain asyncio.Lock -- Python's own FIFO-fair primitive, with
+        no priority-ordering concept of its own. A priority request that
+        arrives after several normal requests are already queued on that
+        lock waits its turn behind them exactly like a normal request
+        would; admission exemption only ever helps BEFORE that point,
+        deciding whether the request is allowed to queue at all rather
+        than where in the queue it lands. If true priority ordering
+        (jumping ahead of already-queued normal requests, not just
+        skipping the shed decision) is ever genuinely needed, it would
+        require a different primitive entirely -- a real priority queue
+        or condition-variable-based scheduler, not a parameter on top of
+        a single shared Lock -- deliberately not built speculatively
+        here without field evidence keep-alive is actually being starved
+        in a way admission exemption alone doesn't already prevent.
 
         priority=True is used by the keep-alive task to bypass queue-depth
         shedding — the keep-alive probe must always be able to run regardless
