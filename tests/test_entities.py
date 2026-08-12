@@ -591,6 +591,62 @@ class TestSelectEntity(unittest.TestCase):
         self.assertEqual(coord.invalidated, [d.register_name])
         self.assertEqual(coord.refresh_calls, 1)
 
+    def test_check_is_available_func(self):
+        """Mirrors TestSwitchEntity's own test_check_is_available_func --
+        same pattern, confirming select.py's own availability handling
+        works correctly when the register IS present."""
+        d = SELECT.HuaweiSolarSelectEntityDescription(
+            key="storage_capacity_control_mode",
+            options=["a", "b"],
+            is_available_key=SELECT.rn.STORAGE_CHARGE_FROM_GRID_FUNCTION,
+            check_is_available_func=lambda charge_from_grid: charge_from_grid,
+        )
+        # _friendly_format() calls .name.lower() on the main register's
+        # own value (an IntEnum in real use) -- a plain string stands in
+        # fine everywhere else in this test file, but not here.
+        main_value = types.SimpleNamespace(name="A")
+        coord = MockCoordinator(data={
+            d.register_name: _Result(main_value),
+            d.is_available_key: _Result(True),
+        })
+        e = _make(SELECT.HuaweiSolarSelectEntity, d, coord, MockDevice())
+        e._handle_coordinator_update()
+        self.assertTrue(e._attr_available)
+        coord.data[d.is_available_key] = _Result(False)
+        e._handle_coordinator_update()
+        self.assertFalse(e._attr_available)
+
+    def test_missing_availability_register_does_not_raise(self):
+        """v2.0.3 FIX (ICS-17, external ICS audit -- confirmed via a real
+        production traceback): the main register present but the
+        SEPARATE availability register missing from coordinator.data
+        (a legitimate, expected state for a partial/degraded coordinator
+        payload) used to raise an uncaught KeyError here, crashing the
+        whole coordinator-update listener callback. Must now complete
+        without raising, with availability falling back to whatever the
+        entity description's own check_is_available_func does with None.
+        """
+        d = SELECT.HuaweiSolarSelectEntityDescription(
+            key="storage_capacity_control_mode",
+            options=["a", "b"],
+            is_available_key=SELECT.rn.STORAGE_CHARGE_FROM_GRID_FUNCTION,
+            check_is_available_func=lambda charge_from_grid: charge_from_grid,
+        )
+        main_value = types.SimpleNamespace(name="A")
+        coord = MockCoordinator(data={
+            d.register_name: _Result(main_value),
+            # d.is_available_key deliberately absent -- the exact
+            # partial-payload scenario the real traceback showed.
+        })
+        e = _make(SELECT.HuaweiSolarSelectEntity, d, coord, MockDevice())
+        e._handle_coordinator_update()  # must not raise
+        self.assertFalse(
+            e._attr_available,
+            "a missing availability register should not be treated as "
+            "available -- None passed to check_is_available_func here "
+            "correctly yields a falsy result",
+        )
+
 
 # ── Button entity ─────────────────────────────────────────────────────────────
 class TestButtonEntity(unittest.TestCase):

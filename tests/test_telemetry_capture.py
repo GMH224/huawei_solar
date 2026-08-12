@@ -351,6 +351,121 @@ class TestTEL007BoundedRetry(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class TestICS03SequenceBasedRemoval(unittest.IsolatedAsyncioTestCase):
+    """ICS-03, external ICS audit -- confirmed genuine defects in this
+    session's own v2.0.2 TEL-001/007/010 fix. Two distinct bugs, both
+    rooted in removing buffered records the wrong way:
+
+    (1) A successful RETRY did not remove its own records from
+        self._buffer (the old `came_from_buffer` check skipped removal
+        specifically for retries), so a retry that eventually succeeded
+        left its records sitting there to be written again later --
+        genuine duplicate writes.
+    (2) Removal was position-based (pop N from the front), which is
+        wrong if the deque's own maxlen eviction has already dropped
+        some of a pending batch's records to make room for newly
+        appended ones -- the position-based pop would then remove the
+        wrong (newer) records instead.
+
+    Both closed by giving every record a stable sequence number and
+    removing by matching that number specifically.
+    """
+
+    def setUp(self):
+        TC.TelemetryCapture.clear_registry()
+        self.dir = tempfile.mkdtemp()
+
+    async def test_successful_retry_does_not_duplicate_the_batch(self):
+        """The core ICS-03 claim: a batch that fails once, then
+        succeeds on retry, must be written exactly once -- not left in
+        self._buffer to be written again by a later flush."""
+        hass = _FakeHass(self.dir, fail_times=1)
+        d = TC.TelemetryCapture(hass, "e")
+        d.set_enabled(True)
+        d.record_snapshot({"x": 1})  # forces an immediate flush (TEL-006)
+        while d._pending_write is not None:
+            await d._pending_write
+        # The retry has now succeeded. Force every subsequent tick's
+        # worth of snapshots through to confirm nothing duplicates.
+        for i in range(2, TC.FLUSH_THRESHOLD + 2):
+            d.record_snapshot({"x": i})
+        await d.async_disable()
+
+        path = os.path.join(self.dir, TC._SUBDIR, f"telemetry_{d.tag}.jsonl")
+        lines = [json.loads(x) for x in open(path).read().splitlines()]
+        x_values = [rec["x"] for rec in lines]
+        self.assertEqual(
+            x_values, sorted(x_values),
+            "records must appear in order with no duplicates",
+        )
+        self.assertEqual(
+            len(x_values), len(set(x_values)),
+            f"a value appears more than once -- the originally-retried "
+            f"batch was written twice. Full sequence: {x_values}",
+        )
+        self.assertEqual(x_values[0], 1, "the originally-failed record must still be present exactly once")
+
+    async def test_give_up_removes_the_batch_from_buffer_not_just_retry_batch(self):
+        """A batch declared permanently lost must not still be sitting
+        in self._buffer to be written by a later, unrelated flush --
+        contradicting its own loss counter."""
+        hass = _FakeHass(self.dir, fail_times=999)  # never succeeds
+        d = TC.TelemetryCapture(hass, "e")
+        d.set_enabled(True)
+        d.record_snapshot({"x": "should_be_lost"})
+        while d._pending_write is not None:
+            await d._pending_write
+        self.assertEqual(d.snapshots_lost_write_failure, 1)
+
+        # Confirm directly: no record with this content is still
+        # sitting in the buffer.
+        remaining = [record for _seq, record in d._buffer]
+        self.assertFalse(
+            any(r.get("x") == "should_be_lost" for r in remaining),
+            "a record counted as permanently lost must not still be "
+            "sitting in the buffer -- it would be written by some "
+            "later, unrelated flush, contradicting its own loss counter",
+        )
+
+    async def test_removal_matches_by_sequence_surviving_maxlen_eviction(self):
+        """The second, subtler ICS-03 race: if the buffer fills to
+        MAX_BUFFERED_SNAPSHOTS while a write is genuinely in flight, the
+        deque's own eviction can drop some of the IN-FLIGHT batch's
+        records to make room for newly appended ones. Removal-by-
+        sequence must still remove exactly the written records (if
+        still present) and never remove a newer record that merely
+        happens to occupy the front of the buffer now.
+        """
+        hass = _FakeHass(self.dir, executor_delay=0.05)
+        d = TC.TelemetryCapture(hass, "e")
+        d.set_enabled(True)
+        d.record_snapshot({"x": 0})  # forces an immediate flush (TEL-006)
+        self.assertIsNotNone(d._pending_write)
+        # While that write is still in flight (delayed by executor_delay),
+        # flood the buffer past MAX_BUFFERED_SNAPSHOTS so the deque's own
+        # eviction drops the in-flight record (seq 0) from the front.
+        for i in range(1, TC.MAX_BUFFERED_SNAPSHOTS + 10):
+            d.record_snapshot({"x": i})
+        remaining_seqs_before = {seq for seq, _ in d._buffer}
+        self.assertNotIn(
+            0, remaining_seqs_before,
+            "test setup check: seq 0 should already be evicted by maxlen "
+            "before the in-flight write even completes",
+        )
+        newest_seq_before = max(remaining_seqs_before)
+
+        await d._pending_write  # the original (now-evicted) write completes
+
+        remaining_seqs_after = {seq for seq, _ in d._buffer}
+        self.assertIn(
+            newest_seq_before, remaining_seqs_after,
+            "a newer record must survive the completed write's own "
+            "removal step -- sequence-based removal must not remove "
+            "records it never actually wrote, even if they now occupy "
+            "the front of the buffer",
+        )
+
+
 class TestTEL003TimerIdempotency(unittest.TestCase):
     """TEL-003, external ICS/IQS audit -- confirmed: async_turn_on() used
     to install a new timer unconditionally, even if one was already

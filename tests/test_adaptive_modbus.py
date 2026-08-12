@@ -96,6 +96,11 @@ def _make_ctrl() -> AdaptiveModbusController:
     ctrl._last_decay_date = None
     ctrl._first_data_date = None
     ctrl._dirty = False
+    # v2.0.3 (ICS-02, external ICS audit): _make_ctrl() bypasses __init__
+    # entirely, so this needs setting explicitly, matching __init__'s own
+    # default -- the same class of gap hit repeatedly this session for
+    # every object.__new__()-based test fixture.
+    ctrl._generation = 0
     ctrl._save_task = None
     ctrl._listeners = []
     ctrl._unsub_push = None
@@ -1086,6 +1091,97 @@ class TestDirtyFlagOrderingFix(unittest.IsolatedAsyncioTestCase):
         await ctrl._async_save()
         ctrl._store.async_save.assert_awaited_once()
         self.assertFalse(ctrl._dirty)
+
+
+# ── v2.0.3: ICS-02 -- adaptive persistence lost-update race (external ICS audit) ──
+
+class TestICS02GenerationRace(unittest.IsolatedAsyncioTestCase):
+    """ICS-02, external ICS audit -- confirmed: _async_save() serializes
+    state, then awaits the actual write. If a mutation happens WHILE
+    that write is suspended (a genuine, real scenario -- an adaptive
+    poll observation arriving mid-save), the old code unconditionally
+    cleared _dirty=False once its own already-in-flight save completed
+    -- silently discarding the fact that newer, unsaved state now
+    existed. The new state stayed correct in memory but was never
+    marked as needing to be saved -- a classic async lost-update race,
+    confirmed here directly, not just structurally."""
+
+    async def test_mutation_during_save_is_not_silently_lost(self):
+        """The core ICS-02 scenario: record_observation()-equivalent
+        mutation (simulated directly via _schedule_save(), the real
+        entry point almost every mutation goes through) happens WHILE
+        the write is suspended. Must remain dirty afterward -- and must
+        NOT need a further, unrelated future mutation to eventually get
+        saved (the loop-based re-save, not just "stays dirty")."""
+        ctrl = _make_ctrl()
+        ctrl._dirty = True
+        save_call_count = 0
+
+        async def _racing_save(_data):
+            nonlocal save_call_count
+            save_call_count += 1
+            if save_call_count == 1:
+                # Simulate a mutation arriving while this first save is
+                # suspended -- the exact ICS-02 scenario. Mutates only
+                # the two fields a real mutation site touches (not the
+                # full _schedule_save(), which also creates a real
+                # asyncio task via self.hass -- an unrelated side effect
+                # this test isn't exercising).
+                ctrl._dirty = True
+                ctrl._generation += 1
+            # else: second call (the loop's own re-save) succeeds cleanly.
+
+        ctrl._store.async_save = AsyncMock(side_effect=_racing_save)
+        await ctrl._async_save()
+
+        self.assertEqual(
+            save_call_count, 2,
+            "a mutation during the first save's own await must trigger "
+            "an immediate second save capturing it -- not leave it "
+            "waiting for some unrelated future mutation",
+        )
+        self.assertFalse(
+            ctrl._dirty,
+            "after the generation-matching second save succeeds, dirty "
+            "must correctly clear",
+        )
+
+    async def test_no_race_clears_dirty_on_first_attempt(self):
+        """Negative case: when nothing mutates state during the await,
+        exactly one save must happen -- confirms the fix didn't turn
+        every save into an unconditional double-save."""
+        ctrl = _make_ctrl()
+        ctrl._dirty = True
+        await ctrl._async_save()
+        ctrl._store.async_save.assert_awaited_once()
+        self.assertFalse(ctrl._dirty)
+
+    async def test_generation_increments_on_every_known_mutation_site(self):
+        """Structural check, at the source level: every self._dirty =
+        True mutation site in this class must also bump self._generation
+        -- confirms the fix wasn't applied to only some of them, leaving
+        a partial, still-racy fix."""
+        source = pathlib.Path(_MOD.__file__).read_text()
+        dirty_true_count = source.count("self._dirty = True")
+        generation_bump_count = source.count("self._generation += 1")
+        self.assertEqual(
+            dirty_true_count, generation_bump_count,
+            f"found {dirty_true_count} '_dirty = True' mutation sites but "
+            f"only {generation_bump_count} '_generation += 1' bumps -- "
+            f"every mutation site must bump the generation, or the race "
+            f"reopens at whichever site was missed",
+        )
+
+    async def test_set_learning_enabled_bumps_generation(self):
+        """set_learning_enabled() sets _dirty directly, not via
+        _schedule_save() -- a separate mutation path that needed its own
+        explicit generation bump, checked directly here rather than
+        only via the generic source-level count above."""
+        ctrl = _make_ctrl()
+        ctrl.learning_enabled = False
+        before = ctrl._generation
+        ctrl.set_learning_enabled(True)
+        self.assertGreater(ctrl._generation, before)
 
 
 # ── v2.0.1: snapshot() -- confirmed via a genuine production traceback ──────

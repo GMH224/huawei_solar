@@ -39,6 +39,7 @@ import pathlib
 import sys
 import types
 import unittest
+from unittest.mock import AsyncMock, MagicMock
 
 _ROOT = pathlib.Path(__file__).parent.parent
 
@@ -424,6 +425,102 @@ class TestQualityGatedValueExtraction(unittest.TestCase):  # v2.0.0
             "the rated-capacity diagnostic read must also be quality-gated, "
             "not just the segment-building fields",
         )
+
+
+class TestICS06RestoreErrorBoundary(unittest.IsolatedAsyncioTestCase):
+    """ICS-06, external ICS audit -- confirmed: restore() sat OUTSIDE
+    the load-failure try/except -- a store that loaded successfully
+    (syntactically valid) but was structurally corrupt could make
+    restore() raise, bypassing the "corrupt store must not block
+    setup" guarantee the load-failure branch already provides, and
+    aborting initialization entirely (no listener ever gets
+    subscribed -- battery-health tracking silently stops working for
+    that device) rather than gracefully starting fresh."""
+
+    def _make_manager(self, load_return):
+        mgr = object.__new__(MGR.BatteryHealthManager)
+        mgr.serial_number = "SNTEST"
+        mgr.hass = MagicMock()
+        mgr.coordinator = MagicMock()
+        mgr.coordinator.async_add_listener = MagicMock(return_value=lambda: None)
+        mgr.engine = BH.BatteryHealthEngine()
+        mgr._store = MagicMock()
+        mgr._store.async_load = AsyncMock(return_value=load_return)
+        return mgr
+
+    async def test_structurally_corrupt_but_loadable_store_does_not_abort_init(self):
+        """The core ICS-06 scenario: async_load() succeeds (no
+        exception), but the loaded data is structurally wrong in a way
+        that makes restore() itself raise -- the "segments" field is a
+        string instead of the dict restore() expects. Must not abort
+        initialization -- the listener must still get subscribed,
+        matching the same "corrupt store must not block setup"
+        guarantee the load-failure branch already provides."""
+        corrupt_data = {
+            "schema_version": BH.SCHEMA_VERSION,  # must match, or restore()
+                                                    # early-returns before
+                                                    # ever reaching the
+                                                    # vulnerable code path
+            "segments": "not_a_dict_at_all",
+        }
+        mgr = self._make_manager(corrupt_data)
+        await mgr.async_initialize()  # must not raise
+        mgr.coordinator.async_add_listener.assert_called_once()
+        self.assertIsNotNone(
+            mgr._unsub,
+            "the coordinator listener must still be subscribed after a "
+            "restore() failure -- otherwise battery-health tracking is "
+            "silently disabled for this device with no listener ever set",
+        )
+
+    async def test_engine_is_replaced_not_partially_mutated(self):
+        """A partial restore (some fields successfully overwritten
+        before the exception, others not reached) must not leave the
+        engine in an inconsistent mix -- the whole engine is discarded
+        and replaced with a genuinely fresh one, reusing its own
+        already-resolved .cfg."""
+        corrupt_data = {
+            "schema_version": BH.SCHEMA_VERSION,
+            "first_seen_ts": 123456.0,  # a field restore() sets successfully...
+            "segments": "not_a_dict_at_all",  # ...before this one raises
+        }
+        mgr = self._make_manager(corrupt_data)
+        original_engine = mgr.engine
+        await mgr.async_initialize()
+        self.assertIsNot(
+            mgr.engine, original_engine,
+            "the engine must be replaced entirely after a restore() "
+            "failure, not reused with only some of its fields "
+            "successfully overwritten by the corrupt data",
+        )
+        self.assertIsNone(
+            mgr.engine.first_seen_ts,
+            "the replacement engine must be genuinely fresh -- not "
+            "carrying over the one field the corrupt data DID manage "
+            "to set before restore() raised on a later one",
+        )
+
+    async def test_normal_valid_restore_still_works(self):
+        """Negative case: a genuinely valid, loadable store must still
+        restore correctly -- confirms the fix didn't make every restore
+        path start fresh regardless of validity."""
+        valid_data = {
+            "schema_version": BH.SCHEMA_VERSION,
+            "first_seen_ts": 999.0,
+            "held_subscores": {},
+            "learning_enabled": True,
+            "settling_events": 0,
+            "ceiling": {},
+            "segments": {},
+            "efficiency": {},
+            "balance": {},
+            "stress": {},
+            "charge_counter": {},
+            "discharge_counter": {},
+        }
+        mgr = self._make_manager(valid_data)
+        await mgr.async_initialize()
+        self.assertEqual(mgr.engine.first_seen_ts, 999.0)
 
 
 if __name__ == "__main__":

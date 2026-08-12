@@ -669,3 +669,64 @@ class TestPriorityAirtimeBudget(unittest.TestCase):
                     "traffic by type",
                 )
         asyncio.run(_go())
+
+
+# ── v2.0.3: ICS-09 -- priority is admission exemption, not lock ordering ────
+
+class TestICS09PriorityIsAdmissionExemptionNotLockOrdering(unittest.TestCase):
+    """ICS-09, external ICS audit -- confirmed: 'priority' only ever
+    meant admission exemption (bypassing queue-depth shedding), never
+    true lock-acquisition ordering -- every request, priority or not,
+    waits on the same plain, FIFO asyncio.Lock once admitted. This test
+    proves the behavioural claim directly, not just checks the
+    docstring wording: a priority request submitted AFTER two normal
+    requests are already queued on the lock must still be serviced
+    after them, not ahead of them."""
+
+    def test_priority_request_does_not_jump_already_queued_normal_requests(self):
+        async def _go():
+            g = _fresh_guard()
+            service_order: list[str] = []
+            first_holder_may_release = asyncio.Event()
+
+            async def _hold_then_release(name: str):
+                async with g.request(label=name):
+                    service_order.append(name)
+                    if name == "holder":
+                        await first_holder_may_release.wait()
+
+            # "holder" acquires first and holds the lock, forcing
+            # everything else to genuinely queue rather than race.
+            holder_task = asyncio.create_task(_hold_then_release("holder"))
+            await asyncio.sleep(0)  # let holder actually acquire the lock
+
+            # Two NORMAL requests start queuing on the lock while it's held.
+            normal1_task = asyncio.create_task(_hold_then_release("normal1"))
+            normal2_task = asyncio.create_task(_hold_then_release("normal2"))
+            await asyncio.sleep(0)  # let both genuinely start waiting on the lock
+
+            # A PRIORITY request arrives AFTER the two normal ones are
+            # already queued -- the exact scenario ICS-09 describes.
+            async def _priority_request():
+                async with g.request(priority=True, label="priority"):
+                    service_order.append("priority")
+
+            priority_task = asyncio.create_task(_priority_request())
+            await asyncio.sleep(0)
+
+            first_holder_may_release.set()
+            await asyncio.gather(holder_task, normal1_task, normal2_task, priority_task)
+
+            self.assertEqual(service_order[0], "holder")
+            self.assertEqual(
+                service_order[1:3], ["normal1", "normal2"],
+                "the two already-queued normal requests must be serviced "
+                "before the priority one that arrived after them -- "
+                "priority=True does not grant lock-acquisition priority, "
+                "only admission exemption from queue-depth shedding "
+                "(this is the exact claim ICS-09 identified as "
+                "undocumented, now proven directly rather than assumed)",
+            )
+            self.assertEqual(service_order[3], "priority")
+
+        asyncio.run(_go())

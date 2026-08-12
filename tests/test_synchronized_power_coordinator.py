@@ -819,3 +819,87 @@ class TestAR9CacheHitRecording:
             result = await coord._async_update_data()
         assert result.inv1_pv_power == 3000
         coord._telemetry.record_cache_hit.assert_called_once_with()
+
+
+# ── v2.0.3: ICS-01 -- fallback temporal alignment (external ICS audit) ──────
+
+class TestICS01FallbackTemporalAlignment:
+    """ICS-01, external ICS audit -- confirmed: the fallback path
+    accepted any cache value with Quality.GOOD, without checking its age
+    against the other values being combined into the same
+    SynchronizedPowerData result. sample_span_ms only measured when
+    _read_one() happened to be CALLED for each value, not when each
+    value was actually captured -- for a cache hit those are different
+    moments, and the gap was invisible to the metric. A composite could
+    therefore silently combine a several-seconds-old cached value with a
+    just-now physical read and still report a tight sample_span_ms."""
+
+    @pytest.mark.asyncio
+    async def test_aged_cache_value_combined_with_fresh_read_is_flagged_uncertain(self):
+        """The core ICS-01 scenario: one value served from a cache entry
+        old enough to exceed the alignment tolerance, combined with
+        another value from a fresh physical read. Must now be flagged
+        is_temporally_uncertain=True -- confirmed false (never flagged)
+        before this fix, regardless of how old the cache value actually
+        was, since age was never consulted at all."""
+        inv1_cache = _FakeCache()
+        # 5.0s -- clearly past SYNC_POWER_CACHE_ALIGNMENT_TOLERANCE_S (3.0s).
+        inv1_cache.set(rn.INPUT_POWER, quality=_Q.GOOD, age=5.0, value=3000)
+        coord = _make_coordinator_with_caches(
+            inv1_cache=inv1_cache, meter_cache=None,  # meter has no cache -> physical read
+            has_meter=True, has_battery=False,
+        )
+        # Force the full aligned shortcut to miss, so the dedicated-read
+        # fallback (MOD-01's per-value check) is what actually serves
+        # the cached value.
+        with patch.object(sync_mod, "SYNC_POWER_CACHE_ALIGNMENT_TOLERANCE_S", -1.0):
+            shortcut_missed = coord._try_cache_shortcut() is None
+        assert shortcut_missed, "test setup check: shortcut must miss for this test to be meaningful"
+
+        result = await coord._async_update_data()
+        assert result.inv1_pv_power == 3000  # served from the aged cache
+        assert result.grid_power == -500.0  # served from a fresh physical read
+        assert result.is_temporally_uncertain is True, (
+            "a 5.0s-old cached value combined with a fresh physical read "
+            "must be flagged uncertain -- this is exactly the composite "
+            "ICS-01 describes"
+        )
+        assert result.sample_span_ms is not None
+        assert result.sample_span_ms >= 4500, (
+            f"sample_span_ms ({result.sample_span_ms}) must reflect the "
+            f"cached value's real ~5s age, not just the few-millisecond "
+            f"spread between when _read_one() happened to be called for "
+            f"each value (the pre-fix behaviour)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_two_fresh_physical_reads_are_not_flagged_uncertain(self):
+        """Negative case: two values from physical reads completing
+        close together in wall-clock time must NOT be flagged uncertain
+        -- confirms the fix didn't make the check overly conservative."""
+        coord = _make_coordinator_with_caches(
+            inv1_cache=None, meter_cache=None, has_meter=True, has_battery=False,
+        )
+        result = await coord._async_update_data()
+        assert result.is_temporally_uncertain is False
+        assert result.sample_span_ms is not None
+        assert result.sample_span_ms < 1000, "two back-to-back physical reads should be well under 1s apart"
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_alone_within_tolerance_is_not_flagged(self):
+        """A cache value young enough to be within tolerance, combined
+        with a fresh read, must NOT be flagged -- confirms the fix
+        checks the actual age against the actual tolerance, not just
+        "any cache use at all"."""
+        inv1_cache = _FakeCache()
+        inv1_cache.set(rn.INPUT_POWER, quality=_Q.GOOD, age=0.5, value=3000)
+        coord = _make_coordinator_with_caches(
+            inv1_cache=inv1_cache, meter_cache=None, has_meter=True, has_battery=False,
+        )
+        with patch.object(sync_mod, "SYNC_POWER_CACHE_ALIGNMENT_TOLERANCE_S", -1.0):
+            assert coord._try_cache_shortcut() is None
+        result = await coord._async_update_data()
+        assert result.is_temporally_uncertain is False, (
+            "a 0.5s-old cached value combined with a fresh read is well "
+            "within the 3.0s tolerance and must not be flagged"
+        )

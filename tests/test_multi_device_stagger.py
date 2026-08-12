@@ -43,7 +43,15 @@ _COORDINATOR_START_DELAYS = {
     # v2.0.0b (MOD-03, external ICS audit)
     "sync_power":    timedelta(seconds=16),
 }
-_MULTI_DEVICE_STAGGER_STRIDE = timedelta(seconds=5)
+# v2.0.3 (ICS-04, external ICS audit -- confirmed): was 5s, smaller than
+# the 16s span _COORDINATOR_START_DELAYS' own five offsets already
+# occupy -- see __init__.py's own comment on this same constant for the
+# full reasoning. Reproduced here per this file's own established
+# convention (see module docstring); kept in sync with the real value,
+# and test_stride_exceeds_max_offset_in_the_real_source below checks the
+# REAL source directly, not just this reproduction, so the two cannot
+# silently drift apart again.
+_MULTI_DEVICE_STAGGER_STRIDE = timedelta(seconds=20)
 
 
 def _staggered_start_delay(kind: str, device_index: int) -> timedelta:
@@ -81,6 +89,60 @@ class TestStaggeredStartDelay(unittest.TestCase):
         field capture; the stride must comfortably exceed that with margin,
         or the fix wouldn't actually separate the bursts in practice."""
         self.assertGreaterEqual(_MULTI_DEVICE_STAGGER_STRIDE.total_seconds(), 2.0)
+
+    def test_no_cross_kind_collision_across_three_devices(self):
+        """ICS-03, external ICS audit -- confirmed: the ORIGINAL 5s stride
+        was large enough to clear the same-type collision the tests above
+        already check, but too small to prevent a DIFFERENT coordinator
+        TYPE on a later device from landing inside an earlier device's
+        own window -- e.g. device 2's "main" (0 + 2*5 = 10s) landing
+        exactly on device 0's own "configuration" (10s) with the old 5s
+        stride. Checked directly: every (device, kind) pair across four
+        devices must get a genuinely unique offset, not just "unique
+        among same-kind pairs"."""
+        seen: dict[float, tuple[int, str]] = {}
+        for device_index in range(4):
+            for kind in _COORDINATOR_START_DELAYS:
+                delay = _staggered_start_delay(kind, device_index).total_seconds()
+                if delay in seen:
+                    other_device, other_kind = seen[delay]
+                    self.fail(
+                        f"collision at {delay}s: device {device_index}'s "
+                        f"'{kind}' and device {other_device}'s "
+                        f"'{other_kind}' both land here -- the exact cross-"
+                        f"kind collision ICS-04 identified"
+                    )
+                seen[delay] = (device_index, kind)
+
+    def test_stride_exceeds_max_offset_in_the_real_source(self):
+        """The actual guarantee (stride > max base offset) checked
+        against the REAL __init__.py source directly, not just this
+        file's own reproduction above -- confirms the two cannot
+        silently drift apart and reopen ICS-04 without this test
+        catching it."""
+        source = _INIT_SRC.read_text()
+        stride_idx = source.find("_MULTI_DEVICE_STAGGER_STRIDE = timedelta(seconds=")
+        assert stride_idx > -1, "_MULTI_DEVICE_STAGGER_STRIDE not found in __init__.py"
+        stride_line = source[stride_idx: source.find(")", stride_idx) + 1]
+        real_stride = float(
+            stride_line.split("seconds=")[1].rstrip(")")
+        )
+        idx = source.find("_COORDINATOR_START_DELAYS = {")
+        end = source.find("\n}", idx)
+        table_src = source[idx:end]
+        offsets = [
+            float(m) for m in __import__("re").findall(
+                r"timedelta\(seconds=(\d+(?:\.\d+)?)\)", table_src,
+            )
+        ]
+        assert offsets, "could not parse any offsets from _COORDINATOR_START_DELAYS"
+        self.assertGreater(
+            real_stride, max(offsets),
+            f"stride ({real_stride}s) must exceed the maximum base offset "
+            f"({max(offsets)}s) in the REAL source, or a cross-kind "
+            f"collision (ICS-04) becomes possible again for some device "
+            f"count",
+        )
 
     def test_sync_power_slot_comes_after_every_other_coordinator(self):
         """v2.0.0b (MOD-03, external ICS audit -- confirmed): SyncPower

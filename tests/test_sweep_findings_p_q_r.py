@@ -37,6 +37,7 @@ _COORD_SRC = pathlib.Path(__file__).parent.parent / "update_coordinator.py"
 _SELECT_SRC = pathlib.Path(__file__).parent.parent / "select.py"
 _BUTTON_SRC = pathlib.Path(__file__).parent.parent / "button.py"
 _SERVICES_SRC = pathlib.Path(__file__).parent.parent / "services.py"
+_INIT_SRC = pathlib.Path(__file__).parent.parent / "__init__.py"
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -514,6 +515,247 @@ class TestServiceLockingStaticChecks(unittest.TestCase):
             f"expected to find all {len(write_function_names)} write "
             f"functions, found {len(found_names)}: missing "
             f"{write_function_names - found_names}"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ICS-07 — fixed charge/discharge period semantic validation (external ICS audit)
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestICS07PeriodSemanticValidation(unittest.TestCase):
+    """ICS-07, external ICS audit -- confirmed: only character-level
+    syntax (HH:MM format, integer wattage, line count) was validated --
+    nothing checked whether the resulting periods made sense together.
+    Checked directly against the vendor huawei_solar package's own
+    ChargeDischargePeriodRegisters.encode() before writing the fix: it
+    only validates the maximum period COUNT, nothing about ordering or
+    overlap either -- confirming nothing upstream of the device itself
+    would have caught this.
+
+    services.py is a heavy file (per this project's established
+    convention -- see test_multi_device_stagger.py's own docstring for
+    the same trade-off applied to __init__.py), so the validation logic
+    is reproduced here for direct behavioural testing, with a source-
+    level check confirming the real function is genuinely called before
+    the write.
+    """
+
+    @staticmethod
+    def _validate(periods):
+        """Reproduces services.py's own _validate_fixed_charge_periods()
+        exactly -- see that function's own docstring for the full
+        reasoning, including why this mirrors the vendor package's own
+        validation algorithm for the sibling TOU-period register types."""
+        for start_time, end_time, _power in periods:
+            if start_time >= end_time:
+                raise ValueError(f"Invalid period: start must be strictly before end")
+        sorted_periods = sorted(periods, key=lambda p: p[0])
+        for prev, current in zip(sorted_periods, sorted_periods[1:]):
+            prev_start, prev_end, _ = prev
+            cur_start, cur_end, _ = current
+            if (
+                prev_start <= cur_start < prev_end
+                or prev_start < cur_end <= prev_end
+            ):
+                raise ValueError("Overlapping periods")
+
+    def test_start_after_end_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self._validate([(9 * 60, 8 * 60, 1000)])  # 09:00-08:00
+
+    def test_start_equal_end_is_rejected(self):
+        """Zero-length period -- also invalid, same check catches it."""
+        with self.assertRaises(ValueError):
+            self._validate([(9 * 60, 9 * 60, 1000)])
+
+    def test_midnight_wraparound_is_rejected(self):
+        """23:00-01:00 -- the report's own cited example. Confirmed
+        against the vendor package's own sibling TOU-period validation
+        (register_definitions/periods.py) before deciding this: that
+        code rejects start >= end unconditionally too, with no
+        wraparound special-case -- this is not a guess about device
+        semantics, it matches how the SAME vendor package already
+        treats this exact family of period types elsewhere."""
+        with self.assertRaises(ValueError):
+            self._validate([(23 * 60, 1 * 60, 1000)])
+
+    def test_overlapping_periods_are_rejected(self):
+        with self.assertRaises(ValueError):
+            self._validate([
+                (8 * 60, 12 * 60, 1000),   # 08:00-12:00
+                (10 * 60, 14 * 60, 1000),  # 10:00-14:00, overlaps the above
+            ])
+
+    def test_duplicate_periods_are_rejected_as_a_special_case_of_overlap(self):
+        with self.assertRaises(ValueError):
+            self._validate([
+                (8 * 60, 12 * 60, 1000),
+                (8 * 60, 12 * 60, 2000),  # identical times, different power
+            ])
+
+    def test_adjacent_non_overlapping_periods_are_accepted(self):
+        """Negative case: back-to-back periods (one ends exactly when the
+        next starts) must NOT be flagged -- confirms the overlap check
+        isn't overly conservative."""
+        self._validate([
+            (8 * 60, 12 * 60, 1000),   # 08:00-12:00
+            (12 * 60, 16 * 60, 1000),  # 12:00-16:00, starts exactly when the first ends
+        ])
+
+    def test_genuinely_valid_periods_are_accepted(self):
+        self._validate([
+            (0, 6 * 60, 1000),
+            (18 * 60, 23 * 60 + 59, 1000),
+        ])
+
+    def test_order_of_input_does_not_matter(self):
+        """Overlap detection must not depend on periods already being
+        sorted -- confirms the function sorts internally."""
+        with self.assertRaises(ValueError):
+            self._validate([
+                (10 * 60, 14 * 60, 1000),  # given out of chronological order
+                (8 * 60, 12 * 60, 1000),
+            ])
+
+    # ── source-level: the real function is actually wired in ──────────
+
+    def test_validation_function_exists_in_real_source(self):
+        source = _SERVICES_SRC.read_text()
+        assert "def _validate_fixed_charge_periods(" in source
+
+    def test_set_fixed_charge_periods_calls_validation_before_the_write(self):
+        source = _SERVICES_SRC.read_text()
+        idx = source.find("async def set_fixed_charge_periods(")
+        end = source.find("\nasync def ", idx + 10)
+        body = source[idx: end if end > -1 else idx + 2000]
+        validate_idx = body.find("_validate_fixed_charge_periods(")
+        write_idx = body.find("await _set_and_invalidate(")
+        assert validate_idx > -1, "set_fixed_charge_periods does not call the validation function"
+        assert write_idx > -1
+        assert validate_idx < write_idx, (
+            "validation must happen BEFORE the write, not after -- "
+            "otherwise an invalid schedule could still reach the device "
+            "before being rejected"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ICS-10 — service registration lifecycle (external ICS audit)
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestICS10ServiceRegistrationLifecycle(unittest.TestCase):
+    """ICS-10, external ICS audit -- confirmed: services registered on
+    every setup, never unregistered anywhere -- staying registered in
+    Home Assistant's own service registry indefinitely, even with zero
+    huawei_solar entries left loaded.
+
+    services.py is a heavy file (per this project's established
+    convention), so the reference-counting logic is reproduced here for
+    direct behavioural testing, with source-level checks confirming the
+    real functions are correctly wired together.
+    """
+
+    class _FakeHassServices:
+        """Minimal stand-in for hass.services -- just enough to observe
+        which service names get removed, and how many times."""
+        def __init__(self):
+            self.removed: list[str] = []
+
+        def async_remove(self, _domain, service_name):
+            self.removed.append(service_name)
+
+    @staticmethod
+    def _make_unload_services(entries_with_services, all_service_names):
+        """Reproduces services.py's own async_unload_services() exactly
+        -- see that function's own docstring for the full reasoning."""
+        def _unload(hass_services, entry_id):
+            entries_with_services.discard(entry_id)
+            if entries_with_services:
+                return
+            for service_name in all_service_names:
+                hass_services.async_remove("huawei_solar", service_name)
+        return _unload
+
+    def test_single_entry_unregisters_on_its_own_unload(self):
+        entries = {"entry_a"}
+        unload = self._make_unload_services(entries, ["forcible_charge"])
+        hass_services = self._FakeHassServices()
+        unload(hass_services, "entry_a")
+        self.assertEqual(hass_services.removed, ["forcible_charge"])
+
+    def test_second_of_two_entries_does_not_unregister_while_first_remains(self):
+        """The core ICS-10 reference-counting claim: with two entries
+        both needing services, unloading only one must NOT unregister
+        anything -- the other entry still needs them."""
+        entries = {"entry_a", "entry_b"}
+        unload = self._make_unload_services(entries, ["forcible_charge"])
+        hass_services = self._FakeHassServices()
+        unload(hass_services, "entry_a")
+        self.assertEqual(
+            hass_services.removed, [],
+            "services must stay registered while entry_b still needs them",
+        )
+        self.assertEqual(entries, {"entry_b"})
+
+    def test_unregisters_only_after_the_last_entry_unloads(self):
+        entries = {"entry_a", "entry_b"}
+        unload = self._make_unload_services(entries, ["forcible_charge"])
+        hass_services = self._FakeHassServices()
+        unload(hass_services, "entry_a")
+        self.assertEqual(hass_services.removed, [])
+        unload(hass_services, "entry_b")
+        self.assertEqual(
+            hass_services.removed, ["forcible_charge"],
+            "services must be unregistered once the LAST entry needing "
+            "them has unloaded",
+        )
+
+    def test_unloading_an_entry_that_never_registered_services_is_safe(self):
+        """An entry that never had CONF_ENABLE_PARAMETER_CONFIGURATION
+        enabled (never added to entries_with_services in the first
+        place) must not crash or falsely trigger unregistration of
+        services another, real entry still needs."""
+        entries = {"entry_a"}  # only entry_a ever registered
+        unload = self._make_unload_services(entries, ["forcible_charge"])
+        hass_services = self._FakeHassServices()
+        unload(hass_services, "entry_never_had_services")  # must not raise
+        self.assertEqual(
+            hass_services.removed, [],
+            "entry_a's services must remain registered -- the unloading "
+            "entry was never one of the entries that needed them",
+        )
+
+    # ── source-level: the real functions are correctly wired together ──
+
+    def test_async_unload_services_exists_and_unregisters_via_discard(self):
+        source = _SERVICES_SRC.read_text()
+        idx = source.find("async def async_unload_services(")
+        assert idx > -1, "async_unload_services not found in services.py"
+        end = source.find("\nasync def ", idx + 10)
+        body = source[idx: end if end > -1 else idx + 1500]
+        assert "_entries_with_services.discard(" in body, (
+            "must use discard(), not remove() -- an entry that never "
+            "registered services must not crash unload"
+        )
+        assert "hass.services.async_remove(" in body
+
+    def test_async_setup_entry_import_and_unload_wiring(self):
+        """Confirms __init__.py actually imports and calls
+        async_unload_services() during unload -- not just that the
+        function exists in services.py, unreachable from anywhere."""
+        source = _INIT_SRC.read_text()
+        assert "async_unload_services" in source, (
+            "__init__.py does not import or call async_unload_services "
+            "at all -- the fix exists in services.py but is never "
+            "actually invoked"
+        )
+        idx = source.find("async def async_unload_entry(")
+        assert idx > -1
+        end = source.find("\nasync def ", idx + 10)
+        body = source[idx: end if end > -1 else idx + 3000]
+        assert "await async_unload_services(hass, entry)" in body, (
+            "async_unload_entry() must actually await "
+            "async_unload_services(), not just import the name"
         )
 
 

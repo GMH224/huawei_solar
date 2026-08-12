@@ -46,15 +46,39 @@ BD = _load("bus_diagnostics")
 
 
 class _FakeHass:
-    """Minimal hass: runs executor jobs inline so writes are observable."""
+    """Hass fake with genuine async semantics.
 
-    def __init__(self, base: str):
+    v2.0.3 (ICS-08, external ICS audit -- confirmed, the same defect as
+    TEL-005 already closed in test_telemetry_capture.py): the original
+    version of this fake ran executor jobs INLINE, synchronously --
+    structurally unable to exercise a pending executor job, a late
+    failure, or a teardown-during-write race. async_add_executor_job is
+    now genuinely awaitable (and independently controllable per test via
+    executor_delay/executor_error), and async_create_task genuinely
+    schedules a real asyncio.Task rather than running the coroutine to
+    completion immediately.
+    """
+
+    def __init__(
+        self, base: str, *,
+        executor_delay: float = 0.0,
+        executor_error: Exception | None = None,
+    ):
         self.config = types.SimpleNamespace(path=lambda *p: os.path.join(base, *p))
         self.jobs = 0
+        self.executor_delay = executor_delay
+        self.executor_error = executor_error
 
-    def async_add_executor_job(self, fn, *args):
+    async def async_add_executor_job(self, fn, *args):
         self.jobs += 1
-        fn(*args)
+        if self.executor_delay:
+            await asyncio.sleep(self.executor_delay)
+        if self.executor_error is not None:
+            raise self.executor_error
+        return fn(*args)
+
+    def async_create_task(self, coro):
+        return asyncio.ensure_future(coro)
 
 
 class TestCaptureDisabledByDefault(unittest.TestCase):
@@ -85,7 +109,7 @@ class TestCaptureDisabledByDefault(unittest.TestCase):
         self.assertFalse(fresh.enabled)
 
 
-class TestFlushRateLimit(unittest.TestCase):
+class TestFlushRateLimit(unittest.IsolatedAsyncioTestCase):
     """The first flush must never be rate-limited.
 
     REGRESSION: `_last_flush` was initialised to 0.0, which the rate-limit
@@ -104,26 +128,32 @@ class TestFlushRateLimit(unittest.TestCase):
         d = BD.BusDiagnostics(_FakeHass(self.dir), "e")
         self.assertIsNone(d._last_flush)
 
-    def test_first_flush_happens_even_at_low_monotonic(self):
+    async def test_first_flush_happens_even_at_low_monotonic(self):
         hass = _FakeHass(self.dir)
         d = BD.BusDiagnostics(hass, "e")
         d.set_enabled(True)
         for _ in range(BD.FLUSH_THRESHOLD):
             d.record(endpoint="e", label="c", wait_ms=1, service_ms=2,
                      queue_depth=0, outcome="ok")
+        self.assertIsNotNone(d._pending_write)
+        await d._pending_write
         self.assertGreaterEqual(hass.jobs, 1, "first flush must not be suppressed")
 
-    def test_second_flush_is_rate_limited(self):
+    async def test_second_flush_is_rate_limited(self):
         hass = _FakeHass(self.dir)
         d = BD.BusDiagnostics(hass, "e")
         d.set_enabled(True)
-        for _ in range(BD.FLUSH_THRESHOLD * 2):
+        for _ in range(BD.FLUSH_THRESHOLD):
+            d.record(endpoint="e", label="c", wait_ms=1, service_ms=2,
+                     queue_depth=0, outcome="ok")
+        await d._pending_write
+        for _ in range(BD.FLUSH_THRESHOLD):
             d.record(endpoint="e", label="c", wait_ms=1, service_ms=2,
                      queue_depth=0, outcome="ok")
         self.assertEqual(hass.jobs, 1, "a burst must not cause continuous I/O")
 
 
-class TestCaptureBounded(unittest.TestCase):
+class TestCaptureBounded(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         BD.BusDiagnostics.clear_registry()
         self.dir = tempfile.mkdtemp()
@@ -140,13 +170,14 @@ class TestCaptureBounded(unittest.TestCase):
         self.assertLessEqual(len(d._buffer), BD.MAX_BUFFERED_RECORDS)
         self.assertGreater(d.records_dropped, 0)
 
-    def test_flush_writes_jsonl(self):
+    async def test_flush_writes_jsonl(self):
         hass = _FakeHass(self.dir)
         d = BD.BusDiagnostics(hass, "e")
         d.set_enabled(True)
         for _ in range(BD.FLUSH_THRESHOLD):
             d.record(endpoint="e", label="battery_coord", wait_ms=12.3,
                      service_ms=45.6, queue_depth=2, outcome="ok", registers=5)
+        await d._pending_write
         path = os.path.join(self.dir, BD._SUBDIR, f"bus_{d.tag}.jsonl")
         self.assertTrue(os.path.exists(path))
         lines = [json.loads(x) for x in open(path).read().splitlines()]
@@ -155,20 +186,19 @@ class TestCaptureBounded(unittest.TestCase):
         self.assertEqual(lines[0]["service_ms"], 45.6)
         self.assertEqual(lines[0]["regs"], 5)
 
-    def test_write_failure_does_not_raise(self):
+    async def test_write_failure_does_not_raise(self):
         """Diagnostics faults must cost diagnostics and nothing else."""
-        class _Boom(_FakeHass):
-            def async_add_executor_job(self, fn, *args):
-                raise OSError("disk gone")
-        d = BD.BusDiagnostics(_Boom(self.dir), "e")
+        hass = _FakeHass(self.dir, executor_error=OSError("disk gone"))
+        d = BD.BusDiagnostics(hass, "e")
         d.set_enabled(True)
         for _ in range(BD.FLUSH_THRESHOLD):
             d.record(endpoint="e", label="c", wait_ms=1, service_ms=2,
                      queue_depth=0, outcome="ok")
+        await d._pending_write  # must not raise
         self.assertGreater(d.write_errors, 0)
 
 
-class TestConfidentiality(unittest.TestCase):
+class TestConfidentiality(unittest.IsolatedAsyncioTestCase):
     def test_endpoint_is_pseudonymised(self):
         """A capture must be shareable without exposing the installation."""
         endpoint = "192.168.1.55:502"
@@ -214,7 +244,7 @@ class TestConfidentiality(unittest.TestCase):
         """
         self.assertNotIn("HV9990001111", BD.sanitise_label("HV9990001111_x"))
 
-    def test_written_records_contain_no_serial(self):
+    async def test_written_records_contain_no_serial(self):
         dirpath = tempfile.mkdtemp()
         hass = _FakeHass(dirpath)
         d = BD.BusDiagnostics(hass, "192.168.1.55:502")
@@ -223,10 +253,11 @@ class TestConfidentiality(unittest.TestCase):
             d.record(endpoint="192.168.1.55:502",
                      label="HV9990001111_battery_data_update_coordinator",
                      wait_ms=1, service_ms=2, queue_depth=0, outcome="ok")
+        await d._pending_write
         blob = open(os.path.join(dirpath, BD._SUBDIR, f"bus_{d.tag}.jsonl")).read()
         self.assertNotIn("HV9990001111", blob)
 
-    def test_records_contain_no_endpoint_or_serial(self):
+    async def test_records_contain_no_endpoint_or_serial(self):
         dirpath = tempfile.mkdtemp()
         hass = _FakeHass(dirpath)
         d = BD.BusDiagnostics(hass, "192.168.1.55:502")
@@ -234,6 +265,7 @@ class TestConfidentiality(unittest.TestCase):
         for _ in range(BD.FLUSH_THRESHOLD):
             d.record(endpoint="192.168.1.55:502", label="inverter_data",
                      wait_ms=1, service_ms=2, queue_depth=0, outcome="ok")
+        await d._pending_write
         blob = open(os.path.join(dirpath, BD._SUBDIR, f"bus_{d.tag}.jsonl")).read()
         self.assertNotIn("192.168.1.55", blob)
         self.assertNotIn("502", blob.replace('"service_ms":2', ''))

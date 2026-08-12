@@ -241,6 +241,15 @@ class TestWriteTimeoutAndSequenceAtomicity:
         "set_zero_power_grid_connection",
         "set_maximum_feed_grid_power",
         "set_maximum_feed_grid_power_percentage",
+        # v2.0.3 (ICS-11, external ICS audit -- confirmed): these two SOC-
+        # targeted variants were missing from this list entirely -- which
+        # is precisely why MOD-19's original fix, and this exact test,
+        # never caught that they still used the old, per-call
+        # _set_and_invalidate() pattern. The gap wasn't in the fix logic
+        # itself; it was in this list not naming every function that
+        # needed it.
+        "forcible_charge_soc",
+        "forcible_discharge_soc",
     ]
 
     def _function_body(self, name: str) -> str:
