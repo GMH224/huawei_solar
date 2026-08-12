@@ -634,6 +634,13 @@ class _FakeCapture:
             self.cancel_periodic()
             self.cancel_periodic = None
 
+    async def async_disable(self) -> None:
+        # v2.0.2 (TEL-002): the switch entity now calls this, not
+        # set_enabled(False) directly -- same effect here (this fake has
+        # no real flush to await), but async so the entity's own
+        # `await self._capture.async_disable()` call works unchanged.
+        self.set_enabled(False)
+
     def record_snapshot(self, snapshot: dict) -> None:
         self.snapshots.append(snapshot)
 

@@ -1086,3 +1086,60 @@ class TestDirtyFlagOrderingFix(unittest.IsolatedAsyncioTestCase):
         await ctrl._async_save()
         ctrl._store.async_save.assert_awaited_once()
         self.assertFalse(ctrl._dirty)
+
+
+# ── v2.0.1: snapshot() -- confirmed via a genuine production traceback ──────
+
+class TestSnapshotPublicMethod(unittest.TestCase):
+    """v2.0.1 (confirmed via a genuine production traceback, not a static
+    audit finding this time): this method existed as `_snapshot()`
+    (private), but every external caller (diagnostics.py,
+    telemetry_capture.py) called it as `.snapshot()` -- the public name.
+    Every one of those calls raised AttributeError in production, every
+    ~30 seconds once the telemetry capture switch was enabled, and on
+    every attempt to use Home Assistant's own "Download Diagnostics"
+    feature for this integration.
+
+    No test anywhere in this project's whole suite ever called
+    .snapshot() at all before this -- not test_entities.py's switch
+    tests (which never registered a real controller for their test
+    serial, so the lookup silently returned None and the call was never
+    reached), and not this file either. This test exists specifically to
+    close that gap directly, at the source, not just at one of its
+    callers."""
+
+    def test_snapshot_is_callable_and_returns_the_expected_keys(self):
+        ctrl = _make_ctrl()
+        snap = ctrl.snapshot()
+        for key in (
+            "poll_interval_s", "gap_ms", "timeout_s", "max_queue_depth",
+            "confidence_pct", "slot_failure_rate_pct", "in_transition",
+            "days_of_data", "shed_count", "admission_timeout_count",
+            "bus_occupancy_pct",
+        ):
+            self.assertIn(key, snap, f"snapshot() is missing expected key '{key}'")
+
+    def test_private_name_no_longer_exists(self):
+        """The rename must be complete, not a case where both names
+        happen to work -- confirms the old name is genuinely gone,
+        not just that the new one was added alongside it."""
+        ctrl = _make_ctrl()
+        self.assertFalse(hasattr(ctrl, "_snapshot"))
+
+    def test_internal_callers_use_the_new_public_name(self):
+        """_push_to_listeners() and the diagnostic sensor entity's
+        async_added_to_hass() both called the private name before this
+        fix -- checked directly at the source level that both were
+        updated, not just the external callers this bug was actually
+        discovered through."""
+        source = pathlib.Path(_MOD.__file__).read_text()
+        self.assertNotIn(
+            "self._snapshot()", source,
+            "an internal caller is still using the old private name",
+        )
+        self.assertNotIn(
+            "._controller._snapshot()", source,
+            "the diagnostic sensor entity is still using the old "
+            "private name",
+        )
+        self.assertIn("self.snapshot()", source)
