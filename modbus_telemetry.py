@@ -211,8 +211,32 @@ class ModbusTelemetry:
             if self._batch_sizes
             else 0.0
         )
+        # v2.0.3 FIX (F-03, external ICS audit -- confirmed, with exact
+        # numbers matched against a real telemetry capture: 24 timeouts,
+        # 24 total_failures, yet failure_rate_percent: 0.0 for one
+        # device; 7/7/0.0 for another): record_timeout() (above) always
+        # increments total_failures (the lifetime counter) but only ever
+        # appends to self._timeouts, never self._failures -- so this
+        # rolling, windowed rate was silently blind to any failure
+        # pattern that happened to be all timeouts, exactly the case
+        # both devices in that real capture were in. failure_rate_percent
+        # itself is deliberately left with its EXISTING meaning (non-
+        # timeout failures only) rather than silently redefined to
+        # include timeouts -- per the audit's own recommendation, and
+        # consistent with this project's own established discipline
+        # elsewhere (v2.0.0a F16 and others) of never changing an
+        # existing field's semantics out from under whatever already
+        # consumes it. The blind spot is closed instead by adding two
+        # new, explicitly-named fields that were never ambiguous about
+        # what they measure.
         failure_rate = (
             round(fail_ph / req_ph * 100, 1) if req_ph else 0.0
+        )
+        timeout_rate = (
+            round(to_ph / req_ph * 100, 1) if req_ph else 0.0
+        )
+        overall_failed_attempt_rate = (
+            round((fail_ph + to_ph) / req_ph * 100, 1) if req_ph else 0.0
         )
 
         snap = {
@@ -221,6 +245,8 @@ class ModbusTelemetry:
             "timeouts_per_hour": to_ph,
             "cache_hits_per_hour": cache_ph,
             "failure_rate_percent": failure_rate,
+            "timeout_rate_percent": timeout_rate,
+            "overall_failed_attempt_rate_percent": overall_failed_attempt_rate,
             "avg_batch_size": avg_batch,
             "total_requests": self.total_requests,
             "total_failures": self.total_failures,

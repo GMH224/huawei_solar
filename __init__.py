@@ -490,8 +490,31 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
                     await asyncio.sleep(
                         _staggered_start_delay("sync_power", 0).total_seconds()
                     )
+                    # v2.0.3 FIX (F-02, external ICS audit -- confirmed via a
+                    # genuine production traceback): this used to call
+                    # coord.async_config_entry_first_refresh() -- but that
+                    # API's own contract requires the config entry to still
+                    # be in ConfigEntryState.SETUP_IN_PROGRESS, and this
+                    # coroutine, by design (see the comment above this
+                    # function), only ever runs AFTER async_setup_entry()
+                    # has already returned and the entry has transitioned to
+                    # LOADED. The call was therefore destined to always
+                    # raise ConfigEntryError from the moment the v2.0.0b
+                    # deferral was introduced -- confirmed directly from a
+                    # real HA log's own traceback, not just inferred from
+                    # source. async_request_refresh() is the correct,
+                    # ordinary post-setup refresh mechanism every other
+                    # coordinator in this integration already uses for its
+                    # own non-first polls; unlike
+                    # async_config_entry_first_refresh(), it does not raise
+                    # on failure at all (it records the failure on the
+                    # coordinator itself and notifies listeners) -- the
+                    # try/except below is kept regardless, as a defensive
+                    # measure consistent with this background task's own
+                    # "must never raise" contract, not because this call is
+                    # expected to need it.
                     try:
-                        await coord.async_config_entry_first_refresh()
+                        await coord.async_request_refresh()
                     except Exception:  # noqa: BLE001 — background task must not raise
                         _LOGGER.exception(
                             "SynchronizedPowerCoordinator: first refresh failed; "
