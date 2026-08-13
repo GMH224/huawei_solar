@@ -42,6 +42,8 @@ _COORDINATOR_START_DELAYS = {
     "configuration": timedelta(seconds=10),
     # v2.0.0b (MOD-03, external ICS audit)
     "sync_power":    timedelta(seconds=16),
+    # v2.0.7 (START-01, ICS quality audit -- confirmed)
+    "optimizer":     timedelta(seconds=18),
 }
 # v2.0.3 (ICS-04, external ICS audit -- confirmed): was 5s, smaller than
 # the 16s span _COORDINATOR_START_DELAYS' own five offsets already
@@ -146,16 +148,42 @@ class TestStaggeredStartDelay(unittest.TestCase):
 
     def test_sync_power_slot_comes_after_every_other_coordinator(self):
         """v2.0.0b (MOD-03, external ICS audit -- confirmed): SyncPower
-        must be positioned AFTER the other four coordinators' slots, not
-        merely present -- the whole point is giving their first polls a
-        real chance to populate the regular caches before SyncPower's own
-        (now cache-first, MOD-01) reads run."""
-        other_kinds = [k for k in _COORDINATOR_START_DELAYS if k != "sync_power"]
+        must be positioned AFTER the ORIGINAL four coordinators' slots
+        (main/power_meter/energy_storage/configuration), not merely
+        present -- the whole point is giving their first polls a real
+        chance to populate the regular caches before SyncPower's own
+        (now cache-first, MOD-01) reads run. Deliberately excludes
+        'optimizer' (added later, v2.0.7/START-01, positioned after
+        sync_power on purpose) -- this test's own claim was never about
+        being the single latest slot overall, only later than the four
+        it was originally reasoned against."""
+        original_four = {"main", "power_meter", "energy_storage", "configuration"}
         sync_power_delay = _staggered_start_delay("sync_power", 0)
-        for kind in other_kinds:
+        for kind in original_four:
             self.assertGreaterEqual(
                 sync_power_delay, _staggered_start_delay(kind, 0),
                 f"sync_power's stagger slot must not be earlier than "
+                f"'{kind}''s",
+            )
+
+    def test_optimizer_slot_exists_and_comes_after_every_other_coordinator(self):
+        """START-01 (ICS quality audit -- confirmed): the optimizer
+        coordinator previously had NO stagger slot at all -- as a sibling
+        (not subclass) of HuaweiSolarUpdateCoordinator, it never inherited
+        _start_delay, so its background first-refresh could fire at t=0
+        alongside the main inverter's own first poll. Must now have its
+        own slot, positioned no earlier than every other coordinator
+        type's, same reasoning as sync_power above."""
+        self.assertIn(
+            "optimizer", _COORDINATOR_START_DELAYS,
+            "optimizer must have its own entry in _COORDINATOR_START_DELAYS",
+        )
+        other_kinds = [k for k in _COORDINATOR_START_DELAYS if k != "optimizer"]
+        optimizer_delay = _staggered_start_delay("optimizer", 0)
+        for kind in other_kinds:
+            self.assertGreaterEqual(
+                optimizer_delay, _staggered_start_delay(kind, 0),
+                f"optimizer's stagger slot must not be earlier than "
                 f"'{kind}''s",
             )
 
@@ -203,6 +231,64 @@ class TestSyncPowerFirstRefreshIsStaggered(unittest.TestCase):
             '_staggered_start_delay("sync_power", 0)', body[sleep_idx: refresh_idx],
             "must sleep for the staggered sync_power delay specifically, "
             "not an arbitrary or hardcoded duration",
+        )
+
+
+# ── 3b. START-01: optimizer's first refresh actually sleeps before firing ──
+
+class TestOptimizerFirstRefreshIsStaggered(unittest.TestCase):
+    """START-01 (ICS quality audit -- confirmed): create_optimizer_update_
+    coordinator()'s _first_refresh() used to fire immediately, with no
+    stagger delay of its own -- the optimizer coordinator is a sibling,
+    not a subclass, of HuaweiSolarUpdateCoordinator, so it never inherited
+    the regular _start_delay mechanism at all."""
+
+    _UPDATE_COORD_SRC = pathlib.Path(__file__).parent.parent / "update_coordinator.py"
+
+    def test_optimizer_first_refresh_sleeps_before_the_actual_refresh(self):
+        source = self._UPDATE_COORD_SRC.read_text()
+        idx = source.find("async def create_optimizer_update_coordinator(")
+        assert idx > -1, "create_optimizer_update_coordinator not found in update_coordinator.py"
+        body = source[idx: idx + 4000]
+        sleep_idx = body.find("await asyncio.sleep(start_delay.total_seconds())")
+        refresh_idx = body.find("await coordinator.async_config_entry_first_refresh()")
+        self.assertGreater(
+            sleep_idx, -1, "no stagger sleep found -- START-01 has regressed",
+        )
+        self.assertGreater(refresh_idx, -1, "async_config_entry_first_refresh() call not found")
+        self.assertLess(
+            sleep_idx, refresh_idx,
+            "the stagger sleep must happen BEFORE the actual first refresh",
+        )
+        self.assertIn(
+            "start_delay: timedelta = timedelta(0)", body,
+            "create_optimizer_update_coordinator must accept a start_delay "
+            "parameter, matching the pattern used for the other four "
+            "coordinator types",
+        )
+
+    def test_call_site_passes_the_staggered_optimizer_delay(self):
+        source = _INIT_SRC.read_text()
+        idx = source.find("await create_optimizer_update_coordinator(")
+        assert idx > -1, "create_optimizer_update_coordinator call site not found in __init__.py"
+        depth = 0
+        i = idx + len("await create_optimizer_update_coordinator(") - 1
+        end = idx
+        while i < len(source):
+            if source[i] == "(":
+                depth += 1
+            elif source[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+            i += 1
+        call_src = source[idx:end]
+        self.assertIn(
+            'start_delay=_staggered_start_delay("optimizer", device_index)',
+            call_src,
+            "the real call site must pass a per-device staggered delay, "
+            "not omit start_delay or hardcode a constant",
         )
 
 

@@ -177,16 +177,84 @@ class TestQueueDepthAccounting(unittest.TestCase):
             self.assertEqual(g.queue_depth, 0)
         _run(_go())
 
-    def test_admission_timeout_does_not_fire_once_lock_is_already_held(self):
-        """A failure AFTER the lock was successfully acquired (e.g. during
-        the inter-request gap sleep) is a different situation entirely --
-        the device communication phase has effectively begun. Must not be
-        misclassified as an admission-phase timeout."""
+    def test_lock_acquired_and_released_cleanly_is_unaffected(self):
+        """Sanity: the ordinary happy path (lock acquired, gap honoured,
+        released cleanly, no exception at all) must be completely
+        unaffected by the MOD-03 fix below -- renamed from this test's
+        old name/docstring, which claimed lock-acquisition already marks
+        the end of the admission phase. That claim is exactly what
+        MOD-03 (ICS quality audit -- confirmed) corrects: the
+        inter-request gap sleep AFTER lock acquisition is still part of
+        admission, not device communication -- see the two tests below
+        for the actual behavioural proof."""
         async def _go():
             g = _fresh_guard()
             async with g.request():
                 pass  # lock acquired and released cleanly -- no exception at all
         _run(_go())  # sanity: the happy path is unaffected by this change
+
+    def test_adversarial_timeout_during_gap_sleep_is_admission_timeout(self):
+        """MOD-03 (ICS quality audit -- confirmed): a TimeoutError arising
+        AFTER the lock is acquired but WHILE still waiting out the
+        inter-request gap (device not yet contacted at all) must still be
+        reclassified as ModbusAdmissionTimeout -- not escape unclassified,
+        which the coordinator would then treat as a genuine device
+        timeout. Pre-fix, this check used `not lock_acquired`, which was
+        already False by this point in the sequence.
+
+        Directly patches the module's asyncio.sleep to raise TimeoutError
+        at the gap-wait call site, rather than relying on real outer-
+        cancellation timing: empirically, wrapping g.request() in an
+        outer asyncio.timeout() surfaces as CancelledError at this
+        method's own exception handler, not TimeoutError -- the
+        TimeoutError conversion happens at the OUTER context's own
+        boundary, past this method's own scope, so it can never be
+        observed as TimeoutError here via that specific mechanism. This
+        test instead verifies the method's OWN classification logic in
+        isolation: GIVEN a TimeoutError at this point (from whatever
+        source), is it correctly attributed to admission, not device
+        communication -- which is the actual, narrower guarantee
+        _t_admitted vs lock_acquired changes.
+        """
+        ModbusAdmissionTimeout = _MOD.ModbusAdmissionTimeout
+
+        async def _raise_timeout(_wait):
+            raise TimeoutError("simulated timeout during gap wait")
+
+        async def _go():
+            g = _fresh_guard()
+            g._last_request_end = time.monotonic()
+            g._effective_gap = 1.0  # forces the gap-wait branch to run
+            with patch.object(_MOD.asyncio, "sleep", _raise_timeout):
+                with self.assertRaises(ModbusAdmissionTimeout):
+                    async with g.request():
+                        pass  # never reached
+        _run(_go())
+
+    def test_timeout_after_admission_fully_completes_is_not_reclassified(self):
+        """Negative case: once admission is genuinely complete (lock held
+        AND gap satisfied, self._t_admitted set), a subsequent failure is
+        real device-communication territory and must NOT be turned into
+        ModbusAdmissionTimeout -- confirms the fix narrowed to the actual
+        admission window, not "anytime after entering request()"."""
+        ModbusAdmissionTimeout = _MOD.ModbusAdmissionTimeout
+
+        async def _go():
+            g = _fresh_guard()
+            # Gap already satisfied (elapsed >> effective_gap): admission
+            # completes essentially immediately, well before the request
+            # body itself ever raises.
+            g._last_request_end = 0.0
+            g._effective_gap = MIN_INTER_REQUEST_GAP.total_seconds()
+            with self.assertRaises(TimeoutError) as ctx:
+                async with g.request():
+                    raise TimeoutError("simulated device timeout, post-admission")
+            self.assertNotIsInstance(
+                ctx.exception, ModbusAdmissionTimeout,
+                "a failure occurring after admission genuinely completed "
+                "must pass through unchanged, not be reclassified",
+            )
+        _run(_go())
 
     def test_is_busy_reflects_lock_state(self):
         async def _go():

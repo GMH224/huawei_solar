@@ -143,7 +143,7 @@ class TestExecuteBatchFixes(unittest.TestCase):
             end = _SOURCE.find("\n    def ", start + 1)
         body = _SOURCE[start:end if end > start else len(_SOURCE)]
         self.assertIn(
-            "self._adaptive.record_request(chunk_ms, success=True, timeout=False)",
+            "self._adaptive.record_request(\n                                    chunk_ms, success=True, timeout=False,",
             body,
             "the per-chunk success path must record into the adaptive "
             "learner at the point each chunk's own RTT is known",
@@ -217,7 +217,7 @@ class TestExecuteBatchFixes(unittest.TestCase):
         # (which would indicate an inner AND an outer call coexisting).
         self.assertEqual(
             _SOURCE.count(
-                "self._adaptive.record_request(chunk_ms, success=True, timeout=False)"
+                "self._adaptive.record_request(\n                                    chunk_ms, success=True, timeout=False,"
             ),
             1,
         )
@@ -227,7 +227,7 @@ class TestExecuteBatchFixes(unittest.TestCase):
         batch total, and not (per the old design) only the worst chunk's
         RTT reused for every chunk."""
         self.assertIn(
-            "self._adaptive.record_request(chunk_ms, success=True, timeout=False)",
+            "self._adaptive.record_request(\n                                    chunk_ms, success=True, timeout=False,",
             _SOURCE,
         )
         self.assertNotIn(
@@ -242,6 +242,78 @@ class TestExecuteBatchFixes(unittest.TestCase):
         self.assertGreater(exec_pos, 0)
         self.assertGreater(rec_pos, exec_pos,
             "telemetry.record_request must come AFTER _execute_batch (BUG-10)")
+
+
+# ── MOD-01: transaction-level SHED/ADMISSION congestion accounting ───────────
+
+class TestMOD01TransactionLevelCongestionAccounting(unittest.TestCase):
+    """v2.0.7 (MOD-01, ICS quality audit -- confirmed): _execute_batch's own
+    failure-recording branch must route SHED/ADMISSION_TIMEOUT to the same
+    diagnostics-only adaptive methods the poll-level handlers already use
+    (_record_shed()/_record_admission_timeout(), elsewhere in this file),
+    not to record_request(success=False) -- which trains the adaptive
+    failure-rate model on internal bus congestion, not inverter behaviour.
+    """
+
+    @staticmethod
+    def _execute_batch_body() -> str:
+        start = _SOURCE.find("async def _execute_batch(")
+        assert start != -1, "test setup invalid -- _execute_batch not found"
+        # Delimit by the next top-level (4-space-indented) def/async def.
+        end_candidates = [
+            p for p in (
+                _SOURCE.find("\n    def ", start + 1),
+                _SOURCE.find("\n    async def ", start + 1),
+            ) if p > start
+        ]
+        end = min(end_candidates) if end_candidates else len(_SOURCE)
+        return _SOURCE[start:end]
+
+    def test_shed_routes_to_note_shed_not_record_request(self):
+        body = self._execute_batch_body()
+        self.assertIn(
+            "if reason == Reason.SHED:", body,
+            "SHED must be branched on explicitly inside _execute_batch",
+        )
+        self.assertIn("self._adaptive.note_shed()", body)
+
+    def test_admission_timeout_routes_to_note_admission_timeout(self):
+        body = self._execute_batch_body()
+        self.assertIn(
+            "elif reason == Reason.ADMISSION_TIMEOUT:", body,
+            "ADMISSION_TIMEOUT must be branched on explicitly, alongside SHED",
+        )
+        self.assertIn("self._adaptive.note_admission_timeout()", body)
+
+    def test_genuine_failure_still_reaches_record_request(self):
+        """Negative case: the fix must not accidentally swallow real
+        device failures too -- TIMEOUT/DEVICE_BUSY/LINK_DOWN must still
+        reach record_request(success=False)."""
+        body = self._execute_batch_body()
+        self.assertIn(
+            "self._adaptive.record_request(\n                                        0.0, success=False,",
+            body,
+            "a genuine (non-congestion) failure must still be recorded "
+            "as an adaptive failure -- confirms the fix narrowed the "
+            "exclusion to SHED/ADMISSION_TIMEOUT specifically, not "
+            "every failure",
+        )
+
+    def test_record_request_appears_exactly_once_in_the_else_branch(self):
+        """Adversarial: confirms the OLD unconditional call is actually
+        gone, not merely that new branches were added alongside it --
+        record_request(success=False must now appear exactly once in
+        this method (the genuine-failure else branch), not also
+        unconditionally right after the reason classification."""
+        body = self._execute_batch_body()
+        occurrences = body.count("record_request(\n                                        0.0, success=False,")
+        self.assertEqual(
+            occurrences, 1,
+            f"expected exactly 1 record_request(success=False) call site "
+            f"inside _execute_batch (the else branch), found {occurrences} "
+            "-- if 2, the old unconditional call was left in place "
+            "alongside the new branches instead of being replaced",
+        )
 
 
 # ── Energy counter stale-cache exclusion ──────────────────────────────────────

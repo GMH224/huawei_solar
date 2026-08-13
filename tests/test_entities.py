@@ -303,6 +303,20 @@ def _install_lib_stubs() -> None:
     tps.HuaweiSolarInverterData = type("HuaweiSolarInverterData", (), {})
     tps.HuaweiSolarConfigEntry = object
 
+    # v2.0.7 (ICS-12, ICS quality audit -- confirmed): button.py now
+    # imports get_device_write_lock from .types -- a minimal but
+    # behaviourally faithful stand-in (real per-serial asyncio.Lock
+    # registry, same as the real implementation) so tests exercising
+    # button.py's actual lock-acquisition call site work against real
+    # asyncio.Lock semantics, not a no-op.
+    _stub_write_locks: dict[str, asyncio.Lock] = {}
+
+    def _stub_get_device_write_lock(serial_number):
+        if serial_number not in _stub_write_locks:
+            _stub_write_locks[serial_number] = asyncio.Lock()
+        return _stub_write_locks[serial_number]
+    tps.get_device_write_lock = _stub_get_device_write_lock
+
     ucmod = mod("huawei_solar.update_coordinator")
     ucmod.HuaweiSolarUpdateCoordinator = type("HuaweiSolarUpdateCoordinator", (), {})
     ucmod.HuaweiSolarOptimizerUpdateCoordinator = type("HuaweiSolarOptimizerUpdateCoordinator", (), {})
@@ -417,10 +431,17 @@ class MockCoordinator:
 
 
 class MockDevice:
-    def __init__(self, set_result=True, raises=None):
+    def __init__(self, set_result=True, raises=None, serial_number="MOCKSERIAL001"):
         self._set_result = set_result
         self._raises = raises
         self.set_calls = []
+        # v2.0.7 (ICS-12, ICS quality audit -- confirmed): button.py's
+        # StopForcibleCharge button now looks up a per-serial write lock
+        # (_get_device_write_lock(self.device.serial_number)), so this
+        # mock needs a real attribute for that lookup to succeed -- a
+        # fixed default so existing tests that don't care about the
+        # specific value need no changes.
+        self.serial_number = serial_number
 
     async def set(self, name, value):
         self.set_calls.append((name, value))
@@ -670,6 +691,66 @@ class TestButtonEntity(unittest.TestCase):
         e.device = MockDevice(set_result=True)
         e._configuration_update_coordinator = None
         _run(e.async_press())  # must not raise when no config coordinator present
+
+    def test_adversarial_press_serialises_against_the_shared_write_lock(self):
+        """ICS-12 (ICS quality audit -- confirmed): async_press() must
+        actually wait on the SAME per-serial lock services.py's own
+        stop_forcible_charge() uses -- not merely hold ModbusGuard, which
+        only prevents mid-sequence interleaving, not two COMPLETE
+        sequences racing back-to-back. Proven directly: hold the shared
+        lock for this serial manually (simulating a concurrent service
+        call already in flight), start a press, confirm it makes ZERO
+        progress while the lock is held, then release and confirm it
+        proceeds -- not just that both eventually succeed independently."""
+        async def _go():
+            e = object.__new__(BUTTON.StopForcibleChargeButtonEntity)
+            dev = MockDevice(set_result=True, serial_number="SHARED-LOCK-TEST")
+            coord = MockCoordinator()
+            e.device = dev
+            e._configuration_update_coordinator = coord
+
+            lock = BUTTON._get_device_write_lock("SHARED-LOCK-TEST")
+            await lock.acquire()
+            try:
+                press_task = asyncio.ensure_future(e.async_press())
+                # Give the event loop a real chance to run the task up to
+                # its own lock-acquire point.
+                await asyncio.sleep(0.05)
+                self.assertEqual(
+                    len(dev.set_calls), 0,
+                    "async_press() must not have written anything yet -- "
+                    "it should be blocked waiting on the lock this test "
+                    "already holds for the SAME serial number",
+                )
+            finally:
+                lock.release()
+            await press_task
+            self.assertEqual(
+                len(dev.set_calls), 4,
+                "once the lock is released, the press must complete "
+                "normally, proving this isn't simply deadlocked or "
+                "silently skipped",
+            )
+        _run(_go())
+
+    def test_different_serials_do_not_serialise_against_each_other(self):
+        """Negative case: the lock is per-SERIAL, not global -- a press
+        for one device must not wait on another device's lock."""
+        async def _go():
+            e = object.__new__(BUTTON.StopForcibleChargeButtonEntity)
+            dev = MockDevice(set_result=True, serial_number="DEVICE-B")
+            e.device = dev
+            e._configuration_update_coordinator = None
+
+            other_lock = BUTTON._get_device_write_lock("DEVICE-A")
+            await other_lock.acquire()
+            try:
+                # Must complete promptly -- not blocked by DEVICE-A's lock.
+                await asyncio.wait_for(e.async_press(), timeout=1.0)
+            finally:
+                other_lock.release()
+            self.assertEqual(len(dev.set_calls), 4)
+        _run(_go())
 
 
 class _FakeCapture:

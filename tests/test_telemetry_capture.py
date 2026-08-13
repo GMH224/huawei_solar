@@ -530,5 +530,97 @@ class TestTEL009SnapshotTimingWording(unittest.TestCase):
         self.assertIn("capture tick", source)
 
 
+class TestSectionEBatteryHealthTelemetryWiring(unittest.TestCase):  # v2.0.7
+    """Section E, this release: build_telemetry_snapshot()'s new
+    battery_health_manager_cls parameter."""
+
+    class _FakeDevice:
+        def __init__(self, serial):
+            self.serial_number = serial
+
+    class _FakeDD:
+        def __init__(self, serial):
+            self.device = TestSectionEBatteryHealthTelemetryWiring._FakeDevice(serial)
+
+    class _FakeBHManager:
+        def __init__(self, snap):
+            self._snap = snap
+
+        def snapshot(self):
+            return self._snap
+
+    class _FakeBHManagerRegistry:
+        _registry: dict = {}
+
+        @classmethod
+        def get(cls, serial):
+            return cls._registry.get(serial)
+
+    def test_omitted_parameter_does_not_add_a_battery_health_section(self):
+        """Backward compatibility: every existing caller that doesn't
+        pass battery_health_manager_cls at all must see identical
+        output to before this change."""
+        dd = self._FakeDD("SN1")
+        snap = TC.build_telemetry_snapshot(
+            [dd], None, include_register_overlap=False,
+            adaptive_controller_cls=self._FakeBHManagerRegistry,
+            modbus_telemetry_cls=self._FakeBHManagerRegistry,
+        )
+        # No adaptive/telemetry registered either -> no device section at all.
+        self.assertEqual(snap["devices"], {})
+
+    def test_battery_health_section_present_when_manager_registered(self):
+        registry = type("Registry", (), {"_data": {"SN1": self._FakeBHManager(
+            {"bhi": 92.5, "confidence": "normal"})}})
+        registry.get = classmethod(lambda cls, serial: cls._data.get(serial))
+        dd = self._FakeDD("SN1")
+        snap = TC.build_telemetry_snapshot(
+            [dd], None, include_register_overlap=False,
+            adaptive_controller_cls=self._FakeBHManagerRegistry,
+            modbus_telemetry_cls=self._FakeBHManagerRegistry,
+            battery_health_manager_cls=registry,
+        )
+        tag = next(iter(snap["devices"]))
+        self.assertIn("battery_health", snap["devices"][tag])
+        self.assertEqual(snap["devices"][tag]["battery_health"]["bhi"], 92.5)
+
+    def test_devices_without_battery_health_are_skipped_cleanly(self):
+        """A device with no registered BatteryHealthManager (e.g. this
+        release's CONF_BH_ENABLED disabled, or no battery at all) must
+        not raise or add an empty battery_health section -- same "not
+        yet known" skip already established for adaptive/telemetry."""
+        empty_registry = type("EmptyRegistry", (), {"get": classmethod(lambda cls, s: None)})
+        dd = self._FakeDD("SN-NO-BATTERY")
+        snap = TC.build_telemetry_snapshot(
+            [dd], None, include_register_overlap=False,
+            adaptive_controller_cls=self._FakeBHManagerRegistry,
+            modbus_telemetry_cls=self._FakeBHManagerRegistry,
+            battery_health_manager_cls=empty_registry,
+        )
+        self.assertEqual(snap["devices"], {})
+
+    def test_device_serial_is_pseudonymised_same_as_adaptive_telemetry(self):
+        """battery_health must not leak a real serial number into the
+        capture file -- same pseudonym scheme every other section uses."""
+        adaptive_registry = type("AdaptiveRegistry", (), {
+            "_data": {"SN-REAL-SERIAL-123": object()},
+            "get": classmethod(lambda cls, s: None),  # not registered here
+        })
+        bh_registry = type("BHRegistry", (), {
+            "_data": {"SN-REAL-SERIAL-123": self._FakeBHManager({"bhi": 88.0})},
+        })
+        bh_registry.get = classmethod(lambda cls, s: cls._data.get(s))
+        dd = self._FakeDD("SN-REAL-SERIAL-123")
+        snap = TC.build_telemetry_snapshot(
+            [dd], None, include_register_overlap=False,
+            adaptive_controller_cls=adaptive_registry,
+            modbus_telemetry_cls=adaptive_registry,
+            battery_health_manager_cls=bh_registry,
+        )
+        tag = next(iter(snap["devices"]))
+        self.assertNotIn("SN-REAL-SERIAL-123", tag)
+        self.assertTrue(tag.startswith("dev"))
+
+
 if __name__ == "__main__":
     unittest.main()

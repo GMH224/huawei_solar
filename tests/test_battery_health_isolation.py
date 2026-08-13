@@ -147,6 +147,74 @@ def _find_func(tree: ast.Module, name: str):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+class TestTOPO01UnitDiscovery(unittest.TestCase):  # v2.0.7 (TOPO-01 done properly)
+    """_active_storage_units() must reuse the SAME proven capability
+    flags __init__.py's own battery_1_device_info/battery_2_device_info
+    already use -- never a live probe of a possibly-absent unit (see
+    that function's own docstring for why: RegisterClient.get_multiple()
+    fails the WHOLE batch, not just one register, when any register in
+    it doesn't exist)."""
+
+    class _FakeStorageProductModel:
+        NONE = 0
+        HUAWEI_LUNA2000 = 1
+
+    def _device(self, battery_2_type):
+        d = type("FakeDevice", (), {})()
+        d.battery_2_type = battery_2_type
+        return d
+
+    def test_single_unit_by_default(self):
+        d = self._device(self._FakeStorageProductModel.NONE)
+        self.assertEqual(MGR._active_storage_units(d), [1])
+
+    def test_second_unit_included_when_present(self):
+        d = self._device(self._FakeStorageProductModel.HUAWEI_LUNA2000)
+        self.assertEqual(MGR._active_storage_units(d), [1, 2])
+
+    def test_missing_device_or_attribute_defaults_to_single_unit_not_a_crash(self):
+        """Adversarial: a coordinator whose .device is None, or a device
+        object with no battery_2_type at all, must default to the safe,
+        already-proven single-unit case -- not raise, and NEVER
+        speculatively include unit 2 when its presence can't actually be
+        confirmed."""
+        self.assertEqual(MGR._active_storage_units(None), [1])
+        bare_device = type("BareDevice", (), {})()  # no battery_2_type attr
+        self.assertEqual(MGR._active_storage_units(bare_device), [1])
+
+    def test_pack_slots_cover_all_three_packs_per_active_unit(self):
+        self.assertEqual(
+            MGR.pack_slots_for_units([1]),
+            [(1, 1), (1, 2), (1, 3)],
+        )
+        self.assertEqual(
+            MGR.pack_slots_for_units([1, 2]),
+            [(1, 1), (1, 2), (1, 3), (2, 1), (2, 2), (2, 3)],
+        )
+
+    def test_required_register_names_scales_with_unit_count(self):
+        one_unit = MGR.required_register_names([1])
+        two_units = MGR.required_register_names([1, 2])
+        self.assertEqual(len(two_units) - len(one_unit), 3 * len(MGR._PACK_FIELD_SUFFIXES))
+        # Every unit-2 pack register must genuinely be unit-2-addressed,
+        # not accidentally duplicated unit-1 names.
+        for pack in range(1, MGR.PACK_COUNT + 1):
+            self.assertIn(
+                MGR._pack_register_name(2, pack, "voltage"), two_units,
+            )
+            self.assertNotIn(
+                MGR._pack_register_name(2, pack, "voltage"), one_unit,
+            )
+
+    def test_unit_2_never_read_when_absent(self):
+        """The core safety guarantee: with only unit 1 active, ZERO
+        unit-2 registers appear in the required list at all -- confirms
+        this is a hard gate, not merely a preference."""
+        names = MGR.required_register_names([1])
+        for name in names:
+            self.assertNotIn("storage_unit_2", name)
+
+
 class TestGoldenRegisterSet(unittest.TestCase):  # T19.1
     """The Modbus footprint is pinned; growth must be a deliberate change.
 
@@ -177,6 +245,16 @@ class TestGoldenRegisterSet(unittest.TestCase):  # T19.1
     #: the SLOW tier their name would otherwise default to -- see
     #: register_cache.py's own _TIER_OVERRIDES for the same reasoning
     #: already established for the unit-level counters.
+    #: v2.0.7 CHANGE (deliberate, +6 registers): Section F of this
+    #: release wires up per-pack current and serial number -- confirmed
+    #: present in the underlying huawei-solar register map, PDU-adjacent
+    #: to the other per-pack fields already polled every tick, so the
+    #: marginal bus-traffic cost is expected to be low, same reasoning as
+    #: v2.0.6's own addition above. Raw data only this release -- neither
+    #: field is yet consumed by any capacity/SOH computation (that's
+    #: Architecture Phases 2/3, deliberately deferred); this addition
+    #: exists so no further register-map change is needed once that work
+    #: happens.
     GOLDEN = sorted([
         "storage_charging_cutoff_capacity",
         "storage_state_of_capacity",
@@ -213,6 +291,12 @@ class TestGoldenRegisterSet(unittest.TestCase):  # T19.1
         "storage_unit_1_battery_pack_1_total_discharge",
         "storage_unit_1_battery_pack_2_total_discharge",
         "storage_unit_1_battery_pack_3_total_discharge",
+        "storage_unit_1_battery_pack_1_current",
+        "storage_unit_1_battery_pack_2_current",
+        "storage_unit_1_battery_pack_3_current",
+        "storage_unit_1_battery_pack_1_serial_number",
+        "storage_unit_1_battery_pack_2_serial_number",
+        "storage_unit_1_battery_pack_3_serial_number",
     ])
 
     def test_register_set_matches_golden_list(self):
@@ -228,7 +312,9 @@ class TestGoldenRegisterSet(unittest.TestCase):  # T19.1
         # v2.0.6: raised from 25 to 40 for Tier 3's own deliberate +12
         # (see GOLDEN's own comment above) -- still a guard rail against
         # further, unreviewed growth, not a removal of one.
-        self.assertLessEqual(len(MGR.REQUIRED_REGISTER_NAMES), 40)
+        # v2.0.7: raised from 40 to 46 for Section F's own deliberate +6
+        # (see GOLDEN's own comment above) -- same reasoning.
+        self.assertLessEqual(len(MGR.REQUIRED_REGISTER_NAMES), 46)
 
 
 class TestSetupPathIsolation(unittest.TestCase):  # T19.2 / T19.4
@@ -457,6 +543,137 @@ class TestQualityGatedValueExtraction(unittest.TestCase):  # v2.0.0
         )
 
 
+class TestSectionEManagerSnapshot(unittest.TestCase):  # v2.0.7
+    """Section E, this release: BatteryHealthManager.snapshot() is the
+    integration point telemetry_capture.py consumes, same public role
+    AdaptiveModbusController.snapshot()/ModbusTelemetry.snapshot() play
+    for their own subsystems."""
+
+    def test_snapshot_includes_topology_and_report_attributes(self):
+        mgr = object.__new__(MGR.BatteryHealthManager)
+        mgr._active_units = [1]
+        mgr._pack_slots = MGR.pack_slots_for_units([1])
+        mgr.engine = BH.BatteryHealthEngine(
+            pack_count=len(mgr._pack_slots),
+            pack_slot_labels=[f"u{u}p{p}" for u, p in mgr._pack_slots],
+        )
+        # Force a report to exist -- update() populates self._last_report.
+        mgr.engine.update(BH.HealthSample(
+            timestamp=0.0, soc=90.0, power_w=-2500.0,
+            lifetime_discharge_kwh=0.0, charge_ceiling_soc=100.0,
+        ))
+        snap = mgr.snapshot()
+        self.assertEqual(snap["active_units"], [1])
+        self.assertEqual(snap["pack_slots"], ["u1p1", "u1p2", "u1p3"])
+        self.assertIn("bhi", snap)
+        self.assertIn("confidence", snap)
+        # Report attributes (Section E's own condition_coverage etc.)
+        # must be present, confirming the wholesale merge actually works.
+        self.assertIn("condition_coverage", snap)
+        self.assertIn("pack_current_share_deviation_pct", snap)
+
+    def test_snapshot_reflects_multi_unit_topology(self):
+        mgr = object.__new__(MGR.BatteryHealthManager)
+        mgr._active_units = [1, 2]
+        mgr._pack_slots = MGR.pack_slots_for_units([1, 2])
+        mgr.engine = BH.BatteryHealthEngine(
+            pack_count=len(mgr._pack_slots),
+            pack_slot_labels=[f"u{u}p{p}" for u, p in mgr._pack_slots],
+        )
+        mgr.engine.update(BH.HealthSample(
+            timestamp=0.0, soc=90.0, power_w=-2500.0,
+            lifetime_discharge_kwh=0.0, charge_ceiling_soc=100.0,
+        ))
+        snap = mgr.snapshot()
+        self.assertEqual(snap["active_units"], [1, 2])
+        self.assertEqual(len(snap["pack_slots"]), 6)
+        self.assertIn("u2p1", snap["pack_slots"])
+
+
+class TestSectionFCurrentAndSerialWiring(unittest.TestCase):  # v2.0.7
+    """Section F, this release: per-pack current and serial number,
+    confirmed present in the underlying register map but not previously
+    read at all. Verifies the actual wiring end to end -- register names
+    declared, included in required_register_names(), and populated onto
+    PackSample by _build_sample() -- not just that the fields exist on
+    the dataclass."""
+
+    @staticmethod
+    def _cache_with_all(values):
+        cache = RC.RegisterCache()
+        for name, value in values.items():
+            cache.update({name: RC.Result(value, None)})
+        return cache
+
+    def test_pack_current_registers_are_in_required_register_names(self):
+        names = MGR.required_register_names([1])
+        for pack in range(1, MGR.PACK_COUNT + 1):
+            self.assertIn(MGR._pack_register_name(1, pack, "current"), names)
+
+    def test_pack_serial_registers_are_in_required_register_names(self):
+        names = MGR.required_register_names([1])
+        for pack in range(1, MGR.PACK_COUNT + 1):
+            self.assertIn(MGR._pack_register_name(1, pack, "serial_number"), names)
+
+    def test_build_sample_populates_current_and_serial_per_pack(self):
+        mgr = object.__new__(MGR.BatteryHealthManager)
+        mgr.coordinator = type("FakeCoord", (), {})()
+        mgr._pack_slots = MGR.pack_slots_for_units([1])
+        mgr._ambient_entity = None
+        mgr._ambient_warned = False
+
+        values = {}
+        for pack in range(1, MGR.PACK_COUNT + 1):
+            values[MGR._pack_register_name(1, pack, "working_status")] = (
+                MGR.PACK_WORKING_STATUS_RUNNING
+            )
+            values[MGR._pack_register_name(1, pack, "voltage")] = 53.0
+            values[MGR._pack_register_name(1, pack, "maximum_temperature")] = 25.0
+            values[MGR._pack_register_name(1, pack, "minimum_temperature")] = 24.0
+            values[MGR._pack_register_name(1, pack, "state_of_capacity")] = 80.0
+            values[MGR._pack_register_name(1, pack, "charge_discharge_power")] = -1200.0
+            values[MGR._pack_register_name(1, pack, "total_charge")] = 100.0
+            values[MGR._pack_register_name(1, pack, "total_discharge")] = 95.0
+            values[MGR._pack_register_name(1, pack, "soh_calibration_status")] = 0
+            values[MGR._pack_register_name(1, pack, "current")] = -22.5 - pack
+            values[MGR._pack_register_name(1, pack, "serial_number")] = f"SN-PACK-{pack}"
+        values[MGR._RN_UNIT_CALIBRATION] = 0
+
+        cache = self._cache_with_all(values)
+        data = {name: cache.get(name) for name in values}
+
+        mgr.coordinator.cache = cache
+        sample = mgr._build_sample(data)
+
+        self.assertEqual(len(sample.packs), MGR.PACK_COUNT)
+        for idx, pack_sample in enumerate(sample.packs):
+            pack = idx + 1
+            self.assertAlmostEqual(pack_sample.current_a, -22.5 - pack, places=3)
+            self.assertEqual(pack_sample.serial_number, f"SN-PACK-{pack}")
+
+    def test_missing_current_and_serial_degrade_to_none_not_a_crash(self):
+        """Negative case: an offline/unreadable pack (no current/serial
+        registers present this tick) must not raise -- same tolerance
+        every other per-pack field already has."""
+        mgr = object.__new__(MGR.BatteryHealthManager)
+        mgr.coordinator = type("FakeCoord", (), {})()
+        mgr._pack_slots = MGR.pack_slots_for_units([1])
+        mgr._ambient_entity = None
+        mgr._ambient_warned = False
+
+        values = {}
+        for pack in range(1, MGR.PACK_COUNT + 1):
+            values[MGR._pack_register_name(1, pack, "working_status")] = 0  # offline
+        cache = self._cache_with_all(values)
+        data = {name: cache.get(name) for name in values}
+        mgr.coordinator.cache = cache
+
+        sample = mgr._build_sample(data)  # must not raise
+        for pack_sample in sample.packs:
+            self.assertIsNone(pack_sample.current_a)
+            self.assertIsNone(pack_sample.serial_number)
+
+
 class TestICS06RestoreErrorBoundary(unittest.IsolatedAsyncioTestCase):
     """ICS-06, external ICS audit -- confirmed: restore() sat OUTSIDE
     the load-failure try/except -- a store that loaded successfully
@@ -476,6 +693,12 @@ class TestICS06RestoreErrorBoundary(unittest.IsolatedAsyncioTestCase):
         mgr.engine = BH.BatteryHealthEngine()
         mgr._store = MagicMock()
         mgr._store.async_load = AsyncMock(return_value=load_return)
+        # v2.0.7 (TOPO-01 done properly, this release): async_initialize()
+        # now reads self._register_names (computed once at real __init__
+        # time from discovered topology) -- this bypasses __init__ via
+        # object.__new__, so it must be set explicitly here, same as
+        # every other attribute this helper already fakes.
+        mgr._register_names = MGR.required_register_names([1])
         return mgr
 
     async def test_structurally_corrupt_but_loadable_store_does_not_abort_init(self):

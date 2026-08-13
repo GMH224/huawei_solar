@@ -111,6 +111,12 @@ def _make_ctrl() -> AdaptiveModbusController:
     ctrl._suppress_reason = ""
     ctrl.suppressed_observations = 0
     ctrl.settling_events = 0
+    # v2.0.7 (MOD-02 telemetry, ICS quality audit -- confirmed):
+    # _make_ctrl() bypasses __init__ entirely, so this needs setting
+    # explicitly, matching __init__'s own default -- same class of gap
+    # hit repeatedly this session for every object.__new__()-based test
+    # fixture.
+    ctrl._granularity_counts = {}
     # v1.2.3 instrumentation (diagnostics only)
     ctrl.last_batch_ms = 0.0
     ctrl.last_chunk_count = 0
@@ -824,6 +830,64 @@ class TestLearningGate(unittest.TestCase):
         raw = ctrl._serialize()
         self.assertFalse(raw["learning_enabled"])
         self.assertEqual(raw["suppressed_observations"], 42)
+
+
+class TestMOD02GranularityTelemetry(unittest.TestCase):  # v2.0.7
+    """MOD-02 telemetry (ICS quality audit -- confirmed): record_request()
+    is called once per CHUNK from _execute_batch() (transaction-level)
+    and once per whole poll from every other call site (poll-level), with
+    no way to tell the two apart from the outside -- this is purely
+    observational visibility into that split, deliberately NOT a change
+    to record()/confidence/n, which stay byte-for-byte identical
+    regardless of granularity (see the adversarial test below)."""
+
+    def test_default_granularity_is_poll(self):
+        ctrl = _make_ctrl()
+        ctrl.record_request(100.0, success=True, timeout=False)
+        snap = ctrl.snapshot()
+        self.assertEqual(snap["poll_level_requests"], 1)
+        self.assertEqual(snap["transaction_level_requests"], 0)
+
+    def test_transaction_granularity_is_counted_separately(self):
+        ctrl = _make_ctrl()
+        for _ in range(5):
+            ctrl.record_request(50.0, success=True, timeout=False,
+                                granularity="transaction")
+        for _ in range(2):
+            ctrl.record_request(50.0, success=True, timeout=False)
+        snap = ctrl.snapshot()
+        self.assertEqual(snap["transaction_level_requests"], 5)
+        self.assertEqual(snap["poll_level_requests"], 2)
+
+    def test_adversarial_granularity_never_affects_recorded_n_or_confidence(self):
+        """The core guarantee: granularity is pure bookkeeping on the
+        side -- record()'s own n/confidence must be byte-for-byte
+        identical to a run with no granularity label at all."""
+        ctrl_a = _make_ctrl()
+        ctrl_b = _make_ctrl()
+        for _ in range(8):
+            ctrl_a.record_request(75.0, success=True, timeout=False,
+                                  granularity="transaction")
+            ctrl_b.record_request(75.0, success=True, timeout=False)
+        slot_a = ctrl_a._slots[ctrl_a._current_slot_index()]
+        slot_b = ctrl_b._slots[ctrl_b._current_slot_index()]
+        self.assertEqual(slot_a.n, slot_b.n)
+        self.assertEqual(
+            ctrl_a.get_params().confidence, ctrl_b.get_params().confidence,
+        )
+
+    def test_suppressed_observations_do_not_count_toward_either_granularity(self):
+        """A discarded (learning-disabled) observation must not inflate
+        either granularity counter -- matches the existing
+        suppressed_observations behaviour exactly."""
+        ctrl = _make_ctrl()
+        ctrl.set_learning_enabled(False)
+        ctrl.record_request(100.0, success=True, timeout=False,
+                            granularity="transaction")
+        snap = ctrl.snapshot()
+        self.assertEqual(snap["transaction_level_requests"], 0)
+        self.assertEqual(snap["poll_level_requests"], 0)
+        self.assertEqual(snap["suppressed_observations"], 1)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -640,6 +640,152 @@ class TestICS07PeriodSemanticValidation(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# CP-02 — capacity control period day-coverage validation (ICS quality audit)
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestCP02CapacityControlPeriodValidation(unittest.TestCase):
+    """CP-02, ICS quality audit -- confirmed: PeakSettingPeriodRegisters
+    (the vendor huawei_solar package) already implements the correct
+    per-weekday full-coverage check in its own _validate() method, but
+    encode() never calls it -- a genuine vendor defect, confirmed
+    directly against that source. Nothing in this repo's own write path
+    (only regex syntax validation) caught it either. Reproduced here for
+    direct behavioural testing, mirroring services.py's own
+    _validate_capacity_control_periods() exactly -- see that function's
+    own docstring for the full reasoning."""
+
+    @staticmethod
+    def _period(start, end, days, power=1000):
+        days_effective = [False] * 7
+        for d in days:
+            days_effective[d] = True
+        return (start, end, power, tuple(days_effective))
+
+    @staticmethod
+    def _validate(periods):
+        """Reproduces services.py's own _validate_capacity_control_periods()
+        exactly, operating on (start, end, power, days_effective) tuples
+        instead of PeakSettingPeriod instances, to avoid needing the
+        vendor package's own dataclass here."""
+        for day_idx in range(7):
+            active = [p for p in periods if p[3][day_idx]]
+            if not active:
+                raise ValueError(f"day {day_idx} not covered at all")
+            active = sorted(active, key=lambda p: p[0])
+            if active[0][0] != 0:
+                raise ValueError(f"day {day_idx} not covered from 00:00")
+            for prev, cur in zip(active, active[1:]):
+                if cur[0] not in (prev[1], prev[1] + 1):
+                    raise ValueError(f"day {day_idx} has a gap or overlap")
+            if active[-1][1] not in (24 * 60 - 1, 24 * 60):
+                raise ValueError(f"day {day_idx} not covered until 23:59")
+
+    _ALL_DAYS = list(range(7))
+
+    def test_missing_day_is_rejected(self):
+        """A period set that only covers 6 of 7 days must be rejected --
+        this is CP-02's exact scenario: the regex only checks character
+        syntax, never day coverage."""
+        with self.assertRaises(ValueError):
+            self._validate([
+                self._period(0, 24 * 60, [0, 1, 2, 3, 4, 5]),  # Saturday (6) missing
+            ])
+
+    def test_day_not_starting_at_midnight_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self._validate([
+                self._period(60, 24 * 60, self._ALL_DAYS),  # starts at 01:00, not 00:00
+            ])
+
+    def test_gap_between_periods_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self._validate([
+                self._period(0, 12 * 60, self._ALL_DAYS),
+                # gap: 12:00-12:05 uncovered before this period starts
+                self._period(12 * 60 + 5, 24 * 60, self._ALL_DAYS),
+            ])
+
+    def test_overlap_between_periods_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self._validate([
+                self._period(0, 14 * 60, self._ALL_DAYS),
+                self._period(12 * 60, 24 * 60, self._ALL_DAYS),  # overlaps 12:00-14:00
+            ])
+
+    def test_day_not_covered_until_end_of_day_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self._validate([
+                self._period(0, 23 * 60, self._ALL_DAYS),  # ends at 23:00, not 23:59/24:00
+            ])
+
+    def test_adversarial_single_bad_day_among_otherwise_valid_ones_is_caught(self):
+        """The most realistic failure mode: six days are perfectly
+        covered, only one has a subtle gap -- must still be caught, not
+        averaged away or skipped because most days are fine."""
+        periods = [
+            self._period(0, 24 * 60, [0, 1, 2, 3, 4, 6]),  # covers 6 of 7 days fully
+            self._period(0, 12 * 60, [5]),                 # Friday: only half the day
+            # Friday: a genuine 2-minute gap at 12:00-12:02 -- NOT the
+            # 1-minute tolerance the vendor's own algorithm accepts
+            # (confirmed separately below), so this must be rejected.
+            self._period(12 * 60 + 2, 24 * 60, [5]),
+        ]
+        with self.assertRaises(ValueError):
+            self._validate(periods)
+
+    def test_genuinely_complete_schedule_is_accepted(self):
+        """Negative case: a full, gap-free, overlap-free, every-day
+        schedule must be accepted -- confirms the fix isn't overly
+        conservative and doesn't reject valid, realistic input."""
+        self._validate([
+            self._period(0, 8 * 60, self._ALL_DAYS, power=500),
+            self._period(8 * 60, 20 * 60, self._ALL_DAYS, power=3000),
+            self._period(20 * 60, 24 * 60, self._ALL_DAYS, power=500),
+        ])
+
+    def test_adjacent_periods_one_minute_apart_are_accepted(self):
+        """Negative case: the vendor's own algorithm accepts a 1-minute
+        gap at the boundary (end_time, end_time+1 both valid starts for
+        the next period) -- confirms this repo's mirror matches that
+        exactly, not a stricter or looser rule."""
+        self._validate([
+            self._period(0, 12 * 60, self._ALL_DAYS),
+            self._period(12 * 60 + 1, 24 * 60, self._ALL_DAYS),
+        ])
+
+    def test_order_of_input_does_not_matter(self):
+        with self.assertRaises(ValueError):
+            self._validate([
+                self._period(12 * 60, 24 * 60, self._ALL_DAYS),  # given out of order
+                self._period(0, 11 * 60, self._ALL_DAYS),         # leaves a gap regardless
+            ])
+
+    # ── source-level: the real function is actually wired in ──────────
+
+    def test_validation_function_exists_in_real_source(self):
+        source = _SERVICES_SRC.read_text()
+        assert "def _validate_capacity_control_periods(" in source
+
+    def test_set_capacity_control_periods_calls_validation_before_the_write(self):
+        source = _SERVICES_SRC.read_text()
+        idx = source.find("async def set_capacity_control_periods(")
+        assert idx > -1
+        end = source.find("\nasync def ", idx + 10)
+        body = source[idx: end if end > -1 else idx + 2000]
+        validate_idx = body.find("_validate_capacity_control_periods(")
+        write_idx = body.find("await _set_and_invalidate(")
+        assert validate_idx > -1, (
+            "set_capacity_control_periods does not call the validation function"
+        )
+        assert write_idx > -1
+        assert validate_idx < write_idx, (
+            "validation must happen BEFORE the write, not after -- "
+            "otherwise an incomplete/gapped schedule could still reach "
+            "the device before being rejected"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # ICS-10 — service registration lifecycle (external ICS audit)
 # ═══════════════════════════════════════════════════════════════════════
 

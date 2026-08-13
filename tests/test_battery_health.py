@@ -398,6 +398,63 @@ class TestCounterReset(unittest.TestCase):  # T7
         mon.feed(99.5)  # within tolerance
         self.assertEqual(mon.reset_count, 0)
 
+    def test_adversarial_small_regression_does_not_advance_last(self):
+        """BH-10 (ICS quality audit -- confirmed): a small backward step
+        (within COUNTER_RESET_TOLERANCE_KWH) must be rejected as a
+        quality event, not silently accepted as the new true value --
+        otherwise the NEXT feed() computes its own delta against an
+        already-regressed number, propagating a negative-looking
+        movement instead of containing it here."""
+        mon = bh.CounterMonitor("test")
+        mon.feed(100.0)
+        result = mon.feed(99.5)  # within tolerance -- must be rejected
+        self.assertEqual(
+            result, 100.0,
+            "a rejected small regression must return the PREVIOUS "
+            "(higher, trusted) continuous value, not the regressed one",
+        )
+        self.assertEqual(
+            mon.last_raw, 100.0,
+            "_last must not advance to the regressed value",
+        )
+        self.assertTrue(
+            mon.is_stale,
+            "a rejected regression is a quality event and must be "
+            "reflected in is_stale, same as a missing reading",
+        )
+        self.assertEqual(mon.reset_count, 0)
+        # A genuine subsequent reading (at or above the retained value)
+        # must resume normally, not be permanently stuck.
+        result2 = mon.feed(101.0)
+        self.assertEqual(result2, 101.0)
+        self.assertFalse(mon.is_stale)
+
+    def test_adversarial_repeated_small_regressions_never_advance(self):
+        """Several small regressions in a row must each be rejected
+        independently -- confirms the fix doesn't just catch the first
+        one and then start trusting a lower baseline."""
+        mon = bh.CounterMonitor("test")
+        mon.feed(100.0)
+        for raw in (99.5, 99.6, 99.9, 99.1):
+            result = mon.feed(raw)
+            self.assertEqual(result, 100.0)
+            self.assertEqual(mon.last_raw, 100.0)
+        self.assertEqual(mon.reset_count, 0)
+
+    def test_regression_exactly_at_tolerance_boundary_still_advances(self):
+        """Negative case: a decrease of EXACTLY the tolerance is not
+        `< last - tolerance` (strict), so it must fall through neither
+        to reset nor to small-regression rejection -- confirms the fix's
+        new `elif` didn't tighten the existing reset boundary."""
+        mon = bh.CounterMonitor("test")
+        mon.feed(100.0)
+        result = mon.feed(99.0)  # exactly at tolerance, not below it
+        self.assertEqual(mon.reset_count, 0)
+        # This lands in the new small-regression branch (99.0 < 100.0),
+        # so it must be rejected the same as any other small regression.
+        self.assertEqual(result, 100.0)
+        self.assertEqual(mon.last_raw, 100.0)
+
     def test_engine_reset_invalidates_open_segment(self):
         eng = bh.BatteryHealthEngine(_cfg())
         for i, soc in enumerate([90, 80, 70]):
@@ -611,6 +668,36 @@ class TestStress(unittest.TestCase):  # T10
         eng.stress.feed(_sample(300.0, soc=50.0, temp=25.0))
         eng.stress.prune(3 * DAY)
         self.assertIsNone(eng.stress.stress_ratio())
+
+    def test_adversarial_gap_not_integrated_under_next_samples_conditions(self):
+        """BH-05 (ICS quality audit -- confirmed): missing temperature/SOC
+        samples must reset the integration anchor, not silently carry the
+        stale _last_ts forward -- otherwise the NEXT valid (and possibly
+        very different) sample gets blamed for the entire gap duration."""
+        eng = bh.BatteryHealthEngine(_cfg())
+        eng.stress.feed(_sample(0.0, soc=50.0, temp=25.0))       # anchor
+        eng.stress.feed(_sample(300.0, soc=50.0, temp=25.0))     # 300s @ ratio 1.0
+        # A 600s outage: temperature missing, then SOC missing.
+        eng.stress.feed(_sample(600.0, soc=50.0, temp=None))
+        eng.stress.feed(_sample(900.0, soc=None, temp=25.0))
+        # Resumes with a genuinely hot, high-SOC sample -- must be
+        # treated as a fresh interval START, not integrated across the
+        # 900s gap at this sample's own extreme conditions.
+        eng.stress.feed(_sample(1200.0, soc=100.0, temp=35.0))
+        eng.stress.feed(_sample(1260.0, soc=100.0, temp=35.0))   # 60s @ ratio 5.0
+        ratio = eng.stress.stress_ratio()
+        expected = (1.0 * 300 + 5.0 * 60) / (300 + 60)
+        self.assertAlmostEqual(
+            ratio, expected, places=2,
+            msg=f"got {ratio:.3f}, expected {expected:.3f} -- if this is "
+                "~4.05 instead, the gap was wrongly integrated at the hot "
+                "sample's conditions (the pre-fix no-op bug)",
+        )
+        self.assertLess(
+            ratio, 2.0,
+            "a correctly excluded gap must not let 900s of extreme "
+            "conditions dominate what is really only 360s of measurement",
+        )
 
 
 class TestComposite(unittest.TestCase):  # T11
@@ -836,6 +923,62 @@ class TestStressRunningTotals(unittest.TestCase):  # T16
         self.assertEqual(eng.stress._total_dt, 0.0)
 
 
+class TestBH06SignatureIncludesPackAttrs(unittest.TestCase):  # v2.0.7
+    def test_adversarial_pack_attrs_alone_change_the_signature(self):
+        """BH-06 (ICS quality audit -- confirmed): a pack-only diagnostic
+        change (e.g. one pack completing a new segment) must change the
+        signature even when every OTHER tracked value is identical --
+        otherwise the manager's notify gate never fires for a
+        pack-health-only update, and the entity's pack attributes go
+        stale."""
+        base = dict(bhi=90.0, confidence="normal", soh_capacity=98.0,
+                    soh_efficiency=None, soh_balance=None, stress_index=50,
+                    stress_ratio=1.0, predicted_soh=None, health_divergence=None,
+                    efc=10.0, warranty_consumed_pct=5.0,
+                    attributes={
+                        "segment_count": 3, "excluded_calibration_segment_count": 0,
+                        "discarded_segment_count": 0, "counter_resets": 0,
+                        "contributing_terms": ["capacity"], "learning_enabled": True,
+                        "learning_active": True,
+                        "pack_capacity_soh_percent": [98.0, 97.0, 99.0],
+                        "pack_capacity_segment_count": [3, 3, 3],
+                        "pack_capacity_spread_pct": 2.0,
+                    })
+        r1 = bh.HealthReport(**base)
+        base2 = dict(base)
+        base2["attributes"] = dict(base["attributes"])
+        # Only pack 2's own segment count changed (a new pack-level
+        # segment closed) -- every other field is byte-for-byte identical.
+        base2["attributes"]["pack_capacity_segment_count"] = [3, 4, 3]
+        r2 = bh.HealthReport(**base2)
+        self.assertNotEqual(
+            r1.signature(), r2.signature(),
+            "a pack-only attribute change must be visible in the "
+            "signature, or the manager will never notify the entity",
+        )
+
+    def test_signature_stable_when_pack_attrs_genuinely_unchanged(self):
+        """Negative case: identical pack attributes must not spuriously
+        change the signature -- confirms the fix didn't make every tick
+        look different."""
+        attrs = {
+            "segment_count": 3, "pack_capacity_soh_percent": [98.0, 97.0, 99.0],
+            "pack_capacity_segment_count": [3, 3, 3],
+            "pack_capacity_spread_pct": 2.0,
+        }
+        r1 = bh.HealthReport(bhi=90.0, attributes=dict(attrs))
+        r2 = bh.HealthReport(bhi=90.0, attributes=dict(attrs))
+        self.assertEqual(r1.signature(), r2.signature())
+
+    def test_signature_handles_absent_pack_attrs_gracefully(self):
+        """A report with no pack attributes at all (e.g. unit-only
+        history, or a topology with no packs discovered) must not raise
+        -- tuple(None or ()) must degrade to an empty tuple, not crash."""
+        r = bh.HealthReport(bhi=90.0, attributes={})
+        sig = r.signature()  # must not raise
+        self.assertIn((), sig)
+
+
 class TestReportSignature(unittest.TestCase):  # T17
     def test_signature_stable_across_idle_ticks(self):
         # Homogeneous stress conditions (below-knee SOC, constant temp) so the
@@ -1058,6 +1201,57 @@ class TestCapacityReference(unittest.TestCase):  # T21 / Finding H
         soh, _ = eng.segments.soh_capacity()
         self.assertGreater(soh, 100.0)
         self.assertLessEqual(soh, cfg.soh_capacity_clip_max)
+
+    def test_calibration_tainted_segments_do_not_count_toward_reference_gate(self):
+        """BH-04 (ICS quality audit -- confirmed): calibration-excluded
+        segments must not count toward capacity_reference_min_segments --
+        they are explicitly untrustworthy for SOH aggregation (weight
+        0.0), and must be equally untrustworthy for defining the
+        reference every subsequent SOH% is measured against."""
+        cfg = _cfg(freshness_tau_kwh=1e12, capacity_reference_min_segments=10,
+                   capacity_reference_min_span_days=5.0)
+        eng2 = bh.BatteryHealthEngine(cfg)
+        t = 0.0
+        for i in range(10):
+            energy = 22.8 * 0.23
+            t = _run_discharge(eng2, i * DAY, 100.0, 77.0, i * energy,
+                               (i + 1) * energy, calib=True)
+        self.assertIsNone(
+            eng2.segments.reference_capacity_kwh,
+            "10 calibration-tainted segments spanning >5 days must NOT "
+            "be enough to auto-capture a reference -- BH-04's exact gap",
+        )
+        for seg in eng2.segments.segments:
+            self.assertTrue(seg.exclude_calibration)
+
+    def test_reference_value_excludes_calibration_tainted_segments(self):
+        """Once enough genuinely clean segments exist, the captured
+        reference value itself must reflect only those -- not be pulled
+        toward a differently-valued calibration-tainted segment mixed
+        into the same segment list."""
+        cfg = _cfg(freshness_tau_kwh=1e12, capacity_reference_min_segments=10,
+                   capacity_reference_min_span_days=5.0)
+        eng = bh.BatteryHealthEngine(cfg)
+        t = 0.0
+        # 5 calibration-tainted segments at a very different (higher)
+        # capacity -- must never contribute to the reference.
+        for i in range(5):
+            energy = 40.0 * 0.23
+            t = _run_discharge(eng, i * DAY, 100.0, 77.0, i * energy,
+                               (i + 1) * energy, calib=True)
+        # 10 genuinely clean segments at 22.8 kWh -- these alone must
+        # define the reference.
+        base = t + DAY
+        for i in range(10):
+            energy = 22.8 * 0.23
+            t = _run_discharge(eng, base + i * DAY, 100.0, 77.0, i * energy,
+                               (i + 1) * energy, calib=False)
+        self.assertIsNotNone(eng.segments.reference_capacity_kwh)
+        self.assertAlmostEqual(
+            eng.segments.reference_capacity_kwh, 22.8, delta=0.3,
+            msg="reference must reflect only the clean 22.8 kWh segments, "
+                "not be pulled toward the tainted 40.0 kWh ones",
+        )
 
     def test_reanchor_appends_epoch_and_refuses_on_thin_data(self):
         cfg = _cfg(freshness_tau_kwh=1e12, capacity_reference_min_segments=10,
@@ -1616,6 +1810,83 @@ class TestSettlingPeriod(unittest.TestCase):  # T30
         self.assertFalse(eng.report.attributes["learning_active"])
 
 
+class TestBH03RecoveryHardDiscardsActiveSegment(unittest.TestCase):  # v2.0.7
+    """BH-03 (ICS quality audit -- confirmed): mark_recovery() must hard-
+    discard an in-progress segment, not merely mark a bridgeable gap --
+    otherwise pre-recovery and post-recovery discharge can be joined into
+    one implied-capacity calculation across an event that specifically
+    should not be trusted for continuity."""
+
+    def test_adversarial_mid_segment_recovery_discards_not_bridges(self):
+        """A segment opened before an explicit recovery, interrupted by
+        mark_recovery() mid-flight, then apparently 'closed' afterward,
+        must produce ZERO segments -- not one bridged segment spanning
+        the recovery event."""
+        cfg = _cfg(freshness_tau_kwh=1e12, settling_period_s=1.0)
+        eng = bh.BatteryHealthEngine(cfg)
+        # Open a segment: a genuine, in-progress discharge.
+        for i in range(11):
+            frac = i / 10
+            eng.update(_sample(i * 60, soc=100.0 - 10.0 * frac, power=-2500.0,
+                               temp=20.0, chg=0.0, dis=1.0 * frac))
+        self.assertTrue(
+            eng.segments._active, "test setup invalid -- no segment open yet",
+        )
+        # A real-world recovery/maintenance event fires mid-segment.
+        eng.mark_recovery("adversarial test recovery", now=11 * 60.0)
+        self.assertFalse(
+            eng.segments._active,
+            "mark_recovery() must hard-discard the in-progress segment, "
+            "not leave it pending for a bridge",
+        )
+        # Time passes (settling), then the discharge appears to "resume"
+        # and reach what would, if bridged, look like a clean close.
+        for i in range(12, 22):
+            frac = (i - 11) / 10
+            eng.update(_sample(i * 60, soc=90.0 - 10.0 * frac, power=-2500.0,
+                               temp=20.0, chg=0.0, dis=1.0 + 1.0 * frac))
+        eng.update(_sample(23 * 60, soc=80.0, power=CLOSE_POWER, temp=20.0,
+                           chg=0.0, dis=2.0))
+        self.assertEqual(
+            len(eng.segments.segments), 0,
+            "pre-recovery and post-recovery discharge must never combine "
+            "into one implied-capacity segment across the recovery event",
+        )
+
+    def test_pack_counter_reset_discards_the_open_unit_segment_too(self):
+        """A pack's own counter reset (a real, plausible single-pack
+        replacement) triggers mark_recovery() at the engine level --
+        which must now hard-discard any currently open UNIT-level
+        segment, not silently leave it bridgeable across a pack-swap
+        event that is itself a hard topology boundary
+        (architecture review §30)."""
+        cfg = _cfg(freshness_tau_kwh=1e12, settling_period_s=1.0)
+        eng = bh.BatteryHealthEngine(cfg)
+
+        def _pack(soc, dis):
+            return bh.PackSample(voltage=53.0, temp_max=25.0, temp_min=24.0,
+                                  online=True, soc=soc, power_w=-2500.0,
+                                  lifetime_discharge_kwh=dis)
+
+        for i in range(6):
+            packs = [_pack(90.0, 1.0 * i) for _ in range(3)]
+            eng.update(_sample(i * 60, soc=100.0 - i, power=-2500.0,
+                               temp=20.0, chg=0.0, dis=1.0 * i, packs=packs))
+        self.assertTrue(eng.segments._active)
+        # Pack 1's own counter drops by far more than tolerance (last
+        # value 5.0 -> 0.1, a 4.9 kWh regression): a plausible physical
+        # pack replacement, not sensor jitter.
+        packs = [_pack(90.0, 0.1), _pack(90.0, 6.0), _pack(90.0, 6.0)]
+        eng.update(_sample(6 * 60, soc=94.0, power=-2500.0, temp=20.0,
+                           chg=0.0, dis=6.0, packs=packs))
+        self.assertFalse(
+            eng.segments._active,
+            "a pack-level counter reset must hard-discard the currently "
+            "open unit-level segment via mark_recovery(), not merely "
+            "leave it as a bridgeable gap",
+        )
+
+
 class TestTier3PackCapacityTracker(unittest.TestCase):  # v2.0.6, battery health architecture review
     """PackCapacityTracker: a direct, measured per-pack capacity estimate,
     reusing SegmentTracker exactly as-is per pack. See that class's own
@@ -1624,11 +1895,11 @@ class TestTier3PackCapacityTracker(unittest.TestCase):  # v2.0.6, battery health
 
     @staticmethod
     def _pack(soc, power=-2500.0, chg=0.0, dis=0.0, online=True,
-              voltage=53.0, temp_max=25.0, temp_min=24.0):
+              voltage=53.0, temp_max=25.0, temp_min=24.0, serial=None):
         return bh.PackSample(
             voltage=voltage, temp_max=temp_max, temp_min=temp_min, online=online,
             soc=soc, power_w=power, lifetime_charge_kwh=chg,
-            lifetime_discharge_kwh=dis,
+            lifetime_discharge_kwh=dis, serial_number=serial,
         )
 
     def _run_pack_discharge(self, eng, t0, soc0, soc1, dis0, dis1, steps=20):
@@ -1652,6 +1923,120 @@ class TestTier3PackCapacityTracker(unittest.TestCase):  # v2.0.6, battery health
         packs = [self._pack(soc1, power=CLOSE_POWER, dis=dis1) for _ in range(3)]
         eng.update(_sample(t0 + (steps + 1) * 60, soc=soc1, power=CLOSE_POWER,
                            chg=0.0, dis=0.0, packs=packs))
+
+    def test_pack_rated_capacity_is_scaled_by_pack_count(self):
+        """BH-01/BH-08 (ICS quality audit -- confirmed): rated_capacity_kwh
+        must be pack-scaled exactly like implied_capacity_min_kwh/max_kwh
+        already are -- it is the SOH fallback denominator, not just a
+        plausibility-band input, so leaving it at the unit-wide value
+        would silently corrupt every pack's SOH% before it accumulates
+        its own measured reference."""
+        cfg = _cfg(rated_capacity_kwh=20.7)
+        tracker = bh.PackCapacityTracker(cfg, pack_count=3)
+        for t in tracker.trackers:
+            self.assertAlmostEqual(t._cfg.rated_capacity_kwh, 6.9, places=6)
+        # The unit-level cfg object itself must be untouched -- pack
+        # scaling must never leak back into the caller's own config.
+        self.assertEqual(cfg.rated_capacity_kwh, 20.7)
+
+    def test_adversarial_old_unscaled_reference_would_have_reported_wildly_wrong_soh(self):
+        """A pack with a genuine, fully healthy ~1/3-share capacity must
+        report SOH near 100% from the fallback alone (no measured
+        reference established yet) -- not ~33%, which is what comparing
+        a pack-scale capacity against the whole unit's rated_capacity_kwh
+        would produce. This is the exact BH-01 failure mode: reported
+        pack SOH is wrong for that pack's *entire early-life learning
+        period*, not a one-off rounding error."""
+        cfg = _cfg(rated_capacity_kwh=20.7, freshness_tau_kwh=1e12,
+                    capacity_reference_min_segments=999)  # never auto-captures
+        eng = bh.BatteryHealthEngine(cfg)
+        # Each pack discharges ~6.9 kWh over a 90%->10% SOC swing --
+        # exactly a fair one-third share of the unit's 20.7 kWh nameplate,
+        # i.e. a genuinely healthy pack, not a degraded one.
+        self._run_pack_discharge(eng, 0.0, 90.0, 10.0, 0.0, 6.9)
+        soh_list = eng.pack_capacity.soh_capacity_per_pack()
+        for i, (soh, attrs) in enumerate(soh_list):
+            self.assertIsNotNone(soh, f"pack {i + 1} produced no SOH at all")
+            self.assertFalse(
+                attrs["capacity_reference_is_measured"],
+                f"pack {i + 1}: test setup invalid -- a measured reference "
+                "was captured, so this is no longer testing the fallback path",
+            )
+            self.assertGreater(
+                soh, 90.0,
+                f"pack {i + 1} SOH = {soh:.1f}% -- a healthy, fair-share "
+                "pack must not be reported as roughly one-third dead "
+                "(the pre-fix symptom: ~33% from comparing a pack-scale "
+                "capacity against the whole unit's rated_capacity_kwh)",
+            )
+
+    def test_offline_pack_does_not_accumulate_a_capacity_segment(self):
+        """BH-02 (ICS quality audit -- confirmed): a pack reporting
+        online=False throughout an apparent discharge must not learn a
+        capacity segment from it -- an offline pack's cached/stale
+        fields must not be trusted as real measured operation."""
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        eng = bh.BatteryHealthEngine(cfg)
+        for i in range(21):
+            frac = i / 20
+            soc = 95.0 - 20.0 * frac
+            packs = [
+                self._pack(soc, dis=1.6 * frac, online=False),  # offline the whole time
+                self._pack(soc, dis=1.6 * frac, online=True),   # control: online, same data
+                self._pack(soc, dis=1.6 * frac, online=True),
+            ]
+            eng.update(_sample(i * 60, soc=95.0, power=-2500.0, chg=0.0,
+                               dis=0.0, packs=packs))
+        packs = [
+            self._pack(75.0, power=CLOSE_POWER, dis=1.6, online=False),
+            self._pack(75.0, power=CLOSE_POWER, dis=1.6, online=True),
+            self._pack(75.0, power=CLOSE_POWER, dis=1.6, online=True),
+        ]
+        eng.update(_sample(21 * 60, soc=75.0, power=CLOSE_POWER, chg=0.0,
+                           dis=0.0, packs=packs))
+        self.assertEqual(
+            len(eng.pack_capacity.trackers[0].segments), 0,
+            "an offline pack must not accumulate a segment even though "
+            "its own sample fields describe an apparent, plausible discharge",
+        )
+        # Control: an online pack fed the exact same data must behave
+        # exactly as before this fix -- confirms the gate is specific to
+        # `online`, not an accidental general regression.
+        self.assertEqual(len(eng.pack_capacity.trackers[1].segments), 1)
+        self.assertEqual(len(eng.pack_capacity.trackers[2].segments), 1)
+
+    def test_offline_pack_reset_detection_still_works_once_it_returns(self):
+        """A counter reset that occurs on an offline pack must still be
+        caught once it reports valid data again -- BH-02's gate must
+        suppress *learning*, not counter tracking, which has to stay
+        continuous to correctly classify the first post-recovery reading."""
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        eng = bh.BatteryHealthEngine(cfg)
+        packs = [self._pack(90.0, dis=5.0, online=True) for _ in range(3)]
+        eng.update(_sample(0, soc=90.0, power=-2500.0, chg=0.0, dis=0.0, packs=packs))
+        # Pack 1 goes offline; while offline its own counter (as reported)
+        # regresses far past COUNTER_RESET_TOLERANCE_KWH -- a plausible
+        # physical replacement while disconnected.
+        packs = [
+            self._pack(88.0, dis=0.2, online=False),
+            self._pack(88.0, dis=5.2, online=True),
+            self._pack(88.0, dis=5.2, online=True),
+        ]
+        eng.update(_sample(60, soc=88.0, power=-2500.0, chg=0.0, dis=0.0, packs=packs))
+        # Pack 1 returns online with the low post-replacement counter
+        # confirmed on a second reading.
+        packs = [
+            self._pack(85.0, dis=0.4, online=True),
+            self._pack(85.0, dis=5.4, online=True),
+            self._pack(85.0, dis=5.4, online=True),
+        ]
+        eng.update(_sample(120, soc=85.0, power=-2500.0, chg=0.0, dis=0.0, packs=packs))
+        self.assertGreaterEqual(
+            eng.pack_capacity._discharge_counters[0].reset_count,
+            1,
+            "pack 1's own reset must still be detected even though the "
+            "regression was first observed while the pack was offline",
+        )
 
     def test_pack_segment_is_detected_and_contributes_to_that_packs_soh(self):
         """A genuine per-pack discharge must be detected by that pack's
@@ -1800,6 +2185,234 @@ class TestTier3PackCapacityTracker(unittest.TestCase):  # v2.0.6, battery health
         eng.restore(old_data)  # must not raise
         self.assertIsNone(eng.first_seen_ts)  # started fresh, not "restored" v1 data
 
+    def test_schema_reset_is_recorded_not_silent(self):
+        """BH-09 (ICS quality audit -- confirmed): a schema-mismatch
+        fresh-start must leave a visible trace on the engine itself --
+        previously only a WARNING log line, easy to miss and with no
+        lasting record anywhere the entity's own attributes could
+        surface."""
+        eng = bh.BatteryHealthEngine(_cfg())
+        self.assertIsNone(eng.last_schema_reset_ts)
+        self.assertIsNone(eng.last_schema_reset_from_version)
+        eng.restore({"schema_version": 1, "first_seen_ts": 123.0})
+        self.assertIsNotNone(
+            eng.last_schema_reset_ts,
+            "a schema mismatch must record WHEN the reset happened",
+        )
+        self.assertEqual(eng.last_schema_reset_from_version, 1)
+        # attributes are only populated on the next _evaluate(), same as
+        # every other attribute this engine exposes -- restore() itself
+        # does not call it.
+        report = eng.update(_sample(0, soc=50.0, power=0.0, chg=0.0, dis=0.0))
+        self.assertEqual(report.attributes["schema_reset_from_version"], 1)
+        self.assertIsNotNone(report.attributes["schema_reset_ts"])
+
+    def test_no_schema_reset_recorded_on_clean_restore(self):
+        """Negative case: a genuinely matching schema_version must NOT
+        record a reset -- confirms the fix doesn't fire on every restore."""
+        eng = bh.BatteryHealthEngine(_cfg())
+        eng.first_seen_ts = 99.0
+        data = eng.to_dict()
+        eng2 = bh.BatteryHealthEngine(_cfg())
+        eng2.restore(data)
+        self.assertIsNone(eng2.last_schema_reset_ts)
+        self.assertIsNone(eng2.last_schema_reset_from_version)
+
+    def test_registered_migration_is_applied_instead_of_fresh_start(self):
+        """A future schema bump that DOES register a migrator must have
+        it actually applied -- proves the registry mechanism itself
+        works, not just that it's present and unused."""
+        old_version = bh.SCHEMA_VERSION - 1 if bh.SCHEMA_VERSION > 0 else 0
+        # Register a trivial migrator for this test only, then restore it
+        # afterward so other tests are never affected by test ordering.
+        original_migrations = dict(bh._SCHEMA_MIGRATIONS)
+
+        def _migrate(data):
+            data = dict(data)
+            data["schema_version"] = bh.SCHEMA_VERSION
+            data["first_seen_ts"] = 555.0
+            return data
+
+        bh._SCHEMA_MIGRATIONS[old_version] = _migrate
+        try:
+            eng = bh.BatteryHealthEngine(_cfg())
+            eng.restore({"schema_version": old_version})
+            self.assertEqual(
+                eng.first_seen_ts, 555.0,
+                "a registered migration must actually be applied, not "
+                "bypassed in favor of the fresh-start fallback",
+            )
+            self.assertIsNone(
+                eng.last_schema_reset_ts,
+                "a successful migration is not a reset and must not be "
+                "recorded as one",
+            )
+        finally:
+            bh._SCHEMA_MIGRATIONS.clear()
+            bh._SCHEMA_MIGRATIONS.update(original_migrations)
+
+
+class TestTopologyPackReplacementDetection(unittest.TestCase):  # v2.0.7 (TOPO-01 done properly)
+    """A different, non-None serial appearing in the same wiring slot
+    must be treated as a genuine physical pack replacement -- fresh
+    tracker for that slot, previous pack's history discarded outright,
+    not bridged or merely gap-marked. Age/SOH tracking follows the
+    physical pack, not the wiring position."""
+
+    @staticmethod
+    def _pack(soc, dis, serial, online=True):
+        return bh.PackSample(voltage=53.0, temp_max=25.0, temp_min=24.0,
+                              online=online, soc=soc, power_w=-2500.0,
+                              lifetime_discharge_kwh=dis, serial_number=serial)
+
+    def test_first_ever_observation_is_not_a_replacement(self):
+        """Negative case: seeing a serial for the very first time (no
+        prior known serial for this slot) must never itself be treated
+        as a replacement -- only a CHANGE from one known serial to a
+        different one is."""
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        tracker = bh.PackCapacityTracker(cfg, pack_count=1)
+        s = _sample(0, soc=90.0, power=-2500.0, chg=0.0, dis=0.0,
+                    packs=[self._pack(90.0, 0.0, "SN-AAA")])
+        tracker.feed(s, learning=True)
+        self.assertEqual(tracker.pack_replaced_count[0], 0)
+        self.assertEqual(tracker._last_serial[0], "SN-AAA")
+
+    def test_adversarial_serial_change_discards_old_history_entirely(self):
+        """The core guarantee: once a real pack has accumulated segments
+        and a reference capacity, a serial change must wipe ALL of it --
+        not just discard an in-progress segment -- because the new
+        physical pack genuinely has zero history of its own."""
+        cfg = _cfg(freshness_tau_kwh=1e12, capacity_reference_min_segments=2,
+                   capacity_reference_min_span_days=1.0)
+        tracker = bh.PackCapacityTracker(cfg, pack_count=1)
+        t = 0.0
+        # Build real history under the old pack's identity -- two full
+        # discharge/close cycles, same shape as the proven
+        # _run_pack_discharge() helper above (21 ticks + 1 close tick).
+        for cycle in range(2):
+            dis0 = cycle * 1.6
+            dis1 = (cycle + 1) * 1.6
+            for i in range(21):
+                frac = i / 20
+                soc = 100.0 - 20.0 * frac
+                dis = dis0 + (dis1 - dis0) * frac
+                tracker.feed(_sample(t, soc=soc, power=-2500.0, chg=0.0, dis=0.0,
+                                     packs=[self._pack(soc, dis, "SN-OLD")]),
+                            learning=True)
+                t += 60
+            tracker.feed(_sample(t, soc=80.0, power=CLOSE_POWER, chg=0.0, dis=0.0,
+                                 packs=[self._pack(80.0, dis1, "SN-OLD")]),
+                        learning=True)
+            t += 3600 * 6
+        self.assertGreater(
+            len(tracker.trackers[0].segments), 0,
+            "test setup invalid -- no history accumulated to discard",
+        )
+        old_segment_count = len(tracker.trackers[0].segments)
+
+        # Now the physical pack in this slot is replaced.
+        tracker.feed(
+            _sample(t, soc=90.0, power=-2500.0, chg=0.0, dis=0.0,
+                   packs=[self._pack(90.0, 0.0, "SN-NEW")]),
+            learning=True,
+        )
+        self.assertEqual(
+            len(tracker.trackers[0].segments), 0,
+            f"old pack's {old_segment_count} segments must be entirely "
+            "discarded on replacement, not carried forward",
+        )
+        self.assertIsNone(
+            tracker.trackers[0].reference_capacity_kwh,
+            "the new pack's SOH must start from a fresh, unmeasured "
+            "reference -- not the old pack's reference capacity",
+        )
+        self.assertEqual(tracker.pack_replaced_count[0], 1)
+        self.assertEqual(tracker._last_serial[0], "SN-NEW")
+
+    def test_same_serial_repeated_is_never_a_replacement(self):
+        """Negative case: the same pack reporting the same serial every
+        tick (the overwhelmingly common case) must never trigger a
+        replacement."""
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        tracker = bh.PackCapacityTracker(cfg, pack_count=1)
+        t = 0.0
+        for i in range(10):
+            tracker.feed(
+                _sample(t, soc=90.0, power=-2500.0, chg=0.0, dis=0.0,
+                       packs=[self._pack(90.0, i * 0.1, "SN-STABLE")]),
+                learning=True,
+            )
+            t += 60
+        self.assertEqual(tracker.pack_replaced_count[0], 0)
+
+    def test_missing_serial_does_not_reset_or_forget_the_last_known_one(self):
+        """A temporarily unreadable serial (None) must not itself be
+        treated as a change, and must not overwrite the last known good
+        value -- only a genuinely DIFFERENT non-None serial should."""
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        tracker = bh.PackCapacityTracker(cfg, pack_count=1)
+        tracker.feed(
+            _sample(0, soc=90.0, power=-2500.0, chg=0.0, dis=0.0,
+                   packs=[self._pack(90.0, 0.0, "SN-KNOWN")]),
+            learning=True,
+        )
+        tracker.feed(
+            _sample(60, soc=89.0, power=-2500.0, chg=0.0, dis=0.1,
+                   packs=[self._pack(89.0, 0.1, None)]),  # serial unreadable this tick
+            learning=True,
+        )
+        self.assertEqual(
+            tracker._last_serial[0], "SN-KNOWN",
+            "a missing serial reading must not overwrite the last known one",
+        )
+        self.assertEqual(tracker.pack_replaced_count[0], 0)
+
+    def test_persistence_round_trip_preserves_last_serial_and_replaced_count(self):
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        tracker = bh.PackCapacityTracker(cfg, pack_count=2, slot_labels=["u1p1", "u1p2"])
+        tracker.feed(
+            _sample(0, soc=90.0, power=-2500.0, chg=0.0, dis=0.0,
+                   packs=[self._pack(90.0, 0.0, "SN-A"), self._pack(90.0, 0.0, "SN-B")]),
+            learning=True,
+        )
+        tracker.feed(
+            _sample(60, soc=89.0, power=-2500.0, chg=0.0, dis=0.1,
+                   packs=[self._pack(89.0, 0.1, "SN-A-REPLACED"), self._pack(89.0, 0.1, "SN-B")]),
+            learning=True,
+        )
+        data = tracker.to_dict()
+
+        tracker2 = bh.PackCapacityTracker(cfg, pack_count=2, slot_labels=["u1p1", "u1p2"])
+        tracker2.restore(data)
+        self.assertEqual(tracker2._last_serial, ["SN-A-REPLACED", "SN-B"])
+        self.assertEqual(tracker2.pack_replaced_count, [1, 0])
+
+    def test_topology_change_since_last_save_does_not_misapply_last_serial(self):
+        """If slot_labels differ from what was persisted (e.g. a second
+        storage unit was added, shifting/renumbering slots since the
+        last save), restore() must not blindly apply positionally-
+        mismatched last_serial data -- treated as unknown instead of
+        risking a false replacement (or false non-replacement) against
+        the wrong physical pack."""
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        old = bh.PackCapacityTracker(cfg, pack_count=1, slot_labels=["u1p1"])
+        old.feed(
+            _sample(0, soc=90.0, power=-2500.0, chg=0.0, dis=0.0,
+                   packs=[self._pack(90.0, 0.0, "SN-A")]),
+            learning=True,
+        )
+        data = old.to_dict()
+
+        # Topology grew: now 2 slots with DIFFERENT labels than before.
+        new = bh.PackCapacityTracker(cfg, pack_count=2, slot_labels=["u1p1", "u2p1"])
+        new.restore(data)
+        self.assertIsNone(
+            new._last_serial[0],
+            "mismatched slot_labels must not have last_serial silently "
+            "applied -- treated as unknown, not assumed to still align",
+        )
+
 
 class TestTier3CapacityNormalization(unittest.TestCase):  # v2.0.6, battery health architecture review
     """Temperature/rate normalization, from PHASE1_BATTERY_HEALTH_DESIGN
@@ -1854,6 +2467,30 @@ class TestTier3CapacityNormalization(unittest.TestCase):  # v2.0.6, battery heal
         # f_temp clamped to capacity_norm_factor_floor (0.5): normalized
         # capacity must not exceed raw / floor.
         self.assertLessEqual(normalized, 20.0 / cfg.capacity_norm_factor_floor + 1e-6)
+
+    def test_adversarial_combined_cold_and_high_rate_capped_at_single_factor_floor(self):
+        """BH-07 (ICS quality audit -- confirmed): a segment that is BOTH
+        extremely cold AND extremely high-rate must not compound past
+        the single-factor floor -- pre-fix, each factor independently
+        clamping to 0.5 let the PRODUCT fall to 0.25 (a 4x correction);
+        the combined correction must now be capped at the same 2x a
+        single adverse factor alone would produce."""
+        cfg = bh.BatteryHealthConfig()
+        # Extreme cold (well past the temperature floor) AND extreme
+        # rate (well past the rate floor): 8 kWh over 0.1h = 80 kW
+        # average power, and -40C.
+        seg = self._seg(implied=20.0, avg_temp_c=-40.0, energy_kwh=8.0, duration_h=0.1)
+        normalized = seg.normalized_capacity_kwh(cfg)
+        single_factor_bound = 20.0 / cfg.capacity_norm_factor_floor  # 2x, not 4x
+        self.assertLessEqual(
+            normalized, single_factor_bound + 1e-6,
+            f"got {normalized:.2f}, must not exceed {single_factor_bound:.2f} "
+            "(the pre-fix bug allowed up to 80.0, a 4x correction from "
+            "two floors compounding multiplicatively)",
+        )
+        # Confirm this is a REAL, binding constraint for this input --
+        # not a vacuously true assertion because neither floor was hit.
+        self.assertAlmostEqual(normalized, single_factor_bound, places=2)
 
     def test_avg_temp_c_accumulates_only_valid_readings(self):
         """A segment with some missing temperature ticks must average
@@ -1913,3 +2550,185 @@ class TestTier3CapacityNormalization(unittest.TestCase):  # v2.0.6, battery heal
             eng.segments.reference_capacity_kwh, normalized, places=2,
             msg="the captured reference must equal the NORMALIZED value, not raw",
         )
+
+
+class TestSectionEConditionCoverageAndFloorHits(unittest.TestCase):  # v2.0.7
+    """Section E, this release: purely observational telemetry for the
+    deferred Architecture Phase 2/3 questions. Every assertion here
+    checks visibility only -- none of this may ever change soh_capacity,
+    BHI, or any other health output (see the adversarial isolation test
+    at the end of this class)."""
+
+    def test_nominal_conditions_bucket_correctly(self):
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        eng = bh.BatteryHealthEngine(cfg)
+        _run_discharge(eng, 0, 95.0, 75.0, 0.0, 6.0, temp=25.0, power=-2500.0)
+        self.assertEqual(
+            eng.segments.condition_coverage.get("nominal:low_rate"), 1,
+        )
+
+    def test_cold_high_rate_segment_buckets_correctly(self):
+        cfg = _cfg(freshness_tau_kwh=1e12, capacity_rate_ref_w=5000.0,
+                   capacity_temp_sigma_c=15.0)
+        eng = bh.BatteryHealthEngine(cfg)
+        # -20C (deviation -45 from the 25C default ref -> "cold"),
+        # ~17kW average power (well above the 5kW default ref -> "high_rate")
+        for i in range(21):
+            frac = i / 20
+            eng.update(_sample(i * 60, soc=95.0 - 20.0 * frac, power=-2500.0,
+                               chg=0.0, dis=6.0 * frac, temp=-19.0))
+        eng.update(_sample(21 * 60, soc=75.0, power=CLOSE_POWER, chg=0.0,
+                           dis=6.0, temp=-19.0))
+        self.assertEqual(
+            eng.segments.condition_coverage.get("cold:high_rate"), 1,
+        )
+
+    def test_missing_temperature_buckets_as_temp_unknown(self):
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        eng = bh.BatteryHealthEngine(cfg)
+        # temp=None throughout -- avg_temp_c on the closed segment must
+        # be None, bucketed as temp_unknown, not silently defaulted.
+        for i in range(21):
+            frac = i / 20
+            eng.update(_sample(i * 60, soc=95.0 - 20.0 * frac, power=-2500.0,
+                               chg=0.0, dis=6.0 * frac, temp=None))
+        eng.update(_sample(21 * 60, soc=75.0, power=CLOSE_POWER, chg=0.0,
+                           dis=6.0, temp=None))
+        found = [k for k in eng.segments.condition_coverage if k.startswith("temp_unknown:")]
+        self.assertEqual(len(found), 1)
+
+    def test_multiple_segments_accumulate_not_overwrite(self):
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        eng = bh.BatteryHealthEngine(cfg)
+        t = _run_discharge(eng, 0, 95.0, 75.0, 0.0, 4.5, temp=25.0, power=-2500.0)
+        _run_discharge(eng, t, 95.0, 75.0, 4.5, 9.0, temp=25.0, power=-2500.0)
+        self.assertEqual(
+            eng.segments.condition_coverage.get("nominal:low_rate"), 2,
+            "a second segment in the same bucket must increment, not reset",
+        )
+
+    def test_adversarial_combined_floor_hit_is_counted(self):
+        """BH-07's combined floor (both cold AND high-rate simultaneously)
+        must be counted as a real occurrence when it genuinely binds."""
+        cfg = _cfg(freshness_tau_kwh=1e12, capacity_rate_ref_w=5000.0,
+                   capacity_temp_sigma_c=15.0)
+        eng = bh.BatteryHealthEngine(cfg)
+        # Extreme cold AND extreme rate: well past both individual floors,
+        # forcing the combined-product clamp to actually bind. 6.0 kWh
+        # over a 20% SOC drop keeps implied capacity (30.0) within the
+        # unit-scale [8,35] plausibility band.
+        for i in range(21):
+            frac = i / 20
+            eng.update(_sample(i * 60, soc=95.0 - 20.0 * frac, power=-2500.0,
+                               chg=0.0, dis=6.0 * frac, temp=-19.0))
+        eng.update(_sample(21 * 60, soc=75.0, power=CLOSE_POWER, chg=0.0,
+                           dis=6.0, temp=-19.0))
+        self.assertGreaterEqual(eng.segments.combined_norm_floor_hits, 1)
+
+    def test_negative_case_mild_conditions_never_hit_the_floor(self):
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        eng = bh.BatteryHealthEngine(cfg)
+        _run_discharge(eng, 0, 95.0, 75.0, 0.0, 6.0, temp=25.0, power=-2500.0)
+        self.assertEqual(eng.segments.combined_norm_floor_hits, 0)
+
+    def test_adversarial_telemetry_never_affects_soh_capacity(self):
+        """The core isolation guarantee: two engines fed IDENTICAL data
+        must report byte-for-byte identical soh_capacity/BHI regardless
+        of what condition_coverage/combined_norm_floor_hits happen to
+        record -- confirms this telemetry is genuinely observational,
+        never fed back into any computation."""
+        cfg = _cfg(freshness_tau_kwh=1e12, capacity_reference_min_segments=1,
+                   capacity_reference_min_span_days=0.0)
+        eng_a = bh.BatteryHealthEngine(cfg)
+        eng_b = bh.BatteryHealthEngine(cfg)
+        for eng in (eng_a, eng_b):
+            _run_discharge(eng, 0, 95.0, 75.0, 0.0, 6.0, temp=-19.0, power=-2500.0)
+        soh_a, _ = eng_a.segments.soh_capacity()
+        soh_b, _ = eng_b.segments.soh_capacity()
+        self.assertEqual(soh_a, soh_b)
+        # Sanity: telemetry itself was genuinely recorded (not skipped),
+        # so this isn't a vacuous comparison of two untouched engines.
+        self.assertGreater(len(eng_a.segments.condition_coverage), 0)
+
+    def test_persistence_round_trip(self):
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        eng = bh.BatteryHealthEngine(cfg)
+        _run_discharge(eng, 0, 95.0, 75.0, 0.0, 6.0, temp=25.0, power=-2500.0)
+        data = eng.segments.to_dict()
+        eng2 = bh.BatteryHealthEngine(cfg)
+        eng2.segments.restore(data)
+        self.assertEqual(
+            eng2.segments.condition_coverage, eng.segments.condition_coverage,
+        )
+        self.assertEqual(
+            eng2.segments.combined_norm_floor_hits,
+            eng.segments.combined_norm_floor_hits,
+        )
+
+
+class TestSectionECurrentShareDeviation(unittest.TestCase):  # v2.0.7
+    @staticmethod
+    def _pack(soc, current):
+        return bh.PackSample(voltage=53.0, temp_max=25.0, temp_min=24.0,
+                              online=True, soc=soc, power_w=-2500.0,
+                              lifetime_discharge_kwh=0.0, current_a=current)
+
+    def test_none_with_fewer_than_two_readings(self):
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        tracker = bh.PackCapacityTracker(cfg, pack_count=3)
+        tracker.feed(
+            _sample(0, soc=90.0, power=-2500.0, chg=0.0, dis=0.0,
+                   packs=[self._pack(90.0, -10.0), self._pack(90.0, None),
+                          self._pack(90.0, None)]),
+            learning=True,
+        )
+        self.assertIsNone(tracker.current_share_deviation_pct())
+
+    def test_even_current_share_reports_zero_deviation(self):
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        tracker = bh.PackCapacityTracker(cfg, pack_count=3)
+        tracker.feed(
+            _sample(0, soc=90.0, power=-2500.0, chg=0.0, dis=0.0,
+                   packs=[self._pack(90.0, -10.0), self._pack(90.0, -10.0),
+                          self._pack(90.0, -10.0)]),
+            learning=True,
+        )
+        self.assertAlmostEqual(tracker.current_share_deviation_pct(), 0.0)
+
+    def test_adversarial_uneven_current_share_is_detected(self):
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        tracker = bh.PackCapacityTracker(cfg, pack_count=3)
+        tracker.feed(
+            _sample(0, soc=90.0, power=-2500.0, chg=0.0, dis=0.0,
+                   packs=[self._pack(90.0, -8.0), self._pack(90.0, -10.0),
+                          self._pack(90.0, -12.0)]),
+            learning=True,
+        )
+        # mean=-10, spread=4 -> 4/10*100 = 40%
+        self.assertAlmostEqual(tracker.current_share_deviation_pct(), 40.0, places=1)
+
+    def test_near_zero_mean_current_returns_none_not_a_crash(self):
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        tracker = bh.PackCapacityTracker(cfg, pack_count=2)
+        tracker.feed(
+            _sample(0, soc=90.0, power=0.0, chg=0.0, dis=0.0,
+                   packs=[self._pack(90.0, 0.0001), self._pack(90.0, -0.0001)]),
+            learning=True,
+        )
+        self.assertIsNone(tracker.current_share_deviation_pct())
+
+    def test_updates_on_every_feed_uses_latest_not_first(self):
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        tracker = bh.PackCapacityTracker(cfg, pack_count=2)
+        tracker.feed(
+            _sample(0, soc=90.0, power=-2500.0, chg=0.0, dis=0.0,
+                   packs=[self._pack(90.0, -5.0), self._pack(90.0, -5.0)]),
+            learning=True,
+        )
+        tracker.feed(
+            _sample(60, soc=89.0, power=-2500.0, chg=0.0, dis=0.1,
+                   packs=[self._pack(89.0, -8.0), self._pack(89.0, -12.0)]),
+            learning=True,
+        )
+        # mean=-10, spread=4 -> 40%, using the SECOND (latest) reading
+        self.assertAlmostEqual(tracker.current_share_deviation_pct(), 40.0, places=1)
