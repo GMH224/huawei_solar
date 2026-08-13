@@ -146,6 +146,25 @@ class _FakeGuard:
 
 _guard_stub.ModbusGuard = _FakeGuard
 
+# v2.0.5 (F-04, external ICS audit): _record_failure() in the real
+# module now imports these two alongside ModbusGuard, to distinguish
+# internal bus contention from a genuine device timeout for telemetry
+# purposes -- this stub needs to provide them too, or the real module's
+# own top-level import fails during collection. Real subclass
+# relationship (of TimeoutError) preserved, matching modbus_guard.py's
+# own definitions, since _record_failure()'s own isinstance() checks
+# depend on it.
+class _FakeModbusQueueShed(TimeoutError):
+    pass
+
+
+class _FakeModbusAdmissionTimeout(TimeoutError):
+    pass
+
+
+_guard_stub.ModbusQueueShed = _FakeModbusQueueShed
+_guard_stub.ModbusAdmissionTimeout = _FakeModbusAdmissionTimeout
+
 # Stub .modbus_telemetry
 _telemetry_stub = types.ModuleType("huawei_solar_telemetry_stub")
 _telemetry_stub.ModbusTelemetry = MagicMock
@@ -343,6 +362,9 @@ def _make_coordinator(inv1=None, inv2=None, has_meter=True, has_battery=True):
     coord.shortcut_misses = 0
     coord.fallback_cache_hits = 0
     coord.fallback_physical_reads = 0
+    # v2.0.5 (F-05): same gap as above, for the two new counters.
+    coord.temporally_uncertain_count = 0
+    coord.results_with_span_computed = 0
     coord._primary_guard = _FakeGuard.get_or_create("SN-INV1")
     coord._secondary_guard = (
         _FakeGuard.get_or_create(inv2.serial_number) if inv2 else None
@@ -903,3 +925,88 @@ class TestICS01FallbackTemporalAlignment:
             "a 0.5s-old cached value combined with a fresh read is well "
             "within the 3.0s tolerance and must not be flagged"
         )
+
+
+# ── v2.0.5: F-05 -- aggregate temporal-uncertainty telemetry (external ICS audit) ──
+
+class TestF05TemporallyUncertainAggregateTracking:
+    """F-05, external ICS audit -- confirmed genuine gap: ICS-01/ICS-05
+    (v2.0.3) correctly compute is_temporally_uncertain per-result, but
+    nothing tracked how often it actually fires in practice -- the
+    report's own concern about the dedicated-read fallback's per-value
+    guard-release-between-reads risk had no way to be answered from
+    data. These two new counters (temporally_uncertain_count, results_
+    with_span_computed) close that gap."""
+
+    @pytest.mark.asyncio
+    async def test_uncertain_result_increments_both_counters(self):
+        inv1_cache = _FakeCache()
+        inv1_cache.set(rn.INPUT_POWER, quality=_Q.GOOD, age=5.0, value=3000)
+        coord = _make_coordinator_with_caches(
+            inv1_cache=inv1_cache, meter_cache=None, has_meter=True, has_battery=False,
+        )
+        with patch.object(sync_mod, "SYNC_POWER_CACHE_ALIGNMENT_TOLERANCE_S", -1.0):
+            assert coord._try_cache_shortcut() is None
+        result = await coord._async_update_data()
+        assert result.is_temporally_uncertain is True  # test setup sanity check
+        assert coord.temporally_uncertain_count == 1
+        assert coord.results_with_span_computed == 1
+
+    @pytest.mark.asyncio
+    async def test_certain_result_increments_denominator_only(self):
+        """A result that computed a real span but stayed within
+        tolerance must still count toward the denominator (results_
+        with_span_computed) -- it just must not count toward the
+        numerator (temporally_uncertain_count)."""
+        coord = _make_coordinator_with_caches(
+            inv1_cache=None, meter_cache=None, has_meter=True, has_battery=False,
+        )
+        result = await coord._async_update_data()
+        assert result.is_temporally_uncertain is False
+        assert coord.results_with_span_computed == 1
+        assert coord.temporally_uncertain_count == 0
+
+    @pytest.mark.asyncio
+    async def test_snapshot_exposes_the_rate(self):
+        inv1_cache = _FakeCache()
+        inv1_cache.set(rn.INPUT_POWER, quality=_Q.GOOD, age=5.0, value=3000)
+        coord = _make_coordinator_with_caches(
+            inv1_cache=inv1_cache, meter_cache=None, has_meter=True, has_battery=False,
+        )
+        with patch.object(sync_mod, "SYNC_POWER_CACHE_ALIGNMENT_TOLERANCE_S", -1.0):
+            assert coord._try_cache_shortcut() is None
+        await coord._async_update_data()
+        snap = coord.snapshot()
+        self_check = {"temporally_uncertain_count", "results_with_span_computed", "temporally_uncertain_rate"}
+        assert self_check <= snap.keys(), f"missing fields: {self_check - snap.keys()}"
+        assert snap["temporally_uncertain_count"] == 1
+        assert snap["results_with_span_computed"] == 1
+        assert snap["temporally_uncertain_rate"] == 1.0
+
+    @pytest.mark.asyncio
+    async def test_snapshot_rate_is_none_with_zero_denominator(self):
+        """Matches this class's own established convention (shortcut_
+        hit_rate/fallback_cache_hit_rate) for an empty denominator."""
+        coord = _make_coordinator_with_caches(
+            inv1_cache=None, meter_cache=None, has_meter=False, has_battery=False,
+        )
+        snap = coord.snapshot()
+        assert snap["temporally_uncertain_rate"] is None
+
+    @pytest.mark.asyncio
+    async def test_aligned_shortcut_path_never_increments_either_counter(self):
+        """The aligned shortcut always has is_temporally_uncertain=False
+        by construction (see that field's own comment in the dataclass)
+        -- confirms it is deliberately NOT double-counted alongside the
+        fallback path's own tracking."""
+        inv1_cache = _FakeCache()
+        inv1_cache.set(rn.INPUT_POWER, quality=_Q.GOOD, age=0.1, value=3000)
+        meter_cache = _FakeCache()
+        meter_cache.set(rn.POWER_METER_ACTIVE_POWER, quality=_Q.GOOD, age=0.1, value=-500.0)
+        coord = _make_coordinator_with_caches(
+            inv1_cache=inv1_cache, meter_cache=meter_cache, has_meter=True, has_battery=False,
+        )
+        result = coord._try_cache_shortcut()
+        assert result is not None, "test setup check: shortcut must hit for this test to be meaningful"
+        assert coord.temporally_uncertain_count == 0
+        assert coord.results_with_span_computed == 0

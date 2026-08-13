@@ -656,7 +656,7 @@ class TestAdmissionTimeoutClassification(unittest.TestCase):
         separate fix applied to its own inline bookkeeping."""
         idx = _SOURCE.find('f"Timeout from {self.device.serial_number} optimizers')
         self.assertGreater(idx, -1, "optimizer timeout handler not found")
-        window = _SOURCE[max(0, idx - 1800): idx]
+        window = _SOURCE[max(0, idx - 2600): idx]
         self.assertIn("is_shed = isinstance(err, ModbusQueueShed)", window)
         self.assertIn(
             "is_admission_timeout = isinstance(err, ModbusAdmissionTimeout)", window,
