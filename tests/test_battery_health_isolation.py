@@ -162,6 +162,21 @@ class TestGoldenRegisterSet(unittest.TestCase):  # T19.1
     #: anchors for 122 consecutive days and zero balance samples for 78.
     #: Cost: one U16 register, adjacent to the storage control block already
     #: polled by the integration's own end-of-charge SOC entity.
+    #: v2.0.6 CHANGE (deliberate, +12 registers): Tier 3 of the battery
+    #: health architecture review added PackCapacityTracker -- a direct,
+    #: measured per-pack capacity estimate (the same segment-detection
+    #: approach the unit-level tracker already uses), chosen over a
+    #: simpler dV/dT-only balance proxy once per-pack SOC/power/lifetime
+    #: charge/discharge counters were confirmed to exist with the same
+    #: units/gain as their unit-level equivalents. Cost: 12 registers (3
+    #: packs x 4 fields), but all four sit in a tight, PDU-adjacent block
+    #: (38229-38240) alongside storage_unit_1_battery_pack_N_voltage,
+    #: already read every poll -- confirmed against the real register map
+    #: before adding these, not assumed. The two counter fields per pack
+    #: (total_charge/total_discharge) specifically need NORMAL tier, not
+    #: the SLOW tier their name would otherwise default to -- see
+    #: register_cache.py's own _TIER_OVERRIDES for the same reasoning
+    #: already established for the unit-level counters.
     GOLDEN = sorted([
         "storage_charging_cutoff_capacity",
         "storage_state_of_capacity",
@@ -186,6 +201,18 @@ class TestGoldenRegisterSet(unittest.TestCase):  # T19.1
         "storage_unit_1_battery_pack_1_soh_calibration_status",
         "storage_unit_1_battery_pack_2_soh_calibration_status",
         "storage_unit_1_battery_pack_3_soh_calibration_status",
+        "storage_unit_1_battery_pack_1_state_of_capacity",
+        "storage_unit_1_battery_pack_2_state_of_capacity",
+        "storage_unit_1_battery_pack_3_state_of_capacity",
+        "storage_unit_1_battery_pack_1_charge_discharge_power",
+        "storage_unit_1_battery_pack_2_charge_discharge_power",
+        "storage_unit_1_battery_pack_3_charge_discharge_power",
+        "storage_unit_1_battery_pack_1_total_charge",
+        "storage_unit_1_battery_pack_2_total_charge",
+        "storage_unit_1_battery_pack_3_total_charge",
+        "storage_unit_1_battery_pack_1_total_discharge",
+        "storage_unit_1_battery_pack_2_total_discharge",
+        "storage_unit_1_battery_pack_3_total_discharge",
     ])
 
     def test_register_set_matches_golden_list(self):
@@ -198,7 +225,10 @@ class TestGoldenRegisterSet(unittest.TestCase):  # T19.1
     def test_register_count_is_bounded(self):
         # Guard rail: a batched poll of this size is known-good on the
         # reporter's hardware. Meaningful growth needs re-validation.
-        self.assertLessEqual(len(MGR.REQUIRED_REGISTER_NAMES), 25)
+        # v2.0.6: raised from 25 to 40 for Tier 3's own deliberate +12
+        # (see GOLDEN's own comment above) -- still a guard rail against
+        # further, unreviewed growth, not a removal of one.
+        self.assertLessEqual(len(MGR.REQUIRED_REGISTER_NAMES), 40)
 
 
 class TestSetupPathIsolation(unittest.TestCase):  # T19.2 / T19.4

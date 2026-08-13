@@ -40,6 +40,22 @@ DAY = 86_400.0
 
 def _cfg(**overrides) -> "bh.BatteryHealthConfig":
     cfg = bh.BatteryHealthConfig()
+    # v2.0.6 (Tier 3, battery health architecture review): neutralizes
+    # capacity temperature/rate normalization for every test using this
+    # shared helper, unless a test explicitly overrides these fields
+    # itself. Matches PHASE1_BATTERY_HEALTH_DESIGN.md's own documented
+    # lesson from the prior attempt at this exact feature, word for
+    # word: _run_discharge() (below) compresses a full discharge into 20
+    # simulated minutes, implying unrealistic rates (tens of kW against
+    # a 5 kW residential capacity_rate_ref_w) that a working rate-
+    # normalization correctly reacts to strongly -- these pre-existing
+    # tests predate normalization and are not testing it, so the fix is
+    # neutralizing it here, not weakening the normalization logic
+    # itself. Confirmed this was genuinely needed, not assumed from the
+    # design doc alone: five pre-existing tests failed with exactly this
+    # symptom (estimated_capacity_kwh roughly doubled) before this fix.
+    cfg.capacity_temp_sigma_c = 1e9
+    cfg.capacity_rate_ref_w = 1e9
     for k, v in overrides.items():
         setattr(cfg, k, v)
     return cfg
@@ -164,13 +180,62 @@ class TestFreshnessAndGolden(unittest.TestCase):  # T5
         self.assertAlmostEqual(seg1.freshness, 1.0, places=2)
         self.assertAlmostEqual(seg2.freshness, math.exp(-4.0 / 40.0), places=3)
 
-    def test_golden_segment_weight_boost(self):
+    def test_calibration_overlap_excludes_the_segment(self):
+        """v2.0.6 (Tier 1, battery health architecture review): replaces
+        the old test_golden_segment_weight_boost, which checked the
+        OPPOSITE of what's now correct. Calibration overlap must fully
+        EXCLUDE a segment (weight 0.0), not boost it -- see
+        DischargeSegment.exclude_calibration's own comment for why."""
         cfg = _cfg(freshness_tau_kwh=1e12)
         eng = bh.BatteryHealthEngine(cfg)
         _run_discharge(eng, 0.0, 95.0, 75.0, 0.0, 4.0, calib=True)
         seg = eng.segments.segments[0]
-        self.assertTrue(seg.golden)
-        self.assertAlmostEqual(seg.weight(cfg), 20.0 ** 2 * 4.0, places=1)
+        self.assertTrue(seg.exclude_calibration)
+        self.assertEqual(seg.weight(cfg), 0.0)
+
+    def test_segment_with_no_calibration_overlap_is_not_excluded(self):
+        """Negative case: a completely ordinary segment must not be
+        excluded -- confirms the fix didn't make exclusion the default."""
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        eng = bh.BatteryHealthEngine(cfg)
+        _run_discharge(eng, 0.0, 95.0, 75.0, 0.0, 4.0, calib=False)
+        seg = eng.segments.segments[0]
+        self.assertFalse(seg.exclude_calibration)
+        self.assertGreater(seg.weight(cfg), 0.0)
+
+    def test_segment_starting_within_settle_window_after_completion_is_excluded(self):
+        """The edge-detection half of Tier 1, not covered by the old
+        test at all: a segment starting shortly after calibration
+        COMPLETES (not while still active) must also be excluded -- the
+        raw register can't distinguish "calibrating" from "just
+        finished" from one reading, so the settle window covers this
+        ambiguity."""
+        cfg = _cfg(freshness_tau_kwh=1e12, calibration_settle_s=300.0)
+        eng = bh.BatteryHealthEngine(cfg)
+        # Calibration active, then completes (nonzero -> zero edge).
+        eng.update(_sample(0, soc=50.0, power=0.0, chg=0.0, dis=0.0, calib=True))
+        eng.update(_sample(60, soc=50.0, power=0.0, chg=0.0, dis=0.0, calib=False))
+        # A segment starting 100s later -- well within the 300s settle window.
+        _run_discharge(eng, 160.0, 95.0, 75.0, 0.0, 4.0, calib=False)
+        seg = eng.segments.segments[0]
+        self.assertTrue(
+            seg.exclude_calibration,
+            "a segment starting within the settle window after a "
+            "detected calibration completion must be excluded",
+        )
+
+    def test_segment_starting_well_after_settle_window_is_not_excluded(self):
+        """Negative case: the exclusion must not linger forever -- once
+        the settle window has genuinely passed, a new segment is
+        ordinary again."""
+        cfg = _cfg(freshness_tau_kwh=1e12, calibration_settle_s=300.0)
+        eng = bh.BatteryHealthEngine(cfg)
+        eng.update(_sample(0, soc=50.0, power=0.0, chg=0.0, dis=0.0, calib=True))
+        eng.update(_sample(60, soc=50.0, power=0.0, chg=0.0, dis=0.0, calib=False))
+        # A segment starting 1000s later -- well past the 300s settle window.
+        _run_discharge(eng, 1060.0, 95.0, 75.0, 4.0, 8.0, calib=False)
+        seg = eng.segments.segments[0]
+        self.assertFalse(seg.exclude_calibration)
 
 
 class TestGapHandling(unittest.TestCase):  # T6 (contract corrected in v1.1.8)
@@ -1183,6 +1248,110 @@ class TestEfficiencyAnchorTiers(unittest.TestCase):  # T25 / Findings L, O
         self.assertEqual(len(eng.efficiency.windows), 1)
 
 
+class TestTier2CalibrationAwareness(unittest.TestCase):  # v2.0.6, battery health architecture review
+    """Tier 2: EfficiencyTracker and BalanceTracker must not treat a
+    reading captured during calib_uncertain as trustworthy, for the same
+    reasoning Tier 1 already established for SegmentTracker -- see
+    DischargeSegment.exclude_calibration's own comment for the full
+    background. Confirmed directly from this project's own code comments
+    (not assumed) that this matters MORE for efficiency specifically:
+    tier-1 anchors are described as being "at a BMS recalibration point"
+    -- a structural, not incidental, overlap.
+    """
+
+    def test_efficiency_anchor_is_disqualified_during_calibration(self):
+        """A reading that would otherwise fully qualify as a tier-1
+        anchor must not, while calib_uncertain -- confirms
+        _anchor_tier() itself rejects it, not just the resulting window."""
+        cfg = _cfg(eff_baseline_windows=1)
+        eng = bh.BatteryHealthEngine(cfg)
+        self.assertEqual(
+            eng.efficiency._anchor_tier(
+                _sample(0.0, soc=100.0, power=0.0, chg=0.0, dis=0.0),
+                calib_uncertain=True,
+            ),
+            0,
+            "a reading during calib_uncertain must never qualify as an "
+            "anchor, regardless of how well it otherwise satisfies the "
+            "tier-1/tier-2 conditions",
+        )
+
+    def test_efficiency_window_not_built_from_calibration_overlap_anchor(self):
+        """End-to-end: a window whose FIRST anchor was captured during
+        calibration must never form, even once a later, genuinely clean
+        anchor arrives."""
+        cfg = _cfg(eff_baseline_windows=1)
+        eng = bh.BatteryHealthEngine(cfg)
+        eng.efficiency.feed(
+            _sample(0.0, soc=100.0, power=0.0, chg=0.0, dis=0.0),
+            calib_uncertain=True,
+        )
+        eng.efficiency.feed(
+            _sample(DAY, soc=100.0, power=0.0, chg=20.0, dis=19.8),
+            calib_uncertain=False,
+        )
+        self.assertEqual(
+            len(eng.efficiency.windows), 0,
+            "no window should form -- the first anchor was never "
+            "actually recorded (disqualified at calib_uncertain time), "
+            "so the second reading became the FIRST anchor instead, not "
+            "the end of a window",
+        )
+
+    def test_efficiency_unaffected_when_not_calibrating(self):
+        """Negative case: ordinary anchors must still work exactly as
+        before -- confirms Tier 2 didn't break Tier 2's own prerequisite
+        (unmodified default behaviour)."""
+        cfg = _cfg(eff_baseline_windows=1)
+        eng = bh.BatteryHealthEngine(cfg)
+        eng.efficiency.feed(_sample(0.0, soc=100.0, power=0.0, chg=0.0, dis=0.0))
+        eng.efficiency.feed(_sample(DAY, soc=100.0, power=0.0, chg=20.0, dis=19.8))
+        self.assertEqual(len(eng.efficiency.windows), 1)
+
+    def test_balance_score_not_accumulated_during_calibration(self):
+        """Raw dV/dT are still recorded (matching learn=False's own
+        established behaviour) but no score/baseline capture happens."""
+        cfg = _cfg(balance_baseline_min_samples=1)
+        eng = bh.BatteryHealthEngine(cfg)
+        packs = [bh.PackSample(voltage=53.0, temp_max=25.0, temp_min=24.0, online=True),
+                 bh.PackSample(voltage=53.1, temp_max=25.1, temp_min=24.1, online=True)]
+        eng.balance.feed(
+            _sample(0.0, soc=100.0, power=0.0, packs=packs, ceiling=100.0),
+            calib_uncertain=True,
+        )
+        self.assertEqual(len(eng.balance.raw_dv), 1, "raw values must still be recorded")
+        self.assertIsNone(
+            eng.balance.baseline_dv,
+            "no baseline may be captured from a sample during calib_uncertain",
+        )
+
+    def test_balance_unaffected_when_not_calibrating(self):
+        cfg = _cfg(balance_baseline_min_samples=1)
+        eng = bh.BatteryHealthEngine(cfg)
+        packs = [bh.PackSample(voltage=53.0, temp_max=25.0, temp_min=24.0, online=True),
+                 bh.PackSample(voltage=53.1, temp_max=25.1, temp_min=24.1, online=True)]
+        eng.balance.feed(_sample(0.0, soc=100.0, power=0.0, packs=packs, ceiling=100.0))
+        self.assertIsNotNone(eng.balance.baseline_dv)
+
+    def test_engine_wires_calib_uncertain_into_both_trackers_end_to_end(self):
+        """Full integration through BatteryHealthEngine.update() itself,
+        not the trackers called directly -- confirms the centralized
+        edge-detection (moved here from SegmentTracker in this same
+        refactor) actually reaches efficiency and balance, not just
+        capacity."""
+        cfg = _cfg(eff_baseline_windows=1, balance_baseline_min_samples=1)
+        eng = bh.BatteryHealthEngine(cfg)
+        packs = [bh.PackSample(voltage=53.0, temp_max=25.0, temp_min=24.0, online=True),
+                 bh.PackSample(voltage=53.1, temp_max=25.1, temp_min=24.1, online=True)]
+        eng.update(_sample(0.0, soc=100.0, power=0.0, chg=0.0, dis=0.0,
+                           packs=packs, ceiling=100.0, calib=True))
+        self.assertIsNone(
+            eng.balance.baseline_dv,
+            "the engine must propagate calibration state to balance, "
+            "not just capacity",
+        )
+
+
 class TestBalanceDiagnosticChannels(unittest.TestCase):  # T26
     """Independent MIN-sensor channel and physical-unit deviations."""
 
@@ -1445,3 +1614,302 @@ class TestSettlingPeriod(unittest.TestCase):  # T30
                            temp=20.0))
         self.assertAlmostEqual(eng.report.efc, 150.0, places=1)
         self.assertFalse(eng.report.attributes["learning_active"])
+
+
+class TestTier3PackCapacityTracker(unittest.TestCase):  # v2.0.6, battery health architecture review
+    """PackCapacityTracker: a direct, measured per-pack capacity estimate,
+    reusing SegmentTracker exactly as-is per pack. See that class's own
+    docstring for the full reasoning behind choosing this over the
+    parked design's simpler per-pack-SOC-blended-into-balance plan."""
+
+    @staticmethod
+    def _pack(soc, power=-2500.0, chg=0.0, dis=0.0, online=True,
+              voltage=53.0, temp_max=25.0, temp_min=24.0):
+        return bh.PackSample(
+            voltage=voltage, temp_max=temp_max, temp_min=temp_min, online=online,
+            soc=soc, power_w=power, lifetime_charge_kwh=chg,
+            lifetime_discharge_kwh=dis,
+        )
+
+    def _run_pack_discharge(self, eng, t0, soc0, soc1, dis0, dis1, steps=20):
+        """Drive all three packs identically through one discharge, unless
+        a test overrides a specific pack afterward. Closes with a
+        CHARGING tick, matching _run_discharge()'s own established
+        pattern (v1.2.0: idle no longer closes a segment).
+
+        dis0/dis1 are pack-scale kWh (a single pack's own nameplate is
+        roughly 1/3 of the whole unit's ~20.7 kWh, hence PackCapacity
+        Tracker's own scaled implied-capacity plausibility band) -- NOT
+        the same magnitude as _run_discharge()'s own unit-scale values.
+        """
+        for i in range(steps + 1):
+            frac = i / steps
+            soc = soc0 + (soc1 - soc0) * frac
+            dis = dis0 + (dis1 - dis0) * frac
+            packs = [self._pack(soc, dis=dis) for _ in range(3)]
+            eng.update(_sample(t0 + i * 60, soc=soc0, power=-2500.0,
+                               chg=0.0, dis=0.0, packs=packs))
+        packs = [self._pack(soc1, power=CLOSE_POWER, dis=dis1) for _ in range(3)]
+        eng.update(_sample(t0 + (steps + 1) * 60, soc=soc1, power=CLOSE_POWER,
+                           chg=0.0, dis=0.0, packs=packs))
+
+    def test_pack_segment_is_detected_and_contributes_to_that_packs_soh(self):
+        """A genuine per-pack discharge must be detected by that pack's
+        own SegmentTracker instance and contribute to its own
+        soh_capacity -- confirms the reused-as-is wiring actually works
+        end to end, not just compiles."""
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        eng = bh.BatteryHealthEngine(cfg)
+        self._run_pack_discharge(eng, 0.0, 95.0, 75.0, 0.0, 1.6)
+        for i, tracker in enumerate(eng.pack_capacity.trackers):
+            self.assertEqual(
+                len(tracker.segments), 1,
+                f"pack {i + 1}'s own tracker must have exactly one segment",
+            )
+
+    def test_packs_track_independently(self):
+        """One pack's own segment must not affect another's -- confirms
+        genuine independence, not a shared/aliased tracker instance."""
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        eng = bh.BatteryHealthEngine(cfg)
+        for i in range(21):
+            frac = i / 20
+            soc = 95.0 - 20.0 * frac
+            # Pack 1 discharges 4 kWh; pack 2 discharges 8 kWh (weaker
+            # implied capacity); pack 3 stays flat (no segment at all).
+            packs = [
+                self._pack(soc, dis=1.6 * frac),
+                self._pack(soc, dis=1.0 * frac),  # weaker: less energy for the same SOC drop
+                self._pack(100.0, power=0.0, dis=0.0),  # never discharges
+            ]
+            eng.update(_sample(i * 60, soc=95.0, power=-2500.0, chg=0.0,
+                               dis=0.0, packs=packs))
+        # Close packs 1/2 with a charging tick (v1.2.0: idle alone doesn't
+        # close a segment); pack 3 never opened one, so this is a no-op
+        # for it either way.
+        packs = [
+            self._pack(75.0, power=CLOSE_POWER, dis=1.6),
+            self._pack(75.0, power=CLOSE_POWER, dis=1.0),
+            self._pack(100.0, power=CLOSE_POWER, dis=0.0),
+        ]
+        eng.update(_sample(21 * 60, soc=75.0, power=CLOSE_POWER, chg=0.0,
+                           dis=0.0, packs=packs))
+        self.assertEqual(len(eng.pack_capacity.trackers[0].segments), 1)
+        self.assertEqual(len(eng.pack_capacity.trackers[1].segments), 1)
+        self.assertEqual(
+            len(eng.pack_capacity.trackers[2].segments), 0,
+            "a pack that never discharges must have no segments at all",
+        )
+
+    def test_pack_counter_reset_is_isolated_to_that_pack(self):
+        """A single pack's own lifetime counter resetting (e.g. that pack
+        being physically replaced) must discard only that pack's own
+        active segment -- not the other packs', and not the unit-level
+        tracker's."""
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        eng = bh.BatteryHealthEngine(cfg)
+        packs = [self._pack(90.0, dis=0.0) for _ in range(3)]
+        eng.update(_sample(0, soc=90.0, power=-2500.0, chg=0.0, dis=0.0, packs=packs))
+        # All three packs progress normally -- pack 1 past 1.0 kWh
+        # specifically, so its own genuine reset (below) exceeds
+        # COUNTER_RESET_TOLERANCE_KWH (1.0).
+        packs = [
+            self._pack(85.0, dis=1.5),
+            self._pack(85.0, dis=0.5),
+            self._pack(85.0, dis=0.5),
+        ]
+        eng.update(_sample(60, soc=85.0, power=-2500.0, chg=0.0, dis=0.0, packs=packs))
+        # Pack 1's own counter genuinely resets (1.5 -> 0.01, a 1.49 kWh
+        # decrease, exceeding the 1.0 kWh tolerance); packs 2/3 continue
+        # discharging normally and uninterrupted.
+        packs = [
+            self._pack(80.0, dis=0.01),
+            self._pack(80.0, dis=0.7),
+            self._pack(80.0, dis=0.7),
+        ]
+        eng.update(_sample(120, soc=80.0, power=-2500.0, chg=0.0, dis=0.0, packs=packs))
+        # Pack 1's ORIGINAL segment (start ts=0) must have been discarded
+        # (counter reset detected) -- confirmed via discarded_segments,
+        # not _active: the same tick's own data still shows pack 1
+        # discharging, so a genuinely NEW segment correctly starts right
+        # away (active=True again is expected -- it's a different
+        # segment now, not the discarded one).
+        self.assertGreaterEqual(eng.pack_capacity.trackers[0].discarded_segments, 1)
+        self.assertEqual(
+            len(eng.pack_capacity.trackers[0].segments), 0,
+            "the discarded segment must never have contributed to soh_capacity",
+        )
+        # Packs 2 and 3 must be unaffected -- still actively tracking their
+        # own, uninterrupted discharge, with nothing discarded.
+        self.assertTrue(eng.pack_capacity.trackers[1]._active)
+        self.assertTrue(eng.pack_capacity.trackers[2]._active)
+        self.assertEqual(eng.pack_capacity.trackers[1].discarded_segments, 0)
+        self.assertEqual(eng.pack_capacity.trackers[2].discarded_segments, 0)
+
+    def test_spread_metric_reflects_the_weaker_pack(self):
+        """The headline diagnostic this whole tracker exists for: a
+        measurably weaker pack must show up as a nonzero spread."""
+        cfg = _cfg(freshness_tau_kwh=1e12, eff_baseline_windows=999,
+                   balance_baseline_min_samples=999)
+        eng = bh.BatteryHealthEngine(cfg)
+        for i in range(21):
+            frac = i / 20
+            soc = 95.0 - 20.0 * frac
+            packs = [
+                self._pack(soc, dis=1.6 * frac),   # normal pack
+                self._pack(soc, dis=1.0 * frac),   # weaker: less energy for the same SOC drop
+                self._pack(soc, dis=1.6 * frac),   # normal pack
+            ]
+            eng.update(_sample(i * 60, soc=95.0, power=-2500.0, chg=0.0,
+                               dis=0.0, packs=packs))
+        packs = [
+            self._pack(75.0, power=CLOSE_POWER, dis=1.6),
+            self._pack(75.0, power=CLOSE_POWER, dis=1.0),
+            self._pack(75.0, power=CLOSE_POWER, dis=1.6),
+        ]
+        eng.update(_sample(21 * 60, soc=75.0, power=CLOSE_POWER, chg=0.0,
+                           dis=0.0, packs=packs))
+        report = eng.report
+        spread = report.attributes.get("pack_capacity_spread_pct")
+        self.assertIsNotNone(spread)
+        self.assertGreater(spread, 0.0)
+
+    def test_pack_capacity_persists_and_restores(self):
+        """Round-trips through to_dict()/restore() -- confirms Tier 3's
+        new state survives a restart the same way every other tracker's
+        own state already does."""
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        eng = bh.BatteryHealthEngine(cfg)
+        self._run_pack_discharge(eng, 0.0, 95.0, 75.0, 0.0, 1.6)
+        data = eng.to_dict()
+        eng2 = bh.BatteryHealthEngine(cfg)
+        eng2.restore(data)
+        for i in range(3):
+            self.assertEqual(
+                len(eng2.pack_capacity.trackers[i].segments),
+                len(eng.pack_capacity.trackers[i].segments),
+            )
+
+    def test_old_schema_version_starts_fresh_not_crashes(self):
+        """v2.0.6's SCHEMA_VERSION bump (1 -> 2, for pack_capacity) must
+        make old, pre-Tier-3 persisted data start fresh cleanly, not
+        crash -- matching the operator's own explicit choice (no
+        migration needed, OK to lose history)."""
+        eng = bh.BatteryHealthEngine(_cfg())
+        old_data = {"schema_version": 1, "first_seen_ts": 123.0}
+        eng.restore(old_data)  # must not raise
+        self.assertIsNone(eng.first_seen_ts)  # started fresh, not "restored" v1 data
+
+
+class TestTier3CapacityNormalization(unittest.TestCase):  # v2.0.6, battery health architecture review
+    """Temperature/rate normalization, from PHASE1_BATTERY_HEALTH_DESIGN
+    .md's own §6.2. Formula tested directly against DischargeSegment.
+    normalized_capacity_kwh() with hand-built segments -- isolates the
+    formula itself from segment-detection mechanics, matching this
+    file's own established pattern for testing weight() directly."""
+
+    @staticmethod
+    def _seg(implied=20.0, avg_temp_c=None, energy_kwh=4.0, duration_h=1.0):
+        return bh.DischargeSegment(
+            start_ts=0.0, end_ts=duration_h * 3600.0, soc_start=95.0,
+            soc_end=75.0, energy_kwh=energy_kwh, implied_capacity_kwh=implied,
+            freshness=1.0, exclude_calibration=False, avg_temp_c=avg_temp_c,
+        )
+
+    def test_no_temperature_defaults_to_neutral_f_temp(self):
+        cfg = bh.BatteryHealthConfig()  # normalization NOT neutralized here -- testing it directly
+        seg = self._seg(implied=20.0, avg_temp_c=None, energy_kwh=0.001, duration_h=1000.0)
+        # near-zero average power too (via a tiny energy/long duration),
+        # so f_rate is also neutral -- isolates f_temp's own None handling.
+        self.assertAlmostEqual(seg.normalized_capacity_kwh(cfg), 20.0, places=2)
+
+    def test_at_reference_temperature_f_temp_is_neutral(self):
+        cfg = bh.BatteryHealthConfig()
+        seg = self._seg(implied=20.0, avg_temp_c=cfg.capacity_temp_ref_c,
+                        energy_kwh=0.001, duration_h=1000.0)
+        self.assertAlmostEqual(seg.normalized_capacity_kwh(cfg), 20.0, places=2)
+
+    def test_cold_segment_normalized_capacity_exceeds_raw(self):
+        """A genuinely cold segment's RAW implied capacity understates the
+        pack's true health -- normalization must correct upward."""
+        cfg = bh.BatteryHealthConfig()
+        seg = self._seg(implied=20.0, avg_temp_c=0.0, energy_kwh=0.001, duration_h=1000.0)
+        normalized = seg.normalized_capacity_kwh(cfg)
+        self.assertGreater(normalized, 20.0)
+
+    def test_high_power_segment_normalized_capacity_exceeds_raw(self):
+        """A genuine high-rate discharge understates true capacity the
+        same way -- normalization must correct upward here too."""
+        cfg = bh.BatteryHealthConfig()
+        # 8 kWh over 0.5h = 16 kW average power, well above the 5 kW reference.
+        seg = self._seg(implied=20.0, avg_temp_c=cfg.capacity_temp_ref_c,
+                        energy_kwh=8.0, duration_h=0.5)
+        normalized = seg.normalized_capacity_kwh(cfg)
+        self.assertGreater(normalized, 20.0)
+
+    def test_clamp_floor_is_respected_for_extreme_temperature(self):
+        cfg = bh.BatteryHealthConfig()
+        seg = self._seg(implied=20.0, avg_temp_c=-40.0, energy_kwh=0.001, duration_h=1000.0)
+        normalized = seg.normalized_capacity_kwh(cfg)
+        # f_temp clamped to capacity_norm_factor_floor (0.5): normalized
+        # capacity must not exceed raw / floor.
+        self.assertLessEqual(normalized, 20.0 / cfg.capacity_norm_factor_floor + 1e-6)
+
+    def test_avg_temp_c_accumulates_only_valid_readings(self):
+        """A segment with some missing temperature ticks must average
+        only the valid ones -- not treat a missing reading as zero."""
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        eng = bh.BatteryHealthEngine(cfg)
+        for i in range(21):
+            frac = i / 20
+            soc = 95.0 - 20.0 * frac
+            dis = 4.0 * frac
+            # Alternate valid/missing temperature readings.
+            temp = 20.0 if i % 2 == 0 else None
+            eng.update(_sample(i * 60, soc=soc, power=-2500.0, chg=0.0,
+                               dis=dis, temp=temp))
+        eng.update(_sample(21 * 60, soc=75.0, power=CLOSE_POWER, chg=0.0, dis=4.0, temp=20.0))
+        self.assertEqual(len(eng.segments.segments), 1)
+        self.assertAlmostEqual(eng.segments.segments[0].avg_temp_c, 20.0, places=1)
+
+    def test_avg_temp_c_is_none_when_never_valid(self):
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        eng = bh.BatteryHealthEngine(cfg)
+        for i in range(21):
+            frac = i / 20
+            soc = 95.0 - 20.0 * frac
+            dis = 4.0 * frac
+            eng.update(_sample(i * 60, soc=soc, power=-2500.0, chg=0.0, dis=dis, temp=None))
+        eng.update(_sample(21 * 60, soc=75.0, power=CLOSE_POWER, chg=0.0, dis=4.0, temp=None))
+        self.assertEqual(len(eng.segments.segments), 1)
+        self.assertIsNone(eng.segments.segments[0].avg_temp_c)
+
+    def test_reference_capacity_capture_uses_normalized_not_raw(self):
+        """The auto-captured reference must match the SAME normalization
+        soh_capacity()'s own mean_cap uses -- confirms the consistency
+        fix (not comparing a normalized numerator against a raw
+        reference) actually took effect, not just that it compiles."""
+        cfg = _cfg(freshness_tau_kwh=1e12, capacity_reference_min_segments=1,
+                   capacity_reference_min_span_days=0.0,
+                   capacity_temp_sigma_c=20.0, capacity_rate_ref_w=5000.0)
+        eng = bh.BatteryHealthEngine(cfg)
+        # A cold, high-power segment: normalized capacity must exceed raw.
+        # 6.0 kWh over a 20% SOC drop (implied=30.0, within the unit-scale
+        # [8,35] plausibility band) across ~21 simulated minutes -> ~17 kW
+        # average power, well above the 5 kW reference.
+        for i in range(21):
+            frac = i / 20
+            soc = 95.0 - 20.0 * frac
+            dis = 6.0 * frac
+            eng.update(_sample(i * 60, soc=soc, power=-2500.0, chg=0.0,
+                               dis=dis, temp=0.0))
+        eng.update(_sample(21 * 60, soc=75.0, power=CLOSE_POWER, chg=0.0,
+                           dis=6.0, temp=0.0))
+        seg = eng.segments.segments[0]
+        raw = seg.implied_capacity_kwh
+        normalized = seg.normalized_capacity_kwh(cfg)
+        self.assertGreater(normalized, raw)
+        self.assertAlmostEqual(
+            eng.segments.reference_capacity_kwh, normalized, places=2,
+            msg="the captured reference must equal the NORMALIZED value, not raw",
+        )
