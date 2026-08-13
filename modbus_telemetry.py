@@ -102,16 +102,51 @@ class ModbusTelemetry:
         self.device_info = device_info
 
         # Rolling timestamp deques — one entry per event
+        # v2.0.5 FIX (F-04, external ICS audit -- confirmed with exact
+        # numbers matched against the real telemetry capture: timeout_
+        # rate_percent readings up to 400%, e.g. 1 request / 3 timeouts):
+        # every rate this class computes used to divide by req_ph (len(
+        # self._requests)) alone. record_request() is only ever called
+        # AFTER a batch succeeds (update_coordinator.py's own comment:
+        # "record_request after batch so count is accurate") -- so
+        # req_ph counts successful batches, not attempts. Any window
+        # with more failures than successes produced a rate exceeding
+        # 100%, which is not a meaningful percentage.
+        #
+        # self._attempts (below) is the fix: bumped by every recording
+        # method below, success or failure alike, so it always equals
+        # the true population every rate's numerator is drawn from --
+        # every rate this class computes is now mathematically bounded
+        # to [0, 100]% by construction, not just usually.
+        self._attempts: deque[float] = deque()
         self._requests: deque[float] = deque()
         self._failures: deque[float] = deque()
+        # v2.0.5 (F-04): split from one shared "timeout" bucket into the
+        # three genuinely distinct outcomes it always actually was.
+        # self._timeouts is KEPT, unchanged in meaning (all three kinds
+        # combined) -- pre-existing, established field, not touched --
+        # but the new, specific deques let timeout_rate_percent (below)
+        # mean what its own name says: a genuine DEVICE timeout rate,
+        # not device timeouts, internal bus contention, and admission
+        # queueing delay all conflated into one number, which is the
+        # separate conflation concern this same audit raised in its own
+        # section 11 -- not just the denominator bug, a second, related
+        # semantic problem closed by the same redesign.
         self._timeouts: deque[float] = deque()
+        self._device_timeouts: deque[float] = deque()
+        self._queue_sheds: deque[float] = deque()
+        self._admission_timeouts: deque[float] = deque()
         self._cache_hits: deque[float] = deque()
         self._batch_sizes: deque[int] = deque()
 
         # Lifetime totals (never reset)
+        self.total_attempts: int = 0
         self.total_requests: int = 0
         self.total_failures: int = 0
         self.total_timeouts: int = 0
+        self.total_device_timeouts: int = 0
+        self.total_queue_sheds: int = 0
+        self.total_admission_timeouts: int = 0
         self.total_cache_hits: int = 0
         self.total_skipped_polls: int = 0
         self._night_mode: bool = False
@@ -130,26 +165,64 @@ class ModbusTelemetry:
     # ── event recording (called from coordinators) ────────────────────────────
 
     def record_request(self, batch_size: int = 1) -> None:
-        """Record a Modbus request."""
+        """Record a successful Modbus request."""
         now = time.monotonic()
         self._requests.append(now)
+        self._attempts.append(now)
         self._batch_sizes.append(batch_size)
         self.total_requests += 1
+        self.total_attempts += 1
         self._evict(now)
 
     def record_failure(self) -> None:
         """Record a non-timeout failure."""
         now = time.monotonic()
         self._failures.append(now)
+        self._attempts.append(now)
         self.total_failures += 1
+        self.total_attempts += 1
         self._evict(now)
 
-    def record_timeout(self) -> None:
-        """Record a timeout."""
+    def record_timeout(self, kind: str = "device") -> None:
+        """Record a timeout.
+
+        v2.0.5 FIX (F-04, external ICS audit -- confirmed): `kind`
+        distinguishes a genuine device/transport timeout from internal
+        bus contention (a queue shed or an admission timeout) -- both of
+        which this project's own established discipline elsewhere
+        (MOD-09 and others) already treats as "not the inverter's fault"
+        for the adaptive-learning model, but which this telemetry class
+        previously folded into one undifferentiated timeout bucket
+        regardless. Every caller of this method (update_coordinator.py's
+        own three _record_*() methods, plus the optimizer coordinator's
+        own inline copy) already independently classifies which of the
+        three actually happened -- this just makes that existing
+        classification visible in telemetry too, not a new judgement
+        call invented here.
+
+        self._timeouts (the pre-existing, established deque/counter) is
+        deliberately still updated on every call here, regardless of
+        kind, keeping its own existing meaning (all three kinds
+        combined) completely unchanged -- only the NEW, kind-specific
+        counters and self._attempts are new behaviour.
+        """
+        if kind not in ("device", "queue_shed", "admission"):
+            raise ValueError(f"record_timeout: unknown kind {kind!r}")
         now = time.monotonic()
         self._timeouts.append(now)
+        self._attempts.append(now)
         self.total_timeouts += 1
         self.total_failures += 1
+        self.total_attempts += 1
+        if kind == "device":
+            self._device_timeouts.append(now)
+            self.total_device_timeouts += 1
+        elif kind == "queue_shed":
+            self._queue_sheds.append(now)
+            self.total_queue_sheds += 1
+        else:  # "admission"
+            self._admission_timeouts.append(now)
+            self.total_admission_timeouts += 1
         self._evict(now)
 
     def record_cache_hits(self, count: int) -> None:
@@ -185,9 +258,13 @@ class ModbusTelemetry:
         """Remove entries older than the rolling window from all deques."""
         cutoff = now - _WINDOW_SEC
         for dq in (
+            self._attempts,
             self._requests,
             self._failures,
             self._timeouts,
+            self._device_timeouts,
+            self._queue_sheds,
+            self._admission_timeouts,
             self._cache_hits,
         ):
             while dq and dq[0] < cutoff:
@@ -201,9 +278,13 @@ class ModbusTelemetry:
         now = time.monotonic()
         self._evict(now)
 
+        attempts_ph = len(self._attempts)
         req_ph = len(self._requests)
         fail_ph = len(self._failures)
         to_ph = len(self._timeouts)
+        device_to_ph = len(self._device_timeouts)
+        shed_ph = len(self._queue_sheds)
+        admission_to_ph = len(self._admission_timeouts)
         cache_ph = len(self._cache_hits)
 
         avg_batch = (
@@ -219,38 +300,72 @@ class ModbusTelemetry:
         # appends to self._timeouts, never self._failures -- so this
         # rolling, windowed rate was silently blind to any failure
         # pattern that happened to be all timeouts, exactly the case
-        # both devices in that real capture were in. failure_rate_percent
-        # itself is deliberately left with its EXISTING meaning (non-
-        # timeout failures only) rather than silently redefined to
-        # include timeouts -- per the audit's own recommendation, and
-        # consistent with this project's own established discipline
-        # elsewhere (v2.0.0a F16 and others) of never changing an
-        # existing field's semantics out from under whatever already
-        # consumes it. The blind spot is closed instead by adding two
-        # new, explicitly-named fields that were never ambiguous about
-        # what they measure.
+        # both devices in that real capture were in.
+        #
+        # v2.0.5 FIX (F-04, external ICS audit -- confirmed, with exact
+        # numbers matched against the real telemetry capture: readings
+        # up to timeout_rate_percent: 400.0): ALL rates below are now
+        # computed over attempts_ph (self._attempts, bumped by every
+        # recording method above -- success or any failure kind alike),
+        # not req_ph (successful batches only, since record_request()
+        # only ever fires after a batch succeeds). Every rate's
+        # numerator is a strict subset of the same attempts_ph
+        # population by construction, so every rate below is now
+        # mathematically bounded to [0, 100]% -- not just usually, as a
+        # side effect of typically-low failure counts, but always,
+        # structurally.
+        #
+        # timeout_rate_percent's own MEANING also changes here, not just
+        # its denominator: it now reflects device_to_ph (genuine device/
+        # transport timeouts) specifically, not to_ph (which still
+        # includes queue sheds and admission timeouts -- internal bus
+        # contention this project's own established discipline
+        # elsewhere, MOD-09 and others, already treats as "not the
+        # inverter's fault" for adaptive learning, but which this metric
+        # previously conflated with genuine device timeouts regardless).
+        # failure_rate_percent's own existing meaning (non-timeout
+        # failures only) is unchanged -- only its denominator is fixed.
         failure_rate = (
-            round(fail_ph / req_ph * 100, 1) if req_ph else 0.0
+            round(fail_ph / attempts_ph * 100, 1) if attempts_ph else 0.0
         )
         timeout_rate = (
-            round(to_ph / req_ph * 100, 1) if req_ph else 0.0
+            round(device_to_ph / attempts_ph * 100, 1) if attempts_ph else 0.0
         )
         overall_failed_attempt_rate = (
-            round((fail_ph + to_ph) / req_ph * 100, 1) if req_ph else 0.0
+            round((fail_ph + device_to_ph) / attempts_ph * 100, 1)
+            if attempts_ph else 0.0
+        )
+        # New fields: internal bus contention, now visible in its own
+        # right rather than hidden inside a device-timeout-named metric.
+        queue_shed_rate = (
+            round(shed_ph / attempts_ph * 100, 1) if attempts_ph else 0.0
+        )
+        admission_timeout_rate = (
+            round(admission_to_ph / attempts_ph * 100, 1) if attempts_ph else 0.0
         )
 
         snap = {
+            "attempts_per_hour": attempts_ph,
             "requests_per_hour": req_ph,
             "failures_per_hour": fail_ph,
             "timeouts_per_hour": to_ph,
+            "device_timeouts_per_hour": device_to_ph,
+            "queue_sheds_per_hour": shed_ph,
+            "admission_timeouts_per_hour": admission_to_ph,
             "cache_hits_per_hour": cache_ph,
             "failure_rate_percent": failure_rate,
             "timeout_rate_percent": timeout_rate,
             "overall_failed_attempt_rate_percent": overall_failed_attempt_rate,
+            "queue_shed_rate_percent": queue_shed_rate,
+            "admission_timeout_rate_percent": admission_timeout_rate,
             "avg_batch_size": avg_batch,
+            "total_attempts": self.total_attempts,
             "total_requests": self.total_requests,
             "total_failures": self.total_failures,
             "total_timeouts": self.total_timeouts,
+            "total_device_timeouts": self.total_device_timeouts,
+            "total_queue_sheds": self.total_queue_sheds,
+            "total_admission_timeouts": self.total_admission_timeouts,
             "total_cache_hits": self.total_cache_hits,
             "total_skipped_polls": self.total_skipped_polls,
             "night_mode_active": self._night_mode,
@@ -353,6 +468,85 @@ _TELEMETRY_SENSORS: list[tuple[str, str, str | None, str, dict]] = [
         "mdi:percent",
         {"state_class": SensorStateClass.MEASUREMENT},
     ),
+    # v2.0.5 (F-04, external ICS audit): these two fields were added to
+    # the snapshot dict by v2.0.4's own F-03 fix, but a real gap from
+    # that same fix -- never noticed until this later pass -- is that
+    # they were never wired up as actual HA sensor entities, only ever
+    # reachable via the raw telemetry JSONL capture, not visible in the
+    # UI at all. Added here alongside the new v2.0.5 fields, since
+    # they're the same kind of oversight this pass is already fixing.
+    (
+        "timeout_rate_percent",
+        "Modbus device timeout rate",
+        "%",
+        "mdi:timer-alert-outline",
+        {"state_class": SensorStateClass.MEASUREMENT},
+    ),
+    (
+        "overall_failed_attempt_rate_percent",
+        "Modbus overall failed attempt rate",
+        "%",
+        "mdi:percent-outline",
+        {"state_class": SensorStateClass.MEASUREMENT},
+    ),
+    # v2.0.5 (F-04): internal bus contention, now visible in its own
+    # right instead of hidden inside timeout_rate_percent (which now
+    # means genuine device timeouts specifically -- see modbus_telemetry
+    # .py's own snapshot() docstring for the full reasoning).
+    (
+        "queue_shed_rate_percent",
+        "Modbus queue shed rate",
+        "%",
+        "mdi:filter-remove-outline",
+        {"state_class": SensorStateClass.MEASUREMENT},
+    ),
+    (
+        "admission_timeout_rate_percent",
+        "Modbus admission timeout rate",
+        "%",
+        "mdi:timer-sand",
+        {"state_class": SensorStateClass.MEASUREMENT},
+    ),
+    (
+        "attempts_per_hour",
+        "Modbus attempts / hour",
+        None,
+        "mdi:counter",
+        {
+            "state_class": SensorStateClass.MEASUREMENT,
+            "entity_registry_enabled_default": False,
+        },
+    ),
+    (
+        "device_timeouts_per_hour",
+        "Modbus device timeouts / hour",
+        None,
+        "mdi:timer-off-outline",
+        {
+            "state_class": SensorStateClass.MEASUREMENT,
+            "entity_registry_enabled_default": False,
+        },
+    ),
+    (
+        "queue_sheds_per_hour",
+        "Modbus queue sheds / hour",
+        None,
+        "mdi:filter-remove-outline",
+        {
+            "state_class": SensorStateClass.MEASUREMENT,
+            "entity_registry_enabled_default": False,
+        },
+    ),
+    (
+        "admission_timeouts_per_hour",
+        "Modbus admission timeouts / hour",
+        None,
+        "mdi:timer-sand",
+        {
+            "state_class": SensorStateClass.MEASUREMENT,
+            "entity_registry_enabled_default": False,
+        },
+    ),
     (
         "avg_batch_size",
         "Avg Modbus batch size",
@@ -375,6 +569,46 @@ _TELEMETRY_SENSORS: list[tuple[str, str, str | None, str, dict]] = [
         "Modbus total failures",
         None,
         "mdi:alert-circle",
+        {
+            "state_class": SensorStateClass.TOTAL_INCREASING,
+            "entity_registry_enabled_default": False,
+        },
+    ),
+    (
+        "total_attempts",
+        "Modbus total attempts",
+        None,
+        "mdi:counter",
+        {
+            "state_class": SensorStateClass.TOTAL_INCREASING,
+            "entity_registry_enabled_default": False,
+        },
+    ),
+    (
+        "total_device_timeouts",
+        "Modbus total device timeouts",
+        None,
+        "mdi:timer-off-outline",
+        {
+            "state_class": SensorStateClass.TOTAL_INCREASING,
+            "entity_registry_enabled_default": False,
+        },
+    ),
+    (
+        "total_queue_sheds",
+        "Modbus total queue sheds",
+        None,
+        "mdi:filter-remove-outline",
+        {
+            "state_class": SensorStateClass.TOTAL_INCREASING,
+            "entity_registry_enabled_default": False,
+        },
+    ),
+    (
+        "total_admission_timeouts",
+        "Modbus total admission timeouts",
+        None,
+        "mdi:timer-sand",
         {
             "state_class": SensorStateClass.TOTAL_INCREASING,
             "entity_registry_enabled_default": False,

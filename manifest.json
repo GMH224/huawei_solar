@@ -5,16 +5,16 @@
         "usb"
     ],
     "config_flow": true,
-    "documentation": "https://github.com/wlcrs/huawei_solar/wiki",
-    "issue_tracker": "https://github.com/wlcrs/huawei_solar/issues",
+    "documentation": "https://github.com/GMH224/huawei_solar/wiki",
+    "issue_tracker": "https://github.com/GMH224/huawei_solar/issues",
     "requirements": [
         "huawei-solar>=3.0.5"
     ],
     "codeowners": [
-        "@wlcrs"
+        "@GMH224"
     ],
     "iot_class": "local_polling",
-    "version": "2.0.4",
+    "version": "2.0.5",
     "loggers": [
         "huawei_solar",
         "tmodbus"

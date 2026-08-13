@@ -542,7 +542,7 @@ class HuaweiSolarUpdateCoordinator(
         self._consecutive_timeouts += 1
         self._consecutive_failures += 1
         if self.telemetry:
-            self.telemetry.record_timeout()
+            self.telemetry.record_timeout(kind="device")
         if self._adaptive:
             self._adaptive.record_request(0.0, success=False, timeout=True)
 
@@ -561,7 +561,7 @@ class HuaweiSolarUpdateCoordinator(
         self._consecutive_failures += 1
         self._shed_count += 1
         if self.telemetry:
-            self.telemetry.record_timeout()
+            self.telemetry.record_timeout(kind="queue_shed")
         if self._adaptive:
             self._adaptive.note_shed()   # diagnostics only, NOT a failure
 
@@ -582,7 +582,7 @@ class HuaweiSolarUpdateCoordinator(
         self._consecutive_timeouts += 1
         self._consecutive_failures += 1
         if self.telemetry:
-            self.telemetry.record_timeout()
+            self.telemetry.record_timeout(kind="admission")
         if self._adaptive:
             self._adaptive.note_admission_timeout()   # diagnostics only, NOT a failure
 
@@ -1607,7 +1607,20 @@ class HuaweiSolarOptimizerUpdateCoordinator(
             self._consecutive_timeouts += 1
             self._consecutive_failures += 1
             if self.telemetry:
-                self.telemetry.record_timeout()
+                # v2.0.5 FIX (F-04, external ICS audit -- confirmed): this
+                # call used to be unconditional -- always kind="device"
+                # by default -- even though is_shed/is_admission_timeout
+                # (below) already correctly classify which of the three
+                # actually happened, for the adaptive-learning bookkeeping
+                # right underneath this same call. Telemetry gets the
+                # same classification now instead of silently discarding
+                # it.
+                if is_shed:
+                    self.telemetry.record_timeout(kind="queue_shed")
+                elif is_admission_timeout:
+                    self.telemetry.record_timeout(kind="admission")
+                else:
+                    self.telemetry.record_timeout(kind="device")
             if self._adaptive:
                 if is_shed:
                     # Internal contention — diagnostics only, never learning.

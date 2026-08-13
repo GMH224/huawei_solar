@@ -1,8 +1,8 @@
 # Huawei Solar Integration
 
 [![hacs_badge](https://img.shields.io/badge/HACS-Default-orange.svg)](https://github.com/hacs/integration)
-[![GitHub release](https://img.shields.io/github/release/wlcrs/huawei_solar.svg)](https://GitHub.com/wlcrs/huawei_solar/releases/)
-[![Documentation](https://img.shields.io/badge/Documentation-2D963D?logo=read-the-docs&logoColor=white)](https://github.com/wlcrs/huawei_solar/wiki)
+[![GitHub release](https://img.shields.io/github/release/GMH224/huawei_solar.svg)](https://GitHub.com/GMH224/huawei_solar/releases/)
+[![Documentation](https://img.shields.io/badge/Documentation-2D963D?logo=read-the-docs&logoColor=white)](https://github.com/GMH224/huawei_solar/wiki)
 ![](https://img.shields.io/badge/dynamic/json?color=41BDF5&logo=home-assistant&label=integration%20usage&suffix=%20installs&cacheSeconds=15600&url=https://analytics.home-assistant.io/custom_integrations.json&query=$.huawei_solar.total)
 
 This integration exposes the information and functions made available by Huawei Solar installations over Modbus to Home Assistant.
@@ -16,7 +16,7 @@ This integration exposes the information and functions made available by Huawei 
 - [Inverter polling frequency](#inverter-polling-frequency)
 - [FAQ - Troubleshooting](#faq---troubleshooting)
 
-Looking for more information? The [Wiki](https://github.com/wlcrs/huawei_solar/wiki) contains in-depth documentation and support materials.
+Looking for more information? The [Wiki](https://github.com/GMH224/huawei_solar/wiki) contains in-depth documentation and support materials.
 
 ## Screenshots
 
@@ -38,7 +38,7 @@ Looking for more information? The [Wiki](https://github.com/wlcrs/huawei_solar/w
 
 **Services**
 
-This integration exposes multiple services, allowing you to [actively control the amount of electricity exported to the grid](https://github.com/wlcrs/huawei_solar/wiki/Changing-Active-Power-Control) and [forcibly charge/discharge your battery](https://github.com/wlcrs/huawei_solar/wiki/Force-charge-discharge-battery).
+This integration exposes multiple services, allowing you to [actively control the amount of electricity exported to the grid](https://github.com/GMH224/huawei_solar/wiki/Changing-Active-Power-Control) and [forcibly charge/discharge your battery](https://github.com/GMH224/huawei_solar/wiki/Force-charge-discharge-battery).
 
 ![services](images/services.png)
 
@@ -63,7 +63,7 @@ This integration supports two connection modes to Huawei solar devices:
 - direct serial connection to the RS485A1 and RS485B1 pins of the COM port of SUN2000 inverters
 - network connection
 
-Detailed information can be found on the ['Connecting to the inverter' Wiki-page](https://github.com/wlcrs/huawei_solar/wiki/Connecting-to-the-inverter)
+Detailed information can be found on the ['Connecting to the inverter' Wiki-page](https://github.com/GMH224/huawei_solar/wiki/Connecting-to-the-inverter)
 
 > [!NOTE]
 > Modbus devices only support **one connection at a time**.
@@ -79,7 +79,7 @@ This integration supports inverters running firmware versions released in 2023 a
 
 1. Install this integration with HACS, or copy the contents of this
 repository into the `custom_components/huawei_solar` directory
-   [![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=wlcrs&repository=huawei_solar&category=integration)
+   [![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=GMH224&repository=huawei_solar&category=integration)
 
 3. Restart HA
 4. Start the configuration flow:
@@ -160,7 +160,7 @@ The integration will poll the inverter for new values every 30 seconds. If you w
 
 **Q**: The Daily Yield/Total Yield is incorrect: it also goes up when the battery is discharging.
 
-**A**: Huawei does not provide a Modbus register that represents the *output* of the inverter produced by energy coming only from the solar panels. It does provide a register that represents the *input* of the solar panels, but that does not take into account the conversion losses of the inverter. cfr. the Wiki page '[Daily Solar Yield](https://github.com/wlcrs/huawei_solar/wiki/Daily-Solar-Yield)' for some possible workarounds. cfr. [#1](https://github.com/wlcrs/huawei_solar/issues/1) for more context.
+**A**: Huawei does not provide a Modbus register that represents the *output* of the inverter produced by energy coming only from the solar panels. It does provide a register that represents the *input* of the solar panels, but that does not take into account the conversion losses of the inverter. cfr. the Wiki page '[Daily Solar Yield](https://github.com/GMH224/huawei_solar/wiki/Daily-Solar-Yield)' for some possible workarounds. cfr. [#1](https://github.com/GMH224/huawei_solar/issues/1) for more context.
 
 ---
 
@@ -191,7 +191,7 @@ The integration will poll the inverter for new values every 30 seconds. If you w
 
 **Q**: The "Daily Yield" value reported does not match with the value from FusionSolar?
 
-**A**: The "Daily Yield" reported by the inverter is the *output* yield of the inverter, and not the *input* from your solar panels. It therefore includes the yield from discharging the battery, but misses the yield used to charge the battery. FusionSolar computes the "Yield" by combining the values from "Daily Yield", "Battery Day Charge" and "Battery Day Discharge". [More information on the Wiki ...](https://github.com/wlcrs/huawei_solar/wiki/Daily-Solar-Yield)
+**A**: The "Daily Yield" reported by the inverter is the *output* yield of the inverter, and not the *input* from your solar panels. It therefore includes the yield from discharging the battery, but misses the yield used to charge the battery. FusionSolar computes the "Yield" by combining the values from "Daily Yield", "Battery Day Charge" and "Battery Day Discharge". [More information on the Wiki ...](https://github.com/GMH224/huawei_solar/wiki/Daily-Solar-Yield)
 
 ---
 

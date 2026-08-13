@@ -85,7 +85,7 @@ from .const import (
     SYNC_POWER_POLL_DEADLINE,
     UPDATE_TIMEOUT,
 )
-from .modbus_guard import ModbusGuard
+from .modbus_guard import ModbusAdmissionTimeout, ModbusGuard, ModbusQueueShed
 from .modbus_telemetry import ModbusTelemetry
 from .register_cache import Quality
 
@@ -276,6 +276,19 @@ class SynchronizedPowerCoordinator(DataUpdateCoordinator[SynchronizedPowerData])
         self.shortcut_misses: int = 0
         self.fallback_cache_hits: int = 0
         self.fallback_physical_reads: int = 0
+        # v2.0.5 (F-05, external ICS audit -- confirmed genuine gap: the
+        # ICS-01/ICS-05 fix (v2.0.3) correctly computes is_temporally_
+        # uncertain per-result, but nothing tracked how often it actually
+        # fires in practice -- the report's own concern about the
+        # dedicated-read fallback's per-value guard-release-between-reads
+        # risk had no way to be answered from data, only bounded
+        # indirectly via fallback_cache_hit_rate above. results_with_
+        # span_computed is the denominator (only results where at least
+        # two values had a real, distinct capture time -- see sample_
+        # span_ms's own None-when-fewer-than-two-values behaviour);
+        # temporally_uncertain_count is the numerator.
+        self.temporally_uncertain_count: int = 0
+        self.results_with_span_computed: int = 0
         # v2.0.0 (V2_ARCHITECTURE_DESIGN.md §8.2): optional references to the
         # regular per-device RegisterCache instances that already hold these
         # same four registers, checked for a cheap shortcut before falling
@@ -387,6 +400,16 @@ class SynchronizedPowerCoordinator(DataUpdateCoordinator[SynchronizedPowerData])
             # (SYNC_POWER_UPDATE_INTERVAL), this is directly interpretable
             # without needing either rate above explained first.
             "physical_reads_total": self.fallback_physical_reads,
+            # v2.0.5 (F-05, external ICS audit): directly answers how
+            # often a result was actually flagged temporally uncertain
+            # (ICS-01/ICS-05, v2.0.3) -- previously only inferable
+            # indirectly via fallback_cache_hit_rate above, not measured.
+            "temporally_uncertain_count": self.temporally_uncertain_count,
+            "results_with_span_computed": self.results_with_span_computed,
+            "temporally_uncertain_rate": (
+                round(self.temporally_uncertain_count / self.results_with_span_computed, 3)
+                if self.results_with_span_computed else None
+            ),
         }
 
     # ── poll ───────────────────────────────────────────────────────────────────
@@ -726,6 +749,14 @@ class SynchronizedPowerCoordinator(DataUpdateCoordinator[SynchronizedPowerData])
                 "tolerance -- marking this reading temporally uncertain",
                 sample_span_ms, SYNC_POWER_CACHE_ALIGNMENT_TOLERANCE_S * 1000.0,
             )
+        # v2.0.5 (F-05): tracked here, the one place is_temporally_
+        # uncertain is ever computed with a genuine sample_span_ms (the
+        # aligned-shortcut path above always has it False by
+        # construction, so is deliberately not double-counted here).
+        if sample_span_ms is not None:
+            self.results_with_span_computed += 1
+            if is_temporally_uncertain:
+                self.temporally_uncertain_count += 1
 
         return SynchronizedPowerData(
             inv1_pv_power=inv1_pv,
@@ -769,8 +800,24 @@ def _cache_value_w(cache: "RegisterCache | None", name: Any) -> float | None:
 
 
 def _record_failure(telemetry: ModbusTelemetry, exc: Exception) -> None:
-    """Route the exception to the appropriate telemetry counter."""
-    if isinstance(exc, TimeoutError):
-        telemetry.record_timeout()
+    """Route the exception to the appropriate telemetry counter.
+
+    v2.0.5 FIX (F-04, external ICS audit -- confirmed): this used to
+    treat every TimeoutError as a device timeout unconditionally. But
+    the guard.request() this helper's own caller (_read_one(), above)
+    is wrapped around can itself raise ModbusQueueShed or
+    ModbusAdmissionTimeout -- both TimeoutError subclasses representing
+    internal bus contention, not a genuine device timeout -- exactly the
+    same three-way distinction update_coordinator.py's own _record_
+    timeout()/_record_shed()/_record_admission_timeout() already make.
+    This was the one remaining record_timeout() call site in the whole
+    project still collapsing all three into "device" by default.
+    """
+    if isinstance(exc, ModbusQueueShed):
+        telemetry.record_timeout(kind="queue_shed")
+    elif isinstance(exc, ModbusAdmissionTimeout):
+        telemetry.record_timeout(kind="admission")
+    elif isinstance(exc, TimeoutError):
+        telemetry.record_timeout(kind="device")
     else:
         telemetry.record_failure()

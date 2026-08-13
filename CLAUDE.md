@@ -26,7 +26,7 @@ A [Home Assistant](https://www.home-assistant.io/) custom integration (HACS) for
 monitoring and controlling Huawei SUN2000 series solar inverters and LUNA2000 /
 LG RESU batteries via **Modbus TCP** (LAN) or **Modbus RTU** (USB).
 
-Built on the [`huawei-solar`](https://github.com/wlcrs/huawei-solar) Python
+Built on the [`huawei-solar`](https://github.com/GMH224/huawei_solar) Python
 library. Exposes:
 
 | HA platform | Examples |
