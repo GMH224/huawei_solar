@@ -10,7 +10,7 @@ Design summary (see BATTERY_HEALTH.md for the full rationale):
 
     - SOH_cap  — capacity retention from harvested discharge segments
                  (ΔSOC²·freshness weighting, SOC-correction guard,
-                 Huawei-SOH-calibration "golden" anchors)
+                 excluded-calibration-window segments)
     - SOH_eff  — round-trip efficiency drift between full-charge anchors
                  (replaces voltage-sag internal-resistance estimation, which
                  is invalid behind the LUNA2000-S1 Module+ per-module
@@ -37,12 +37,12 @@ import logging
 import math
 import time as time_module
 from collections import deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
 _LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # ── Plausibility bounds (samples outside are DISCARDED, never clipped) ───────
 SOC_MIN, SOC_MAX = 0.0, 100.0
@@ -96,7 +96,59 @@ class BatteryHealthConfig:
     full_charge_soc: float = 97.0             # "full" for freshness/anchors
     freshness_tau_kwh: float = 40.0           # coulomb-drift decay constant
     segment_max_idle_s: float = 21600.0       # 6 h at rest ends a segment
-    golden_weight_boost: float = 4.0          # Huawei SOH-calibration segments
+    # v2.0.6 (Tier 3, battery health architecture review): capacity
+    # temperature/rate normalization, from PHASE1_BATTERY_HEALTH_DESIGN
+    # .md's own §6.2 -- a real capacity change (cell aging) and a
+    # temporary reading swing (cold weather, a high-power discharge) both
+    # move implied_capacity_kwh the same way; without this, a genuinely
+    # healthy pack tested only in winter, or only under high load, reads
+    # as more degraded than it is. f_T(T) = exp(-(T-T_ref)^2/sigma_T^2),
+    # f_rate(P) = 1/(1+(P/P_ref)^gamma), C_normalized = C_raw/(f_T*f_rate)
+    # -- both factors clamped to >= capacity_norm_factor_floor, and each
+    # independently defaults to neutral (1.0) when its own input is
+    # unavailable, never a reason to discard a segment.
+    #
+    # capacity_temp_ref_c: 25 C is not a guess -- the near-universal
+    # battery industry reference temperature; this project's own
+    # stress_ref_temp_c (below) already independently anchors at the
+    # same value elsewhere, not introduced fresh here.
+    capacity_temp_ref_c: float = 25.0
+    # capacity_temp_sigma_c: width of the Gaussian temperature penalty.
+    # At sigma=20, a segment averaging 10 C from the 25 C reference
+    # (f_T = exp(-225/400) ~= 0.57) is barely adjusted; one averaging 0 C
+    # (f_T = exp(-625/400) ~= 0.21, clamped to the floor) is treated as
+    # meaningfully less trustworthy -- a genuinely reasoned default for a
+    # residential temperate-climate installation, not an arbitrary round
+    # number, but explicitly tunable once real segment-level temperature
+    # data exists to check it against.
+    capacity_temp_sigma_c: float = 20.0
+    # capacity_rate_ref_w: 5 kW, matching this same design doc's own
+    # "5 kW residential reference" framing (§6.2) -- a segment averaging
+    # this power sits exactly at the clamp floor (f_rate=0.5); a lower-
+    # power, gentler discharge is barely penalized.
+    capacity_rate_ref_w: float = 5000.0
+    # capacity_rate_gamma: exponent controlling how sharply the rate
+    # penalty grows above capacity_rate_ref_w. gamma=2 (quadratic) is a
+    # common, reasoned choice for this style of logistic curve -- soft
+    # near the reference point, steep well above it.
+    capacity_rate_gamma: float = 2.0
+    # Neither correction factor may push a segment's effective weight
+    # below this floor -- a normalization correcting for a real, but
+    # partial, effect must never let a single adverse reading dominate
+    # or invalidate an otherwise-good segment outright.
+    capacity_norm_factor_floor: float = 0.5
+    # v2.0.6 FIX (Tier 1, battery health architecture review): replaces
+    # golden_weight_boost (see DischargeSegment.exclude_calibration's own
+    # comment for the full reasoning behind this replacement -- the old
+    # golden_weight_boost mechanism boosted a segment's weight 4x when
+    # calibration was seen during it; this settle window instead EXCLUDES
+    # such a segment entirely). Reuses the same 300s default as settling_
+    # period_s -- both express "don't trust data immediately after a
+    # known disruption" -- as its own, separately-named field rather than
+    # literally sharing settling_period_s, since these are conceptually
+    # different triggers (coordinator recovery vs. a calibration
+    # completion) a future tuning pass may want to set independently.
+    calibration_settle_s: float = 300.0        # 5 minutes
     trim_fraction: float = 0.10               # weighted trimmed mean
 
     # SOH_eff — round-trip efficiency drift
@@ -215,6 +267,20 @@ class PackSample:
     temp_max: float | None = None
     temp_min: float | None = None
     online: bool = False
+    #: v2.0.6 (Tier 3, battery health architecture review): per-pack
+    #: signals enabling a DIRECT, measured per-pack capacity estimate --
+    #: the same segment-detection approach the unit-level tracker
+    #: already uses (see PackCapacityTracker below), applied per pack --
+    #: rather than inferring pack degradation only from the dV/dT-at-rest
+    #: proxy BalanceTracker already provides. Confirmed against the real
+    #: register map before adding these: same units/gain as their
+    #: unit-level equivalents (kWh/100, %/10, W/1), and PDU-adjacent to
+    #: the pack voltage register already read every poll, so the actual
+    #: bus-traffic cost of adding them is expected to be low.
+    soc: float | None = None
+    power_w: float | None = None
+    lifetime_charge_kwh: float | None = None
+    lifetime_discharge_kwh: float | None = None
 
 
 @dataclass
@@ -291,6 +357,29 @@ def validate_sample(raw: HealthSample) -> HealthSample:
                 temp_max=_valid_or_none(pack.temp_max, TEMP_MIN_C, TEMP_MAX_C, "pack_tmax"),
                 temp_min=_valid_or_none(pack.temp_min, TEMP_MIN_C, TEMP_MAX_C, "pack_tmin"),
                 online=bool(pack.online),
+                # v2.0.6 FIX (Tier 3, battery health architecture review):
+                # these four fields were added to PackSample for
+                # PackCapacityTracker, but this reconstruction loop was
+                # never updated to carry them through -- every pack's own
+                # new data was silently dropped here (defaulted to None
+                # by simply never being set), even though _build_sample()
+                # populated them correctly upstream. Caught by direct
+                # end-to-end testing (segments never formed at all), not
+                # by code review alone -- worth being honest that this
+                # was a real gap in this same pass's own work, not a
+                # pre-existing one. Same bounds as their unit-level
+                # equivalents above, per the same "per-field discard"
+                # philosophy this whole function is already built around.
+                soc=_valid_or_none(pack.soc, SOC_MIN, SOC_MAX, "pack_soc"),
+                power_w=_valid_or_none(
+                    pack.power_w, -POWER_LIMIT_W, POWER_LIMIT_W, "pack_power"
+                ),
+                lifetime_charge_kwh=_valid_or_none(
+                    pack.lifetime_charge_kwh, 0.0, 1e9, "pack_lifetime_charge"
+                ),
+                lifetime_discharge_kwh=_valid_or_none(
+                    pack.lifetime_discharge_kwh, 0.0, 1e9, "pack_lifetime_discharge"
+                ),
             )
         )
     return out
@@ -439,7 +528,24 @@ class DischargeSegment:
     energy_kwh: float
     implied_capacity_kwh: float
     freshness: float          # exp(-throughput_since_full/τ) at segment start
-    golden: bool              # Huawei SOH calibration ran during this segment
+    #: v2.0.6 FIX (Tier 1, battery health architecture review -- confirmed
+    #: genuinely live in production, not hypothetical): replaces `golden:
+    #: bool`. The old field meant "a Huawei SOH calibration ran during
+    #: this segment" and, via weight()'s own golden_weight_boost
+    #: multiplier (4.0x), treated that overlap as a STRONGER anchor.
+    #: PHASE1_BATTERY_HEALTH_DESIGN.md's own careful analysis (§3, §6.3)
+    #: concluded the opposite is correct: the raw calibration register is
+    #: a plain U16 that cannot distinguish "calibrating right now" from
+    #: "just finished" from a single reading -- only the nonzero -> zero
+    #: TRANSITION is unambiguous -- so there was never a confirmed-safe
+    #: basis for treating overlap as extra-reliable data. Data captured
+    #: while the BMS's own SOC/capacity model may itself be actively
+    #: recalibrating is exactly the kind of reading this whole engine's
+    #: "quality-aware inputs" philosophy exists to distrust, not amplify.
+    #: weight() now returns 0.0 for such a segment -- full exclusion from
+    #: the trimmed-mean aggregation, matching the parked design's own
+    #: conclusion exactly, not a guess made fresh here.
+    exclude_calibration: bool
     gap_bridged: int = 0      # v1.1.8: data gaps spanned by this segment
     #: v1.2.0 (Finding J): implied capacity depends ~2% on where in the SOC
     #: range the segment sat (field: 22.98 kWh at midpoint 85-100% vs
@@ -447,16 +553,67 @@ class DischargeSegment:
     #: capacity change unless the operating band is recorded alongside it.
     soc_midpoint: float = 0.0
     charge_ceiling: float | None = None
+    #: v2.0.6 (Tier 3, battery health architecture review): accumulated
+    #: LIVE during the segment (SegmentTracker.feed()'s own running
+    #: mean), counting only valid/non-None temperature samples -- None,
+    #: not zero or a guess, if too few valid readings were captured
+    #: during this specific segment. Feeds normalized_capacity_kwh()
+    #: below; see BatteryHealthConfig's own capacity_temp_ref_c/
+    #: capacity_temp_sigma_c/capacity_rate_ref_w/capacity_rate_gamma
+    #: comment for the full reasoning behind this normalization.
+    avg_temp_c: float | None = None
 
     @property
     def delta_soc(self) -> float:
         return self.soc_start - self.soc_end
 
+    @property
+    def duration_hours(self) -> float:
+        return max((self.end_ts - self.start_ts) / 3600.0, 1e-9)
+
+    @property
+    def avg_power_w(self) -> float:
+        """Average power over the segment -- recoverable EXACTLY from
+        energy/duration, both already present via cumulative-counter
+        differences that already tolerate gaps by construction. Chosen
+        over reading a live power register directly for rate
+        normalization for exactly this reason (PHASE1_BATTERY_HEALTH_
+        DESIGN.md §6.2): avoids needing a separate, independently-
+        gap-prone signal for something already exactly derivable from
+        data this segment already has.
+        """
+        return self.energy_kwh / self.duration_hours * 1000.0
+
+    def normalized_capacity_kwh(self, cfg: BatteryHealthConfig) -> float:
+        """implied_capacity_kwh, corrected for the segment's own average
+        temperature and discharge rate -- see BatteryHealthConfig's own
+        capacity_temp_ref_c comment for the full formula and reasoning.
+        Both correction factors default to neutral (1.0) when their own
+        input is unavailable -- never a reason to discard a segment,
+        matching every other quality-related decision in this engine.
+        """
+        f_temp = 1.0
+        if self.avg_temp_c is not None:
+            f_temp = math.exp(
+                -((self.avg_temp_c - cfg.capacity_temp_ref_c) ** 2)
+                / (cfg.capacity_temp_sigma_c ** 2)
+            )
+            f_temp = max(f_temp, cfg.capacity_norm_factor_floor)
+        f_rate = 1.0
+        power = abs(self.avg_power_w)
+        if power > 0:
+            f_rate = 1.0 / (
+                1.0 + (power / cfg.capacity_rate_ref_w) ** cfg.capacity_rate_gamma
+            )
+            f_rate = max(f_rate, cfg.capacity_norm_factor_floor)
+        return self.implied_capacity_kwh / (f_temp * f_rate)
+
     def weight(self, cfg: BatteryHealthConfig) -> float:
-        w = self.delta_soc ** 2 * self.freshness
-        if self.golden:
-            w *= cfg.golden_weight_boost
-        return w
+        # v2.0.6 (Tier 1): full exclusion, not a boost -- see
+        # exclude_calibration's own field comment above for why.
+        if self.exclude_calibration:
+            return 0.0
+        return self.delta_soc ** 2 * self.freshness
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -465,14 +622,25 @@ class DischargeSegment:
     def from_dict(cls, d: dict[str, Any]) -> DischargeSegment:
         kwargs = {k: d[k] for k in (
             "start_ts", "end_ts", "soc_start", "soc_end", "energy_kwh",
-            "implied_capacity_kwh", "freshness", "golden",
+            "implied_capacity_kwh", "freshness",
         )}
+        # v2.0.6 (Tier 1): tolerate persisted segments from before this
+        # field existed (defaults to not-excluded, matching this field's
+        # own predecessor "golden" defaulting to falsy for old data) --
+        # no migration of the OLD golden-boost data is attempted or
+        # needed (operator's own call: 30 days of history, not worth
+        # preserving), only a guarantee this doesn't crash on load.
+        kwargs["exclude_calibration"] = bool(d.get("exclude_calibration", False))
         # Tolerate pre-1.1.8 persisted segments (field added in 1.1.8).
         kwargs["gap_bridged"] = int(d.get("gap_bridged", 0))
         # Pre-1.2.0 segments predate these fields.
         kwargs["soc_midpoint"] = float(
             d.get("soc_midpoint", (d["soc_start"] + d["soc_end"]) / 2.0))
         kwargs["charge_ceiling"] = d.get("charge_ceiling")
+        # v2.0.6 (Tier 3): pre-Tier-3 segments predate avg_temp_c --
+        # defaults to None (not zero or a guess), matching this field's
+        # own "None if too few valid readings" semantics exactly.
+        kwargs["avg_temp_c"] = d.get("avg_temp_c")
         return cls(**kwargs)
 
 
@@ -484,10 +652,19 @@ class SegmentTracker:
         means the BMS snapped its SOC mid-segment → discard (§Finding 3).
       * Freshness weighting — segments starting shortly after a 100% charge
         (fresh coulomb-count anchor) weigh more (§Finding 3).
-      * Golden segments — a Huawei SOH calibration cycle is the BMS's own
-        controlled full-cycle measurement → boosted weight (§Finding 1).
+      * Calibration exclusion — a segment overlapping a Huawei SOH
+        calibration event (or its settle window) is fully EXCLUDED from
+        aggregation, not boosted (v2.0.6, Tier 1 -- see DischargeSegment.
+        exclude_calibration's own comment for why; this docstring's own
+        earlier "golden segments -> boosted weight" description was the
+        incorrect, now-fixed behaviour, corrected here to match).
       * Robust aggregation — weighted trimmed mean + spread, not a plain
         weighted mean a single outlier can drag.
+      * Temperature/rate normalization (v2.0.6, Tier 3) — implied capacity
+        is corrected for the segment's own average temperature and
+        discharge rate before aggregation, so a genuinely healthy pack
+        tested only in winter or only under high load doesn't read as
+        more degraded than it is.
     """
 
     def __init__(self, cfg: BatteryHealthConfig) -> None:
@@ -499,8 +676,19 @@ class SegmentTracker:
         self._start_soc = 0.0
         self._start_discharge_kwh = 0.0
         self._last_soc = 0.0
-        self._seg_calibration_seen = False
+        # v2.0.6 (Tier 1): renamed from _seg_calibration_seen -- same
+        # underlying tracking (was calibration ever relevant during this
+        # segment's lifetime), repurposed for exclusion instead of a
+        # golden-boost. See DischargeSegment.exclude_calibration's own
+        # comment for the full reasoning.
+        self._seg_exclude_calibration = False
         self._seg_freshness = 1.0
+        # v2.0.6 (Tier 3): running mean of temperature samples seen while
+        # THIS segment is active -- counts only valid/non-None readings,
+        # finalized into DischargeSegment.avg_temp_c (None if none were
+        # ever valid) at _close().
+        self._seg_temp_sum = 0.0
+        self._seg_temp_count = 0
         # Freshness bookkeeping
         self._throughput_since_full_kwh = 0.0
         self._last_discharge_kwh: float | None = None
@@ -525,10 +713,30 @@ class SegmentTracker:
 
     # ── feed ────────────────────────────────────────────────────────────────
     def feed(
-        self, s: HealthSample, counter_stale: bool = False
+        self, s: HealthSample, counter_stale: bool = False,
+        calib_uncertain: bool = False,
     ) -> DischargeSegment | None:
         """Process one sample; return a completed segment if one just closed."""
         cfg = self._cfg
+
+        # v2.0.6 (Tier 2, battery health architecture review): calibration
+        # edge detection MOVED to BatteryHealthEngine.update() -- computed
+        # once there, now three consumers need it (this tracker,
+        # EfficiencyTracker, BalanceTracker), not just this one. See that
+        # method's own comment for the full mechanism; calib_uncertain is
+        # simply consumed here now, not computed.
+        if self._active and calib_uncertain:
+            self._seg_exclude_calibration = True
+
+        # v2.0.6 (Tier 3): temperature accumulation, independent of
+        # segment state and of soc/power/discharge availability below --
+        # same reasoning as the freshness bookkeeping immediately after
+        # this: a missing value here shouldn't discard anything, just
+        # not count toward the running mean.
+        if self._active and s.battery_temp_c is not None:
+            self._seg_temp_sum += s.battery_temp_c
+            self._seg_temp_count += 1
+
         soc, power = s.soc, s.power_w
         discharge = s.lifetime_discharge_kwh
 
@@ -573,7 +781,7 @@ class SegmentTracker:
             # counter value - the start endpoint would be stale by however
             # long the read had been failing.
             if discharging and not counter_stale:
-                self._begin(s, soc, discharge)
+                self._begin(s, soc, discharge, calib_uncertain)
             elif discharging:
                 self.stale_endpoint_skips += 1
             return None
@@ -591,7 +799,7 @@ class SegmentTracker:
                     f"{cfg.max_gap_bridge_s / 60.0:.0f} min bridge limit"
                 )
                 if discharging:
-                    self._begin(s, soc, discharge)
+                    self._begin(s, soc, discharge, calib_uncertain)
                 return None
             self._gap_pending = False
             self._bridges_in_segment += 1
@@ -601,8 +809,13 @@ class SegmentTracker:
                 "battery_health: bridged a %.0f s data gap mid-segment", elapsed
             )
 
-        if s.soh_calibration_active:
-            self._seg_calibration_seen = True
+        # v2.0.6 (Tier 1): the old "if s.soh_calibration_active:
+        # self._seg_calibration_seen = True" block that lived here is now
+        # redundant -- the new, more comprehensive calib_uncertain check
+        # at the top of this method (which also covers the settle window
+        # after completion, not just "currently active") already updates
+        # self._seg_exclude_calibration for every active segment on every
+        # tick, before this point is ever reached.
 
         if soc > self._last_soc + cfg.soc_backstep_tolerance:
             # SOC rose: charging blip or SOC correction → close at last point.
@@ -652,7 +865,10 @@ class SegmentTracker:
             self._discard(reason)
 
     # ── internals ───────────────────────────────────────────────────────────
-    def _begin(self, s: HealthSample, soc: float, discharge: float) -> None:
+    def _begin(
+        self, s: HealthSample, soc: float, discharge: float,
+        calib_uncertain: bool = False,
+    ) -> None:
         self._active = True
         self._start_ts = s.timestamp
         self._start_soc = soc
@@ -662,10 +878,25 @@ class SegmentTracker:
         self._idle_since = None
         self._bridges_in_segment = 0
         self._seg_ceiling = s.charge_ceiling_soc
-        self._seg_calibration_seen = bool(s.soh_calibration_active)
+        # v2.0.6 (Tier 2): calib_uncertain is now passed in directly (see
+        # BatteryHealthEngine.update()'s own comment for where it's
+        # computed) -- needed here specifically because feed()'s own
+        # top-of-method check only updates an ALREADY-active segment;
+        # self._active only becomes True below, so THIS tick -- the
+        # segment's own first one -- would otherwise be missed.
+        self._seg_exclude_calibration = calib_uncertain
         self._seg_freshness = math.exp(
             -self._throughput_since_full_kwh / self._cfg.freshness_tau_kwh
         )
+        # v2.0.6 (Tier 3): same reasoning as calib_uncertain immediately
+        # above -- feed()'s own top-of-method accumulation only updates an
+        # ALREADY-active segment, so this segment's own first tick would
+        # otherwise never contribute to its own avg_temp_c.
+        self._seg_temp_sum = 0.0
+        self._seg_temp_count = 0
+        if s.battery_temp_c is not None:
+            self._seg_temp_sum = s.battery_temp_c
+            self._seg_temp_count = 1
 
     def _discard(self, reason: str) -> None:
         _LOGGER.debug("battery_health: discarding segment (%s)", reason)
@@ -704,10 +935,16 @@ class SegmentTracker:
             energy_kwh=energy,
             implied_capacity_kwh=implied,
             freshness=self._seg_freshness,
-            golden=self._seg_calibration_seen,
+            exclude_calibration=self._seg_exclude_calibration,
             gap_bridged=self._bridges_in_segment,
             soc_midpoint=(self._start_soc + end_soc) / 2.0,
             charge_ceiling=self._seg_ceiling,
+            # v2.0.6 (Tier 3): None (not zero/a guess) if no valid
+            # temperature reading was ever captured during this segment.
+            avg_temp_c=(
+                self._seg_temp_sum / self._seg_temp_count
+                if self._seg_temp_count > 0 else None
+            ),
         )
         self.segments.append(seg)
         self.last_segment_ts = self._start_ts
@@ -738,7 +975,7 @@ class SegmentTracker:
         segs = self.segments
         attrs: dict[str, Any] = {
             "segment_count": len(segs),
-            "golden_segment_count": sum(1 for s in segs if s.golden),
+            "excluded_calibration_segment_count": sum(1 for s in segs if s.exclude_calibration),
             "discarded_segment_count": self.discarded_segments,
             "gap_bridged_count": self.gap_bridged_count,
             "stale_endpoint_skips": self.stale_endpoint_skips,
@@ -748,7 +985,11 @@ class SegmentTracker:
             return None, attrs
 
         weighted = sorted(
-            ((s.implied_capacity_kwh, s.weight(cfg)) for s in segs),
+            # v2.0.6 FIX (Tier 3, battery health architecture review):
+            # was s.implied_capacity_kwh (raw) -- see DischargeSegment.
+            # normalized_capacity_kwh()'s own docstring for the full
+            # temperature/rate correction this applies.
+            ((s.normalized_capacity_kwh(cfg), s.weight(cfg)) for s in segs),
             key=lambda t: t[0],
         )
         total_w = sum(w for _, w in weighted)
@@ -801,8 +1042,16 @@ class SegmentTracker:
                 max(s.end_ts for s in segs) - min(s.start_ts for s in segs)
             ) / SECONDS_PER_DAY
             if span_days >= cfg.capacity_reference_min_span_days:
+                # v2.0.6 FIX (Tier 3): was s.implied_capacity_kwh (raw) --
+                # must match the SAME normalization mean_cap above now
+                # uses, since SOH% below is computed as mean_cap /
+                # reference. Comparing a normalized numerator against a
+                # raw-valued reference would be an inconsistent
+                # comparison, not just a smaller inaccuracy -- caught
+                # while making this exact change, not a separate,
+                # later-discovered issue.
                 self.set_reference(
-                    _median(sorted(s.implied_capacity_kwh for s in segs)),
+                    _median(sorted(s.normalized_capacity_kwh(cfg) for s in segs)),
                     reason="auto: %d segments spanning %.0f days"
                            % (len(segs), span_days),
                     ts=max(s.end_ts for s in segs),
@@ -878,6 +1127,176 @@ class SegmentTracker:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Per-pack capacity — a direct, measured degradation signal per pack
+# ═════════════════════════════════════════════════════════════════════════════
+class PackCapacityTracker:
+    """Per-pack capacity estimation, mirroring SegmentTracker's own
+    segment-detection approach but applied independently to each of the
+    battery's packs.
+
+    v2.0.6 (Tier 3, battery health architecture review): a direct,
+    measured per-pack capacity signal -- chosen over the parked design's
+    original, simpler plan (blend per-pack SOC additively into the
+    existing dV/dT balance score, PHASE1_BATTERY_HEALTH_DESIGN.md §6.4)
+    once per-pack lifetime charge/discharge counters were confirmed to
+    exist (storage_unit_1_battery_pack_{1,2,3}_total_charge/discharge)
+    and already polled for other entities, with the same units/gain as
+    their unit-level equivalents. Directly answers "is pack 2 degrading
+    faster than 1/3" with a measured implied-capacity number, the same
+    kind of measurement the unit-level tracker already makes, rather
+    than only an indirect proxy (dV/dT spread at rest).
+
+    Each pack gets its OWN SegmentTracker instance -- reused exactly as
+    written, not reimplemented, so every guard it already has (SOC-
+    correction, freshness weighting, trimmed-mean aggregation, and now
+    Tier 1's calibration exclusion) applies identically per pack, with
+    zero duplicated logic to drift out of sync. Each pack also gets its
+    OWN pair of CounterMonitor instances, separate from each other and
+    from the unit-level ones: a single pack replacement -- a real,
+    plausible maintenance event -- resets only that pack's own lifetime
+    counters, not the unit's or the other two packs'.
+    """
+
+    def __init__(self, cfg: BatteryHealthConfig, pack_count: int = 3) -> None:
+        self._cfg = cfg
+        self.pack_count = pack_count
+        # v2.0.6 FIX (Tier 3): implied_capacity_min_kwh/max_kwh are
+        # calibrated for the WHOLE unit's nameplate capacity (default
+        # 8-35 kWh, around a 20.7 kWh unit) -- a single pack's true
+        # capacity is roughly 1/pack_count of that, so reusing cfg as-is
+        # here would make SegmentTracker's own plausibility band (_close()
+        # -- "SOC-correction / glitch guard") systematically reject
+        # genuine per-pack segments, not just implausible ones. Caught by
+        # direct end-to-end testing (a pack discharging a realistic
+        # amount for its own size produced zero segments, not because
+        # nothing happened but because every one was silently discarded
+        # as implausible), not by code review alone. A scaled COPY of cfg
+        # is used for the per-pack trackers below -- everything else
+        # (freshness_tau_kwh, min_segment_delta_soc, calibration_
+        # settle_s, etc.) stays identical to the unit-level config, only
+        # the two capacity-band fields are pack-scaled.
+        pack_cfg = replace(
+            cfg,
+            implied_capacity_min_kwh=cfg.implied_capacity_min_kwh / pack_count,
+            implied_capacity_max_kwh=cfg.implied_capacity_max_kwh / pack_count,
+        )
+        self.trackers: list[SegmentTracker] = [
+            SegmentTracker(pack_cfg) for _ in range(pack_count)
+        ]
+        self._charge_counters: list[CounterMonitor] = [
+            CounterMonitor(f"pack_{i + 1}_charge") for i in range(pack_count)
+        ]
+        self._discharge_counters: list[CounterMonitor] = [
+            CounterMonitor(f"pack_{i + 1}_discharge") for i in range(pack_count)
+        ]
+
+    def feed(
+        self, s: HealthSample, learning: bool, calib_uncertain: bool = False,
+    ) -> bool:
+        """Feed one tick to every pack's own tracker.
+
+        Returns True if any pack's own counter reset requires a broader
+        recovery response (mirrors BatteryHealthEngine.update()'s own
+        counter-reset handling, applied per pack instead of once).
+        """
+        any_reset = False
+        for i in range(self.pack_count):
+            pack = s.packs[i] if i < len(s.packs) else PackSample()
+            pre = (
+                self._charge_counters[i].reset_count
+                + self._discharge_counters[i].reset_count
+            )
+            # charge is fed through too (for its own reset detection) even
+            # though SegmentTracker's own feed() only reads discharge --
+            # matching the unit-level engine's own symmetric handling of
+            # both counters.
+            self._charge_counters[i].feed(pack.lifetime_charge_kwh)
+            corrected_discharge = self._discharge_counters[i].feed(
+                pack.lifetime_discharge_kwh
+            )
+            post = (
+                self._charge_counters[i].reset_count
+                + self._discharge_counters[i].reset_count
+            )
+            if post != pre:
+                self.trackers[i].discard_active(
+                    f"pack {i + 1} lifetime counter reset"
+                )
+                any_reset = True
+            if not learning:
+                self.trackers[i].mark_gap()
+                continue
+            # Synthetic per-pack view: SegmentTracker's own feed() reads
+            # soc/power_w/lifetime_discharge_kwh/charge_ceiling_soc from a
+            # HealthSample -- reused completely as-is here, unmodified,
+            # rather than generalizing SegmentTracker itself to accept a
+            # different input shape for a single new caller.
+            #
+            # v2.0.6 (Tier 3): battery_temp_c is populated too, from this
+            # pack's own temp_max/temp_min average -- without it,
+            # SegmentTracker's own temperature normalization (added in
+            # this same pass) would always default to neutral for every
+            # per-pack segment, silently missing the same correction the
+            # unit-level tracker gets. Falls back to whichever of the two
+            # is available if only one is.
+            pack_temp_c: float | None = None
+            if pack.temp_max is not None and pack.temp_min is not None:
+                pack_temp_c = (pack.temp_max + pack.temp_min) / 2.0
+            elif pack.temp_max is not None:
+                pack_temp_c = pack.temp_max
+            elif pack.temp_min is not None:
+                pack_temp_c = pack.temp_min
+            pack_sample = HealthSample(
+                timestamp=s.timestamp,
+                soc=pack.soc,
+                power_w=pack.power_w,
+                lifetime_discharge_kwh=corrected_discharge,
+                charge_ceiling_soc=s.charge_ceiling_soc,
+                battery_temp_c=pack_temp_c,
+            )
+            self.trackers[i].feed(
+                pack_sample,
+                counter_stale=self._discharge_counters[i].is_stale,
+                calib_uncertain=calib_uncertain,
+            )
+        return any_reset
+
+    def mark_gap(self) -> None:
+        for t in self.trackers:
+            t.mark_gap()
+
+    def prune(self, now: float) -> None:
+        for t in self.trackers:
+            t.prune(now)
+
+    def soh_capacity_per_pack(self) -> list[tuple[float | None, dict[str, Any]]]:
+        """One (soh_percent, attrs) pair per pack, same shape as
+        SegmentTracker.soh_capacity() itself, in pack order (1, 2, 3...)."""
+        return [t.soh_capacity() for t in self.trackers]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "trackers": [t.to_dict() for t in self.trackers],
+            "charge_counters": [c.to_dict() for c in self._charge_counters],
+            "discharge_counters": [c.to_dict() for c in self._discharge_counters],
+        }
+
+    def restore(self, data: dict[str, Any]) -> None:
+        trackers_data = data.get("trackers", [])
+        for i, t in enumerate(self.trackers):
+            if i < len(trackers_data):
+                t.restore(trackers_data[i])
+        charge_data = data.get("charge_counters", [])
+        for i, c in enumerate(self._charge_counters):
+            if i < len(charge_data):
+                c.restore(charge_data[i])
+        discharge_data = data.get("discharge_counters", [])
+        for i, c in enumerate(self._discharge_counters):
+            if i < len(discharge_data):
+                c.restore(discharge_data[i])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # SOH_eff — round-trip efficiency drift between full-charge anchors
 # ═════════════════════════════════════════════════════════════════════════════
 class EfficiencyTracker:
@@ -921,8 +1340,24 @@ class EfficiencyTracker:
         self.last_ceiling: float | None = None
 
     # ── anchor qualification ────────────────────────────────────────────────
-    def _anchor_tier(self, s: HealthSample) -> int:
-        """Return 1 or 2 for a qualifying anchor, else 0."""
+    def _anchor_tier(self, s: HealthSample, calib_uncertain: bool = False) -> int:
+        """Return 1 or 2 for a qualifying anchor, else 0.
+
+        v2.0.6 FIX (Tier 2, battery health architecture review -- confirmed
+        directly from this class's own comments elsewhere in the file, not
+        assumed): tier 1's own condition (SOC >= eff_anchor_tier1_soc) is
+        specifically described as "at a BMS recalibration point" -- meaning
+        efficiency's highest-quality anchors are structurally, deliberately
+        the SAME moments Huawei's own SOH calibration is most likely to be
+        running, not an incidental coincidence the way capacity's segment
+        overlap is. A reading captured while calib_uncertain never
+        qualifies as an anchor at all here -- simpler and safer than
+        excluding only the resulting eta window after the fact, since
+        EITHER endpoint of a window being uncertain should disqualify it,
+        and this way neither endpoint ever can be.
+        """
+        if calib_uncertain:
+            return 0
         cfg = self._cfg
         if s.soc is None or s.power_w is None:
             return 0
@@ -937,7 +1372,9 @@ class EfficiencyTracker:
             return 2
         return 0
 
-    def feed(self, s: HealthSample, learn: bool = True) -> None:
+    def feed(
+        self, s: HealthSample, learn: bool = True, calib_uncertain: bool = False,
+    ) -> None:
         cfg = self._cfg
         # Finding O: a ceiling change invalidates cross-epoch comparison, and
         # must be detected even on ticks where the counters failed to read.
@@ -960,7 +1397,7 @@ class EfficiencyTracker:
         if s.lifetime_charge_kwh is None or s.lifetime_discharge_kwh is None:
             return
 
-        tier = self._anchor_tier(s)
+        tier = self._anchor_tier(s, calib_uncertain=calib_uncertain)
         if tier == 0:
             return
 
@@ -1158,7 +1595,9 @@ class BalanceTracker:
             return cfg.balance_min_soc
         return max(cfg.balance_min_soc_floor, ceiling - cfg.balance_ceiling_margin)
 
-    def feed(self, s: HealthSample, learn: bool = True) -> None:
+    def feed(
+        self, s: HealthSample, learn: bool = True, calib_uncertain: bool = False,
+    ) -> None:
         """Process a sample.
 
         When *learn* is False (learning switch off, or still settling after a
@@ -1166,6 +1605,16 @@ class BalanceTracker:
         live values, but no score is accumulated, no baseline is captured and
         no epoch is started - nothing irreversible happens on data that may be
         untrustworthy.
+
+        v2.0.6 (Tier 2, battery health architecture review): calib_uncertain
+        gets the identical treatment as learn=False below, for the same
+        reasoning -- raw dV/dT are still worth displaying even during an
+        ambiguous BMS calibration state, but scoring/baseline capture from
+        it is not confirmed-safe (see DischargeSegment.exclude_calibration's
+        own comment for the full reasoning, which applies here too: this
+        tracker builds a score from a comparison against a learned
+        baseline, the same category of stateful comparison capacity's
+        segments and efficiency's anchors both already guard).
         """
         cfg = self._cfg
         if s.soc is None or s.power_w is None:
@@ -1213,7 +1662,7 @@ class BalanceTracker:
                 (s.timestamp, [t - s.ambient_temp_c for t in temps]))
         self.sample_soc.append(s.soc)
 
-        if not learn:
+        if not learn or calib_uncertain:
             return          # raw values recorded above; nothing irreversible
 
         if cfg.balance_use_baseline and self.baseline_dv is None:
@@ -1520,7 +1969,7 @@ class HealthReport:
             self.efc,
             self.warranty_consumed_pct,
             self.attributes.get("segment_count"),
-            self.attributes.get("golden_segment_count"),
+            self.attributes.get("excluded_calibration_segment_count"),
             self.attributes.get("discarded_segment_count"),
             self.attributes.get("counter_resets"),
             tuple(self.attributes.get("contributing_terms", ())),
@@ -1535,6 +1984,10 @@ class BatteryHealthEngine:
     def __init__(self, cfg: BatteryHealthConfig | None = None) -> None:
         self.cfg = cfg or BatteryHealthConfig()
         self.segments = SegmentTracker(self.cfg)
+        # v2.0.6 (Tier 3): direct per-pack capacity, alongside (not instead
+        # of) the unit-level self.segments -- see PackCapacityTracker's own
+        # docstring for the full reasoning.
+        self.pack_capacity = PackCapacityTracker(self.cfg)
         self.efficiency = EfficiencyTracker(self.cfg)
         self.balance = BalanceTracker(self.cfg)
         self.stress = StressAccumulator(self.cfg)
@@ -1557,6 +2010,16 @@ class BatteryHealthEngine:
         self.settling_events = 0
         self.dirty = False                     # persistence hint for manager
         self._last_report = HealthReport()
+        # v2.0.6 (Tier 2, battery health architecture review): calibration
+        # edge-detection state, MOVED HERE from SegmentTracker (Tier 1's own
+        # original home for it) now that EfficiencyTracker and
+        # BalanceTracker also need to know when calibration makes a
+        # reading's trustworthiness uncertain -- see this class's own
+        # update() for the full reasoning on why centralizing here (single
+        # source of truth, computed once per tick) is now the right design
+        # with three consumers, not one.
+        self._calib_prev_active = False
+        self._calib_settle_until: float | None = None
 
     # ── main entry point ────────────────────────────────────────────────────
     def update(self, raw: HealthSample) -> HealthReport:
@@ -1590,22 +2053,76 @@ class BatteryHealthEngine:
         # tracker sees it, so a reboot artefact cannot fire a baseline epoch.
         s.charge_ceiling_soc = self.ceiling.feed(s.charge_ceiling_soc)
 
+        # v2.0.6 (Tier 2, battery health architecture review): calibration
+        # edge detection, computed ONCE here and passed to all three
+        # trackers below -- moved from SegmentTracker (Tier 1's own
+        # original home for it). The raw calibration register is a plain
+        # U16 that cannot distinguish "calibrating right now" from "just
+        # finished" from a single reading -- only the nonzero -> zero
+        # TRANSITION is unambiguous, hence tracking the previous tick's
+        # own state here rather than trying to interpret one reading in
+        # isolation. This runs unconditionally, before any tracker sees
+        # the sample, since the edge can occur at any time and doesn't
+        # depend on soc/power/discharge being present.
+        calib_active = s.soh_calibration_active
+        if self._calib_prev_active and not calib_active:
+            self._calib_settle_until = s.timestamp + self.cfg.calibration_settle_s
+            _LOGGER.info(
+                "battery_health: SOH calibration completion detected; "
+                "excluding readings for %.0f s across capacity, "
+                "efficiency, and balance tracking",
+                self.cfg.calibration_settle_s,
+            )
+        self._calib_prev_active = calib_active
+        # True if calibration is active right now, OR still within the
+        # settle window after a detected completion -- either way, this
+        # reading is not confirmed-safe to treat as trustworthy (see
+        # DischargeSegment.exclude_calibration's own comment for the full
+        # reasoning, which applies identically to efficiency's anchors and
+        # balance's rest samples, not just capacity's segments).
+        calib_uncertain = calib_active or (
+            self._calib_settle_until is not None
+            and s.timestamp < self._calib_settle_until
+        )
+
         learning = self.learning_active(s.timestamp)
         counter_stale = self._discharge_counter.is_stale
         seg_before = (len(self.segments.segments), self.segments.discarded_segments,
                       self.segments.gap_bridged_count)
         if learning:
-            closed = self.segments.feed(s, counter_stale=counter_stale)
+            closed = self.segments.feed(
+                s, counter_stale=counter_stale, calib_uncertain=calib_uncertain,
+            )
             if closed is not None:
                 self.dirty = True
         else:
             closed = None
             self.segments.mark_gap()
+        # v2.0.6 (Tier 3): per-pack capacity tracking runs alongside the
+        # unit-level tracker above, fed the same sample and the same
+        # calib_uncertain determination. A pack's own counter reset (a
+        # single pack replacement, a real maintenance event distinct from
+        # the whole unit resetting) is treated the same way the unit-level
+        # reset above is: it triggers mark_recovery() too, since something
+        # physical changed underneath this reading either way.
+        pack_before = tuple(
+            (len(t.segments), t.discarded_segments) for t in self.pack_capacity.trackers
+        )
+        pack_reset = self.pack_capacity.feed(
+            s, learning=learning, calib_uncertain=calib_uncertain,
+        )
+        if pack_reset:
+            self.mark_recovery("pack lifetime counter reset", now=s.timestamp)
+            self.dirty = True
+        if tuple(
+            (len(t.segments), t.discarded_segments) for t in self.pack_capacity.trackers
+        ) != pack_before:
+            self.dirty = True
         eff_base_before = self.efficiency.baseline
         bal_base_before = self.balance.baseline_dv
         bal_n_before = len(self.balance.scores)
-        self.efficiency.feed(s, learn=learning)
-        self.balance.feed(s, learn=learning)
+        self.efficiency.feed(s, learn=learning, calib_uncertain=calib_uncertain)
+        self.balance.feed(s, learn=learning, calib_uncertain=calib_uncertain)
         # Finding E: persist on every material state change, not only on a
         # closed segment.  The efficiency baseline in particular is a
         # once-in-a-lifetime reference that was previously lost on an
@@ -1621,6 +2138,7 @@ class BatteryHealthEngine:
             self.dirty = True
         self.stress.feed(s)
         self.segments.prune(s.timestamp)
+        self.pack_capacity.prune(s.timestamp)
         self.stress.prune(s.timestamp)
 
         self._last_report = self._evaluate(s.timestamp)
@@ -1677,6 +2195,7 @@ class BatteryHealthEngine:
         since it integrates over *time* and an outage is not a calm period.
         """
         self.segments.mark_gap()
+        self.pack_capacity.mark_gap()
         self.stress.mark_gap()
 
     @property
@@ -1716,7 +2235,13 @@ class BatteryHealthEngine:
                 span_days, self.cfg.capacity_reference_min_span_days)
             return False
         self.segments.set_reference(
-            _median(sorted(s.implied_capacity_kwh for s in segs)),
+            # v2.0.6 FIX (Tier 3): was s.implied_capacity_kwh (raw) -- must
+            # match the same normalization soh_capacity()'s own auto-
+            # capture path now uses (see that method's own comment on
+            # this identical fix), or a manual re-anchor would silently
+            # reintroduce the inconsistent-comparison bug the auto path
+            # was just fixed for.
+            _median(sorted(s.normalized_capacity_kwh(self.cfg) for s in segs)),
             reason="manual re-anchor", ts=max(s.end_ts for s in segs))
         self.dirty = True
         return True
@@ -1732,6 +2257,29 @@ class BatteryHealthEngine:
         r.attributes.update(cap_attrs)
         r.attributes.update(eff_attrs)
         r.attributes.update(bal_attrs)
+
+        # v2.0.6 (Tier 3, battery health architecture review): per-pack
+        # capacity is informational, never part of the BHI composite
+        # below -- the composite is already defined as capacity/
+        # efficiency/balance, and this is a diagnostic BREAKDOWN of the
+        # unit-level capacity term above, not a fourth term. Directly
+        # answers this tracker's own original motivation ("is one pack
+        # degrading faster than the others") with a measured spread,
+        # not just three separate numbers a user would have to compare
+        # by eye.
+        pack_results = self.pack_capacity.soh_capacity_per_pack()
+        pack_soh = [v for v, _attrs in pack_results]
+        r.attributes["pack_capacity_soh_percent"] = [
+            round(v, 1) if v is not None else None for v in pack_soh
+        ]
+        r.attributes["pack_capacity_segment_count"] = [
+            attrs.get("segment_count") for _v, attrs in pack_results
+        ]
+        known_soh = [v for v in pack_soh if v is not None]
+        r.attributes["pack_capacity_spread_pct"] = (
+            round(max(known_soh) - min(known_soh), 1)
+            if len(known_soh) >= 2 else None
+        )
 
         # Composite over available measured terms only (renormalized weights;
         # a missing term must never crater the composite as an implicit 0).
@@ -1864,6 +2412,7 @@ class BatteryHealthEngine:
             "settling_events": self.settling_events,
             "ceiling": self.ceiling.to_dict(),
             "segments": self.segments.to_dict(),
+            "pack_capacity": self.pack_capacity.to_dict(),
             "efficiency": self.efficiency.to_dict(),
             "balance": self.balance.to_dict(),
             "stress": self.stress.to_dict(),
@@ -1890,6 +2439,7 @@ class BatteryHealthEngine:
         self.settling_events = int(data.get("settling_events", 0))
         self.ceiling.restore(data.get("ceiling", {}))
         self.segments.restore(data.get("segments", {}))
+        self.pack_capacity.restore(data.get("pack_capacity", {}))
         self.efficiency.restore(data.get("efficiency", {}))
         self.balance.restore(data.get("balance", {}))
         self.stress.restore(data.get("stress", {}))

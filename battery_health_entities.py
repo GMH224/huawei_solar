@@ -277,7 +277,8 @@ class HuaweiSolarBatteryHealthSensorEntity(SensorEntity):
                 "contributing_terms": report.attributes.get("contributing_terms", []),
                 "held_terms": report.attributes.get("held_terms", []),
                 "segment_count": report.attributes.get("segment_count"),
-                "golden_segment_count": report.attributes.get("golden_segment_count"),
+                "excluded_calibration_segment_count": report.attributes.get(
+                    "excluded_calibration_segment_count"),
                 "discarded_segment_count": report.attributes.get(
                     "discarded_segment_count"),
                 "gap_bridged_count": report.attributes.get("gap_bridged_count"),
@@ -294,6 +295,15 @@ class HuaweiSolarBatteryHealthSensorEntity(SensorEntity):
                     "capacity_reference_captured", "capacity_reference_epochs",
                     "segment_soc_midpoint_mean", "segment_charge_ceiling_mean",
                     "segment_count",
+                    # v2.0.6 (Tier 3, battery health architecture review):
+                    # per-pack capacity, from PackCapacityTracker -- a
+                    # direct, measured per-pack signal, grouped here
+                    # alongside the unit-level capacity diagnostics it's
+                    # a breakdown of, matching this file's own
+                    # established pattern rather than new top-level
+                    # entities for a single addition.
+                    "pack_capacity_soh_percent", "pack_capacity_segment_count",
+                    "pack_capacity_spread_pct",
                 )
             }
         elif self._attr_key == "soh_balance":

@@ -100,6 +100,34 @@ _RN_PACK_CALIBRATION = [
     f"storage_unit_1_battery_pack_{i}_soh_calibration_status"
     for i in range(1, PACK_COUNT + 1)
 ]
+# v2.0.6 (Tier 3, battery health architecture review): per-pack
+# equivalents of _RN_SOC/_RN_POWER/_RN_TOTAL_CHARGE/_RN_TOTAL_DISCHARGE
+# above, feeding PackCapacityTracker (battery_health.py) -- a direct,
+# measured per-pack capacity estimate, the same segment-detection
+# approach the unit-level tracker already uses. Confirmed against the
+# real register map before adding these: same units/gain as their
+# unit-level equivalents, and PDU-adjacent to _RN_PACK_VOLTAGE above
+# (already read every poll), so the marginal bus-traffic cost is
+# expected to be low. See register_cache.py's own _TIER_OVERRIDES for
+# why the two counter lists specifically need NORMAL tier, not the
+# SLOW tier the generic "total_" substring pattern would otherwise
+# assign them.
+_RN_PACK_SOC = [
+    f"storage_unit_1_battery_pack_{i}_state_of_capacity"
+    for i in range(1, PACK_COUNT + 1)
+]
+_RN_PACK_POWER = [
+    f"storage_unit_1_battery_pack_{i}_charge_discharge_power"
+    for i in range(1, PACK_COUNT + 1)
+]
+_RN_PACK_TOTAL_CHARGE = [
+    f"storage_unit_1_battery_pack_{i}_total_charge"
+    for i in range(1, PACK_COUNT + 1)
+]
+_RN_PACK_TOTAL_DISCHARGE = [
+    f"storage_unit_1_battery_pack_{i}_total_discharge"
+    for i in range(1, PACK_COUNT + 1)
+]
 
 REQUIRED_REGISTER_NAMES: list[str] = [
     _RN_SOC,
@@ -115,6 +143,10 @@ REQUIRED_REGISTER_NAMES: list[str] = [
     *_RN_PACK_TMIN,
     *_RN_PACK_STATUS,
     *_RN_PACK_CALIBRATION,
+    *_RN_PACK_SOC,
+    *_RN_PACK_POWER,
+    *_RN_PACK_TOTAL_CHARGE,
+    *_RN_PACK_TOTAL_DISCHARGE,
 ]
 
 
@@ -449,6 +481,18 @@ class BatteryHealthManager:
                     temp_max=_value(cache, data, _RN_PACK_TMAX[i]),
                     temp_min=_value(cache, data, _RN_PACK_TMIN[i]),
                     online=online,
+                    # v2.0.6 (Tier 3): feeds PackCapacityTracker -- see
+                    # this module's own _RN_PACK_SOC/_RN_PACK_POWER/
+                    # _RN_PACK_TOTAL_CHARGE/_RN_PACK_TOTAL_DISCHARGE
+                    # comment for the full reasoning. Quality-gated via
+                    # _value() exactly the same as every other field
+                    # here -- no separate treatment needed.
+                    soc=_value(cache, data, _RN_PACK_SOC[i]),
+                    power_w=_value(cache, data, _RN_PACK_POWER[i]),
+                    lifetime_charge_kwh=_value(cache, data, _RN_PACK_TOTAL_CHARGE[i]),
+                    lifetime_discharge_kwh=_value(
+                        cache, data, _RN_PACK_TOTAL_DISCHARGE[i]
+                    ),
                 )
             )
 

@@ -344,6 +344,22 @@ _TIER_OVERRIDES: dict[str, "RegisterTier"] = {
     "storage_total_charge": RegisterTier.NORMAL,
     "storage_total_discharge": RegisterTier.NORMAL,
     "storage_rated_capacity": RegisterTier.SLOW,
+    # v2.0.6 (Tier 3, battery health architecture review): per-pack
+    # counterparts of the unit-level overrides directly above -- same
+    # reasoning exactly. PackCapacityTracker (battery_health.py) runs the
+    # same segment-detection approach per pack that the unit-level
+    # SegmentTracker already uses, and needs fresh counter readings for
+    # the same reason: a stale counter introduces segment-energy error at
+    # each endpoint. Without this override these would default to SLOW
+    # (matching the generic "total_" substring pattern), which is fine
+    # for a value merely displayed, but not for one feeding active
+    # segment-boundary arithmetic.
+    "storage_unit_1_battery_pack_1_total_charge": RegisterTier.NORMAL,
+    "storage_unit_1_battery_pack_1_total_discharge": RegisterTier.NORMAL,
+    "storage_unit_1_battery_pack_2_total_charge": RegisterTier.NORMAL,
+    "storage_unit_1_battery_pack_2_total_discharge": RegisterTier.NORMAL,
+    "storage_unit_1_battery_pack_3_total_charge": RegisterTier.NORMAL,
+    "storage_unit_1_battery_pack_3_total_discharge": RegisterTier.NORMAL,
 }
 
 
