@@ -58,6 +58,7 @@ from .types import (
     HuaweiSolarConfigEntry,
     HuaweiSolarDeviceData,
     HuaweiSolarInverterData,
+    get_device_write_lock,
 )
 
 ALL_SERVICES = [
@@ -501,18 +502,17 @@ async def _set_and_invalidate_sequence(dd: HuaweiSolarDeviceData):
 # by device serial number (the same pattern already used throughout this
 # codebase for ModbusGuard, AdaptiveModbusController, etc.) provides the
 # same guarantee: any two service-level operations on the same device are
-# always serialised, never interleaved. Locks are deliberately never
-# removed from this registry (unlike ModbusGuard's per-entry remove_source)
-# -- an idle asyncio.Lock is negligible memory, and removing one while a
-# call might still be queued on it would be far more dangerous than never
-# removing it at all.
-_device_write_locks: dict[str, asyncio.Lock] = {}
-
-
+# always serialised, never interleaved.
+#
+# v2.0.7 FIX (ICS-12, ICS quality audit -- confirmed): the actual
+# registry now lives in .types (get_device_write_lock()), shared with
+# button.py's own StopForcibleCharge press -- see that function's own
+# docstring for the full reasoning. This wrapper is kept, under the same
+# name and with the same call signature, purely so every existing call
+# site below (and this project's own static tests asserting this helper
+# exists and is used) needs no changes at all.
 def _get_device_write_lock(serial_number: str) -> asyncio.Lock:
-    if serial_number not in _device_write_locks:
-        _device_write_locks[serial_number] = asyncio.Lock()
-    return _device_write_locks[serial_number]
+    return get_device_write_lock(serial_number)
 
 
 # v2.0.3 (ICS-10, external ICS audit -- confirmed): tracks which config
@@ -974,6 +974,68 @@ def _parse_capacity_control_periods(text: str) -> list[PeakSettingPeriod]:
     return result
 
 
+def _validate_capacity_control_periods(periods: list[PeakSettingPeriod]) -> None:
+    """Reject syntactically-valid but semantically-invalid capacity
+    control period sets before they ever reach the write path.
+
+    v2.0.7 FIX (CP-02, ICS quality audit -- confirmed): the regex this
+    function's own caller applies validates only character-level syntax
+    (HH:MM format, days mask, integer wattage) -- it says nothing about
+    whether the resulting periods actually cover every day completely.
+    PeakSettingPeriodRegisters (the vendor huawei_solar package) DOES
+    already implement the correct check -- a `_validate()` method that
+    requires full 00:00-23:59 coverage per weekday with no gaps -- but
+    its own `encode()` never calls it (a genuine vendor defect,
+    confirmed directly against that source), so nothing upstream of the
+    device would actually catch an incomplete or gapped schedule.
+
+    Deliberately mirrors the vendor's own `_validate()` algorithm
+    exactly, not a reinvented one -- same per-weekday "must start at
+    00:00, each period's start must equal or be one minute past the
+    previous period's end, must reach 23:59/24:00" rule, same
+    sort-by-start-time-then-check-adjacent-pairs approach. Reproduced
+    here (in this repo's own code, not by patching the vendor package --
+    see this project's own settled position on where fixed code for
+    genuinely external dependencies belongs) rather than invented from
+    scratch, for the same reason _validate_fixed_charge_periods() above
+    mirrors ITS sibling vendor validator instead of guessing a new rule.
+    """
+    for day_idx in range(7):
+        active_periods = [p for p in periods if p.days_effective[day_idx]]
+        if not active_periods:
+            raise ValueError(
+                f"Invalid capacity control periods: day index {day_idx} "
+                f"(0=Sunday) has no period covering it at all -- every "
+                f"day of the week must be covered"
+            )
+        active_periods = sorted(active_periods, key=lambda p: p.start_time)
+        if active_periods[0].start_time != 0:
+            raise ValueError(
+                f"Invalid capacity control periods: day index {day_idx} "
+                f"(0=Sunday) is not covered from 00:00 -- its earliest "
+                f"period starts at {active_periods[0].start_time // 60:02d}:"
+                f"{active_periods[0].start_time % 60:02d}"
+            )
+        for prev, current in zip(active_periods, active_periods[1:]):
+            if current.start_time not in (prev.end_time, prev.end_time + 1):
+                raise ValueError(
+                    f"Invalid capacity control periods: day index {day_idx} "
+                    f"(0=Sunday) has a gap or overlap between "
+                    f"{prev.start_time // 60:02d}:{prev.start_time % 60:02d}-"
+                    f"{prev.end_time // 60:02d}:{prev.end_time % 60:02d} and "
+                    f"{current.start_time // 60:02d}:{current.start_time % 60:02d}-"
+                    f"{current.end_time // 60:02d}:{current.end_time % 60:02d} "
+                    f"-- every moment of each day must be covered exactly once"
+                )
+        last = active_periods[-1]
+        if last.end_time not in (24 * 60 - 1, 24 * 60):
+            raise ValueError(
+                f"Invalid capacity control periods: day index {day_idx} "
+                f"(0=Sunday) is not covered until 23:59 -- its latest "
+                f"period ends at {last.end_time // 60:02d}:{last.end_time % 60:02d}"
+            )
+
+
 async def set_capacity_control_periods(service_call: ServiceCall) -> None:
     """Set the Capacity Control Periods of the battery."""
 
@@ -987,10 +1049,17 @@ async def set_capacity_control_periods(service_call: ServiceCall) -> None:
                 f"Invalid periods: could not validate '{service_call.data[DATA_PERIODS]}' as capacity control periods"
             )
 
+        periods = _parse_capacity_control_periods(service_call.data[DATA_PERIODS])
+        # v2.0.7 (CP-02): semantic validation, on top of the syntax
+        # check above -- before this device is ever touched, matching
+        # the same established pattern as set_fixed_charge_periods()'s
+        # own ICS-07 fix.
+        _validate_capacity_control_periods(periods)
+
         await _set_and_invalidate(
             dd,
             rn.STORAGE_CAPACITY_CONTROL_PERIODS,
-            _parse_capacity_control_periods(service_call.data[DATA_PERIODS]),
+            periods,
         )
 
         assert dd.configuration_update_coordinator

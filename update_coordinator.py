@@ -820,7 +820,10 @@ class HuaweiSolarUpdateCoordinator(
                             # correctly tuned against a per-poll RATE and stay
                             # exactly as they were).
                             if self._adaptive:
-                                self._adaptive.record_request(chunk_ms, success=True, timeout=False)
+                                self._adaptive.record_request(
+                                    chunk_ms, success=True, timeout=False,
+                                    granularity="transaction",
+                                )
                             break  # chunk succeeded
 
                         except (TimeoutError, ReadException, ConnectionInterruptedException,
@@ -870,10 +873,35 @@ class HuaweiSolarUpdateCoordinator(
                             # generic except-TimeoutError paths keep working),
                             # so that check alone would misclassify a shed or an
                             # admission-wait as a genuine device timeout here.
+                            #
+                            # v2.0.7 FIX (MOD-01, ICS quality audit -- confirmed):
+                            # this used to call record_request(success=False,...)
+                            # unconditionally for EVERY reason, including SHED
+                            # and ADMISSION_TIMEOUT -- both deliberately
+                            # classified as internal bus-congestion outcomes,
+                            # not inverter failures (see _classify_failure()'s
+                            # own SHED/ADMISSION_TIMEOUT branches). The
+                            # coordinator-level handlers (_record_shed()/
+                            # _record_admission_timeout(), used elsewhere in
+                            # this same file) already correctly route those two
+                            # reasons to note_shed()/note_admission_timeout() --
+                            # diagnostics-only, explicitly NOT the adaptive
+                            # failure-rate model -- but this transaction-level
+                            # path had no equivalent branch, so the same two
+                            # congestion outcomes still silently entered the
+                            # adaptive learner's failure history from here,
+                            # regardless of what the coordinator-level path did.
                             if self._adaptive:
-                                self._adaptive.record_request(
-                                    0.0, success=False, timeout=(reason == Reason.TIMEOUT),
-                                )
+                                if reason == Reason.SHED:
+                                    self._adaptive.note_shed()
+                                elif reason == Reason.ADMISSION_TIMEOUT:
+                                    self._adaptive.note_admission_timeout()
+                                else:
+                                    self._adaptive.record_request(
+                                        0.0, success=False,
+                                        timeout=(reason == Reason.TIMEOUT),
+                                        granularity="transaction",
+                                    )
                             if first_failure is None:
                                 first_failure = exc
                             break  # move on to the next chunk, not the next retry
@@ -1688,6 +1716,7 @@ async def create_optimizer_update_coordinator(
     update_interval: timedelta | None,
     bus_endpoint: str = "",
     entry: Any = None,
+    start_delay: timedelta = timedelta(0),
 ) -> HuaweiSolarOptimizerUpdateCoordinator:
     coordinator = HuaweiSolarOptimizerUpdateCoordinator(
         hass, _LOGGER,
@@ -1720,8 +1749,24 @@ async def create_optimizer_update_coordinator(
     # "this specific file read timed out" than "the device is unreachable" --
     # and the coordinator's normal retry/backoff handles that case the same
     # way it already handles any later transient failure.
+    #
+    # v2.0.7 FIX (START-01, ICS quality audit -- confirmed): this
+    # background task previously fired immediately, with no stagger delay
+    # of its own -- unlike the main/power_meter/energy_storage/
+    # configuration coordinators, this is a SIBLING class (not a
+    # subclass) of HuaweiSolarUpdateCoordinator, so it never inherited
+    # the _start_delay/first-poll stagger mechanism at all (see
+    # HuaweiSolarOptimizerUpdateCoordinator's own docstring for why it
+    # can't share that base class). start_delay is computed by the
+    # caller via _staggered_start_delay("optimizer", device_index), same
+    # pattern __init__.py already uses for the other four coordinator
+    # types, and threaded through here rather than imported directly --
+    # importing from __init__.py here would be circular, since __init__.py
+    # already imports from this module.
     async def _first_refresh() -> None:
         try:
+            if start_delay.total_seconds() > 0:
+                await asyncio.sleep(start_delay.total_seconds())
             await coordinator.async_config_entry_first_refresh()
         except Exception:  # noqa: BLE001 — background task must not raise
             _LOGGER.exception(

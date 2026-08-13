@@ -38,11 +38,38 @@ import math
 import time as time_module
 from collections import deque
 from dataclasses import asdict, dataclass, field, replace
-from typing import Any
+from typing import Any, Callable
 
 _LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+#: v2.0.7 CHANGE (TOPO-01 done properly, this release): pack_capacity's
+#: own persisted shape gained last_serial/pack_replaced_count/
+#: slot_labels, and pack_count itself is no longer always exactly 3 --
+#: bumped 2 -> 3. No migrator registered for 2 -> 3 (see
+#: _SCHEMA_MIGRATIONS' own comment on the 1 -> 2 precedent this repeats):
+#: pre-existing pack-capacity history was tracked by bare slot index with
+#: no serial identity at all, so there is nothing a migration could
+#: honestly map onto the new per-identity structure -- an honest fresh
+#: start (now visibly recorded, see BH-09's schema_reset_ts/
+#: schema_reset_from_version) is more correct than silently guessing.
+SCHEMA_VERSION = 3
+
+# v2.0.7 FIX (BH-09, ICS quality audit -- confirmed): a registry for
+# forward migrations, keyed by the OLD schema_version a migrator upgrades
+# FROM (each entry takes that version's raw persisted dict and returns a
+# dict valid for version+1; restore() below chains entries until it
+# reaches SCHEMA_VERSION or runs out of registered steps). Deliberately
+# EMPTY right now, not populated retroactively for the existing 1 -> 2
+# transition: the operator's own explicit, already-recorded decision for
+# that specific transition was "no migration needed, history not worth
+# keeping" (see v2.0.6's pack_capacity addition and this file's own test
+# suite for that decision). Registering a migrator for 1 -> 2 now would
+# silently reverse an explicit prior decision, not fix a bug. This
+# registry exists so any FUTURE schema bump has somewhere to put a real
+# migration instead of defaulting to "unknown version -> fresh start"
+# forever, which was BH-09's actual complaint -- no migration mechanism
+# existed at all, for any version, ever.
+_SCHEMA_MIGRATIONS: dict[int, Callable[[dict[str, Any]], dict[str, Any]]] = {}
 
 # ── Plausibility bounds (samples outside are DISCARDED, never clipped) ───────
 SOC_MIN, SOC_MAX = 0.0, 100.0
@@ -281,6 +308,18 @@ class PackSample:
     power_w: float | None = None
     lifetime_charge_kwh: float | None = None
     lifetime_discharge_kwh: float | None = None
+    #: v2.0.7 (Section F, this release): raw current and serial number,
+    #: newly read but not yet consumed by any capacity/SOH computation --
+    #: that's Architecture Phases 2/3 (current-derived C-rate normalization,
+    #: serial-based replacement-epoch tracking), deliberately deferred
+    #: pending real telemetry, same as the rest of that document. Reading
+    #: them now means no further register-map change is needed once that
+    #: work happens. current_a follows the same sign convention as
+    #: power_w (positive = charging). serial_number is None whenever the
+    #: pack itself is offline/unreadable, same as every other per-pack
+    #: field here.
+    current_a: float | None = None
+    serial_number: str | None = None
 
 
 @dataclass
@@ -430,6 +469,29 @@ class CounterMonitor:
                 "treating as reset event #%d, not negative energy",
                 self._name, self._last, raw, self.reset_count,
             )
+        elif self._last is not None and raw < self._last:
+            # v2.0.7 FIX (BH-10, ICS quality audit -- confirmed): a
+            # decrease that does NOT exceed COUNTER_RESET_TOLERANCE_KWH
+            # used to fall through to the plain `self._last = raw` below
+            # unconditionally -- silently accepted as a genuine new
+            # reading. A small backward step (sensor jitter, a transient
+            # read glitch) is neither a real reset NOR a value this
+            # engine should ever advance _last to, since the very next
+            # feed() would then compute its own delta against this
+            # already-regressed value, propagating a negative-looking
+            # movement downstream instead of containing it here. Treated
+            # as a quality event, matching raw=None's own handling
+            # immediately above: this tick contributes nothing, _last is
+            # NOT advanced, and the previous (higher, trusted) continuous
+            # value is returned unchanged.
+            self.is_stale = True
+            _LOGGER.debug(
+                "battery_health: %s small counter regression rejected "
+                "(%.3f → %.3f kWh, within %.2f kWh tolerance) — not "
+                "advanced, previous value retained",
+                self._name, self._last, raw, COUNTER_RESET_TOLERANCE_KWH,
+            )
+            return self._last + self._offset
         self._last = raw
         return raw + self._offset
 
@@ -517,6 +579,49 @@ class CeilingMonitor:
 # ═════════════════════════════════════════════════════════════════════════════
 # SOH_cap — discharge segment harvesting
 # ═════════════════════════════════════════════════════════════════════════════
+def _condition_bucket_key(
+    cfg: BatteryHealthConfig, avg_temp_c: float | None, avg_power_w: float,
+) -> str:
+    """Classify one segment's own conditions into a coarse temp/rate
+    bucket, for Section E's condition_coverage telemetry (this release).
+
+    v2.0.7 (Section E, this release): purely observational -- feeds
+    condition_coverage only, never anything in the SOH computation
+    itself. Bucketed RELATIVE to the same reference points
+    (capacity_temp_ref_c, capacity_rate_ref_w) the existing normalization
+    formula already uses, not fixed absolute thresholds -- so "which
+    bins have real-world coverage" stays directly comparable to "which
+    conditions the existing correction already accounts for", even if an
+    operator changes those reference points via config. Deliberately
+    coarse (5 temp bands x 3 rate bands = 15 buckets, plus "temp_unknown")
+    -- fine enough to see whether extreme conditions are actually common
+    or rare, without needing so many buckets that any one of them stays
+    empty for months on typical usage.
+    """
+    if avg_temp_c is None:
+        temp_bucket = "temp_unknown"
+    else:
+        deviation = avg_temp_c - cfg.capacity_temp_ref_c
+        if deviation <= -10:
+            temp_bucket = "cold"
+        elif deviation <= -3:
+            temp_bucket = "cool"
+        elif deviation <= 3:
+            temp_bucket = "nominal"
+        elif deviation <= 10:
+            temp_bucket = "warm"
+        else:
+            temp_bucket = "hot"
+    ratio = abs(avg_power_w) / cfg.capacity_rate_ref_w if cfg.capacity_rate_ref_w else 0.0
+    if ratio <= 0.5:
+        rate_bucket = "low_rate"
+    elif ratio <= 1.5:
+        rate_bucket = "nominal_rate"
+    else:
+        rate_bucket = "high_rate"
+    return f"{temp_bucket}:{rate_bucket}"
+
+
 @dataclass
 class DischargeSegment:
     """One completed, qualifying discharge segment."""
@@ -591,6 +696,22 @@ class DischargeSegment:
         Both correction factors default to neutral (1.0) when their own
         input is unavailable -- never a reason to discard a segment,
         matching every other quality-related decision in this engine.
+
+        v2.0.7 FIX (BH-07, ICS quality audit -- confirmed): each factor
+        was independently floored at capacity_norm_factor_floor (0.5 by
+        default), matching the stated intent that a single adverse
+        reading never dominate a segment. But a segment that is BOTH
+        cold AND high-rate hits both floors at once, and the two
+        multiply: f_temp*f_rate can fall to floor^2 (0.25 at the
+        default), a 4x correction -- twice what either factor was
+        individually meant to allow, and never actually intended by the
+        original design (its own comment above only reasons about "a
+        single adverse reading", not two compounding). The combined
+        product is now floored too, at the SAME configured value, so the
+        worst case matches a single-factor adverse reading, not the
+        product of two. This does not introduce any new unvalidated
+        constant -- it reuses capacity_norm_factor_floor as the ceiling
+        on the combined correction, not just each half of it.
         """
         f_temp = 1.0
         if self.avg_temp_c is not None:
@@ -606,7 +727,8 @@ class DischargeSegment:
                 1.0 + (power / cfg.capacity_rate_ref_w) ** cfg.capacity_rate_gamma
             )
             f_rate = max(f_rate, cfg.capacity_norm_factor_floor)
-        return self.implied_capacity_kwh / (f_temp * f_rate)
+        combined = max(f_temp * f_rate, cfg.capacity_norm_factor_floor)
+        return self.implied_capacity_kwh / combined
 
     def weight(self, cfg: BatteryHealthConfig) -> float:
         # v2.0.6 (Tier 1): full exclusion, not a boost -- see
@@ -710,6 +832,24 @@ class SegmentTracker:
         self.reference_captured_ts: float | None = None
         self.reference_epochs: list[dict[str, Any]] = []
         self.stale_endpoint_skips = 0
+        # v2.0.7 (Section E, this release): purely observational telemetry
+        # for the deferred Architecture Phase 2/3 questions -- neither
+        # field feeds back into any SOH computation, both exist so a
+        # future decision on bin-based correction models / current-based
+        # C-rate can be made from real field coverage data instead of
+        # guessing. condition_coverage buckets each CLOSED segment (not
+        # recomputed live) by its own final avg_temp_c/avg_power_w,
+        # against the SAME reference points (capacity_temp_ref_c,
+        # capacity_rate_ref_w) the existing normalization formula
+        # already uses -- so "which bins have coverage" is directly
+        # comparable to "which bins the existing correction already
+        # covers", not an unrelated grid invented separately.
+        # combined_norm_floor_hits counts how often BH-07's fix (the
+        # combined temp*rate floor) actually binds for a real segment --
+        # answering whether the "up to 4x, now capped to 2x" correction
+        # is a frequent real occurrence or a rare edge case.
+        self.condition_coverage: dict[str, int] = {}
+        self.combined_norm_floor_hits = 0
 
     # ── feed ────────────────────────────────────────────────────────────────
     def feed(
@@ -949,6 +1089,20 @@ class SegmentTracker:
         self.segments.append(seg)
         self.last_segment_ts = self._start_ts
         self._agg_cache = None
+        # v2.0.7 (Section E, this release): purely observational --
+        # neither line below affects `seg` or anything already appended
+        # above. condition_coverage buckets every CLOSED, plausibility-
+        # passing segment (matching what aggregation actually sees, not
+        # every raw sample); combined_norm_floor_hits counts how often
+        # BH-07's combined temp*rate floor actually binds for a real
+        # segment, answering whether that correction is a frequent real
+        # occurrence or a rare edge case.
+        key = _condition_bucket_key(cfg, seg.avg_temp_c, seg.avg_power_w)
+        self.condition_coverage[key] = self.condition_coverage.get(key, 0) + 1
+        normalized = seg.normalized_capacity_kwh(cfg)
+        combined_factor = implied / normalized if normalized else 1.0
+        if combined_factor <= cfg.capacity_norm_factor_floor + 1e-9:
+            self.combined_norm_floor_hits += 1
         return seg
 
     def prune(self, now: float) -> None:
@@ -1034,12 +1188,25 @@ class SegmentTracker:
             attrs["segment_charge_ceiling_mean"] = round(sum(ceils) / len(ceils), 1)
 
         # Finding H: capture a measured beginning-of-life reference once.
+        #
+        # v2.0.7 FIX (BH-04, ICS quality audit -- confirmed): this used
+        # to gate/compute directly off `segs` (every segment, including
+        # ones with exclude_calibration=True). Normal aggregation above
+        # already correctly zero-weights those via weight() -- see Tier
+        # 1's own comment on exclude_calibration -- but this block ran
+        # independently and had no such filter, so a calibration-
+        # contaminated segment could still define the reference every
+        # subsequent SOH% is measured against, even though it can never
+        # contribute to the measured SOH% itself. Filtering to the same
+        # eligible set aggregation already trusts, for the count/span
+        # gate AND the median itself, not just the median.
+        eligible = [s for s in segs if not s.exclude_calibration]
         if (
             self.reference_capacity_kwh is None
-            and len(segs) >= cfg.capacity_reference_min_segments
+            and len(eligible) >= cfg.capacity_reference_min_segments
         ):
             span_days = (
-                max(s.end_ts for s in segs) - min(s.start_ts for s in segs)
+                max(s.end_ts for s in eligible) - min(s.start_ts for s in eligible)
             ) / SECONDS_PER_DAY
             if span_days >= cfg.capacity_reference_min_span_days:
                 # v2.0.6 FIX (Tier 3): was s.implied_capacity_kwh (raw) --
@@ -1051,10 +1218,10 @@ class SegmentTracker:
                 # while making this exact change, not a separate,
                 # later-discovered issue.
                 self.set_reference(
-                    _median(sorted(s.normalized_capacity_kwh(cfg) for s in segs)),
+                    _median(sorted(s.normalized_capacity_kwh(cfg) for s in eligible)),
                     reason="auto: %d segments spanning %.0f days"
-                           % (len(segs), span_days),
-                    ts=max(s.end_ts for s in segs),
+                           % (len(eligible), span_days),
+                    ts=max(s.end_ts for s in eligible),
                 )
 
         reference = self.reference_capacity_kwh or cfg.rated_capacity_kwh
@@ -1102,6 +1269,10 @@ class SegmentTracker:
             "reference_captured_ts": self.reference_captured_ts,
             "reference_epochs": self.reference_epochs,
             "stale_endpoint_skips": self.stale_endpoint_skips,
+            # v2.0.7 (Section E, this release): purely observational --
+            # see __init__'s own comment for the full reasoning.
+            "condition_coverage": dict(self.condition_coverage),
+            "combined_norm_floor_hits": self.combined_norm_floor_hits,
         }
 
     def restore(self, data: dict[str, Any]) -> None:
@@ -1117,6 +1288,10 @@ class SegmentTracker:
         self.reference_captured_ts = data.get("reference_captured_ts")
         self.reference_epochs = list(data.get("reference_epochs", []))
         self.stale_endpoint_skips = int(data.get("stale_endpoint_skips", 0))
+        self.condition_coverage = {
+            str(k): int(v) for k, v in data.get("condition_coverage", {}).items()
+        }
+        self.combined_norm_floor_hits = int(data.get("combined_norm_floor_hits", 0))
         self._gap_pending = False
         self._idle_since = None
         self._last_good_ts = None
@@ -1157,9 +1332,19 @@ class PackCapacityTracker:
     counters, not the unit's or the other two packs'.
     """
 
-    def __init__(self, cfg: BatteryHealthConfig, pack_count: int = 3) -> None:
+    def __init__(
+        self, cfg: BatteryHealthConfig, pack_count: int = 3,
+        slot_labels: list[str] | None = None,
+    ) -> None:
         self._cfg = cfg
         self.pack_count = pack_count
+        # v2.0.7 (TOPO-01 done properly, this release): slot_labels
+        # identifies each tracker's own physical wiring position (e.g.
+        # "u1p2" = storage unit 1, pack 2) -- purely for reporting/
+        # logging identity, since pack_count is no longer always 3 (a
+        # second storage unit, when present, adds 3 more slots). Defaults
+        # to plain "1".."pack_count" for full backward compatibility with
+        # every existing caller/test that doesn't pass this.
         # v2.0.6 FIX (Tier 3): implied_capacity_min_kwh/max_kwh are
         # calibrated for the WHOLE unit's nameplate capacity (default
         # 8-35 kWh, around a 20.7 kWh unit) -- a single pack's true
@@ -1174,21 +1359,65 @@ class PackCapacityTracker:
         # is used for the per-pack trackers below -- everything else
         # (freshness_tau_kwh, min_segment_delta_soc, calibration_
         # settle_s, etc.) stays identical to the unit-level config, only
-        # the two capacity-band fields are pack-scaled.
+        # the capacity-magnitude fields are pack-scaled.
+        #
+        # v2.0.7 FIX (BH-01/BH-08, ICS quality audit -- confirmed): the
+        # scaling above left rated_capacity_kwh untouched at the WHOLE
+        # unit's nameplate value (default 20.7 kWh). SegmentTracker.
+        # soh_capacity() falls back to `self.reference_capacity_kwh or
+        # cfg.rated_capacity_kwh` as its SOH denominator whenever a pack
+        # hasn't yet accumulated a measured reference of its own (its
+        # entire early-life learning period, and again after any pack
+        # replacement) -- so until that reference exists, a genuine
+        # ~6.9 kWh pack was compared against a ~20.7 kWh fallback,
+        # reading ~33% SOH for a fully healthy pack. Huawei does not
+        # expose a per-pack nameplate rating separately from the unit's
+        # own, so unit_rated_capacity / pack_count is the same defensible
+        # equal-share assumption already used for the plausibility band
+        # above, not a fresh, unreasoned choice -- and matches this
+        # project's own confirmed register map (no per-pack rated-
+        # capacity register exists to read instead).
         pack_cfg = replace(
             cfg,
             implied_capacity_min_kwh=cfg.implied_capacity_min_kwh / pack_count,
             implied_capacity_max_kwh=cfg.implied_capacity_max_kwh / pack_count,
+            rated_capacity_kwh=cfg.rated_capacity_kwh / pack_count,
+        )
+        self._pack_cfg = pack_cfg  # kept for rebuilding a tracker on replacement, below
+        self.slot_labels: list[str] = (
+            slot_labels if slot_labels is not None
+            else [str(i + 1) for i in range(pack_count)]
         )
         self.trackers: list[SegmentTracker] = [
             SegmentTracker(pack_cfg) for _ in range(pack_count)
         ]
         self._charge_counters: list[CounterMonitor] = [
-            CounterMonitor(f"pack_{i + 1}_charge") for i in range(pack_count)
+            CounterMonitor(f"pack_{self.slot_labels[i]}_charge") for i in range(pack_count)
         ]
         self._discharge_counters: list[CounterMonitor] = [
-            CounterMonitor(f"pack_{i + 1}_discharge") for i in range(pack_count)
+            CounterMonitor(f"pack_{self.slot_labels[i]}_discharge") for i in range(pack_count)
         ]
+        # v2.0.7 (TOPO-01 done properly, this release): last-observed
+        # serial number per slot, used below to detect a genuine physical
+        # pack replacement (a different serial appearing in the SAME
+        # wiring slot) and distinguish it from that slot merely being
+        # temporarily offline. None means "no serial observed yet" --
+        # deliberately never treated as a replacement on its own (a
+        # first-ever observation, or a still-persisted-but-not-yet-
+        # re-read value after a restart, must not falsely look like a
+        # swap). Persisted in to_dict()/restore() so this survives a
+        # normal HA restart -- otherwise every restart would silently
+        # forget the previously-known identity for a whole polling cycle.
+        self.pack_replaced_count: list[int] = [0] * pack_count
+        self._last_serial: list[str | None] = [None] * pack_count
+        # v2.0.7 (Section E, this release): latest per-pack current
+        # reading, purely observational -- feeds current_share_deviation
+        # telemetry only (see soh_capacity_per_pack's own caller,
+        # BatteryHealthManager, for where this is consumed), never any
+        # SOH computation. None until at least one valid reading for
+        # that slot -- same "no data yet" convention as every other
+        # per-pack field in this engine.
+        self.last_current_a: list[float | None] = [None] * pack_count
 
     def feed(
         self, s: HealthSample, learning: bool, calib_uncertain: bool = False,
@@ -1202,6 +1431,46 @@ class PackCapacityTracker:
         any_reset = False
         for i in range(self.pack_count):
             pack = s.packs[i] if i < len(s.packs) else PackSample()
+            # v2.0.7 (Section E, this release): recorded unconditionally,
+            # regardless of online/learning state below -- purely
+            # observational, and a pack briefly offline shouldn't erase
+            # its last known current reading from telemetry.
+            if pack.current_a is not None:
+                self.last_current_a[i] = pack.current_a
+            # v2.0.7 (TOPO-01 done properly, this release): a genuine
+            # physical pack swap in this wiring slot -- a different,
+            # non-None serial number appearing where a different known
+            # one was previously seen. This must be a HARD boundary, not
+            # a bridgeable gap or even a discard-active-segment-only
+            # event (BH-03's mark_recovery reasoning): the OLD tracker's
+            # entire accumulated history (segments, reference capacity,
+            # everything) belongs to a DIFFERENT physical pack and must
+            # never be attributed to the new one, which starts with zero
+            # known history of its own -- exactly matching "age/SOH is
+            # per physical pack, not per wiring slot". A fresh
+            # SegmentTracker/CounterMonitor pair is built for this slot,
+            # reusing the same pack_cfg every tracker here already uses.
+            if (
+                pack.serial_number is not None
+                and self._last_serial[i] is not None
+                and pack.serial_number != self._last_serial[i]
+            ):
+                _LOGGER.warning(
+                    "battery_health: pack %s replaced (serial %s -> %s) "
+                    "-- starting fresh capacity/SOH tracking for this "
+                    "slot, previous pack's history discarded",
+                    self.slot_labels[i], self._last_serial[i], pack.serial_number,
+                )
+                self.trackers[i] = SegmentTracker(self._pack_cfg)
+                self._charge_counters[i] = CounterMonitor(
+                    f"pack_{self.slot_labels[i]}_charge"
+                )
+                self._discharge_counters[i] = CounterMonitor(
+                    f"pack_{self.slot_labels[i]}_discharge"
+                )
+                self.pack_replaced_count[i] += 1
+            if pack.serial_number is not None:
+                self._last_serial[i] = pack.serial_number
             pre = (
                 self._charge_counters[i].reset_count
                 + self._discharge_counters[i].reset_count
@@ -1223,7 +1492,20 @@ class PackCapacityTracker:
                     f"pack {i + 1} lifetime counter reset"
                 )
                 any_reset = True
-            if not learning:
+            # v2.0.7 FIX (BH-02, ICS quality audit -- confirmed): `not
+            # pack.online` was not a gate at all before this fix -- an
+            # offline/faulted/disconnected pack could still feed its own
+            # tracker whenever its cached/last-known fields happened to
+            # still be present on the sample, exactly the gap the
+            # unit-level engine already closes for its own inputs
+            # (BatteryHealthManager only builds a HealthSample from
+            # genuinely fresh, quality-gated reads). Counters are still
+            # fed either way, same as the `not learning` case below --
+            # reset detection must stay continuous across an offline
+            # period so a real reset occurring while offline is still
+            # caught on the next valid reading, not silently missed.
+            # Only segment/capacity learning is suppressed.
+            if not learning or not pack.online:
                 self.trackers[i].mark_gap()
                 continue
             # Synthetic per-pack view: SegmentTracker's own feed() reads
@@ -1274,11 +1556,41 @@ class PackCapacityTracker:
         SegmentTracker.soh_capacity() itself, in pack order (1, 2, 3...)."""
         return [t.soh_capacity() for t in self.trackers]
 
+    def current_share_deviation_pct(self) -> float | None:
+        """v2.0.7 (Section E, this release): (max-min)/mean across every
+        pack's own last known current reading, as a percentage -- the
+        simplest possible signal for "are packs sharing current roughly
+        evenly right now", informing Architecture §14's deferred
+        current-based C-rate/current-share diagnostic. None until at
+        least 2 packs have a real reading and their mean is non-zero
+        (near-zero mean, e.g. all packs near-idle, would make this ratio
+        meaningless/explosive, not informative).
+        """
+        values = [v for v in self.last_current_a if v is not None]
+        if len(values) < 2:
+            return None
+        mean = sum(values) / len(values)
+        if abs(mean) < 1e-6:
+            return None
+        return round((max(values) - min(values)) / abs(mean) * 100.0, 1)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "trackers": [t.to_dict() for t in self.trackers],
             "charge_counters": [c.to_dict() for c in self._charge_counters],
             "discharge_counters": [c.to_dict() for c in self._discharge_counters],
+            # v2.0.7 (TOPO-01 done properly, this release): persisted so
+            # replacement detection survives a normal HA restart -- see
+            # __init__'s own _last_serial comment for the full reasoning.
+            "last_serial": list(self._last_serial),
+            "pack_replaced_count": list(self.pack_replaced_count),
+            "slot_labels": list(self.slot_labels),
+            # last_current_a is deliberately NOT persisted -- it is a
+            # "most recent live reading" value, and restoring a
+            # potentially hours-old value across a restart would present
+            # it as current when it isn't. Better to start fresh as None
+            # and repopulate on the very next tick than risk a
+            # momentarily misleading current_share_deviation_pct.
         }
 
     def restore(self, data: dict[str, Any]) -> None:
@@ -1294,6 +1606,25 @@ class PackCapacityTracker:
         for i, c in enumerate(self._discharge_counters):
             if i < len(discharge_data):
                 c.restore(discharge_data[i])
+        # v2.0.7 (TOPO-01 done properly, this release): restored
+        # positionally (by slot index), same convention as the trackers/
+        # counters above -- if the persisted slot_labels don't match this
+        # instance's current ones (e.g. topology changed since the last
+        # save: a unit or pack was added/removed), the safest, most
+        # honest behaviour is to NOT restore last_serial for that
+        # mismatched slot at all -- an unknown prior identity is treated
+        # as "no serial observed yet" (see __init__'s own comment: this
+        # can never falsely trigger a replacement on its own), not
+        # silently assumed to match a slot it may not correspond to.
+        persisted_labels = data.get("slot_labels")
+        last_serial_data = data.get("last_serial", [])
+        replaced_data = data.get("pack_replaced_count", [])
+        labels_match = persisted_labels == self.slot_labels
+        for i in range(self.pack_count):
+            if labels_match and i < len(last_serial_data):
+                self._last_serial[i] = last_serial_data[i]
+            if i < len(replaced_data):
+                self.pack_replaced_count[i] = int(replaced_data[i])
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1854,8 +2185,19 @@ class StressAccumulator:
     def feed(self, s: HealthSample) -> None:
         cfg = self._cfg
         if s.battery_temp_c is None or s.soc is None:
-            # Read failure: skip tick; do NOT treat the gap as zero stress.
-            self._last_ts = None if self._last_ts is None else self._last_ts
+            # v2.0.7 FIX (BH-05, ICS quality audit -- confirmed): this was
+            # `self._last_ts = None if self._last_ts is None else
+            # self._last_ts` -- a no-op self-assignment that did nothing
+            # at all, despite the comment's stated intent. The real
+            # effect: _last_ts was never actually cleared on a missing-
+            # input tick, so the NEXT valid sample would compute dt
+            # against the stale _last_ts and integrate the entire gap
+            # using that next sample's own temperature/SOC, as if they'd
+            # applied for the whole interval -- exactly mark_gap()'s own
+            # documented reset behaviour (below), which this tick must
+            # match: skip this tick, exclude the gap's Δt entirely by
+            # starting a fresh interval on the next valid sample.
+            self._last_ts = None
             return
         if self._last_ts is None:
             self._last_ts = s.timestamp
@@ -1975,19 +2317,37 @@ class HealthReport:
             tuple(self.attributes.get("contributing_terms", ())),
             self.attributes.get("learning_enabled"),
             self.attributes.get("learning_active"),
+            # v2.0.7 FIX (BH-06, ICS quality audit -- confirmed): these
+            # three per-pack diagnostics (added in v2.0.6, Tier 3) were
+            # never added to the signature, so a pack-health change could
+            # occur with every OTHER tracked value unchanged -- the
+            # manager's own signature-based notify gate (battery_health_
+            # manager.py) would then never fire, leaving the entity's
+            # displayed pack attributes stale until some unrelated field
+            # happened to change too. Lists wrapped in tuple(), matching
+            # contributing_terms' own established pattern above -- a
+            # signature element must be hashable.
+            tuple(self.attributes.get("pack_capacity_soh_percent") or ()),
+            tuple(self.attributes.get("pack_capacity_segment_count") or ()),
+            self.attributes.get("pack_capacity_spread_pct"),
         )
 
 
 class BatteryHealthEngine:
     """Orchestrates all trackers; one instance per battery-equipped inverter."""
 
-    def __init__(self, cfg: BatteryHealthConfig | None = None) -> None:
+    def __init__(
+        self, cfg: BatteryHealthConfig | None = None,
+        pack_count: int = 3, pack_slot_labels: list[str] | None = None,
+    ) -> None:
         self.cfg = cfg or BatteryHealthConfig()
         self.segments = SegmentTracker(self.cfg)
         # v2.0.6 (Tier 3): direct per-pack capacity, alongside (not instead
         # of) the unit-level self.segments -- see PackCapacityTracker's own
         # docstring for the full reasoning.
-        self.pack_capacity = PackCapacityTracker(self.cfg)
+        self.pack_capacity = PackCapacityTracker(
+            self.cfg, pack_count=pack_count, slot_labels=pack_slot_labels,
+        )
         self.efficiency = EfficiencyTracker(self.cfg)
         self.balance = BalanceTracker(self.cfg)
         self.stress = StressAccumulator(self.cfg)
@@ -2020,6 +2380,15 @@ class BatteryHealthEngine:
         # with three consumers, not one.
         self._calib_prev_active = False
         self._calib_settle_until: float | None = None
+        # v2.0.7 FIX (BH-09, ICS quality audit -- confirmed): visibility
+        # for a schema-mismatch fresh-start, previously only a WARNING
+        # log line with no lasting trace anywhere. Recorded regardless of
+        # whether a migration path exists for the old version (see
+        # restore() below) -- if it falls through to a fresh start, this
+        # is how an operator can tell that happened, and when, from the
+        # entity's own attributes rather than needing to find the log.
+        self.last_schema_reset_ts: float | None = None
+        self.last_schema_reset_from_version: int | None = None
 
     # ── main entry point ────────────────────────────────────────────────────
     def update(self, raw: HealthSample) -> HealthReport:
@@ -2165,11 +2534,28 @@ class BatteryHealthEngine:
                 "system is stable.")
 
     def mark_recovery(self, reason: str, now: float | None = None) -> None:
-        """Suspend learning for the settling period after a recovery."""
+        """Suspend learning for the settling period after a recovery.
+
+        v2.0.7 FIX (BH-03, ICS quality audit -- confirmed): used to call
+        self.segments.mark_gap(), which only marks a *pending*, bridgeable
+        gap -- correct for an ordinary Modbus read gap where continuity
+        can reasonably be assumed, but wrong here. Every current caller
+        of mark_recovery() is precisely the class of event the parked
+        design and the architecture review both list as a hard segment
+        boundary, not a bridgeable one: a counter reset (this engine's
+        own unit-level reset already discards explicitly before calling
+        this, making the change a no-op there; a *pack's own* counter
+        reset previously left the still-open UNIT-level segment merely
+        gap-pending, silently allowed to bridge across a real pack
+        replacement event), and explicit learning re-enablement after a
+        maintenance window (previously the same silent-bridge risk).
+        discard_active() is a no-op when nothing is active, so this is
+        safe to call unconditionally from every existing call site.
+        """
         base = now if now is not None else time_module.time()
         self._settling_until = base + self.cfg.settling_period_s
         self.settling_events += 1
-        self.segments.mark_gap()
+        self.segments.discard_active(reason)
         _LOGGER.info(
             "battery_health: settling for %.0f s after %s - measurement "
             "continues, learning paused",
@@ -2400,6 +2786,33 @@ class BatteryHealthEngine:
         r.attributes["counter_resets"] = (
             self._charge_counter.reset_count + self._discharge_counter.reset_count
         )
+        # v2.0.7 FIX (BH-09, ICS quality audit -- confirmed): surfaces a
+        # schema-mismatch fresh-start on the entity itself, not just a
+        # log line -- see restore()'s own comment for the full reasoning.
+        # None/None when no reset has ever occurred this instance.
+        r.attributes["schema_reset_ts"] = self.last_schema_reset_ts
+        r.attributes["schema_reset_from_version"] = self.last_schema_reset_from_version
+        # v2.0.7 (Section E, this release): purely observational
+        # telemetry for deferred Architecture Phase 2/3 questions -- see
+        # SegmentTracker.__init__'s own condition_coverage/
+        # combined_norm_floor_hits comment for the full reasoning.
+        # Unit-level only here; per-pack condition_coverage is available
+        # via the manager's own attributes (battery_health_manager.py),
+        # not duplicated per-pack here to avoid an unwieldy nested
+        # structure on this entity's own attributes.
+        r.attributes["condition_coverage"] = dict(self.segments.condition_coverage)
+        r.attributes["combined_norm_floor_hits"] = self.segments.combined_norm_floor_hits
+        # v2.0.7 (TOPO-01 done properly, this release): topology self-
+        # description -- without this, a telemetry capture from a
+        # multi-unit installation would be uninterpretable without
+        # cross-referencing entity attributes separately. slot_labels
+        # matches pack_capacity_soh_percent/pack_capacity_segment_count's
+        # own index order exactly (both built from the same slot list).
+        r.attributes["pack_slot_labels"] = list(self.pack_capacity.slot_labels)
+        r.attributes["pack_replaced_count"] = list(self.pack_capacity.pack_replaced_count)
+        r.attributes["pack_current_share_deviation_pct"] = (
+            self.pack_capacity.current_share_deviation_pct()
+        )
         return r
 
     # ── persistence ─────────────────────────────────────────────────────────
@@ -2424,9 +2837,42 @@ class BatteryHealthEngine:
         if not data:
             return
         version = data.get("schema_version")
-        if version != SCHEMA_VERSION:
+        # v2.0.7 FIX (BH-09, ICS quality audit -- confirmed): chain any
+        # registered migrations forward before giving up. With
+        # _SCHEMA_MIGRATIONS currently empty (see its own comment for
+        # why -- the existing 1 -> 2 transition is a deliberate, already
+        # -made "no migration" decision, not left empty by oversight),
+        # this loop is a no-op today and behaviour for that specific
+        # transition is unchanged. It exists so the NEXT schema bump has
+        # a real mechanism available instead of defaulting to fresh-start
+        # forever, which was this finding's actual root cause.
+        seen_versions: set[int] = set()
+        while (
+            isinstance(version, int)
+            and version != SCHEMA_VERSION
+            and version in _SCHEMA_MIGRATIONS
+            and version not in seen_versions  # guard against a migration loop
+        ):
+            seen_versions.add(version)
+            try:
+                data = _SCHEMA_MIGRATIONS[version](data)
+            except Exception:
+                _LOGGER.exception(
+                    "battery_health: migration from schema %s failed — "
+                    "starting fresh instead of risking corrupted state",
+                    version,
+                )
+                data = None
+                break
+            version = data.get("schema_version") if data else None
+        if not data or version != SCHEMA_VERSION:
             _LOGGER.warning(
-                "battery_health: unknown storage schema %s — starting fresh", version
+                "battery_health: unknown storage schema %s — starting fresh",
+                data.get("schema_version") if data else None,
+            )
+            self.last_schema_reset_ts = time_module.time()
+            self.last_schema_reset_from_version = (
+                data.get("schema_version") if data else None
             )
             return
         self.first_seen_ts = data.get("first_seen_ts")

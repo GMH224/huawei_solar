@@ -850,6 +850,13 @@ class ModbusTelemetryCaptureSwitchEntity(SwitchEntity):
                 include_register_overlap=not self._register_overlap_captured,
                 adaptive_controller_cls=AdaptiveModbusController,
                 modbus_telemetry_cls=ModbusTelemetry,
+                # v2.0.7 (Section E, this release): already imported
+                # above for other purposes -- no new import needed.
+                # BatteryHealthManager.get() correctly returns None for
+                # any device without battery health enabled/available,
+                # same "skip cleanly" handling build_telemetry_snapshot()
+                # already has for adaptive/telemetry.
+                battery_health_manager_cls=BatteryHealthManager,
             )
             if "register_overlap" in snapshot:
                 self._register_overlap_captured = True

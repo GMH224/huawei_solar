@@ -387,6 +387,9 @@ class AdaptiveModbusController:
         self._suppress_reason: str = ""
         self.suppressed_observations = 0
         self.settling_events = 0
+        # v2.0.7 (MOD-02 telemetry, ICS quality audit -- confirmed):
+        # observational only -- see record_request()'s own docstring.
+        self._granularity_counts: dict[str, int] = {}
         #: Reported by the coordinator each poll (v1.2.3 instrumentation).
         self.last_batch_ms: float = 0.0
         self.last_chunk_count: int = 0
@@ -649,17 +652,36 @@ class AdaptiveModbusController:
         self.admission_timeout_count += 1
 
     def record_request(
-        self, rtt_ms: float, success: bool, timeout: bool
+        self, rtt_ms: float, success: bool, timeout: bool,
+        granularity: str = "poll",
     ) -> None:
         """Record one completed Modbus request into the current time slot.
 
         Discarded outright while the learning gate is closed. Suppression is
         preferred over down-weighting: a weight would be another unvalidated
         constant, whereas "recorded or not" is directly verifiable.
+
+        v2.0.7 (MOD-02 telemetry, ICS quality audit -- confirmed): `granularity`
+        is purely observational -- it does NOT affect record(), the
+        confidence threshold, or anything else this method already did.
+        MOD-02's actual finding (confidence thresholds designed assuming
+        one call per poll, but this method has been called once per
+        CHUNK from _execute_batch() since v2.0.0a/F15, without a
+        corresponding threshold change) is a real architectural question
+        deliberately NOT decided in this release -- seeing the real
+        transaction-vs-poll call-volume ratio from field telemetry is a
+        precondition for deciding it correctly, not a decision itself.
+        "poll" is the default so every pre-existing call site (this
+        controller's own optimizer-coordinator and non-chunked failure/
+        timeout paths) needs no change at all; only _execute_batch()'s
+        own chunk-level call sites pass "transaction" explicitly.
         """
         if not self.learning_active():
             self.suppressed_observations += 1
             return
+        self._granularity_counts[granularity] = (
+            self._granularity_counts.get(granularity, 0) + 1
+        )
         slot_idx = self._current_slot_index()
         self._slots[slot_idx].record(
             rtt_ms, success, timeout, ADAPTIVE_RTT_SAMPLE_SIZE
@@ -796,6 +818,12 @@ class AdaptiveModbusController:
             "suppressed_observations": self.suppressed_observations,
             "settling_events": self.settling_events,
             "suppress_reason": self._suppress_reason or None,
+            # v2.0.7 (MOD-02 telemetry, ICS quality audit -- confirmed):
+            # the real transaction-vs-poll call-volume split, needed to
+            # decide MOD-02's deferred confidence-threshold question
+            # from field data -- see record_request()'s own docstring.
+            "transaction_level_requests": self._granularity_counts.get("transaction", 0),
+            "poll_level_requests": self._granularity_counts.get("poll", 0),
         }
 
     # ── properties ────────────────────────────────────────────────────────────

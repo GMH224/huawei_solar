@@ -31,6 +31,8 @@ from typing import TYPE_CHECKING, Any, Callable
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.storage import Store
 
+from huawei_solar import register_values as rv
+
 from .battery_health import (
     BatteryHealthConfig,
     BatteryHealthEngine,
@@ -81,73 +83,107 @@ _RN_UNIT_CALIBRATION = "storage_unit_soh_calibration_status"  # 37926
 #: field. Read-only here; the integration exposes a separate writable entity.
 _RN_END_OF_CHARGE_SOC = "storage_charging_cutoff_capacity"    # 47081, %
 
-_RN_PACK_VOLTAGE = [
-    f"storage_unit_1_battery_pack_{i}_voltage" for i in range(1, PACK_COUNT + 1)
-]
-_RN_PACK_TMAX = [
-    f"storage_unit_1_battery_pack_{i}_maximum_temperature"
-    for i in range(1, PACK_COUNT + 1)
-]
-_RN_PACK_TMIN = [
-    f"storage_unit_1_battery_pack_{i}_minimum_temperature"
-    for i in range(1, PACK_COUNT + 1)
-]
-_RN_PACK_STATUS = [
-    f"storage_unit_1_battery_pack_{i}_working_status"
-    for i in range(1, PACK_COUNT + 1)
-]
-_RN_PACK_CALIBRATION = [
-    f"storage_unit_1_battery_pack_{i}_soh_calibration_status"
-    for i in range(1, PACK_COUNT + 1)
-]
-# v2.0.6 (Tier 3, battery health architecture review): per-pack
-# equivalents of _RN_SOC/_RN_POWER/_RN_TOTAL_CHARGE/_RN_TOTAL_DISCHARGE
-# above, feeding PackCapacityTracker (battery_health.py) -- a direct,
-# measured per-pack capacity estimate, the same segment-detection
-# approach the unit-level tracker already uses. Confirmed against the
-# real register map before adding these: same units/gain as their
-# unit-level equivalents, and PDU-adjacent to _RN_PACK_VOLTAGE above
-# (already read every poll), so the marginal bus-traffic cost is
-# expected to be low. See register_cache.py's own _TIER_OVERRIDES for
-# why the two counter lists specifically need NORMAL tier, not the
-# SLOW tier the generic "total_" substring pattern would otherwise
-# assign them.
-_RN_PACK_SOC = [
-    f"storage_unit_1_battery_pack_{i}_state_of_capacity"
-    for i in range(1, PACK_COUNT + 1)
-]
-_RN_PACK_POWER = [
-    f"storage_unit_1_battery_pack_{i}_charge_discharge_power"
-    for i in range(1, PACK_COUNT + 1)
-]
-_RN_PACK_TOTAL_CHARGE = [
-    f"storage_unit_1_battery_pack_{i}_total_charge"
-    for i in range(1, PACK_COUNT + 1)
-]
-_RN_PACK_TOTAL_DISCHARGE = [
-    f"storage_unit_1_battery_pack_{i}_total_discharge"
-    for i in range(1, PACK_COUNT + 1)
-]
+# v2.0.7 (TOPO-01 done properly, this release): per-pack register-name
+# fields are now built dynamically, per (unit, pack) slot, instead of a
+# fixed set of module-level lists hardcoded to storage_unit_1 only.
+# Confirmed against the real register map before this change: storage
+# unit 2's own block is a genuine, separately-addressed register range
+# (offset +126 registers from unit 1's own, same per-pack layout),
+# present in the underlying huawei-solar library today but never read by
+# this integration at all until now. See _active_storage_units() below
+# for how unit 2 is (or isn't) included, and why reading it must stay a
+# hard, conditional gate.
+_PACK_FIELD_SUFFIXES = (
+    "voltage", "maximum_temperature", "minimum_temperature",
+    "working_status", "soh_calibration_status", "state_of_capacity",
+    "charge_discharge_power", "total_charge", "total_discharge",
+    # v2.0.7 (Section F, this release): raw current and serial number --
+    # see PackSample's own current_a/serial_number field comments for
+    # the current, narrower scope (raw data only, not yet consumed by
+    # any capacity/SOH computation -- that's Architecture Phases 2/3).
+    "current", "serial_number",
+)
 
-REQUIRED_REGISTER_NAMES: list[str] = [
-    _RN_SOC,
-    _RN_POWER,
-    _RN_TEMP,
-    _RN_TOTAL_CHARGE,
-    _RN_TOTAL_DISCHARGE,
-    _RN_RATED_CAPACITY,
-    _RN_UNIT_CALIBRATION,
-    _RN_END_OF_CHARGE_SOC,
-    *_RN_PACK_VOLTAGE,
-    *_RN_PACK_TMAX,
-    *_RN_PACK_TMIN,
-    *_RN_PACK_STATUS,
-    *_RN_PACK_CALIBRATION,
-    *_RN_PACK_SOC,
-    *_RN_PACK_POWER,
-    *_RN_PACK_TOTAL_CHARGE,
-    *_RN_PACK_TOTAL_DISCHARGE,
-]
+
+def _pack_register_name(unit: int, pack: int, suffix: str) -> str:
+    return f"storage_unit_{unit}_battery_pack_{pack}_{suffix}"
+
+
+def pack_slots_for_units(units: list[int]) -> list[tuple[int, int]]:
+    """Every (unit, pack) slot to poll and track, in a stable order --
+    unit-major, then pack, e.g. [(1,1),(1,2),(1,3)] for a single unit, or
+    [(1,1),(1,2),(1,3),(2,1),(2,2),(2,3)] with a second unit present.
+
+    All PACK_COUNT slots are always included for every active unit, even
+    though a given installation may have fewer PHYSICAL packs than that
+    in a unit -- an absent pack's own working_status register simply
+    never reads as "running", which BH-02's online-gating (battery_
+    health.py) already correctly treats as "nothing to learn from this
+    tick", the same tolerance already proven safe for a temporarily
+    offline pack. This is deliberately NOT a live discovery/probe: see
+    _active_storage_units()'s own docstring for why probing an absent
+    UNIT (not an absent pack slot within a present unit) is a real risk
+    this project avoids, and why the same reasoning does not apply to
+    individual pack slots within a unit that is already known to exist.
+    """
+    return [(unit, pack) for unit in units for pack in range(1, PACK_COUNT + 1)]
+
+
+def required_register_names(units: list[int]) -> list[str]:
+    """Every register this subsystem needs, for the given set of active
+    storage units. See pack_slots_for_units()/_active_storage_units()
+    for the two different reasons a slot or a whole unit may or may not
+    be included.
+    """
+    names = [
+        _RN_SOC, _RN_POWER, _RN_TEMP, _RN_TOTAL_CHARGE, _RN_TOTAL_DISCHARGE,
+        _RN_RATED_CAPACITY, _RN_UNIT_CALIBRATION, _RN_END_OF_CHARGE_SOC,
+    ]
+    for unit, pack in pack_slots_for_units(units):
+        for suffix in _PACK_FIELD_SUFFIXES:
+            names.append(_pack_register_name(unit, pack, suffix))
+    return names
+
+
+#: Backward-compatible default: unit 1 only, matching every currently-
+#: confirmed real installation (including the one this project's own
+#: hardware evidence comes from) and every existing test written against
+#: that assumption. BatteryHealthManager itself computes its OWN, real
+#: per-instance register list from actual discovered topology -- see
+#: __init__'s own self._register_names -- this module-level constant is
+#: no longer what actually gets polled, only a documented, tested
+#: reference default for the single-unit case.
+REQUIRED_REGISTER_NAMES: list[str] = required_register_names([1])
+
+
+def _active_storage_units(device: Any) -> list[int]:
+    """Which storage units (1 and/or 2) actually exist on this inverter.
+
+    v2.0.7 (TOPO-01 done properly, this release): reuses the SAME proven
+    capability flags (device.battery_1_type/battery_2_type, compared
+    against StorageProductModel.NONE) this integration's own __init__.py
+    already uses to decide whether to create a battery_2 HA device at
+    all -- not a new or separately-reasoned mechanism.
+
+    Unit 1's presence is NOT re-checked here: BatteryHealthManager is
+    only ever constructed when the caller (__init__.py's async_setup_
+    battery_health) has already confirmed connected_energy_storage is
+    not None for this device, which is a stronger precondition than
+    battery_1_type alone.
+
+    Deliberately a hard, conditional gate, not a live probe: RegisterClient.
+    get_multiple() (the core huawei-solar library) only succeeds when every
+    register in one batch is "consecutively available" -- reading a
+    genuinely absent second unit's registers would very likely fail the
+    WHOLE containing Modbus chunk, not just silently return empty for
+    that one register. This must never be attempted speculatively.
+    """
+    units = [1]
+    battery_2_type = getattr(device, "battery_2_type", None)
+    none_value = getattr(rv.StorageProductModel, "NONE", None)
+    if battery_2_type is not None and battery_2_type != none_value:
+        units.append(2)
+    return units
 
 
 def config_from_options(options: dict[str, Any] | None) -> BatteryHealthConfig:
@@ -235,7 +271,28 @@ class BatteryHealthManager:
         self.serial_number = serial_number
         self.coordinator = coordinator
         self.device_info = device_info
-        self.engine = BatteryHealthEngine(config_from_options(options))
+        # v2.0.7 (TOPO-01 done properly, this release): topology is
+        # resolved ONCE at construction time, from the same coordinator.
+        # device object __init__.py's own battery_1_device_info/
+        # battery_2_device_info already use for exactly this decision --
+        # not re-derived per tick. See _active_storage_units()/
+        # pack_slots_for_units()'s own docstrings for the full reasoning
+        # (why unit presence is a hard gate, never a live probe; why
+        # every pack slot within a present unit is always read).
+        self._active_units: list[int] = _active_storage_units(
+            getattr(coordinator, "device", None)
+        )
+        self._pack_slots: list[tuple[int, int]] = pack_slots_for_units(
+            self._active_units
+        )
+        self._register_names: list[str] = required_register_names(
+            self._active_units
+        )
+        self.engine = BatteryHealthEngine(
+            config_from_options(options),
+            pack_count=len(self._pack_slots),
+            pack_slot_labels=[f"u{u}p{p}" for u, p in self._pack_slots],
+        )
         self._store: Store = Store(
             hass, SCHEMA_VERSION, f"{STORAGE_KEY_PREFIX}_{serial_number}"
         )
@@ -325,7 +382,7 @@ class BatteryHealthManager:
         self.engine.mark_recovery("integration start")
         self._unsub = self.coordinator.async_add_listener(
             self._handle_coordinator_update,
-            context={"register_names": list(REQUIRED_REGISTER_NAMES)},
+            context={"register_names": list(self._register_names)},
         )
         _LOGGER.info(
             "battery_health[%s]: initialized (%d segments restored, baseline %s)",
@@ -340,6 +397,40 @@ class BatteryHealthManager:
             self._unsub()
             self._unsub = None
         await self._store.async_save(self.engine.to_dict())
+
+    def snapshot(self) -> dict[str, Any]:
+        """Point-in-time diagnostic snapshot for telemetry_capture.py --
+        same public role AdaptiveModbusController.snapshot()/
+        ModbusTelemetry.snapshot() already play for their own subsystems.
+
+        v2.0.7 (Section E, this release): the whole reason this method
+        exists -- every open Architecture Phase 2/3 question (condition
+        coverage, unit-vs-pack residual, confidence-state distribution,
+        segment cadence, normalization-floor frequency, per-pack current
+        share, topology) needs a real time series to decide from, not
+        just the live entity attributes, which telemetry_capture.py's
+        periodic capture already provides for the Modbus side. Reuses
+        self.engine.report.attributes wholesale -- that dict already
+        carries every one of those fields (see battery_health.py's own
+        _evaluate(), condition_coverage/combined_norm_floor_hits/
+        pack_slot_labels/pack_replaced_count/
+        pack_current_share_deviation_pct comments) -- rather than
+        duplicating field-by-field extraction here, so a future addition
+        to the entity's own attributes is automatically captured too.
+        """
+        report = self.engine.report
+        return {
+            "bhi": report.bhi,
+            "confidence": report.confidence,
+            "soh_capacity": report.soh_capacity,
+            # v2.0.7 (TOPO-01 done properly, this release): topology
+            # self-description -- without this, a capture from a
+            # multi-unit installation would be uninterpretable without
+            # cross-referencing entity attributes separately.
+            "active_units": list(self._active_units),
+            "pack_slots": [f"u{u}p{p}" for u, p in self._pack_slots],
+            **report.attributes,
+        }
 
     def stop(self) -> None:
         """Synchronous teardown of the listener (unload path helper)."""
@@ -468,8 +559,19 @@ class BatteryHealthManager:
         # entity.
         cache = self.coordinator.cache
         packs: list[PackSample] = []
-        for i in range(PACK_COUNT):
-            status = _value(cache, data, _RN_PACK_STATUS[i])
+        # v2.0.7 (TOPO-01 done properly, this release): iterates
+        # self._pack_slots (every (unit, pack) slot actually part of
+        # this installation's discovered topology, computed once at
+        # construction time -- see __init__'s own comment) instead of a
+        # fixed range(PACK_COUNT) over unit-1-only register names. Order
+        # matches self.engine.pack_capacity.trackers/slot_labels exactly
+        # -- both are built from the same self._pack_slots list, so
+        # index i here always corresponds to the same physical slot as
+        # tracker i there.
+        for unit, pack in self._pack_slots:
+            status = _value(
+                cache, data, _pack_register_name(unit, pack, "working_status")
+            )
             try:
                 # int() handles both plain ints and IntEnum register values.
                 online = int(status) == PACK_WORKING_STATUS_RUNNING
@@ -477,27 +579,56 @@ class BatteryHealthManager:
                 online = False
             packs.append(
                 PackSample(
-                    voltage=_value(cache, data, _RN_PACK_VOLTAGE[i]),
-                    temp_max=_value(cache, data, _RN_PACK_TMAX[i]),
-                    temp_min=_value(cache, data, _RN_PACK_TMIN[i]),
+                    voltage=_value(
+                        cache, data, _pack_register_name(unit, pack, "voltage")
+                    ),
+                    temp_max=_value(
+                        cache, data,
+                        _pack_register_name(unit, pack, "maximum_temperature"),
+                    ),
+                    temp_min=_value(
+                        cache, data,
+                        _pack_register_name(unit, pack, "minimum_temperature"),
+                    ),
                     online=online,
                     # v2.0.6 (Tier 3): feeds PackCapacityTracker -- see
-                    # this module's own _RN_PACK_SOC/_RN_PACK_POWER/
-                    # _RN_PACK_TOTAL_CHARGE/_RN_PACK_TOTAL_DISCHARGE
-                    # comment for the full reasoning. Quality-gated via
-                    # _value() exactly the same as every other field
-                    # here -- no separate treatment needed.
-                    soc=_value(cache, data, _RN_PACK_SOC[i]),
-                    power_w=_value(cache, data, _RN_PACK_POWER[i]),
-                    lifetime_charge_kwh=_value(cache, data, _RN_PACK_TOTAL_CHARGE[i]),
+                    # this module's own _PACK_FIELD_SUFFIXES comment for
+                    # the full reasoning. Quality-gated via _value()
+                    # exactly the same as every other field here -- no
+                    # separate treatment needed.
+                    soc=_value(
+                        cache, data,
+                        _pack_register_name(unit, pack, "state_of_capacity"),
+                    ),
+                    power_w=_value(
+                        cache, data,
+                        _pack_register_name(unit, pack, "charge_discharge_power"),
+                    ),
+                    lifetime_charge_kwh=_value(
+                        cache, data, _pack_register_name(unit, pack, "total_charge")
+                    ),
                     lifetime_discharge_kwh=_value(
-                        cache, data, _RN_PACK_TOTAL_DISCHARGE[i]
+                        cache, data,
+                        _pack_register_name(unit, pack, "total_discharge"),
+                    ),
+                    # v2.0.7 (Section F, this release): raw current/
+                    # serial number, quality-gated via _value() exactly
+                    # the same as every other field here. Not yet
+                    # consumed by any computation -- see PackSample's
+                    # own field comments.
+                    current_a=_value(
+                        cache, data, _pack_register_name(unit, pack, "current")
+                    ),
+                    serial_number=_value(
+                        cache, data,
+                        _pack_register_name(unit, pack, "serial_number"),
                     ),
                 )
             )
 
         calib_values = [_value(cache, data, _RN_UNIT_CALIBRATION)] + [
-            _value(cache, data, name) for name in _RN_PACK_CALIBRATION
+            _value(cache, data, _pack_register_name(unit, pack, "soh_calibration_status"))
+            for unit, pack in self._pack_slots
         ]
         calibration_active = False
         for cv in calib_values:

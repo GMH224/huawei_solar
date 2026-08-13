@@ -581,6 +581,7 @@ def build_telemetry_snapshot(
     include_register_overlap: bool,
     adaptive_controller_cls: Any,
     modbus_telemetry_cls: Any,
+    battery_health_manager_cls: Any | None = None,
 ) -> dict[str, Any]:
     """Gather one combined, JSON-serialisable snapshot across every
     coordinator on this entry, for one periodic capture tick.
@@ -604,6 +605,16 @@ def build_telemetry_snapshot(
     means every relevant coordinator is skipped (see check_register_
     overlap()'s own "not yet known, not confirmed disjoint" handling) and
     costs almost nothing to check again on a later tick.
+
+    v2.0.7 (Section E, this release): battery_health_manager_cls is
+    Optional and defaults to None -- unlike adaptive_controller_cls/
+    modbus_telemetry_cls, not every installation has battery health
+    enabled at all (CONF_BH_ENABLED), so the caller can omit this
+    parameter entirely rather than every caller needing a real-vs-fake
+    class either way. When provided, follows the exact same per-serial
+    registry lookup pattern as the other two -- BatteryHealthManager.get
+    (serial), mirroring AdaptiveModbusController.get(serial)/
+    ModbusTelemetry.get(serial) exactly.
     """
     devices: dict[str, Any] = {}
     for dd in device_datas:
@@ -618,6 +629,11 @@ def build_telemetry_snapshot(
         telemetry = modbus_telemetry_cls.get(serial)
         if telemetry is not None:
             section["telemetry"] = telemetry.snapshot()
+
+        if battery_health_manager_cls is not None:
+            bh_manager = battery_health_manager_cls.get(serial)
+            if bh_manager is not None:
+                section["battery_health"] = bh_manager.snapshot()
 
         if section:
             devices[tag] = section

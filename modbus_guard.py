@@ -549,8 +549,24 @@ class ModbusGuard:
                 # bare TimeoutError. Anything else (a genuine external
                 # CancelledError, or a failure once the lock WAS already
                 # held) passes through unchanged.
+                #
+                # v2.0.7 FIX (MOD-03, ICS quality audit -- confirmed): this
+                # used to check `not lock_acquired` -- but lock_acquired
+                # becomes True immediately after guard._lock.acquire()
+                # succeeds, BEFORE the inter-request gap sleep just above
+                # runs. A TimeoutError arriving during that sleep (e.g. an
+                # OUTER caller-side deadline, such as the whole-poll
+                # deadline, firing while still waiting out the gap) had
+                # lock_acquired == True by then, so it fell through this
+                # check entirely and escaped as a bare TimeoutError --
+                # indistinguishable from a genuine device timeout, even
+                # though the device still hadn't been contacted.
+                # self._t_admitted (0.0 until admission genuinely
+                # completes, just above) is the correct boundary: admission
+                # is not complete until the whole sequence -- lock AND gap
+                # -- has finished, not merely once the lock is held.
                 if (
-                    not lock_acquired
+                    not self._t_admitted
                     and isinstance(exc, TimeoutError)
                     and not isinstance(exc, (ModbusQueueShed, ModbusAdmissionTimeout))
                 ):

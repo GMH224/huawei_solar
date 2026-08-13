@@ -12,11 +12,28 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .battery_health_manager import BatteryHealthManager
 from .const import CONF_ENABLE_PARAMETER_CONFIGURATION, DATA_DEVICE_DATAS
+# v2.0.7 FIX (ICS-12, ICS quality audit -- confirmed): this button's
+# stop-forcible-charge press and services.py's own stop_forcible_charge()
+# service are two independent entry points for the same physical
+# command. Both already held ModbusGuard continuously for their own
+# whole write sequence (preventing literal mid-sequence interleaving
+# between them), but had no shared LOGICAL lock -- two complete write
+# sequences, one from each path, could still race back-to-back in
+# unpredictable order if triggered concurrently (e.g. a user presses
+# this button at the same moment an automation calls the service).
+# get_device_write_lock() is the SAME per-serial asyncio.Lock the
+# service path uses, imported from .types (not .services) specifically
+# so this entity-platform module doesn't pick up services.py's own
+# heavier dependency chain (voluptuous schemas, ServiceCall handling)
+# for something this narrow -- see .types' own get_device_write_lock()
+# docstring for the full reasoning on why the shared registry lives
+# there.
 from .types import (
     HuaweiSolarConfigEntry,
     HuaweiSolarDeviceData,
     HuaweiSolarEntity,
     HuaweiSolarInverterData,
+    get_device_write_lock as _get_device_write_lock,
 )
 from .update_coordinator import HuaweiSolarUpdateCoordinator
 
@@ -112,76 +129,88 @@ class StopForcibleChargeButtonEntity(HuaweiSolarEntity, ButtonEntity):
 
     async def async_press(self) -> None:
         """Stop the forcible charge or discharge."""
-        # v2.0.0b (MOD-06, external ICS audit -- confirmed): these four
-        # writes already held ONE continuous guard acquisition (a single
-        # logical "stop forcible charge" operation, avoiding another
-        # coordinator's poll interleaving partway through the sequence --
-        # v2.0.0a/F05's own fix), but placed no bound on how long that
-        # exclusive hold could last. Now uses _guarded_write_sequence()
-        # (types.py), which adds WRITE_SEQUENCE_TIMEOUT as a single
-        # whole-sequence deadline on top of the same guard-holding
-        # guarantee, rather than four independent unbounded writes.
-        # Falls back to unguarded, untimed (today's existing defensive
-        # behaviour, not a new risk) only when this entity has no
-        # coordinator reference at all -- this entity is not a
-        # CoordinatorEntity; it holds an explicitly Optional coordinator
-        # reference, unlike switch/select/number.
-        guard = (
-            self._configuration_update_coordinator.guard
-            if self._configuration_update_coordinator is not None
-            else None
-        )
-        if guard is not None:
-            async with self._guarded_write_sequence(guard, label="button_write") as write:
-                await write(
-                    self.device,
-                    rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_WRITE,
-                    rv.StorageForcibleChargeDischarge.STOP,
-                )
-                await write(self.device, rn.STORAGE_FORCIBLE_DISCHARGE_POWER, 0)
-                await write(
-                    self.device,
-                    rn.STORAGE_FORCED_CHARGING_AND_DISCHARGING_PERIOD,
-                    0,
-                )
-                await write(
-                    self.device,
-                    rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SETTING_MODE,
-                    rv.StorageForcibleChargeDischargeTargetMode.TIME,
-                )
-        else:
-            async with _NullContext():
-                await self.device.set(
-                    rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_WRITE,
-                    rv.StorageForcibleChargeDischarge.STOP,
-                )
-                await self.device.set(rn.STORAGE_FORCIBLE_DISCHARGE_POWER, 0)
-                await self.device.set(
-                    rn.STORAGE_FORCED_CHARGING_AND_DISCHARGING_PERIOD,
-                    0,
-                )
-                await self.device.set(
-                    rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SETTING_MODE,
-                    rv.StorageForcibleChargeDischargeTargetMode.TIME,
-                )
+        # v2.0.7 FIX (ICS-12, ICS quality audit -- confirmed): the whole
+        # method body -- writes AND the cache-invalidation/refresh below
+        # -- is now serialised against services.py's own
+        # stop_forcible_charge() service via the SAME per-serial lock,
+        # matching that service's own lock scope exactly (see its own
+        # `async with _get_device_write_lock(...)` wrapping both the
+        # write sequence and its coordinator refresh). Without this, two
+        # complete "stop forcible charge" sequences -- one from each
+        # entry point -- could race back-to-back with no shared
+        # ordering, and whichever finished last would simply overwrite
+        # the other's fully-applied result.
+        async with _get_device_write_lock(self.device.serial_number):
+            # v2.0.0b (MOD-06, external ICS audit -- confirmed): these four
+            # writes already held ONE continuous guard acquisition (a single
+            # logical "stop forcible charge" operation, avoiding another
+            # coordinator's poll interleaving partway through the sequence --
+            # v2.0.0a/F05's own fix), but placed no bound on how long that
+            # exclusive hold could last. Now uses _guarded_write_sequence()
+            # (types.py), which adds WRITE_SEQUENCE_TIMEOUT as a single
+            # whole-sequence deadline on top of the same guard-holding
+            # guarantee, rather than four independent unbounded writes.
+            # Falls back to unguarded, untimed (today's existing defensive
+            # behaviour, not a new risk) only when this entity has no
+            # coordinator reference at all -- this entity is not a
+            # CoordinatorEntity; it holds an explicitly Optional coordinator
+            # reference, unlike switch/select/number.
+            guard = (
+                self._configuration_update_coordinator.guard
+                if self._configuration_update_coordinator is not None
+                else None
+            )
+            if guard is not None:
+                async with self._guarded_write_sequence(guard, label="button_write") as write:
+                    await write(
+                        self.device,
+                        rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_WRITE,
+                        rv.StorageForcibleChargeDischarge.STOP,
+                    )
+                    await write(self.device, rn.STORAGE_FORCIBLE_DISCHARGE_POWER, 0)
+                    await write(
+                        self.device,
+                        rn.STORAGE_FORCED_CHARGING_AND_DISCHARGING_PERIOD,
+                        0,
+                    )
+                    await write(
+                        self.device,
+                        rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SETTING_MODE,
+                        rv.StorageForcibleChargeDischargeTargetMode.TIME,
+                    )
+            else:
+                async with _NullContext():
+                    await self.device.set(
+                        rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_WRITE,
+                        rv.StorageForcibleChargeDischarge.STOP,
+                    )
+                    await self.device.set(rn.STORAGE_FORCIBLE_DISCHARGE_POWER, 0)
+                    await self.device.set(
+                        rn.STORAGE_FORCED_CHARGING_AND_DISCHARGING_PERIOD,
+                        0,
+                    )
+                    await self.device.set(
+                        rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SETTING_MODE,
+                        rv.StorageForcibleChargeDischargeTargetMode.TIME,
+                    )
 
-        if self._configuration_update_coordinator:
-            # v1.3.15 FIX (Defect Q, part 2): none of the four writes above
-            # were invalidating their cached registers, so the
-            # async_request_refresh() below could be served pre-write
-            # cached values for any register whose TTL hadn't naturally
-            # expired yet -- sensors reflecting this state could continue
-            # showing the OLD (still-forcibly-charging/discharging) values
-            # for as long as that register's cache TTL lasted, looking
-            # exactly like the stop command silently failed.
-            for name in (
-                rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_WRITE,
-                rn.STORAGE_FORCIBLE_DISCHARGE_POWER,
-                rn.STORAGE_FORCED_CHARGING_AND_DISCHARGING_PERIOD,
-                rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SETTING_MODE,
-            ):
-                self._configuration_update_coordinator.invalidate_cache(name)
-            await self._configuration_update_coordinator.async_request_refresh()
+            if self._configuration_update_coordinator:
+                # v1.3.15 FIX (Defect Q, part 2): none of the four writes above
+                # were invalidating their cached registers, so the
+                # async_request_refresh() below could be served pre-write
+                # cached values for any register whose TTL hadn't naturally
+                # expired yet -- sensors reflecting this state could continue
+                # showing the OLD (still-forcibly-charging/discharging) values
+                # for as long as that register's cache TTL lasted, looking
+                # exactly like the stop command silently failed.
+                for name in (
+                    rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_WRITE,
+                    rn.STORAGE_FORCIBLE_DISCHARGE_POWER,
+                    rn.STORAGE_FORCED_CHARGING_AND_DISCHARGING_PERIOD,
+                    rn.STORAGE_FORCIBLE_CHARGE_DISCHARGE_SETTING_MODE,
+                ):
+                    self._configuration_update_coordinator.invalidate_cache(name)
+                await self._configuration_update_coordinator.async_request_refresh()
 
 
 class ResetEfficiencyBaselineButtonEntity(HuaweiSolarEntity, ButtonEntity):

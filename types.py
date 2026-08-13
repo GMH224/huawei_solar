@@ -166,3 +166,40 @@ class HuaweiSolarEntityContext(TypedDict):
     """Context for Huawei Solar Entities."""
 
     register_names: list[RegisterName]
+
+
+# v2.0.7 FIX (ICS-12, ICS quality audit -- confirmed): the per-serial
+# "one logical command at a time" write lock, moved here from services.py
+# so BOTH button.py and services.py can share the SAME registry without
+# button.py needing to import services.py's own heavy dependency chain
+# (voluptuous schemas, ServiceCall handling, config_validation, etc. --
+# none of which an entity-platform module has any other reason to need).
+# types.py is already a dependency of both call sites (button.py already
+# imports from here for _guarded_write_sequence; services.py already
+# imports WRITE_TIMEOUT-adjacent constants), so this adds no new edge.
+#
+# Previously, button.py's StopForcibleCharge press and services.py's own
+# stop_forcible_charge() service held ONLY ModbusGuard (preventing literal
+# mid-sequence interleaving between them, since both already hold the
+# guard for their whole write sequence) but had no shared LOGICAL lock --
+# two COMPLETE write sequences, one from each entry point, could still
+# race back-to-back in unpredictable order if triggered concurrently
+# (e.g. a user presses the button at the same moment an automation calls
+# the service), with whichever finished last simply overwriting the
+# other's fully-applied result.
+_device_write_locks: dict[str, asyncio.Lock] = {}
+
+
+def get_device_write_lock(serial_number: str) -> asyncio.Lock:
+    """Return the shared per-serial write lock, creating it on first use.
+
+    Locks are deliberately never removed from this registry (matching the
+    reasoning already established for the equivalent ModbusGuard/
+    AdaptiveModbusController per-device registries elsewhere in this
+    project): an idle asyncio.Lock is negligible memory, and removing one
+    while a call might still be queued on it would be far more dangerous
+    than never removing it at all.
+    """
+    if serial_number not in _device_write_locks:
+        _device_write_locks[serial_number] = asyncio.Lock()
+    return _device_write_locks[serial_number]

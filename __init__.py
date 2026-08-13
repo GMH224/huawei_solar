@@ -111,6 +111,22 @@ _COORDINATOR_START_DELAYS = {
     # even its "fallback" path into mostly cache hits, not fresh physical
     # reads, rather than merely delaying the same worst-case traffic.
     "sync_power":    timedelta(seconds=16),
+    # v2.0.7 FIX (START-01, ICS quality audit -- confirmed): the optimizer
+    # coordinator's first refresh previously had no stagger slot of its
+    # own at all -- it's a SIBLING class of HuaweiSolarUpdateCoordinator
+    # (see update_coordinator.py's own HuaweiSolarOptimizerUpdateCoordinator
+    # docstring), not a subclass, so it never inherited _start_delay or
+    # the first-poll stagger mechanism the other four coordinator types
+    # get automatically. Its background first-refresh task could
+    # therefore fire at t=0, alongside the main inverter's own first
+    # poll, the exact startup contention this whole stagger scheme exists
+    # to avoid. Positioned after sync_power's own 16s slot -- optimizer
+    # traffic is a distinct register domain from the other five (not
+    # cache-shortcut dependent the way sync_power is), so there's no
+    # sync_power-style reason to place it earlier; simply keeping it
+    # after everything else already scheduled is enough to avoid
+    # colliding with the rest of this device's own startup sequence.
+    "optimizer":     timedelta(seconds=18),
 }
 
 # v1.3.10 FIX (Defect I): the offsets above stagger the FOUR COORDINATOR
@@ -1299,6 +1315,7 @@ async def _setup_inverter_device_data(
                 OPTIMIZER_UPDATE_INTERVAL,
                 bus_endpoint=bus_endpoint,
                 entry=entry,
+                start_delay=_staggered_start_delay("optimizer", device_index),
             )
             optimizer_update_coordinator.attach_telemetry(telemetry)
             optimizer_update_coordinator.attach_adaptive(adaptive)
