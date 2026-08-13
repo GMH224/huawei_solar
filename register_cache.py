@@ -354,12 +354,32 @@ _TIER_OVERRIDES: dict[str, "RegisterTier"] = {
     # (matching the generic "total_" substring pattern), which is fine
     # for a value merely displayed, but not for one feeding active
     # segment-boundary arithmetic.
-    "storage_unit_1_battery_pack_1_total_charge": RegisterTier.NORMAL,
-    "storage_unit_1_battery_pack_1_total_discharge": RegisterTier.NORMAL,
-    "storage_unit_1_battery_pack_2_total_charge": RegisterTier.NORMAL,
-    "storage_unit_1_battery_pack_2_total_discharge": RegisterTier.NORMAL,
-    "storage_unit_1_battery_pack_3_total_charge": RegisterTier.NORMAL,
-    "storage_unit_1_battery_pack_3_total_discharge": RegisterTier.NORMAL,
+    #
+    # v2.0.8 FIX (DEF-015, external ICS quality/defect/architecture audit
+    # -- confirmed): generated for BOTH storage units (1 AND 2), not just
+    # unit 1 -- v2.0.7's own TOPO-01 work added real support for reading
+    # a genuine second storage unit's registers when present
+    # (battery_health_manager.py's _active_storage_units()/
+    # pack_slots_for_units()), but this dict was never updated to match,
+    # confirmed by direct inspection: only unit-1 entries existed. Left
+    # as-is, a second unit's pack counters would silently fall through to
+    # the generic SLOW tier while unit 1's identical registers got
+    # NORMAL -- two physically equivalent storage units feeding the
+    # capacity-learning algorithm with materially different counter
+    # freshness, biasing pack-quality comparisons between them. Generated
+    # from a small range rather than hand-duplicated a second time, per
+    # the audit's own recommendation to stop maintaining this list
+    # manually in only one place -- adding a THIRD copy by hand next time
+    # this needs to grow (a third pack slot, a third unit) is exactly how
+    # this defect happened the first time. Harmless when a unit doesn't
+    # exist on a given installation -- its registers are simply never
+    # requested, so these entries stay permanently inert until they do.
+    **{
+        f"storage_unit_{unit}_battery_pack_{pack}_{suffix}": RegisterTier.NORMAL
+        for unit in (1, 2)
+        for pack in (1, 2, 3)
+        for suffix in ("total_charge", "total_discharge")
+    },
 }
 
 

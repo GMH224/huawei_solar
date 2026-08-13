@@ -249,13 +249,17 @@ class TestOptimizerFirstRefreshIsStaggered(unittest.TestCase):
         source = self._UPDATE_COORD_SRC.read_text()
         idx = source.find("async def create_optimizer_update_coordinator(")
         assert idx > -1, "create_optimizer_update_coordinator not found in update_coordinator.py"
-        body = source[idx: idx + 4000]
+        body = source[idx: idx + 6000]
         sleep_idx = body.find("await asyncio.sleep(start_delay.total_seconds())")
-        refresh_idx = body.find("await coordinator.async_config_entry_first_refresh()")
+        # v2.0.8 FIX (DEF-007, external ICS quality/defect/architecture
+        # audit -- confirmed): the real call is now async_request_refresh(),
+        # not async_config_entry_first_refresh() -- this test's own search
+        # target updated to match, not just the source it's checking.
+        refresh_idx = body.find("await coordinator.async_request_refresh()")
         self.assertGreater(
             sleep_idx, -1, "no stagger sleep found -- START-01 has regressed",
         )
-        self.assertGreater(refresh_idx, -1, "async_config_entry_first_refresh() call not found")
+        self.assertGreater(refresh_idx, -1, "async_request_refresh() call not found")
         self.assertLess(
             sleep_idx, refresh_idx,
             "the stagger sleep must happen BEFORE the actual first refresh",
@@ -266,6 +270,22 @@ class TestOptimizerFirstRefreshIsStaggered(unittest.TestCase):
             "parameter, matching the pattern used for the other four "
             "coordinator types",
         )
+
+    def test_def007_uses_async_request_refresh_not_first_refresh(self):
+        """DEF-007 (external ICS quality/defect/architecture audit --
+        confirmed): async_config_entry_first_refresh() is explicitly
+        contracted (confirmed against the real, installed homeassistant
+        source) for use only while self.config_entry.state ==
+        SETUP_IN_PROGRESS -- this background task always runs after
+        setup has already returned, so it was never a valid call here,
+        despite the v1.3.8 comment's own stated intent to match the
+        sibling coordinators' async_request_refresh() pattern."""
+        source = self._UPDATE_COORD_SRC.read_text()
+        idx = source.find("async def create_optimizer_update_coordinator(")
+        assert idx > -1
+        body = source[idx: idx + 6000]
+        self.assertIn("await coordinator.async_request_refresh()", body)
+        self.assertNotIn("await coordinator.async_config_entry_first_refresh()", body)
 
     def test_call_site_passes_the_staggered_optimizer_delay(self):
         source = _INIT_SRC.read_text()

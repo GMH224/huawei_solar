@@ -674,6 +674,74 @@ class TestSectionFCurrentAndSerialWiring(unittest.TestCase):  # v2.0.7
             self.assertIsNone(pack_sample.serial_number)
 
 
+class TestStoreVersionDecoupling(unittest.IsolatedAsyncioTestCase):  # v2.0.8
+    """Store-version conflation fix (found in the production log during
+    the 2.0.7 telemetry run, independent of either external audit): HA's
+    own Store class has its own version-mismatch protocol, separate from
+    this module's internal schema_version -- conflating the two by
+    passing SCHEMA_VERSION directly as Store's constructor version meant
+    any internal schema bump also broke HA's own load path, silently
+    bypassing BH-09's reset-recording logic before it could ever run."""
+
+    async def test_migrate_func_returns_old_data_completely_unchanged(self):
+        """The core mechanism: regardless of what HA's own old major/
+        minor version numbers were, the override must return the raw
+        data verbatim -- HA's own version machinery must become a
+        complete no-op, deferring 100% of migration/reset decisions to
+        this module's own internal schema_version + _SCHEMA_MIGRATIONS."""
+        store = object.__new__(MGR.BatteryHealthStore)
+        old_data = {
+            "schema_version": 2, "first_seen_ts": 12345.0,
+            "segments": {"foo": "bar"},
+        }
+        result = await store._async_migrate_func(2, 1, old_data)
+        self.assertEqual(result, old_data)
+        self.assertIs(
+            result, old_data,
+            "must return the SAME object, not a copy or reconstruction -- "
+            "confirms this is a genuine pass-through, not a partial "
+            "reinterpretation of the old data's shape",
+        )
+
+    async def test_migrate_func_never_raises_regardless_of_version_gap(self):
+        """Adversarial: the exact scenario from the real production log
+        -- a major version mismatch (old=2, requested=3) -- must not
+        raise NotImplementedError, which is what HA's own unoverridden
+        base class does unconditionally for this case."""
+        store = object.__new__(MGR.BatteryHealthStore)
+        for old_major, old_minor in [(2, 1), (1, 1), (0, 1), (2, 5)]:
+            result = await store._async_migrate_func(
+                old_major, old_minor, {"schema_version": old_major},
+            )
+            self.assertEqual(result, {"schema_version": old_major})
+
+    def test_real_construction_site_uses_the_subclass_not_bare_store(self):
+        """Source-level: confirms the actual __init__ construction site
+        was updated to use BatteryHealthStore, not merely that the
+        subclass exists unused somewhere."""
+        source = pathlib.Path(__file__).parent.parent.joinpath(
+            "battery_health_manager.py"
+        ).read_text()
+        self.assertIn("self._store: Store = BatteryHealthStore(", source)
+        self.assertNotIn("self._store: Store = Store(", source)
+
+    def test_store_version_is_decoupled_from_schema_version(self):
+        """Source-level: confirms the Store's own version argument is no
+        longer SCHEMA_VERSION directly -- the whole point of this fix."""
+        source = pathlib.Path(__file__).parent.parent.joinpath(
+            "battery_health_manager.py"
+        ).read_text()
+        self.assertIn(
+            "BatteryHealthStore(\n            hass, _HA_STORE_FORMAT_VERSION,",
+            source,
+        )
+        self.assertNotIn("Store(\n            hass, SCHEMA_VERSION,", source)
+        # SCHEMA_VERSION must no longer even be imported into this module
+        # -- if it were, that would suggest something still couples the
+        # two, even if not at this exact call site.
+        self.assertNotIn("    SCHEMA_VERSION,\n)", source)
+
+
 class TestICS06RestoreErrorBoundary(unittest.IsolatedAsyncioTestCase):
     """ICS-06, external ICS audit -- confirmed: restore() sat OUTSIDE
     the load-failure try/except -- a store that loaded successfully
@@ -684,13 +752,17 @@ class TestICS06RestoreErrorBoundary(unittest.IsolatedAsyncioTestCase):
     subscribed -- battery-health tracking silently stops working for
     that device) rather than gracefully starting fresh."""
 
-    def _make_manager(self, load_return):
+    def _make_manager(self, load_return, pack_slots=None):
         mgr = object.__new__(MGR.BatteryHealthManager)
         mgr.serial_number = "SNTEST"
         mgr.hass = MagicMock()
         mgr.coordinator = MagicMock()
         mgr.coordinator.async_add_listener = MagicMock(return_value=lambda: None)
-        mgr.engine = BH.BatteryHealthEngine()
+        mgr._pack_slots = pack_slots if pack_slots is not None else MGR.pack_slots_for_units([1])
+        mgr.engine = BH.BatteryHealthEngine(
+            pack_count=len(mgr._pack_slots),
+            pack_slot_labels=[f"u{u}p{p}" for u, p in mgr._pack_slots],
+        )
         mgr._store = MagicMock()
         mgr._store.async_load = AsyncMock(return_value=load_return)
         # v2.0.7 (TOPO-01 done properly, this release): async_initialize()
@@ -751,6 +823,33 @@ class TestICS06RestoreErrorBoundary(unittest.IsolatedAsyncioTestCase):
             "the replacement engine must be genuinely fresh -- not "
             "carrying over the one field the corrupt data DID manage "
             "to set before restore() raised on a later one",
+        )
+
+    async def test_adversarial_corrupt_recovery_preserves_multi_unit_topology(self):
+        """DEF-013 (external ICS quality/defect/architecture audit --
+        confirmed): the fallback engine rebuilt after a structural
+        restore() failure used to reconstruct with ONLY self.engine.cfg,
+        silently defaulting to pack_count=3 regardless of how many
+        storage units/packs this installation actually has. On a
+        two-unit (6-pack) system, this would leave the fallback engine
+        mismatched against the manager's own already-resolved
+        self._pack_slots for the rest of its lifetime."""
+        two_unit_slots = MGR.pack_slots_for_units([1, 2])
+        corrupt_data = {
+            "schema_version": BH.SCHEMA_VERSION,
+            "segments": "not_a_dict_at_all",
+        }
+        mgr = self._make_manager(corrupt_data, pack_slots=two_unit_slots)
+        await mgr.async_initialize()
+        self.assertEqual(
+            mgr.engine.pack_capacity.pack_count, 6,
+            "the fallback engine must be rebuilt with the SAME topology "
+            "already resolved (6 packs across 2 units), not silently "
+            "default back to 3",
+        )
+        self.assertEqual(
+            mgr.engine.pack_capacity.slot_labels,
+            ["u1p1", "u1p2", "u1p3", "u2p1", "u2p2", "u2p3"],
         )
 
     async def test_normal_valid_restore_still_works(self):

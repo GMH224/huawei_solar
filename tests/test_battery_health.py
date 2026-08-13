@@ -116,6 +116,75 @@ class TestValidation(unittest.TestCase):  # T1
         self.assertEqual(s.packs[0].voltage, 26.4)
         self.assertIsNone(s.packs[0].temp_max)
 
+    def test_pack_current_and_serial_carried_through(self):
+        """DEF-011/012 (external ICS audit -- confirmed): current_a and
+        serial_number, added to PackSample in v2.0.7 (Section F), were
+        never wired into validate_sample()'s reconstruction loop -- the
+        exact same class of bug the v2.0.6 comment on the lines just
+        above already documents for a different set of fields."""
+        s = bh.validate_sample(_sample(0, packs=[
+            bh.PackSample(voltage=26.4, temp_max=25.0, temp_min=20.0,
+                          online=True, current_a=-12.5, serial_number="SN-ABC123"),
+        ]))
+        self.assertEqual(s.packs[0].current_a, -12.5)
+        self.assertEqual(s.packs[0].serial_number, "SN-ABC123")
+
+    def test_implausible_pack_current_discarded(self):
+        s = bh.validate_sample(_sample(0, packs=[
+            bh.PackSample(voltage=26.4, temp_max=25.0, temp_min=20.0,
+                          online=True, current_a=99_999.0, serial_number="SN-X"),
+        ]))
+        self.assertIsNone(s.packs[0].current_a)
+        self.assertEqual(s.packs[0].serial_number, "SN-X")  # unaffected
+
+    def test_implausible_pack_serial_discarded(self):
+        for bad in ("", "   ", "x" * 65, 12345, None):
+            s = bh.validate_sample(_sample(0, packs=[
+                bh.PackSample(voltage=26.4, temp_max=25.0, temp_min=20.0,
+                              online=True, current_a=1.0, serial_number=bad),
+            ]))
+            self.assertIsNone(s.packs[0].serial_number, f"bad={bad!r} should discard")
+            self.assertEqual(s.packs[0].current_a, 1.0)  # unaffected
+
+    def test_pack_serial_whitespace_is_stripped(self):
+        s = bh.validate_sample(_sample(0, packs=[
+            bh.PackSample(voltage=26.4, temp_max=25.0, temp_min=20.0,
+                          online=True, serial_number="  SN-Y  "),
+        ]))
+        self.assertEqual(s.packs[0].serial_number, "SN-Y")
+
+    def test_adversarial_replacement_detection_works_through_the_real_pipeline(self):
+        """The actual regression this closes: TOPO-01's pack-replacement
+        detection must work when fed through BatteryHealthEngine.update()
+        -- the real production entry point every sample passes through --
+        not merely when PackCapacityTracker.feed() is called directly, as
+        every pre-existing test (including this project's own from the
+        prior release) did. This is the test that should have existed
+        before DEF-011/012 shipped."""
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        eng = bh.BatteryHealthEngine(cfg, pack_count=1, pack_slot_labels=["u1p1"])
+
+        def _pack(soc, dis, serial):
+            return bh.PackSample(voltage=53.0, temp_max=25.0, temp_min=24.0,
+                                  online=True, soc=soc, power_w=-2500.0,
+                                  lifetime_discharge_kwh=dis, serial_number=serial)
+
+        for i in range(6):
+            eng.update(_sample(i * 60, soc=100.0 - i, power=-2500.0, chg=0.0,
+                               dis=1.0 * i, packs=[_pack(90.0, 1.0 * i, "SN-ORIGINAL")]))
+        self.assertEqual(eng.pack_capacity._last_serial[0], "SN-ORIGINAL")
+        self.assertEqual(eng.pack_capacity.pack_replaced_count[0], 0)
+
+        # Physical pack replaced -- fed through the REAL pipeline this time.
+        eng.update(_sample(6 * 60, soc=94.0, power=-2500.0, chg=0.0, dis=0.1,
+                           packs=[_pack(90.0, 0.1, "SN-REPLACEMENT")]))
+        self.assertEqual(
+            eng.pack_capacity._last_serial[0], "SN-REPLACEMENT",
+            "replacement must be detected through engine.update(), the "
+            "real production path -- not just via direct tracker.feed()",
+        )
+        self.assertEqual(eng.pack_capacity.pack_replaced_count[0], 1)
+
 
 class TestSegmentCapacity(unittest.TestCase):  # T2, T3
     def test_spec_vector_two_segments(self):

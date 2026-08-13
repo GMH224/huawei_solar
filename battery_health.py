@@ -366,6 +366,36 @@ def _valid_or_none(
     return v
 
 
+#: v2.0.8 FIX (DEF-011/012, external ICS audit -- confirmed): a genuine
+#: implausible-current guard for validate_sample() below, sized the same
+#: generous way POWER_LIMIT_W already is (a wide multiple of the real
+#: hardware ceiling, wide enough to never discard genuine data, tight
+#: enough to catch a garbled read) -- derived from POWER_LIMIT_W divided
+#: by a conservatively LOW pack voltage, then rounded up generously, not
+#: a tightly-reasoned physical limit.
+PACK_CURRENT_LIMIT_A = 600.0
+
+#: v2.0.8 FIX (DEF-011/012, external ICS audit -- confirmed): a serial
+#: number is not a bounded numeric quantity, so it needs its own
+#: "plausible or discard" check rather than _valid_or_none() above --
+#: same philosophy (type-check, bounds-check, silently discard), just
+#: adapted for strings. A generous max length guards against a garbled
+#: read producing a nonsense value, not against genuinely long serials.
+_SERIAL_MAX_LEN = 64
+
+
+def _valid_serial_or_none(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    if not stripped or len(stripped) > _SERIAL_MAX_LEN:
+        _LOGGER.debug(
+            "battery_health: discarding implausible pack_serial=%r", value
+        )
+        return None
+    return stripped
+
+
 def validate_sample(raw: HealthSample) -> HealthSample:
     """Apply plausibility bounds field-by-field.  Bad fields become None;
     the rest of the sample stays usable (per-field discard, per spec §9)."""
@@ -419,6 +449,30 @@ def validate_sample(raw: HealthSample) -> HealthSample:
                 lifetime_discharge_kwh=_valid_or_none(
                     pack.lifetime_discharge_kwh, 0.0, 1e9, "pack_lifetime_discharge"
                 ),
+                # v2.0.8 FIX (DEF-011/012, external ICS quality/defect/
+                # architecture audit -- confirmed): current_a/serial_number
+                # were added to PackSample in v2.0.7 (Section F) and
+                # correctly populated upstream by _build_sample(), but
+                # this reconstruction loop was never updated to carry
+                # them through either -- the EXACT SAME class of bug the
+                # v2.0.6 comment above already documents for a different
+                # set of fields, repeated here with a different pair.
+                # Confirmed via direct external audit against real
+                # source, not caught by this project's own tests: every
+                # existing test exercised PackCapacityTracker.feed()
+                # directly, or built HealthSample/PackSample objects by
+                # hand -- none of them went through validate_sample()
+                # itself, the actual real-world entry point every sample
+                # passes through in BatteryHealthEngine.update(). This is
+                # the reason TOPO-01's own pack-replacement detection
+                # (v2.0.7) has been unreachable in production since it
+                # shipped: serial_number always arrived as None by the
+                # time PackCapacityTracker.feed() ever saw it.
+                current_a=_valid_or_none(
+                    pack.current_a, -PACK_CURRENT_LIMIT_A, PACK_CURRENT_LIMIT_A,
+                    "pack_current",
+                ),
+                serial_number=_valid_serial_or_none(pack.serial_number),
             )
         )
     return out

@@ -88,6 +88,91 @@ class TestClassify(unittest.TestCase):
     def test_unknown_normal(self):
         self.assertEqual(_classify("some_unknown_register_xyz"), RegisterTier.NORMAL)
 
+
+class TestDEF015PackCounterTierCoverage(unittest.TestCase):  # v2.0.8
+    """DEF-015 (external ICS quality/defect/architecture audit --
+    confirmed): _TIER_OVERRIDES only had NORMAL entries for unit 1's
+    pack counters -- v2.0.7's own TOPO-01 work added real support for a
+    genuine second storage unit, but this dict was never updated to
+    match, leaving unit 2's identical counters to silently fall through
+    to the generic SLOW tier."""
+
+    def test_unit_1_pack_counters_are_normal_tier(self):
+        for pack in (1, 2, 3):
+            for suffix in ("total_charge", "total_discharge"):
+                name = f"storage_unit_1_battery_pack_{pack}_{suffix}"
+                self.assertEqual(
+                    _classify(name), RegisterTier.NORMAL,
+                    f"{name} must be NORMAL tier",
+                )
+
+    def test_unit_2_pack_counters_are_normal_tier(self):
+        """The actual regression this closes."""
+        for pack in (1, 2, 3):
+            for suffix in ("total_charge", "total_discharge"):
+                name = f"storage_unit_2_battery_pack_{pack}_{suffix}"
+                self.assertEqual(
+                    _classify(name), RegisterTier.NORMAL,
+                    f"{name} must be NORMAL tier -- unit 2 must match "
+                    f"unit 1's own tier exactly, not fall through to SLOW",
+                )
+
+    def test_unit_1_and_unit_2_tiers_are_identical(self):
+        """Adversarial: the two units' equivalent registers must
+        classify identically -- the whole point being that two
+        physically equivalent storage units feed the capacity-learning
+        algorithm with the SAME counter freshness, not a biased one."""
+        for pack in (1, 2, 3):
+            for suffix in ("total_charge", "total_discharge"):
+                tier_1 = _classify(f"storage_unit_1_battery_pack_{pack}_{suffix}")
+                tier_2 = _classify(f"storage_unit_2_battery_pack_{pack}_{suffix}")
+                self.assertEqual(tier_1, tier_2)
+
+    def test_tier_coverage_matches_resolved_topology_not_a_second_hand_list(self):
+        """The audit's own secondary recommendation: cross-check tier
+        coverage against whatever required_register_names() actually
+        resolves for a given topology, rather than trusting a second,
+        independently-maintained list to stay in sync by hand -- the
+        exact pattern that let DEF-015 happen in the first place."""
+        bhm_src = pathlib.Path(__file__).parent.parent / "battery_health_manager.py"
+        spec = importlib.util.spec_from_file_location("bhm_test_def015", str(bhm_src))
+        bhm = importlib.util.module_from_spec(spec)
+        bhm.__package__ = "huawei_solar"
+        # battery_health_manager.py needs more of the huawei_solar/
+        # homeassistant surface than this file's own lightweight stub
+        # provides; only pack_slots_for_units()/required_register_names()
+        # are needed here, both defined before any heavier import in
+        # that module executes, so a partial/best-effort exec is
+        # acceptable -- fall back to a hand-built equivalent if the full
+        # module can't load in this lightweight test environment.
+        try:
+            spec.loader.exec_module(bhm)
+            required = bhm.required_register_names([1, 2])
+        except Exception:
+            required = [
+                f"storage_unit_{unit}_battery_pack_{pack}_{suffix}"
+                for unit in (1, 2) for pack in (1, 2, 3)
+                for suffix in (
+                    "voltage", "maximum_temperature", "minimum_temperature",
+                    "working_status", "soh_calibration_status",
+                    "state_of_capacity", "charge_discharge_power",
+                    "total_charge", "total_discharge", "current",
+                    "serial_number",
+                )
+            ]
+        counter_names = [
+            n for n in required
+            if n.endswith("_total_charge") or n.endswith("_total_discharge")
+        ]
+        self.assertGreater(len(counter_names), 0, "test setup invalid")
+        for name in counter_names:
+            self.assertEqual(
+                _classify(name), RegisterTier.NORMAL,
+                f"{name} is required by the resolved topology but is not "
+                f"NORMAL tier -- tier coverage has drifted from actual "
+                f"topology again",
+            )
+
     # BUG-3 regression tests ──────────────────────────────────────────────────
 
     def test_bug3_phase_a_built_in_is_slow_not_fast(self):

@@ -39,7 +39,6 @@ from .battery_health import (
     HealthReport,
     HealthSample,
     PackSample,
-    SCHEMA_VERSION,
 )
 from .const import (
     CONF_BH_AMBIENT_ENTITY,
@@ -66,6 +65,52 @@ _LOGGER = logging.getLogger(__name__)
 STORAGE_KEY_PREFIX = "huawei_solar_battery_health"
 MIN_SAVE_INTERVAL_S = 300.0          # debounce: at most one write per 5 min
 PACK_COUNT = 3
+
+# v2.0.8 FIX (Store-version conflation, found in production log during the
+# 2.0.7 telemetry run -- not in either audit, discovered independently):
+# HA's own Store class has ITS OWN version-mismatch/migration protocol,
+# entirely separate from this module's own internal `schema_version`
+# dict key (battery_health.py's SCHEMA_VERSION + _SCHEMA_MIGRATIONS,
+# built for BH-09). Passing SCHEMA_VERSION directly as Store's own
+# `version` constructor argument conflated the two: bumping our internal
+# schema (2 -> 3, for TOPO-01) ALSO changed what HA's Store itself
+# expected on disk, and Store's base `_async_migrate_func()` unconditionally
+# raises NotImplementedError unless overridden -- confirmed directly
+# against the installed homeassistant.helpers.storage source. The
+# resulting NotImplementedError propagated out of self._store.async_load()
+# itself, was caught by async_initialize()'s own OUTER try/except (the
+# one guarding the load call, not the one guarding restore()), and `data`
+# became None BEFORE engine.restore() -- and therefore BEFORE BH-09's own
+# schema-mismatch handling -- ever ran. BH-09's whole point (recording
+# last_schema_reset_ts/from_version, visible on the entity) silently
+# never fired for the exact scenario it was built for.
+#
+# _HA_STORE_FORMAT_VERSION is deliberately a SEPARATE, FROZEN constant,
+# not derived from SCHEMA_VERSION and never intended to change again --
+# BatteryHealthStore's own _async_migrate_func() override below makes
+# HA's version-mismatch handling a permanent no-op regardless of what
+# number this is, so all future schema evolution routes exclusively
+# through SCHEMA_VERSION/_SCHEMA_MIGRATIONS, where BH-09's own machinery
+# can actually see and record it.
+_HA_STORE_FORMAT_VERSION = 3
+
+
+class BatteryHealthStore(Store):
+    """Store subclass that hands HA's own version-mismatch handling off
+    entirely to this module's own internal schema_version logic -- see
+    _HA_STORE_FORMAT_VERSION's own module-level comment for the full
+    reasoning. old_data is returned completely unchanged: whatever this
+    module last wrote via engine.to_dict() is exactly what
+    BatteryHealthEngine.restore() already knows how to interpret via its
+    own schema_version key, regardless of what HA's own outer
+    major/minor version happened to be on disk.
+    """
+
+    async def _async_migrate_func(
+        self, old_major_version: int, old_minor_version: int, old_data: Any,
+    ) -> Any:
+        return old_data
+
 PACK_WORKING_STATUS_RUNNING = 2      # rv: 0=offline,1=standby,2=running,3=fault,4=sleep
 
 # Register names (strings from huawei-solar register_names.py) required per
@@ -293,8 +338,8 @@ class BatteryHealthManager:
             pack_count=len(self._pack_slots),
             pack_slot_labels=[f"u{u}p{p}" for u, p in self._pack_slots],
         )
-        self._store: Store = Store(
-            hass, SCHEMA_VERSION, f"{STORAGE_KEY_PREFIX}_{serial_number}"
+        self._store: Store = BatteryHealthStore(
+            hass, _HA_STORE_FORMAT_VERSION, f"{STORAGE_KEY_PREFIX}_{serial_number}"
         )
         self._listeners: list[Callable[[HealthReport], None]] = []
         self._unsub: Callable[[], None] | None = None
@@ -375,7 +420,24 @@ class BatteryHealthManager:
                 "structurally corrupt (restore() failed) — starting fresh",
                 self.serial_number,
             )
-            self.engine = BatteryHealthEngine(self.engine.cfg)
+            # v2.0.8 FIX (DEF-013, external ICS quality/defect/architecture
+            # audit -- confirmed): this used to reconstruct with ONLY
+            # self.engine.cfg, silently dropping the pack_count/
+            # pack_slot_labels the real __init__ construction (above)
+            # already resolved from actual discovered topology --
+            # defaulting to pack_count=3 regardless of how many storage
+            # units/packs this installation genuinely has. On a two-unit
+            # system, a corrupt-state recovery would rebuild an engine
+            # with 3 trackers instead of 6, mismatched against
+            # self._pack_slots for the rest of this manager's own
+            # lifetime. Passing the same topology __init__ already
+            # resolved keeps a fallback rebuild consistent with it,
+            # exactly as a normal (non-corrupt) construction already is.
+            self.engine = BatteryHealthEngine(
+                self.engine.cfg,
+                pack_count=len(self._pack_slots),
+                pack_slot_labels=[f"u{u}p{p}" for u, p in self._pack_slots],
+            )
         # v1.2.1: after any (re)start, registers may briefly report stale or
         # default values.  Measurement resumes immediately; irreversible
         # learning waits out the settling period.

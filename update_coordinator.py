@@ -1767,7 +1767,31 @@ async def create_optimizer_update_coordinator(
         try:
             if start_delay.total_seconds() > 0:
                 await asyncio.sleep(start_delay.total_seconds())
-            await coordinator.async_config_entry_first_refresh()
+            # v2.0.8 FIX (DEF-007, external ICS quality/defect/architecture
+            # audit -- confirmed): this was still async_config_entry_
+            # first_refresh(), even though this call already runs as a
+            # detached background task, not awaited by async_setup_entry
+            # -- exactly the mismatch the v1.3.8 comment above already
+            # describes wanting to fix (bring this coordinator in line
+            # with the "entities show unavailable until the first
+            # scheduled poll" pattern every sibling coordinator uses via
+            # async_request_refresh()), but the actual call was never
+            # updated to match. Confirmed against the real, installed
+            # homeassistant.helpers.update_coordinator source:
+            # async_config_entry_first_refresh() explicitly checks
+            # self.config_entry.state == SETUP_IN_PROGRESS and reports
+            # incorrect usage (already logged for custom integrations
+            # today, flagged to become a hard break in a future HA
+            # version) when called outside that window -- which this
+            # background task, running after setup has already returned,
+            # always is. Also matters independently of that warning: on
+            # failure, async_config_entry_first_refresh() raises
+            # ConfigEntryNotReady, which this bare except Exception
+            # already swallows either way -- meaning the "automatically
+            # raise ConfigEntryNotReady" behavior that method exists FOR
+            # was never actually reachable here, dead code intent even
+            # before considering the state-check warning.
+            await coordinator.async_request_refresh()
         except Exception:  # noqa: BLE001 — background task must not raise
             _LOGGER.exception(
                 "optimizer_coordinator[%s]: first refresh failed; optimizer "
