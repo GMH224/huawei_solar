@@ -269,6 +269,23 @@ class BatteryHealthConfig:
     #: seasonal boundary with no underlying health change.
     subscore_hold_days: float = 90.0
 
+    # v2.0.9 FIX (ICS-19, external ICS audit -- confirmed): PackCapacity
+    # Tracker.current_share_deviation_pct()'s own near-zero guard
+    # (abs(mean) < 1e-6) was far too tight to actually prevent the
+    # ill-conditioning it was written to guard against -- field data
+    # showed values up to ~4,020% from ordinary near-idle mean currents
+    # (well above 1e-6 A, just small relative to normal operating
+    # current), confirming the comment's own stated intent was never
+    # actually enforced by the number chosen. This is a genuine
+    # physically-meaningful floor, not an epsilon: below it, small
+    # absolute measurement noise between packs dominates the computed
+    # ratio, producing a number that reflects sensor noise rather than
+    # real current imbalance. 2.0 A is a judgment call, not a derived
+    # constant -- chosen as a level comfortably above ordinary reading
+    # noise for these packs while still well below any real load
+    # current, not tuned against a specific validated threshold.
+    pack_current_share_min_mean_a: float = 2.0
+
     def normalized_weights(self) -> tuple[float, float, float]:
         """Return (w_cap, w_eff, w_bal) normalized to sum to 1.0."""
         w = (self.weight_capacity, self.weight_efficiency, self.weight_balance)
@@ -1616,15 +1633,28 @@ class PackCapacityTracker:
         simplest possible signal for "are packs sharing current roughly
         evenly right now", informing Architecture §14's deferred
         current-based C-rate/current-share diagnostic. None until at
-        least 2 packs have a real reading and their mean is non-zero
-        (near-zero mean, e.g. all packs near-idle, would make this ratio
-        meaningless/explosive, not informative).
+        least 2 packs have a real reading and their mean is at least
+        pack_current_share_min_mean_a.
+
+        v2.0.9 FIX (ICS-19, external ICS audit -- confirmed): the
+        original guard here was `abs(mean) < 1e-6` -- intended (per this
+        docstring's own prior wording) to catch "near-zero mean... would
+        make this ratio meaningless/explosive", but 1e-6 A is not
+        meaningfully different from exactly zero for a real current
+        reading, so the guard never actually fired for the case it was
+        written for. Field telemetry confirmed this directly: values up
+        to ~4,020% were observed, arithmetically consistent with a small
+        (well above 1e-6, e.g. tens of milliamps) but not-yet-guarded
+        mean current. Replaced with a real, physically-reasoned floor --
+        see pack_current_share_min_mean_a's own comment for why 2.0 A
+        specifically, and that it's a judgment call, not a derived
+        constant.
         """
         values = [v for v in self.last_current_a if v is not None]
         if len(values) < 2:
             return None
         mean = sum(values) / len(values)
-        if abs(mean) < 1e-6:
+        if abs(mean) < self._cfg.pack_current_share_min_mean_a:
             return None
         return round((max(values) - min(values)) / abs(mean) * 100.0, 1)
 

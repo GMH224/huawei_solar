@@ -149,6 +149,21 @@ class ModbusTelemetry:
         self.total_admission_timeouts: int = 0
         self.total_cache_hits: int = 0
         self.total_skipped_polls: int = 0
+        # v2.0.9 (Phase 1.2, this release -- ICS-15, both external ICS
+        # audits): 0x06 SLAVE_DEVICE_BUSY retry logic has existed in
+        # update_coordinator.py since v1.0.6, but had no dedicated
+        # counter anywhere -- both audits independently flagged retry
+        # amplification as "a credible but unquantified risk". total_
+        # physical_attempts counts every actual wire transaction
+        # attempted, including BUSY sub-retries of the same chunk;
+        # total_attempts above (renamed nowhere, kept as-is for
+        # backward compatibility) counts one per chunk's FINAL outcome
+        # only -- the same distinction the newer audit's own report
+        # draws as "logical" vs "physical" attempts. retry_amplification
+        # (physical/logical, computed in snapshot() below) is the
+        # concrete number both audits asked for.
+        self.total_busy_events: int = 0
+        self.total_physical_attempts: int = 0
         self._night_mode: bool = False
 
         # Derived metrics updated on each call to snapshot()
@@ -172,6 +187,10 @@ class ModbusTelemetry:
         self._batch_sizes.append(batch_size)
         self.total_requests += 1
         self.total_attempts += 1
+        # v2.0.9 (Phase 1.2, this release): the physical transaction that
+        # actually succeeded -- see total_physical_attempts' own
+        # __init__ comment for the logical-vs-physical distinction.
+        self.total_physical_attempts += 1
         self._evict(now)
 
     def record_failure(self) -> None:
@@ -181,7 +200,27 @@ class ModbusTelemetry:
         self._attempts.append(now)
         self.total_failures += 1
         self.total_attempts += 1
+        self.total_physical_attempts += 1
         self._evict(now)
+
+    def record_busy_retry(self) -> None:
+        """Record one 0x06 SLAVE_DEVICE_BUSY response that triggered a
+        retry of the same chunk.
+
+        v2.0.9 (Phase 1.2, this release -- ICS-15, both external ICS
+        audits -- confirmed): this is a genuine additional physical wire
+        transaction (the BUSY response itself was a real exchange, and
+        the retry that follows is another one) that was previously
+        completely invisible to telemetry -- neither total_attempts nor
+        any other existing counter saw it, since only the chunk's own
+        FINAL outcome (via record_request/record_failure/record_timeout)
+        was ever recorded. Deliberately does NOT touch total_attempts
+        (the logical/chunk-outcome counter) -- a chunk that BUSY-retried
+        twice then succeeded is still exactly one logical attempt, with
+        three physical ones.
+        """
+        self.total_busy_events += 1
+        self.total_physical_attempts += 1
 
     def record_timeout(self, kind: str = "device") -> None:
         """Record a timeout.
@@ -217,6 +256,13 @@ class ModbusTelemetry:
         if kind == "device":
             self._device_timeouts.append(now)
             self.total_device_timeouts += 1
+            # v2.0.9 (Phase 1.2, this release): only "device" represents
+            # a genuine physical wire transaction that was actually
+            # admitted and sent -- "queue_shed" and "admission" both
+            # mean the request never reached the physical bus at all, so
+            # counting either as a physical attempt would overstate
+            # real wire traffic.
+            self.total_physical_attempts += 1
         elif kind == "queue_shed":
             self._queue_sheds.append(now)
             self.total_queue_sheds += 1
@@ -367,6 +413,22 @@ class ModbusTelemetry:
             "total_queue_sheds": self.total_queue_sheds,
             "total_admission_timeouts": self.total_admission_timeouts,
             "total_cache_hits": self.total_cache_hits,
+            # v2.0.9 (Phase 1.2, this release -- ICS-15, both external
+            # ICS audits): "logical_attempts" is an explicit alias for
+            # total_attempts, matching the exact terminology both audits
+            # used, so the field is self-explanatory in an exported
+            # capture without needing to cross-reference this class's
+            # own naming history. retry_amplification is exactly the
+            # ratio both audits asked for (physical/logical); None when
+            # there have been no logical attempts yet, not a divide by
+            # zero.
+            "logical_attempts": self.total_attempts,
+            "total_physical_attempts": self.total_physical_attempts,
+            "total_busy_events": self.total_busy_events,
+            "retry_amplification": (
+                round(self.total_physical_attempts / self.total_attempts, 3)
+                if self.total_attempts else None
+            ),
             "total_skipped_polls": self.total_skipped_polls,
             "night_mode_active": self._night_mode,
         }

@@ -424,6 +424,21 @@ class ModbusGuard:
             #: actually being read, which is the whole next question.
             self.registers: int | None = None
             self.priority_tier: str | None = None
+            # v2.0.9 (Phase 2.1/2.4, this release -- ICS-16, both external
+            # ICS audits -- confirmed): same "caller fills in after
+            # admission" pattern as registers/priority_tier above, not a
+            # new mechanism. chunk_index/chunk_count/retry_count/
+            # logical_request_id/transition_reason are all optional
+            # (None when the caller doesn't set them, e.g. the keep-alive
+            # probe or write-path callers that don't operate in terms of
+            # chunks at all) so this stays a strict superset of the
+            # existing fields, not a breaking change to anything already
+            # using this context.
+            self.chunk_index: int | None = None
+            self.chunk_count: int | None = None
+            self.retry_count: int | None = None
+            self.logical_request_id: int | None = None
+            self.transition_reason: str | None = None
             self._t_submit: float = 0.0
             self._t_admitted: float = 0.0
             #: Time spent waiting for admission (lock + inter-request gap).
@@ -614,6 +629,13 @@ class ModbusGuard:
                         outcome="error" if exc_type else "ok",
                         registers=self.registers,
                         priority=self.priority_tier,
+                        # v2.0.9 (Phase 2.1/2.4, this release): see
+                        # _RequestContext's own field comments above.
+                        chunk_index=self.chunk_index,
+                        chunk_count=self.chunk_count,
+                        retry_count=self.retry_count,
+                        logical_request_id=self.logical_request_id,
+                        transition_reason=self.transition_reason,
                     )
                 except Exception:  # noqa: BLE001 — diagnostics must never break I/O
                     _LOGGER.exception("ModbusGuard[%s]: diagnostics sink failed",

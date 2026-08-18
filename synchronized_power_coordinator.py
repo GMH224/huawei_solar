@@ -248,6 +248,10 @@ class SynchronizedPowerCoordinator(DataUpdateCoordinator[SynchronizedPowerData])
         inv2_cache: "RegisterCache | None" = None,
         meter_cache: "RegisterCache | None" = None,
         battery_cache: "RegisterCache | None" = None,
+        # v2.0.9 (Phase 3.1, this release): see CONF_SYNC_POWER_DEDICATED_
+        # READS' own comment in const.py for the full reasoning. True
+        # preserves this coordinator's original behaviour exactly.
+        dedicated_reads_enabled: bool = True,
     ) -> None:
         super().__init__(
             hass,
@@ -300,6 +304,15 @@ class SynchronizedPowerCoordinator(DataUpdateCoordinator[SynchronizedPowerData])
         self._inv2_cache = inv2_cache
         self._meter_cache = meter_cache
         self._battery_cache = battery_cache
+        self._dedicated_reads_enabled = dedicated_reads_enabled
+        # v2.0.9 (Phase 3.1, this release): distinct from shortcut_hits/
+        # misses above -- those specifically track the STRICT, aligned
+        # shortcut (_try_cache_shortcut), which cache-only mode never
+        # calls at all (it has its own, more lenient path -- see
+        # _cache_only_snapshot()). This counts every cache-only-mode
+        # evaluation, so the two modes' own activity stays distinguishable
+        # in a snapshot rather than one silently masquerading as the other.
+        self.cache_only_snapshots: int = 0
 
         # v1.3.11 FIX (Defect J, reported by an independent ICS audit and
         # confirmed against source): guards were keyed on inv1/inv2's own
@@ -410,6 +423,14 @@ class SynchronizedPowerCoordinator(DataUpdateCoordinator[SynchronizedPowerData])
                 round(self.temporally_uncertain_count / self.results_with_span_computed, 3)
                 if self.results_with_span_computed else None
             ),
+            # v2.0.9 (Phase 3.1, this release): whether dedicated
+            # physical reads are enabled for this installation, and how
+            # many cache-only snapshots have been served -- lets a
+            # capture directly distinguish an installation running in
+            # cache-only mode from one still using dedicated reads,
+            # without needing to cross-reference config.
+            "dedicated_reads_enabled": self._dedicated_reads_enabled,
+            "cache_only_snapshots": self.cache_only_snapshots,
         }
 
     # ── poll ───────────────────────────────────────────────────────────────────
@@ -509,6 +530,69 @@ class SynchronizedPowerCoordinator(DataUpdateCoordinator[SynchronizedPowerData])
             # well-aligned by construction, not by omission.
         )
 
+    def _cache_only_snapshot(self) -> SynchronizedPowerData:
+        """v2.0.9 (Phase 3.1, this release): the whole point of making
+        dedicated reads optional -- when disabled, this coordinator must
+        never perform a physical read AND must never claim temporal
+        alignment, but the four entities should stay populated rather
+        than going unavailable, since the underlying registers are kept
+        warm regardless by the regular independent per-device
+        coordinators (confirmed directly against source before this was
+        built: INPUT_POWER, POWER_METER_ACTIVE_POWER, STORAGE_CHARGE_
+        DISCHARGE_POWER are all already read by their own standard
+        sensor entities, entirely independent of this coordinator).
+
+        Deliberately more lenient than _try_cache_shortcut_impl() above,
+        not just that method with the tolerance check removed: each
+        value is taken independently -- one stale/unavailable value does
+        not blank out the other three, matching the same per-field
+        tolerance every other part of this engine already applies rather
+        than an all-or-nothing gate. Quality.BAD is excluded (no usable
+        value at all -- never read, known-wrong, or expired); Quality.
+        GOOD and UNCERTAIN are both accepted (a real value exists,
+        confirmed by register_cache.py's own Quality docstring), since
+        cache-only mode's entire premise is best-effort staleness
+        tolerance, not strict freshness.
+
+        Always reports is_temporally_uncertain=True -- alignment was
+        never checked at all in this mode, so claiming otherwise would
+        be the exact "advertise a temporally uncertain composite as
+        equivalent to an atomic measurement" problem today's audit
+        explicitly warns against (§2.7's own requirement).
+        """
+        self.cache_only_snapshots += 1
+        pairs: list[tuple["RegisterCache | None", Any, bool]] = [
+            (self._inv1_cache, rn.INPUT_POWER, True),
+            (self._inv2_cache, rn.INPUT_POWER, self._inv2 is not None),
+            (self._meter_cache, rn.POWER_METER_ACTIVE_POWER, self._has_meter),
+            (self._battery_cache, rn.STORAGE_CHARGE_DISCHARGE_POWER, self._has_battery),
+        ]
+        values: list[float | None] = []
+        ages: list[float] = []
+        for cache, name, applicable in pairs:
+            if not applicable or cache is None:
+                values.append(None)
+                continue
+            quality, _reason, age = cache.quality_of(name)
+            if quality == Quality.BAD:
+                values.append(None)
+                continue
+            values.append(_cache_value_w(cache, name))
+            if age is not None:
+                ages.append(age)
+
+        return SynchronizedPowerData(
+            inv1_pv_power=values[0],
+            inv2_pv_power=values[1],
+            grid_power=values[2],
+            battery_power=values[3],
+            has_inv2=self._inv2 is not None,
+            has_meter=self._has_meter,
+            has_battery=self._has_battery,
+            sample_span_ms=(max(ages) - min(ages)) * 1000.0 if len(ages) >= 2 else None,
+            is_temporally_uncertain=True,
+        )
+
     async def _async_update_data(self) -> SynchronizedPowerData:
         """Read all power-flow registers as a best-effort, near-simultaneous
         sample -- NOT one atomic transaction.
@@ -572,6 +656,13 @@ class SynchronizedPowerCoordinator(DataUpdateCoordinator[SynchronizedPowerData])
         # failure count without ever having verified anything. The counter
         # is simply left untouched on a shortcut hit now -- it reflects
         # only genuine I/O outcomes, from the dedicated-read path below.
+        # v2.0.9 (Phase 3.1, this release): cache-only mode short-circuits
+        # everything below -- no dedicated read is ever attempted, no
+        # alignment tolerance is enforced. See _cache_only_snapshot()'s
+        # own docstring for the full reasoning.
+        if not self._dedicated_reads_enabled:
+            return self._cache_only_snapshot()
+
         shortcut = self._try_cache_shortcut()
         if shortcut is not None:
             return shortcut
