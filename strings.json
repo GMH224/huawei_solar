@@ -57,7 +57,7 @@
       },
       "confirm_setup": {
         "title": "Device found",
-        "description": "Successfully connected to **{model_name}** (serial number: {serial_number}) on slave ID(s): {slave_ids}.\n\nPress Submit to add this device to Home Assistant."
+        "description": "Successfully connected to **{model_name}** (serial number: {serial_number}) on slave ID(s): {slave_ids}.{skipped_notice}\n\nPress Submit to add this device to Home Assistant."
       },
       "cannot_connect": {
         "title": "Could not connect",

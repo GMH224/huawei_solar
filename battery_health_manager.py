@@ -23,6 +23,7 @@ energy-storage coordinator reads.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from datetime import datetime, timezone
@@ -50,6 +51,7 @@ from .const import (
     CONF_BH_WEIGHT_CAPACITY,
     CONF_BH_WEIGHT_EFFICIENCY,
     CONF_BH_WINDOW_DAYS,
+    STORAGE_LOAD_TIMEOUT,
 )
 
 if TYPE_CHECKING:
@@ -382,7 +384,23 @@ class BatteryHealthManager:
         """Load persisted state BEFORE first coordinator update (spec §8),
         then subscribe with the register-name context."""
         try:
-            data = await self._store.async_load()
+            # v2.0.9 FIX (Phase 4.9, this release -- old DEF-012, external
+            # ICS quality/defect/architecture audit -- confirmed): this
+            # load had no timeout of its own -- a genuinely stalled Store
+            # read (disk contention, a wedged filesystem) could block THIS
+            # await, and therefore config-entry setup itself (this is
+            # called directly from __init__.py's own async_setup_entry),
+            # indefinitely. See STORAGE_LOAD_TIMEOUT's own comment in
+            # const.py for the full reasoning, and adaptive_modbus.py's
+            # own async_load() for the identical fix applied there --
+            # both call self._store.async_load() on the same setup
+            # critical path with the same gap. A TimeoutError here is
+            # already correctly handled by the existing `except
+            # Exception` below -- no new exception handling needed, only
+            # the bound itself.
+            data = await asyncio.wait_for(
+                self._store.async_load(), timeout=STORAGE_LOAD_TIMEOUT.total_seconds()
+            )
         except Exception:  # noqa: BLE001 — corrupt store must not block setup
             _LOGGER.exception(
                 "battery_health[%s]: failed to load persisted state — starting fresh",
@@ -458,7 +476,31 @@ class BatteryHealthManager:
         if self._unsub is not None:
             self._unsub()
             self._unsub = None
-        await self._store.async_save(self.engine.to_dict())
+        # v2.0.9 FIX (Phase 4.11, this release -- found during a log
+        # review, not either external audit): this save previously had
+        # neither a timeout NOR any exception handling at all -- a bare
+        # await. A genuinely stalled write (disk contention, a wedged
+        # filesystem) could block entry unload indefinitely; any failure
+        # (not just a hang) would propagate uncaught, potentially
+        # breaking the caller's own unload sequence entirely rather than
+        # simply losing this one, best-effort final flush. Reuses
+        # STORAGE_LOAD_TIMEOUT (const.py) -- same underlying concern
+        # (bounded local HA Store I/O) as the load-side fix Phase 4.9
+        # already applied to this exact class's own async_initialize(),
+        # not a separately-tuned constant for what's genuinely the same
+        # kind of operation.
+        try:
+            await asyncio.wait_for(
+                self._store.async_save(self.engine.to_dict()),
+                timeout=STORAGE_LOAD_TIMEOUT.total_seconds(),
+            )
+        except Exception:  # noqa: BLE001 — a failed final flush must not block unload
+            _LOGGER.exception(
+                "battery_health[%s]: failed to flush state to disk during "
+                "unload; the most recent learning data since the last "
+                "periodic save may be lost. Unload continues regardless",
+                self.serial_number,
+            )
 
     def snapshot(self) -> dict[str, Any]:
         """Point-in-time diagnostic snapshot for telemetry_capture.py --

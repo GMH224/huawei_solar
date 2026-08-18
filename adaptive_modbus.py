@@ -102,6 +102,7 @@ from .const import (
     ADAPTIVE_TIMEOUT_MIN,
     ADAPTIVE_TRANSITION_DURATION_MINUTES,
     DOMAIN,
+    STORAGE_LOAD_TIMEOUT,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -152,6 +153,25 @@ class TimeSlotStats:
     rtt_p95_ms: float = 0.0  # running P95 RTT estimate (ms)
     # Recent raw RTT samples, bounded to ADAPTIVE_RTT_SAMPLE_SIZE
     rtt_samples: list[float] = field(default_factory=list)
+    # v2.0.9 FIX (Phase 3.2, this release -- ICS-08/MOD-02, both external
+    # ICS audits -- confirmed): n/failures above are fed by EVERY
+    # record_request() call regardless of granularity, including the
+    # per-CHUNK calls from _execute_batch() (since v2.0.0a/F15) -- which
+    # is architecturally correct for THEIR purpose (RTT/pacing genuinely
+    # needs per-transaction granularity, confirmed by tracing the actual
+    # gap-derivation formula below, which is fundamentally about spacing
+    # between physical wire transactions). What was never separated is
+    # CONFIDENCE, which conceptually means "how well do I understand
+    # this time-slot's overall behaviour" -- a poll-level question, not
+    # a transaction-level one. Field data confirms this mattered in
+    # practice: n growing ~262-329x faster than genuine poll count meant
+    # confidence saturated to 100% within hours, not the days of
+    # observation the original design assumed. poll_n/poll_failures are
+    # fed ONLY by genuine poll-level record_request() calls (the
+    # default, unchunked call sites) -- see record_poll() below and
+    # AdaptiveModbusController.record_request()'s own updated docstring.
+    poll_n: float = 0.0
+    poll_failures: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -160,6 +180,13 @@ class TimeSlotStats:
             "t": round(self.timeouts, 4),
             "rtt_p95": round(self.rtt_p95_ms, 1),
             "rtt_s": [round(x, 1) for x in self.rtt_samples],
+            # v2.0.9 (Phase 3.2, this release): new keys, additive to the
+            # existing persisted format -- old persisted data simply
+            # won't have these, and from_dict() below defaults them to
+            # 0.0, which is the honest, correct starting point (this
+            # data genuinely didn't exist to migrate from).
+            "poll_n": round(self.poll_n, 4),
+            "poll_f": round(self.poll_failures, 4),
         }
 
     @classmethod
@@ -171,6 +198,8 @@ class TimeSlotStats:
             timeouts=float(d.get("t", 0)),
             rtt_p95_ms=float(d.get("rtt_p95", 0)),
             rtt_samples=[float(x) for x in d.get("rtt_s", [])],
+            poll_n=float(d.get("poll_n", 0)),
+            poll_failures=float(d.get("poll_f", 0)),
         )
 
     def apply_decay(self, factor: float) -> None:
@@ -178,6 +207,12 @@ class TimeSlotStats:
         self.n *= factor
         self.failures *= factor
         self.timeouts *= factor
+        # v2.0.9 (Phase 3.2, this release): decayed identically to n/
+        # failures above -- same reasoning (old observations should
+        # matter less over time), just for the separate poll-level
+        # population.
+        self.poll_n *= factor
+        self.poll_failures *= factor
         # RTT P95 is not decayed — it represents the shape of RTT distribution,
         # not a count, and should remain representative even as counts decay.
 
@@ -207,14 +242,65 @@ class TimeSlotStats:
             idx = max(0, int(math.ceil(0.95 * len(sorted_s))) - 1)
             self.rtt_p95_ms = sorted_s[idx]
 
+    def record_poll(self, success: bool) -> None:
+        """v2.0.9 (Phase 3.2, this release): the genuine poll-level
+        counterpart to record() above -- deliberately simpler (no RTT/
+        timeout tracking; the transaction-level record() already owns
+        that, and duplicating it here would just be the same MOD-02
+        conflation in a new place). Only n/failures exist at this
+        granularity, since "did the whole poll succeed" is the entire
+        poll-level question confidence is meant to answer.
+        """
+        self.poll_n += 1.0
+        if not success:
+            self.poll_failures += 1.0
+
     @property
     def failure_rate(self) -> float:
         return self.failures / self.n if self.n >= 1.0 else 0.0
 
     @property
     def confidence(self) -> float:
-        """0.0 → 1.0 based on how many weighted requests this slot has seen."""
+        """0.0 → 1.0 based on how many weighted TRANSACTION-level (not
+        poll-level) requests this slot has seen.
+
+        v2.0.9 (Phase 3.2, this release): kept unchanged in meaning and
+        computation -- still transaction-based, still exactly what it
+        always was -- because the RTT-pacing formulas that read this
+        historically (see AdaptiveModbusController's own gap/timeout
+        derivation) are genuinely transaction-level concepts and
+        continuing to blend against transaction-level confidence there
+        is correct, not a bug. poll_confidence below is the NEW,
+        separate signal for genuinely poll-level maturity -- see its own
+        docstring for where that's actually used instead.
+        """
         return min(self.n / ADAPTIVE_FULL_CONFIDENCE_N, 1.0)
+
+    @property
+    def poll_confidence(self) -> float:
+        """v2.0.9 (Phase 3.2, this release -- ICS-08/MOD-02, both
+        external ICS audits -- confirmed): the genuinely poll-level
+        confidence signal MOD-02 asked for -- 0.0 -> 1.0 based on how
+        many weighted POLLS (not transactions/chunks) this slot has
+        seen. Uses the SAME ADAPTIVE_FULL_CONFIDENCE_N threshold as
+        confidence above -- no separately-tuned constant invented here,
+        since there's no field evidence yet for what a poll-specific
+        threshold should be; reusing the existing, already-reasoned
+        value is more honest than guessing a new one.
+        """
+        return min(self.poll_n / ADAPTIVE_FULL_CONFIDENCE_N, 1.0)
+
+    @property
+    def poll_failure_rate(self) -> float:
+        """v2.0.9 (Phase 3.2, this release): poll-level counterpart to
+        failure_rate above -- "what fraction of whole POLLS failed",
+        distinct from failure_rate's "what fraction of individual
+        transactions/chunks failed". These can differ substantially: a
+        poll with 8 chunks where 1 chunk failed is one poll-level
+        failure but only a 12.5% transaction-level failure rate for
+        that poll.
+        """
+        return self.poll_failures / self.poll_n if self.poll_n >= 1.0 else 0.0
 
     @property
     def label(self) -> str:
@@ -247,6 +333,13 @@ class AdaptiveParams:
     in_transition: bool
     slot_index: int
     slot_failure_rate: float   # raw failure rate for the current slot
+    # v2.0.9 (Phase 3.2, this release -- ICS-08/MOD-02, both external ICS
+    # audits -- confirmed): the genuinely poll-level confidence signal,
+    # separate from confidence above (transaction-level) -- see
+    # TimeSlotStats.poll_confidence's own docstring for the full
+    # reasoning, and _derive_params()'s own comment for exactly which
+    # blend this drives (poll_interval only, not gap/timeout/queue_depth).
+    poll_confidence: float = 0.0
 
 
 # ── Controller ─────────────────────────────────────────────────────────────────
@@ -373,6 +466,13 @@ class AdaptiveModbusController:
         # Transition state (elevated params for ADAPTIVE_TRANSITION_DURATION_MINUTES)
         self._in_transition: bool = False
         self._transition_expires: float = 0.0   # monotonic time
+        # v2.0.9 (Phase 2.2, this release): see notify_transition()'s own
+        # comment. Deliberately not persisted -- same "most recent live
+        # state" reasoning as last_batch_ms/last_chunk_count elsewhere in
+        # this class; a transition reason from a prior HA session isn't
+        # meaningful after a restart.
+        self._last_transition_reason: str = ""
+        self._last_transition_ts: float | None = None
 
         # Persistence
         self._store: Store = Store(
@@ -393,6 +493,9 @@ class AdaptiveModbusController:
         #: Reported by the coordinator each poll (v1.2.3 instrumentation).
         self.last_batch_ms: float = 0.0
         self.last_chunk_count: int = 0
+        # v2.0.9 (Phase 2.3, this release): see note_batch()'s own
+        # comment. None until the first batch completes.
+        self.last_batch_deadline_margin_ms: float | None = None
         self.shed_count: int = 0
         # v2.0.0b (MOD-09, external ICS audit): a separate diagnostic
         # counter from shed_count above -- see note_admission_timeout()'s
@@ -436,8 +539,21 @@ class AdaptiveModbusController:
         # costs the user every entity in the integration. (v1.2.3 shipped a
         # Store version bump with no migration callable, and the resulting
         # NotImplementedError did exactly that.)
+        #
+        # v2.0.9 FIX (Phase 4.9, this release -- old DEF-012, external ICS
+        # quality/defect/architecture audit -- confirmed): the load itself
+        # had no timeout bound -- a genuinely stalled Store read (disk
+        # contention, a wedged filesystem) could block THIS await, and
+        # therefore config-entry setup itself (this is called directly
+        # from __init__.py's own async_setup_entry), indefinitely. See
+        # STORAGE_LOAD_TIMEOUT's own comment in const.py for the full
+        # reasoning. A TimeoutError here is already correctly handled by
+        # the existing `except Exception` below -- no new exception
+        # handling needed, only the bound itself.
         try:
-            raw = await self._store.async_load()
+            raw = await asyncio.wait_for(
+                self._store.async_load(), timeout=STORAGE_LOAD_TIMEOUT.total_seconds()
+            )
         except Exception:  # noqa: BLE001
             _LOGGER.exception(
                 "AdaptiveModbus[%s]: could not read stored learning data — "
@@ -536,6 +652,23 @@ class AdaptiveModbusController:
 
     # ── public API ────────────────────────────────────────────────────────────
 
+    def current_transition_reason(self) -> str | None:
+        """The reason for the currently-active transition, or None if not
+        currently in one.
+
+        v2.0.9 (Phase 2.1/2.4, this release): a clean public accessor for
+        BusDiagnostics attribution (see update_coordinator.py's own
+        _execute_batch()) -- deliberately not a bare attribute read of
+        _last_transition_reason/_in_transition from outside this class,
+        matching this codebase's own established convention of exposing
+        state through get_params()-style methods, not private fields.
+        Distinct from _last_transition_reason itself, which persists the
+        MOST RECENT reason even after the transition has expired -- this
+        returns None once expired, since attributing a request to a
+        transition that's no longer active would be misleading.
+        """
+        return self._last_transition_reason or None if self._in_transition else None
+
     def get_params(self) -> AdaptiveParams:
         """Return recommended Modbus parameters for the current moment.
 
@@ -600,15 +733,32 @@ class AdaptiveModbusController:
             self.serial_number, reason,
         )
 
-    def note_batch(self, batch_ms: float, chunk_count: int) -> None:
+    def note_batch(
+        self, batch_ms: float, chunk_count: int, deadline_margin_ms: float | None = None,
+    ) -> None:
         """Diagnostics only — never feeds the circadian model.
 
         Records how long a whole poll took and how many chunks it needed, so
         the ratio between the batch total and the per-request RTT is visible
         in a sensor export rather than having to be inferred.
+
+        v2.0.9 (Phase 2.3, this release -- today's ICS audit §23,
+        Architecture doc "Priority 2 — batch deadline margin"):
+        deadline_margin_ms is the remaining headroom
+        (BATCH_POLL_DEADLINE - batch_ms) at the moment this batch
+        completed -- confirmed against field telemetry that a real
+        102.47s batch got uncomfortably close to the 120s outer bound
+        (17.5s margin) without that margin ever being directly visible;
+        an operator would otherwise have to infer it by subtracting
+        last_batch_ms from a constant they'd need to already know.
+        Optional and defaults to None so any caller not yet passing it
+        (there should be exactly one, in update_coordinator.py) degrades
+        cleanly rather than breaking.
         """
         self.last_batch_ms = batch_ms
         self.last_chunk_count = chunk_count
+        if deadline_margin_ms is not None:
+            self.last_batch_deadline_margin_ms = deadline_margin_ms
 
     def note_bus_metrics(
         self,
@@ -662,19 +812,31 @@ class AdaptiveModbusController:
         constant, whereas "recorded or not" is directly verifiable.
 
         v2.0.7 (MOD-02 telemetry, ICS quality audit -- confirmed): `granularity`
-        is purely observational -- it does NOT affect record(), the
+        was originally purely observational -- it did NOT affect record(), the
         confidence threshold, or anything else this method already did.
         MOD-02's actual finding (confidence thresholds designed assuming
         one call per poll, but this method has been called once per
         CHUNK from _execute_batch() since v2.0.0a/F15, without a
-        corresponding threshold change) is a real architectural question
-        deliberately NOT decided in this release -- seeing the real
-        transaction-vs-poll call-volume ratio from field telemetry is a
-        precondition for deciding it correctly, not a decision itself.
-        "poll" is the default so every pre-existing call site (this
-        controller's own optimizer-coordinator and non-chunked failure/
-        timeout paths) needs no change at all; only _execute_batch()'s
-        own chunk-level call sites pass "transaction" explicitly.
+        corresponding threshold change) was deliberately NOT decided in
+        that release -- seeing the real transaction-vs-poll call-volume
+        ratio from field telemetry was a precondition for deciding it
+        correctly, not a decision itself.
+
+        v2.0.9 FIX (Phase 3.2, this release -- ICS-08/MOD-02, both
+        external ICS audits -- confirmed): now decided, from real field
+        data (both this project's own 2.0.7 telemetry and an independent
+        23h capture both showed confidence saturating to 100% within
+        hours via transaction-level n). `granularity="poll"` now ALSO
+        feeds TimeSlotStats.record_poll() -- a genuinely separate,
+        poll-level statistic -- alongside the existing record() call,
+        which keeps its original transaction-level meaning unchanged
+        (see TimeSlotStats.confidence's own docstring for why that's
+        correct to leave as-is, not a bug). "poll" is still the default
+        so every pre-existing call site (this controller's own
+        optimizer-coordinator and non-chunked failure/timeout paths)
+        needs no change at all; only _execute_batch()'s own chunk-level
+        call sites pass "transaction" explicitly, and those do NOT feed
+        poll_n/poll_failures.
         """
         if not self.learning_active():
             self.suppressed_observations += 1
@@ -686,6 +848,8 @@ class AdaptiveModbusController:
         self._slots[slot_idx].record(
             rtt_ms, success, timeout, ADAPTIVE_RTT_SAMPLE_SIZE
         )
+        if granularity == "poll":
+            self._slots[slot_idx].record_poll(success)
         self._schedule_save()
 
     def notify_transition(self, reason: str = "") -> None:
@@ -704,6 +868,15 @@ class AdaptiveModbusController:
         duration = timedelta(minutes=ADAPTIVE_TRANSITION_DURATION_MINUTES)
         self._in_transition = True
         self._transition_expires = time.monotonic() + duration.total_seconds()
+        # v2.0.9 (Phase 2.2, this release -- ICS-13/ICS-14, both external
+        # ICS audits): the reason string was previously only ever used in
+        # this DEBUG log line -- never retained as state, so telemetry
+        # could see THAT a transition was active but never WHY. Field
+        # data already shows transition state strongly correlates with
+        # degradation (19.1% vs 8.4% failure rate); knowing the reason
+        # is the direct next question that correlation raises.
+        self._last_transition_reason = reason or "unknown"
+        self._last_transition_ts = time.monotonic()
         _LOGGER.debug(
             "AdaptiveModbus[%s]: transition detected (%s) — elevated params for %d min",
             self.serial_number,
@@ -791,8 +964,25 @@ class AdaptiveModbusController:
             "timeout_s": params.request_timeout.total_seconds(),
             "max_queue_depth": params.max_queue_depth,
             "confidence_pct": round(params.confidence * 100, 1),
+            # v2.0.9 (Phase 3.2, this release -- ICS-08/MOD-02, both
+            # external ICS audits -- confirmed): exposed separately and
+            # explicitly, not just internally -- a capture must be able
+            # to distinguish these two numbers directly, since they can
+            # now genuinely diverge (confidence_pct saturating fast from
+            # per-chunk observations while poll_confidence_pct climbs
+            # much more slowly from genuine poll counts is the expected,
+            # correct behaviour after this fix, not a discrepancy to
+            # investigate).
+            "poll_confidence_pct": round(params.poll_confidence * 100, 1),
+            "slot_poll_requests": round(slot.poll_n, 1),
             "slot_failure_rate_pct": round(params.slot_failure_rate * 100, 2),
             "in_transition": "ON" if params.in_transition else "OFF",
+            # v2.0.9 (Phase 2.2, this release -- ICS-13/ICS-14, both
+            # external ICS audits): see notify_transition()'s own
+            # comment for the full reasoning. None/None when no
+            # transition has occurred this instance's lifetime.
+            "last_transition_reason": self._last_transition_reason or None,
+            "last_transition_ts": self._last_transition_ts,
             "days_of_data": self.days_of_data,
             "current_slot": self._slot_label(params.slot_index),
             "slot_requests": round(slot.n, 1),
@@ -803,6 +993,12 @@ class AdaptiveModbusController:
             "rtt_p95_ms": round(slot.rtt_p95_ms, 1),
             "last_batch_ms": round(self.last_batch_ms, 1),
             "last_chunk_count": self.last_chunk_count,
+            # v2.0.9 (Phase 2.3, this release): see note_batch()'s own
+            # comment for the full reasoning.
+            "last_batch_deadline_margin_ms": (
+                round(self.last_batch_deadline_margin_ms, 1)
+                if self.last_batch_deadline_margin_ms is not None else None
+            ),
             "shed_count": self.shed_count,
             # v2.0.0b (MOD-09, external ICS audit): exposed alongside
             # shed_count for the same diagnostic-visibility reason.
@@ -874,6 +1070,19 @@ class AdaptiveModbusController:
         applied unconditionally for the transition window.
         """
         confidence = slot.confidence
+        # v2.0.9 FIX (Phase 3.2, this release -- ICS-08/MOD-02, both
+        # external ICS audits -- confirmed): poll_interval below is the
+        # ONE parameter among these four that is genuinely a poll-level
+        # decision ("how often should a whole new poll begin"), not a
+        # transaction-pacing one -- gap_ms/timeout_s/max_queue_depth
+        # further down are all legitimately about individual physical
+        # transactions (spacing between them, waiting for one response,
+        # how many may be outstanding) and correctly continue blending
+        # against the transaction-based `confidence` above unchanged.
+        # Confirmed by tracing each formula's own actual meaning, not a
+        # blanket replacement -- see TimeSlotStats.poll_confidence's own
+        # docstring for the full reasoning.
+        poll_confidence = slot.poll_confidence
         raw_fr = slot.failure_rate
         fr = max(raw_fr, ADAPTIVE_FAILURE_RATE_HIGH) if in_transition else raw_fr
 
@@ -893,7 +1102,15 @@ class AdaptiveModbusController:
             + t * (ADAPTIVE_POLL_MAX.total_seconds() - ADAPTIVE_POLL_MIN.total_seconds())
         )
         poll_s_baseline = ADAPTIVE_POLL_COLD_START.total_seconds()  # 60 s cold start
-        poll_s = confidence * poll_s_derived + (1 - confidence) * poll_s_baseline
+        # v2.0.9 FIX (Phase 3.2, this release): poll_confidence, not
+        # confidence -- this blend decides how much to trust THIS
+        # SLOT'S OWN LEARNED POLL CADENCE, which should mature based on
+        # how many actual polls (not chunks) have been observed. Before
+        # this fix, a slot with thousands of chunk-level observations
+        # but only a handful of genuine polls reached full confidence
+        # here almost immediately, exactly the field-observed symptom
+        # both audits independently flagged.
+        poll_s = poll_confidence * poll_s_derived + (1 - poll_confidence) * poll_s_baseline
         poll_interval = timedelta(seconds=round(poll_s))
 
         # ── Gap: 150 ms → 500 ms (floor is a hardware constraint, not configurable) ──
@@ -953,6 +1170,7 @@ class AdaptiveModbusController:
             in_transition=in_transition,
             slot_index=slot_idx,
             slot_failure_rate=raw_fr,
+            poll_confidence=poll_confidence,
         )
 
     # ── persistence ───────────────────────────────────────────────────────────

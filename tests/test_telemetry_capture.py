@@ -491,26 +491,45 @@ class TestTEL004RegistryReleaseOnUnload(unittest.TestCase):
     remove() existed but was never called in production -- every
     endpoint ever captured stayed referenced forever. BusDiagnostics had
     the identical gap, found while checking whether this was unique to
-    the new feature; it was not."""
+    the new feature; it was not.
+
+    v2.0.9 (Phase 4.8, this release -- old DEF-011, external ICS
+    quality/defect/architecture audit -- confirmed): remove() itself
+    became the NEXT bug in the same area -- unconditional, ignoring
+    whether another entry sharing the same physical endpoint still held
+    a reference. These tests updated to check for release_endpoint()
+    (the reference-counted pairing for switch.py's own acquire_
+    endpoint() call), not remove() directly -- the underlying guarantee
+    these tests check (something real happens on unload, guarded
+    against duplicate calls per endpoint) is unchanged, only the
+    specific method name."""
 
     def _init_source(self) -> str:
         return pathlib.Path(__file__).parent.parent.joinpath("__init__.py").read_text()
 
-    def test_telemetry_capture_remove_is_called_during_unload(self):
+    def test_telemetry_capture_release_is_called_during_unload(self):
         source = self._init_source()
-        self.assertIn("TelemetryCapture.remove(endpoint)", source)
+        self.assertIn("TelemetryCapture.release_endpoint(endpoint)", source)
 
-    def test_bus_diagnostics_remove_is_also_called_during_unload(self):
+    def test_bus_diagnostics_release_is_also_called_during_unload(self):
         """The same gap, found and fixed for the sibling registry too --
         not just the one the audit happened to name."""
         source = self._init_source()
-        self.assertIn("BusDiagnostics.remove(endpoint)", source)
+        self.assertIn("BusDiagnostics.release_endpoint(endpoint)", source)
 
     def test_removal_is_guarded_against_calling_it_more_than_once_per_endpoint(self):
         source = self._init_source()
-        idx = source.find("TelemetryCapture.remove(endpoint)")
+        idx = source.find("TelemetryCapture.release_endpoint(endpoint)")
         window = source[max(0, idx - 400): idx]
         self.assertIn("seen_endpoints", window)
+
+    def test_unconditional_remove_no_longer_used_in_init(self):
+        """Adversarial: confirms the OLD, unconditional remove() calls
+        are genuinely gone from __init__.py's unload path, not merely
+        that release_endpoint() was added alongside them."""
+        source = self._init_source()
+        self.assertNotIn("TelemetryCapture.remove(endpoint)", source)
+        self.assertNotIn("BusDiagnostics.remove(endpoint)", source)
 
 
 class TestTEL009SnapshotTimingWording(unittest.TestCase):

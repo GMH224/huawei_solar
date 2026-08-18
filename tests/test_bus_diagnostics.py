@@ -424,5 +424,199 @@ class TestWaitServiceSplit(unittest.TestCase):
         self.assertFalse(locked)
 
 
+class TestPhase21AttributionFields(unittest.IsolatedAsyncioTestCase):
+    """v2.0.9 (Phase 2.1/2.4, this release -- ICS-16, both external ICS
+    audits): chunk_index/chunk_count/retry_count/logical_request_id/
+    transition_reason -- the fields needed to attribute an extreme event
+    (e.g. a 102s/8-chunk batch) to a specific poll, chunk, and retry
+    sequence, previously entirely absent from every captured record."""
+
+    def setUp(self):
+        BD.BusDiagnostics.clear_registry()
+        self.dir = tempfile.mkdtemp()
+
+    async def test_new_fields_are_captured_and_serialised(self):
+        hass = _FakeHass(self.dir)
+        d = BD.BusDiagnostics(hass, "192.0.2.1:502")
+        d.enabled = True
+        d.record(
+            endpoint="e", label="main_coord", wait_ms=1.0, service_ms=2.0,
+            queue_depth=1, outcome="ok", registers=40, priority="normal",
+            chunk_index=3, chunk_count=8, retry_count=1,
+            logical_request_id=42, transition_reason="night→day",
+        )
+        seq, record = d._buffer[-1]
+        self.assertEqual(record["chunk_idx"], 3)
+        self.assertEqual(record["chunk_n"], 8)
+        self.assertEqual(record["retries"], 1)
+        self.assertEqual(record["req_id"], 42)
+        self.assertEqual(record["transition"], "night→day")
+
+    async def test_new_fields_default_to_none_for_callers_not_passing_them(self):
+        """Negative case: any caller not yet updated (there should be
+        none after this release, but this confirms the extension is
+        additive, not breaking) must not raise and must record None."""
+        hass = _FakeHass(self.dir)
+        d = BD.BusDiagnostics(hass, "192.0.2.1:502")
+        d.enabled = True
+        d.record(endpoint="e", label="c", wait_ms=1, service_ms=2,
+                 queue_depth=0, outcome="ok")  # old-style call, no new kwargs
+        seq, record = d._buffer[-1]
+        self.assertIsNone(record["chunk_idx"])
+        self.assertIsNone(record["req_id"])
+        self.assertIsNone(record["transition"])
+
+    async def test_adversarial_retries_of_same_chunk_share_one_logical_id(self):
+        """The core scenario this closes: multiple physical attempts
+        (BUSY retries) of the SAME chunk must share one logical_request_
+        id, distinguishing them from a different chunk's own attempts --
+        this is what lets a captured file group '3 rows, all belonging
+        to chunk 4 of poll 42' rather than 3 anonymous data points."""
+        hass = _FakeHass(self.dir)
+        d = BD.BusDiagnostics(hass, "192.0.2.1:502")
+        d.enabled = True
+        # Two retries then a success, all logically the same chunk attempt.
+        for retry in (0, 1, 2):
+            d.record(
+                endpoint="e", label="main_coord", wait_ms=1.0, service_ms=2.0,
+                queue_depth=1, outcome=("ok" if retry == 2 else "error"),
+                chunk_index=4, chunk_count=8, retry_count=retry,
+                logical_request_id=42,
+            )
+        ids = [rec["req_id"] for _, rec in list(d._buffer)[-3:]]
+        self.assertEqual(ids, [42, 42, 42])
+        retries = [rec["retries"] for _, rec in list(d._buffer)[-3:]]
+        self.assertEqual(retries, [0, 1, 2])
+
+
+class TestPhase48RefCountedEndpointLifecycle(unittest.TestCase):
+    """Phase 4.8, this release -- old DEF-011, external ICS quality/
+    defect/architecture audit: BusDiagnostics/TelemetryCapture's own
+    remove() was unconditional, ignoring reference count -- unlike
+    ModbusGuard's own established acquire_endpoint()/release_endpoint()
+    pair. One entry unloading could remove a still-in-use instance out
+    from under another entry sharing the same physical endpoint."""
+
+    def setUp(self):
+        BD.BusDiagnostics.clear_registry()
+        self.dir = tempfile.mkdtemp()
+
+    def test_acquire_creates_and_increments(self):
+        hass = _FakeHass(self.dir)
+        inst = BD.BusDiagnostics.acquire_endpoint(hass, "192.0.2.1:502")
+        self.assertIsNotNone(inst)
+        self.assertEqual(BD.BusDiagnostics._ref_counts["192.0.2.1:502"], 1)
+
+    def test_second_acquire_by_a_different_entry_increments_again(self):
+        hass = _FakeHass(self.dir)
+        first = BD.BusDiagnostics.acquire_endpoint(hass, "192.0.2.1:502")
+        second = BD.BusDiagnostics.acquire_endpoint(hass, "192.0.2.1:502")
+        self.assertIs(
+            first, second,
+            "the SAME instance must be returned -- one instance per "
+            "endpoint, shared across every entry using it",
+        )
+        self.assertEqual(BD.BusDiagnostics._ref_counts["192.0.2.1:502"], 2)
+
+    def test_adversarial_release_by_one_entry_does_not_remove_a_still_used_instance(self):
+        """The core scenario this closes: two entries share one
+        physical endpoint. Entry A unloads (releases); Entry B is still
+        loaded and must keep working -- its own BusDiagnostics instance
+        must NOT have been removed out from under it."""
+        hass = _FakeHass(self.dir)
+        inst = BD.BusDiagnostics.acquire_endpoint(hass, "192.0.2.1:502")
+        BD.BusDiagnostics.acquire_endpoint(hass, "192.0.2.1:502")  # Entry B also acquires
+
+        BD.BusDiagnostics.release_endpoint("192.0.2.1:502")  # Entry A unloads
+
+        self.assertIs(
+            BD.BusDiagnostics.get("192.0.2.1:502"), inst,
+            "the instance must still be registered -- Entry B's own "
+            "reference is still outstanding",
+        )
+        self.assertEqual(BD.BusDiagnostics._ref_counts["192.0.2.1:502"], 1)
+
+    def test_instance_removed_only_once_every_entry_has_released(self):
+        hass = _FakeHass(self.dir)
+        BD.BusDiagnostics.acquire_endpoint(hass, "192.0.2.1:502")
+        BD.BusDiagnostics.acquire_endpoint(hass, "192.0.2.1:502")
+
+        BD.BusDiagnostics.release_endpoint("192.0.2.1:502")
+        self.assertIsNotNone(BD.BusDiagnostics.get("192.0.2.1:502"))
+
+        BD.BusDiagnostics.release_endpoint("192.0.2.1:502")
+        self.assertIsNone(BD.BusDiagnostics.get("192.0.2.1:502"))
+        self.assertNotIn("192.0.2.1:502", BD.BusDiagnostics._ref_counts)
+
+    def test_release_with_no_matching_acquire_is_a_safe_noop(self):
+        """Matches ModbusGuard's own established reasoning: teardown
+        code that runs on best-effort/exception paths shouldn't need
+        its own separate bookkeeping to avoid an error here."""
+        BD.BusDiagnostics.release_endpoint("192.0.2.1:502")  # never acquired
+        self.assertIsNone(BD.BusDiagnostics.get("192.0.2.1:502"))
+
+    def test_deprecated_remove_still_works_but_is_unconditional(self):
+        """Negative case: remove() is kept for backward compatibility,
+        but confirmed to still have the OLD, unconditional behaviour --
+        it's documented as deprecated, not silently made safe."""
+        hass = _FakeHass(self.dir)
+        BD.BusDiagnostics.acquire_endpoint(hass, "192.0.2.1:502")
+        BD.BusDiagnostics.acquire_endpoint(hass, "192.0.2.1:502")
+        BD.BusDiagnostics.remove("192.0.2.1:502")
+        self.assertIsNone(
+            BD.BusDiagnostics.get("192.0.2.1:502"),
+            "remove() must still remove unconditionally, regardless of "
+            "ref count -- that's exactly why it's deprecated in favour "
+            "of release_endpoint()",
+        )
+
+    def test_get_or_create_does_not_affect_ref_count(self):
+        """Negative case: plain accessor usage (by coordinators, not
+        entry-level setup) must not itself bump the reference count --
+        only acquire_endpoint() does."""
+        hass = _FakeHass(self.dir)
+        BD.BusDiagnostics.get_or_create(hass, "192.0.2.1:502")
+        BD.BusDiagnostics.get_or_create(hass, "192.0.2.1:502")
+        self.assertNotIn("192.0.2.1:502", BD.BusDiagnostics._ref_counts)
+
+
+
+    """Confirms _RequestContext itself (modbus_guard.py) carries the new
+    fields through to BusDiagnostics.record(), not just that record()
+    accepts them in isolation."""
+
+    def test_request_context_new_fields_default_to_none(self):
+        async def _go():
+            g = MG.ModbusGuard("e")
+            async with g.request(label="test") as req:
+                self.assertIsNone(req.chunk_index)
+                self.assertIsNone(req.chunk_count)
+                self.assertIsNone(req.retry_count)
+                self.assertIsNone(req.logical_request_id)
+                self.assertIsNone(req.transition_reason)
+        asyncio.run(_go())
+
+    def test_request_context_fields_reach_the_diagnostics_sink(self):
+        async def _go():
+            g = MG.ModbusGuard("e")
+            sink = BD.BusDiagnostics(_FakeHass(tempfile.mkdtemp()), "e")
+            sink.enabled = True
+            g.diagnostics = sink
+            async with g.request(label="test") as req:
+                req.chunk_index = 2
+                req.chunk_count = 5
+                req.retry_count = 1
+                req.logical_request_id = 99
+                req.transition_reason = "0x06 SLAVE_DEVICE_BUSY"
+            seq, record = sink._buffer[-1]
+            self.assertEqual(record["chunk_idx"], 2)
+            self.assertEqual(record["chunk_n"], 5)
+            self.assertEqual(record["retries"], 1)
+            self.assertEqual(record["req_id"], 99)
+            self.assertEqual(record["transition"], "0x06 SLAVE_DEVICE_BUSY")
+        asyncio.run(_go())
+
+
 if __name__ == "__main__":
     unittest.main()
+

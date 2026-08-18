@@ -89,6 +89,114 @@ class TestClassify(unittest.TestCase):
         self.assertEqual(_classify("some_unknown_register_xyz"), RegisterTier.NORMAL)
 
 
+class TestUserRequestedTierReclassification(unittest.TestCase):  # v2.0.9
+    """User-requested register tier reclassification, this release.
+    Every entry verified directly against _classify() before being
+    added -- not applied blindly from the user's own category labels.
+    See register_cache.py's own comments at each override for the full
+    per-register reasoning."""
+
+    def test_day_active_power_peak_moved_to_slow(self):
+        """A daily peak-tracking statistic, not an instantaneous power
+        reading. Adversarial: my own first attempt at this fix put it
+        in the wrong list (_SLOW_SUBSTRINGS, checked after FAST) and it
+        silently stayed FAST -- this confirms the corrected placement
+        (_SLOW_PRIORITY_SUBSTRINGS, checked before FAST) actually works."""
+        self.assertEqual(_classify("day_active_power_peak"), RegisterTier.SLOW)
+
+    def test_grid_accumulated_reactive_power_moved_to_slow(self):
+        """A genuine repeat of BUG-3's own documented pattern: a
+        lifetime accumulator reaching FAST via a bare 'reactive_power'
+        substring match before ever reaching its own 'grid_accumulated'
+        SLOW substring."""
+        self.assertEqual(
+            _classify("grid_accumulated_reactive_power"), RegisterTier.SLOW,
+        )
+
+    def test_active_power_settings_moved_to_normal(self):
+        """Control-relevant SETTINGS (a mode enum, two derating
+        parameters), not continuously-varying power VALUES -- FAST's
+        freshness window buys nothing for these at real bus cost."""
+        for name in (
+            "active_power_control_mode",
+            "active_power_fixed_value_derating",
+            "active_power_percentage_derating",
+        ):
+            self.assertEqual(
+                _classify(name), RegisterTier.NORMAL,
+                f"{name} should be NORMAL, not FAST",
+            )
+
+    def test_used_energy_counters_moved_to_normal(self):
+        """Genuinely-used lifetime energy counters, each verified
+        against its real register_names constant before being added --
+        not assumed from the user's own category labels."""
+        for name in (
+            "total_pv_energy_yield", "accumulated_yield_energy",
+            "total_energy_consumption", "grid_accumulated_energy",
+            "inverter_total_energy_yield", "inverter_total_absorbed_energy",
+        ):
+            self.assertEqual(
+                _classify(name), RegisterTier.NORMAL,
+                f"{name} should be NORMAL, not SLOW",
+            )
+
+    def test_dashboard_backing_registers_are_unaffected_and_stay_fast(self):
+        """Negative case: the actual real-time power registers backing
+        a live power-flow dashboard (PV input, grid meter, battery
+        charge/discharge) must be completely untouched by this batch of
+        changes."""
+        for name in (
+            "input_power", "power_meter_active_power",
+            "storage_charge_discharge_power",
+        ):
+            self.assertEqual(
+                _classify(name), RegisterTier.FAST,
+                f"{name} must remain FAST -- it backs a live dashboard value",
+            )
+
+    def test_site_wide_totals_are_not_accumulators_and_stay_fast(self):
+        """Negative case confirming a deliberately-NOT-made change:
+        sdongle_total_active/input/battery_power look superficially
+        similar to the accumulator-mislabelled registers fixed above
+        (same 'total_' + power-substring shape), but 'total' here means
+        spatial aggregation (site-wide sum right now), not temporal
+        accumulation -- verified against real register_names before
+        concluding these were correctly classified already, not changed."""
+        for name in (
+            "sdongle_total_active_power", "sdongle_total_input_power",
+            "sdongle_total_battery_power",
+        ):
+            self.assertEqual(
+                _classify(name), RegisterTier.FAST,
+                f"{name} is a real-time site-wide sum, not an accumulator "
+                f"-- must remain FAST",
+            )
+
+    def test_already_correct_registers_are_unaffected(self):
+        """Negative case: grid_exported_energy (already NORMAL, by not
+        matching any SLOW substring at all) and the battery total_
+        charge/discharge overrides (already NORMAL from a prior
+        release) must be completely unaffected by this batch."""
+        self.assertEqual(_classify("grid_exported_energy"), RegisterTier.NORMAL)
+        self.assertEqual(_classify("storage_total_charge"), RegisterTier.NORMAL)
+        self.assertEqual(_classify("storage_total_discharge"), RegisterTier.NORMAL)
+
+    def test_bug3_original_fix_still_holds(self):
+        """Adversarial: confirms this batch of additions to
+        _SLOW_PRIORITY_SUBSTRINGS didn't accidentally break the
+        original BUG-3 fix it shares a list with."""
+        for name in (
+            "phase_a_active_power", "phase_b_active_power",
+            "phase_c_active_power", "active_power_built_in",
+            "active_power_external",
+        ):
+            self.assertEqual(
+                _classify(name), RegisterTier.SLOW,
+                f"{name}: BUG-3's original fix regressed",
+            )
+
+
 class TestDEF015PackCounterTierCoverage(unittest.TestCase):  # v2.0.8
     """DEF-015 (external ICS quality/defect/architecture audit --
     confirmed): _TIER_OVERRIDES only had NORMAL entries for unit 1's

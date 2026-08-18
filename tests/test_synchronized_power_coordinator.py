@@ -382,6 +382,11 @@ def _make_coordinator(inv1=None, inv2=None, has_meter=True, has_battery=True):
     coord._inv2_cache = None
     coord._meter_cache = None
     coord._battery_cache = None
+    # v2.0.9 (Phase 3.1, this release): same __new__-bypasses-__init__
+    # gap as every fixture above -- matching the real constructor's own
+    # default (dedicated reads ON, preserving existing behaviour).
+    coord._dedicated_reads_enabled = True
+    coord.cache_only_snapshots = 0
     return coord
 
 
@@ -1010,3 +1015,91 @@ class TestF05TemporallyUncertainAggregateTracking:
         assert result is not None, "test setup check: shortcut must hit for this test to be meaningful"
         assert coord.temporally_uncertain_count == 0
         assert coord.results_with_span_computed == 0
+
+
+class TestPhase31CacheOnlyMode:
+    """v2.0.9 (Phase 3.1, this release -- ICS-11, both external ICS
+    audits): SynchronizedPowerCoordinator's dedicated reads made
+    optional. Confirmed against two independent full-day field
+    telemetry captures that temporal alignment is achieved essentially
+    never in practice (96.5%-97.09% temporally uncertain), and that
+    hourly/daily energy accuracy already comes entirely from accumulated
+    device counters, independent of this coordinator."""
+
+    def test_dedicated_reads_disabled_never_calls_the_dedicated_path(self):
+        """The core guarantee: when disabled, _async_update_data() must
+        return via _cache_only_snapshot() and never reach the dedicated-
+        read fallback below it -- confirmed by making the dedicated path
+        raise if it's ever reached."""
+        coord = _make_coordinator(has_meter=False, has_battery=False)
+        coord._dedicated_reads_enabled = False
+        cache = _FakeCache()
+        cache.set(rn.INPUT_POWER, quality=_Q.GOOD, age=1.0, value=3000)
+        coord._inv1_cache = cache
+
+        async def _boom(*a, **kw):
+            raise AssertionError(
+                "dedicated read path must never be reached in cache-only mode"
+            )
+        coord._read_one = _boom  # type: ignore[assignment]
+
+        result = asyncio.run(coord._async_update_data())
+        assert result.inv1_pv_power == 3000
+        assert result.is_temporally_uncertain is True
+        assert coord.cache_only_snapshots == 1
+
+    def test_one_stale_value_does_not_blank_the_others(self):
+        """Adversarial: unlike the strict shortcut (all-or-nothing),
+        cache-only mode must serve each value independently -- one BAD
+        register must not blank out the other three."""
+        coord = _make_coordinator(has_meter=True, has_battery=False)
+        coord._dedicated_reads_enabled = False
+        inv1_cache = _FakeCache()
+        inv1_cache.set(rn.INPUT_POWER, quality=_Q.GOOD, age=1.0, value=3000)
+        meter_cache = _FakeCache()
+        # meter register never set -> quality_of() returns "bad"/None age
+        coord._inv1_cache = inv1_cache
+        coord._meter_cache = meter_cache
+
+        result = asyncio.run(coord._async_update_data())
+        assert result.inv1_pv_power == 3000, "good value must still be served"
+        assert result.grid_power is None, "bad value must be None, not crash"
+
+    def test_uncertain_quality_is_accepted_not_just_good(self):
+        """Cache-only mode's whole premise is best-effort staleness
+        tolerance -- UNCERTAIN (a real value that can't currently be
+        verified fresh) must still be served, unlike the strict shortcut
+        which specifically rejects UNCERTAIN."""
+        coord = _make_coordinator(has_meter=False, has_battery=False)
+        coord._dedicated_reads_enabled = False
+        cache = _FakeCache()
+        cache.set(rn.INPUT_POWER, quality=_Q.UNCERTAIN, age=45.0, value=2500)
+        coord._inv1_cache = cache
+
+        result = asyncio.run(coord._async_update_data())
+        assert result.inv1_pv_power == 2500
+
+    def test_dedicated_reads_enabled_by_default_preserves_existing_behaviour(self):
+        """Negative case: the default (True) must behave exactly as
+        before this release -- confirms the new option doesn't change
+        anything for an installation that never touches it."""
+        coord = _make_coordinator(has_meter=False, has_battery=False)
+        assert coord._dedicated_reads_enabled is True
+        cache = _FakeCache()
+        cache.set(rn.INPUT_POWER, quality=_Q.GOOD, age=1.0, value=3000)
+        coord._inv1_cache = cache
+        result = asyncio.run(coord._async_update_data())
+        # Went through the STRICT shortcut, not cache-only -- confirmed by
+        # is_temporally_uncertain being correctly False (aligned, single
+        # value) rather than cache-only's unconditional True.
+        assert result.is_temporally_uncertain is False
+        assert coord.cache_only_snapshots == 0
+        assert coord.shortcut_hits == 1
+
+    def test_snapshot_exposes_the_new_fields(self):
+        coord = _make_coordinator(has_meter=False, has_battery=False)
+        coord._dedicated_reads_enabled = False
+        coord.cache_only_snapshots = 3
+        snap = coord.snapshot()
+        assert snap["dedicated_reads_enabled"] is False
+        assert snap["cache_only_snapshots"] == 3

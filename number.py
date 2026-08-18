@@ -614,11 +614,18 @@ class HuaweiSolarNumberEntity(
             # read against stale lifecycle state. Now entry-scoped via the
             # coordinator's own create_background_task(), the same pattern
             # already used for the deferred first-poll task.
-            self.coordinator.create_background_task(
-                self.coordinator.verify_write(
-                    self.entity_description.register_name, float(value)
-                ),
-                f"{self.coordinator.name}_verify_write_{self.entity_description.register_name}",
+            #
+            # v2.0.9 FIX (Phase 4.7, this release -- old DEF-010, external
+            # ICS quality/defect/architecture audit -- confirmed): now
+            # routed through schedule_verify_write() instead of create_
+            # background_task() directly -- a rapid second write to this
+            # SAME register (e.g. dragging this slider) cancels the
+            # PREVIOUS write's own still-running verification, which
+            # would otherwise complete a real Modbus read to verify a
+            # value this new write has already superseded. See schedule_
+            # verify_write()'s own docstring for the full reasoning.
+            self.coordinator.schedule_verify_write(
+                self.entity_description.register_name, float(value)
             )
 
         await self.coordinator.async_request_refresh()

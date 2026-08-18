@@ -291,9 +291,14 @@ class HuaweiSolarSelectEntity(
         # v2.0.0b (MOD-10, external ICS audit -- confirmed): entry-scoped
         # via the coordinator, not a bare self.hass.async_create_task() --
         # see number.py's own note on this same pattern.
-        self.coordinator.create_background_task(
-            self.coordinator.verify_write(self.entity_description.register_name, expected),
-            f"{self.coordinator.name}_verify_write_{self.entity_description.register_name}",
+        #
+        # v2.0.9 FIX (Phase 4.7, this release -- old DEF-010, external
+        # ICS quality/defect/architecture audit -- confirmed): routed
+        # through schedule_verify_write() -- see its own docstring in
+        # update_coordinator.py, and number.py's own note on this same
+        # fix.
+        self.coordinator.schedule_verify_write(
+            self.entity_description.register_name, expected
         )
 
         await self.coordinator.async_request_refresh()
@@ -400,9 +405,10 @@ class StorageModeSelectEntity(
         # own note on this same pattern for the full reasoning.
         # v2.0.0b (MOD-10): entry-scoped via the coordinator now, not a bare
         # self.hass.async_create_task().
-        self.coordinator.create_background_task(
-            self.coordinator.verify_write(rn.STORAGE_WORKING_MODE_SETTINGS, expected),
-            f"{self.coordinator.name}_verify_write_{rn.STORAGE_WORKING_MODE_SETTINGS}",
+        # v2.0.9 FIX (Phase 4.7, this release -- old DEF-010): routed
+        # through schedule_verify_write() -- see its own docstring.
+        self.coordinator.schedule_verify_write(
+            rn.STORAGE_WORKING_MODE_SETTINGS, expected
         )
 
         await self.coordinator.async_request_refresh()

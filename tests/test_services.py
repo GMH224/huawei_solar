@@ -324,3 +324,104 @@ class TestWriteTimeoutAndSequenceAtomicity:
             "bound, guard-serialised write sequence -- see its own "
             "MOD-06 fix"
         )
+
+
+class TestDEF004ServiceDispatchIsTargetResolved:
+    """DEF-004 (external ICS quality/defect/architecture audit --
+    confirmed High): reset_maximum_feed_grid_power/set_zero_power_grid_
+    connection/set_maximum_feed_grid_power/set_maximum_feed_grid_power_
+    percentage used to be bound via functools.partial() to a FIXED
+    device-kind ("emma" vs "inverter") resolved from whichever entry
+    happened to register services LAST -- multiple entries with
+    different device kinds coexisting meant dispatch depended on
+    registration order, not on the actual target device named in each
+    service call."""
+
+    @staticmethod
+    def _source() -> str:
+        return _SERVICES_SRC.read_text()
+
+    def test_resolver_function_exists(self):
+        assert "def _resolve_power_control_device(" in self._source()
+
+    def test_resolver_determines_kind_from_the_device_itself(self):
+        source = self._source()
+        idx = source.find("def _resolve_power_control_device(")
+        assert idx > -1
+        end = source.find("\nasync def ", idx)
+        body = source[idx: end if end > -1 else idx + 2000]
+        assert "isinstance(dd.device, EMMADevice)" in body
+        assert "isinstance(dd.device, SUN2000Device)" in body
+        assert "_get_device_data(service_call)" in body, (
+            "must resolve the device generically, once, not via a "
+            "pre-supplied assumption of its kind"
+        )
+
+    def test_handlers_no_longer_take_manager_type_as_a_parameter(self):
+        """The actual fix: each handler's own signature must have
+        dropped manager_type entirely -- it's resolved internally now,
+        not supplied by the caller via functools.partial()."""
+        source = self._source()
+        for name in (
+            "reset_maximum_feed_grid_power", "set_zero_power_grid_connection",
+            "set_maximum_feed_grid_power", "set_maximum_feed_grid_power_percentage",
+        ):
+            idx = source.find(f"async def {name}(")
+            assert idx > -1, name
+            sig_end = source.find(") -> None:", idx)
+            signature = source[idx: sig_end]
+            assert "manager_type" not in signature, (
+                f"{name}'s signature still takes manager_type -- the "
+                f"whole point of this fix is that it no longer needs to"
+            )
+            assert "_resolve_power_control_device(service_call)" in source[idx: idx + 400], (
+                f"{name} does not call the new resolver"
+            )
+
+    def test_functools_partial_no_longer_used_for_these_four_services(self):
+        """Adversarial: confirms the old binding mechanism is genuinely
+        gone from the registration site, not just supplemented."""
+        source = self._source()
+        reg_idx = source.find("async def async_setup_services(")
+        assert reg_idx > -1
+        end = source.find("\nasync def async_unload_services(", reg_idx)
+        body = source[reg_idx: end if end > -1 else reg_idx + 6000]
+        assert "partial(reset_maximum_feed_grid_power" not in body
+        assert "partial(set_zero_power_grid_connection" not in body
+        assert "partial(set_maximum_feed_grid_power" not in body
+
+    def test_each_of_the_four_services_registered_exactly_once(self):
+        """Adversarial: confirms these four are registered ONCE each in
+        async_setup_services(), not twice (once per has_emma branch) --
+        the actual structural change that makes dispatch order-
+        independent."""
+        source = self._source()
+        reg_idx = source.find("async def async_setup_services(")
+        assert reg_idx > -1
+        end = source.find("\nasync def async_unload_services(", reg_idx)
+        body = source[reg_idx: end if end > -1 else reg_idx + 6000]
+        for const_name in (
+            "SERVICE_RESET_MAXIMUM_FEED_GRID_POWER",
+            "SERVICE_SET_ZERO_POWER_GRID_CONNECTION",
+            "SERVICE_SET_MAXIMUM_FEED_GRID_POWER",
+            "SERVICE_SET_MAXIMUM_FEED_GRID_POWER_PERCENT",
+        ):
+            count = body.count(f"\n        {const_name},\n")
+            assert count == 1, (
+                f"{const_name} is registered {count} times in "
+                f"async_setup_services() -- expected exactly 1 "
+                f"(order-independent dispatch), not one per has_emma branch"
+            )
+
+    def test_di_active_power_scheduling_untouched_inverter_only_service(self):
+        """Negative case: set_di_active_power_scheduling has no EMMA
+        equivalent at all -- it must be untouched by this fix, still
+        gated on `if not has_emma`, still using get_inverter_data()
+        directly (no ambiguity to resolve for a genuinely single-kind
+        service)."""
+        source = self._source()
+        idx = source.find("async def set_di_active_power_scheduling(")
+        assert idx > -1
+        body = source[idx: idx + 500]
+        assert "get_inverter_data(service_call)" in body
+        assert "_resolve_power_control_device" not in body

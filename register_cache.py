@@ -315,6 +315,30 @@ _SLOW_PRIORITY_SUBSTRINGS: tuple[str, ...] = (
     "active_power_external",
     "reactive_power_built_in",
     "reactive_power_external",
+    # v2.0.9 (user request, this release -- verified against real
+    # source before adding): a genuine repeat of this exact class of
+    # bug (BUG-3's own documented pattern) on a register that was
+    # missed when BUG-3 was originally fixed. "grid_accumulated_
+    # reactive_power" is a lifetime accumulator (matches the SLOW
+    # "grid_accumulated" substring), but was reaching FAST first via
+    # the plain "reactive_power" substring, since it doesn't match any
+    # of the narrower slow-priority patterns above and this check runs
+    # before the SLOW substring pass ever gets a chance. Confirmed via
+    # direct _classify() call before this fix: returned FAST.
+    "grid_accumulated_reactive_power",
+    # v2.0.9 (user request, this release -- verified against real
+    # register names before adding, and corrected once already: my own
+    # first attempt put this in _SLOW_SUBSTRINGS, which is checked
+    # AFTER _FAST_SUBSTRINGS -- since "day_active_power_peak" ALSO
+    # contains "active_power" (a FAST substring), the FAST check
+    # matched first and this override never took effect, confirmed by
+    # direct _classify() call still returning FAST. This is exactly
+    # BUG-3's own documented pattern, and belongs in THIS list for the
+    # same reason grid_accumulated_reactive_power above does: a
+    # slowly-changing daily peak-tracking statistic, not an
+    # instantaneous power reading, despite its own name containing
+    # "active_power".
+    "day_active_power_peak",
 )
 
 
@@ -380,6 +404,42 @@ _TIER_OVERRIDES: dict[str, "RegisterTier"] = {
         for pack in (1, 2, 3)
         for suffix in ("total_charge", "total_discharge")
     },
+    # v2.0.9 (user request, this release -- verified against real
+    # source/register names before adding, not applied blindly):
+    #
+    # FAST -> NORMAL: these three are control-relevant SETTINGS (a mode
+    # enum, two derating parameters), not continuously-varying
+    # instantaneous power readings -- they only change when explicitly
+    # reconfigured, so FAST's 3s-base/60s-cap freshness window buys
+    # nothing a 30s-base NORMAL window wouldn't already give, at real
+    # bus cost. Confirmed via direct _classify() call before this fix:
+    # all three returned FAST, via the generic "active_power" substring
+    # match, despite none of them being a power VALUE at all.
+    "active_power_control_mode": RegisterTier.NORMAL,
+    "active_power_fixed_value_derating": RegisterTier.NORMAL,
+    "active_power_percentage_derating": RegisterTier.NORMAL,
+    # SLOW -> NORMAL: genuinely used, lifetime-accumulator energy
+    # counters -- confirmed each one's real register name against
+    # huawei_solar.register_names before adding (not assumed from the
+    # user's own category labels). Matches the exact reasoning already
+    # established above for storage_total_charge/discharge: SLOW's 5min
+    # TTL (up to 15min adaptive cap) introduces real staleness for
+    # values used in hourly energy-accuracy calculations, while NORMAL's
+    # 30s base (5min adaptive cap) is a meaningfully closer match to how
+    # often these are actually consulted, at low marginal bus cost
+    # (these are typically PDU-adjacent to other already-read
+    # registers, same reasoning as the existing battery overrides).
+    # grid_exported_energy and storage_total_charge/discharge are
+    # deliberately NOT repeated here -- already NORMAL (the former by
+    # not matching any SLOW substring at all, the latter via the
+    # existing override above) -- and no "grid imported energy" exact
+    # equivalent exists in this device's register set to add.
+    "total_pv_energy_yield": RegisterTier.NORMAL,
+    "accumulated_yield_energy": RegisterTier.NORMAL,
+    "total_energy_consumption": RegisterTier.NORMAL,
+    "grid_accumulated_energy": RegisterTier.NORMAL,
+    "inverter_total_energy_yield": RegisterTier.NORMAL,
+    "inverter_total_absorbed_energy": RegisterTier.NORMAL,
 }
 
 

@@ -17,6 +17,7 @@ import math
 import pathlib
 import sys
 import unittest
+import asyncio
 
 _SRC = pathlib.Path(__file__).parent.parent / "update_coordinator.py"
 _SOURCE = _SRC.read_text()
@@ -313,6 +314,211 @@ class TestMOD01TransactionLevelCongestionAccounting(unittest.TestCase):
             f"inside _execute_batch (the else branch), found {occurrences} "
             "-- if 2, the old unconditional call was left in place "
             "alongside the new branches instead of being replaced",
+        )
+
+
+# ── Energy counter stale-cache exclusion ──────────────────────────────────────
+
+class TestPhase47WriteVerificationCoalescing(unittest.TestCase):
+    """Phase 4.7, this release -- old DEF-010, external ICS quality/
+    defect/architecture audit: rapid repeated writes to the SAME
+    register used to leave every earlier write's own verify_write()
+    task running to completion, wasting a real Modbus read verifying a
+    value a newer write had already superseded.
+
+    Source-level structural checks, matching this test file's own
+    established convention throughout (no test in this file
+    instantiates the real HuaweiSolarUpdateCoordinator -- the coalescing
+    LOGIC itself is exercised directly against real source text here;
+    entity-level wiring is covered separately in test_entities.py)."""
+
+    def _method_body(self, name: str) -> str:
+        idx = _SOURCE.find(f"def {name}(")
+        assert idx > -1, f"{name} not found in update_coordinator.py"
+        end_candidates = [
+            p for p in (
+                _SOURCE.find("\n    def ", idx + 10),
+                _SOURCE.find("\n    async def ", idx + 10),
+                _SOURCE.find("\n    @staticmethod", idx + 10),
+            ) if p > idx
+        ]
+        end = min(end_candidates) if end_candidates else idx + 3000
+        return _SOURCE[idx:end]
+
+    def test_verify_write_tasks_dict_initialized_in_init(self):
+        idx = _SOURCE.find("class HuaweiSolarUpdateCoordinator(")
+        assert idx > -1
+        init_idx = _SOURCE.find("def __init__(", idx)
+        end_idx = _SOURCE.find("\n    def ", init_idx + 10)
+        body = _SOURCE[init_idx:end_idx]
+        self.assertIn(
+            "self._verify_write_tasks: dict[RegisterName, asyncio.Task] = {}",
+            body,
+        )
+
+    def test_schedule_verify_write_method_exists(self):
+        self.assertIn("def schedule_verify_write(", _SOURCE)
+
+    def test_previous_task_is_cancelled_before_a_new_one_starts(self):
+        body = self._method_body("schedule_verify_write")
+        previous_idx = body.find("previous = self._verify_write_tasks.get(name)")
+        cancel_idx = body.find("previous.cancel()")
+        coro_idx = body.find("coro = self.verify_write(name, expected_value)")
+        assert previous_idx > -1, "previous task not looked up"
+        assert cancel_idx > -1, "previous task never cancelled"
+        assert coro_idx > -1, "new verify_write coroutine not created"
+        self.assertLess(
+            previous_idx, cancel_idx,
+            "must look up the previous task before cancelling it",
+        )
+        self.assertLess(
+            cancel_idx, coro_idx,
+            "the previous task must be cancelled BEFORE the new "
+            "verification coroutine is even created, not after",
+        )
+
+    def test_cancel_is_gated_on_not_done(self):
+        """Adversarial: cancelling an already-finished task is harmless
+        but pointless -- confirms the done-check actually gates the
+        cancel call, rather than unconditionally calling .cancel() on
+        whatever was previously in the dict (including None)."""
+        body = self._method_body("schedule_verify_write")
+        idx = body.find("if previous is not None and not previous.done():")
+        assert idx > -1, (
+            "previous.cancel() must be gated on 'previous is not None "
+            "and not previous.done()', not called unconditionally"
+        )
+        cancel_idx = body.find("previous.cancel()", idx)
+        self.assertGreater(cancel_idx, idx)
+        self.assertLess(cancel_idx - idx, 100)
+
+    def test_new_task_is_tracked_in_the_dict(self):
+        body = self._method_body("schedule_verify_write")
+        self.assertIn("self._verify_write_tasks[name] = task", body)
+
+    def test_done_callback_cleans_up_the_tracking_dict(self):
+        """Adversarial: without cleanup, _verify_write_tasks would leak
+        one entry per register ever written to, for the coordinator's
+        entire lifetime."""
+        body = self._method_body("schedule_verify_write")
+        self.assertIn("task.add_done_callback(", body)
+        self.assertIn("self._verify_write_tasks.pop(n, None)", body)
+
+    def test_done_callback_checks_identity_before_popping(self):
+        """Adversarial: the done-callback for an OLD (cancelled) task
+        must not blindly pop whatever is currently in the dict -- if a
+        NEWER task has since replaced it, popping unconditionally would
+        incorrectly clear the current task's own tracking entry too.
+        Must check 'is this callback's own task still the one tracked'
+        before popping."""
+        body = self._method_body("schedule_verify_write")
+        idx = body.find("self._verify_write_tasks.pop(n, None)")
+        assert idx > -1
+        window = body[max(0, idx - 200): idx + 150]
+        self.assertIn(
+            "self._verify_write_tasks.get(n) is t", window,
+            "the done-callback must check identity (is t still the "
+            "tracked task for n) before popping -- otherwise a stale "
+            "callback could clobber a newer task's own entry",
+        )
+
+    def test_reuses_the_return_value_of_create_background_task_api(self):
+        """Confirms the simplification: this method calls entry.
+        async_create_background_task() directly and uses its OWN
+        return value as the trackable Task handle, rather than
+        creating a second, separate Task just to get something
+        cancellable (which was an earlier, overcomplicated draft of
+        this same fix, corrected before landing)."""
+        body = self._method_body("schedule_verify_write")
+        self.assertIn("task = create_task(self.hass, coro, task_name)", body)
+        self.assertNotIn("_await_and_forget", body)
+
+    def test_all_three_call_sites_use_schedule_verify_write(self):
+        """Confirms number.py/select.py (x2)/switch.py (x2) were
+        actually updated to call the new coalescing method, not just
+        that the method exists unused."""
+        for path_name, expected_calls in (
+            ("number.py", 1),
+            ("select.py", 2),
+            ("switch.py", 2),
+        ):
+            path = _SRC.parent / path_name
+            source = path.read_text()
+            # v2.0.9: counts only real call sites (with the coordinator
+            # prefix), not incidental mentions in comments -- e.g.
+            # number.py's own explanatory comment text also contains the
+            # literal string "schedule_verify_write(".
+            count = source.count("self.coordinator.schedule_verify_write(")
+            self.assertEqual(
+                count, expected_calls,
+                f"{path_name}: expected {expected_calls} real call site(s) "
+                f"to self.coordinator.schedule_verify_write(), found {count}",
+            )
+            self.assertNotIn(
+                "create_background_task(\n                self.coordinator.verify_write(",
+                source,
+                f"{path_name}: still uses the old create_background_task("
+                f"verify_write(...)) pattern directly, not yet migrated",
+            )
+
+
+class TestPhase21LogicalRequestIdWiring(unittest.TestCase):
+    """v2.0.9 (Phase 2.1/2.4, this release -- ICS-16, both external ICS
+    audits): confirms _execute_batch() actually generates and threads a
+    logical_request_id through every chunk/retry of one poll, and that
+    the counter is per-coordinator-instance (self._next_logical_request_id
+    in __init__), not a module-level global that would collide across
+    multiple inverters sharing one process."""
+
+
+
+
+    """v2.0.9 (Phase 2.1/2.4, this release -- ICS-16, both external ICS
+    audits): confirms _execute_batch() actually generates and threads a
+    logical_request_id through every chunk/retry of one poll, and that
+    the counter is per-coordinator-instance (self._next_logical_request_id
+    in __init__), not a module-level global that would collide across
+    multiple inverters sharing one process."""
+
+    def test_counter_initialized_in_init(self):
+        idx = _SOURCE.find("class HuaweiSolarUpdateCoordinator(")
+        assert idx > -1
+        init_idx = _SOURCE.find("def __init__(", idx)
+        end_idx = _SOURCE.find("\n    def ", init_idx + 10)
+        body = _SOURCE[init_idx:end_idx]
+        self.assertIn("self._next_logical_request_id: int = 0", body)
+
+    def test_id_generated_once_per_execute_batch_call(self):
+        idx = _SOURCE.find("async def _execute_batch(")
+        assert idx > -1
+        chunk_loop_idx = _SOURCE.find("for chunk_idx, chunk in enumerate(chunks):", idx)
+        gen_idx = _SOURCE.find("self._next_logical_request_id += 1", idx)
+        self.assertGreater(gen_idx, -1, "logical_request_id generation not found")
+        self.assertLess(
+            gen_idx, chunk_loop_idx,
+            "the ID must be generated ONCE, before the chunk loop starts -- "
+            "not per chunk, or every chunk would get its own ID and "
+            "sharing one across a poll would be impossible",
+        )
+
+    def test_same_id_variable_used_for_every_chunk(self):
+        idx = _SOURCE.find("async def _execute_batch(")
+        assert idx > -1
+        end_candidates = [
+            p for p in (
+                _SOURCE.find("\n    async def ", idx + 10),
+            ) if p > idx
+        ]
+        end = min(end_candidates) if end_candidates else idx + 8000
+        body = _SOURCE[idx:end]
+        # The same local variable, not re-derived per chunk/retry.
+        self.assertIn("_req.logical_request_id = logical_request_id", body)
+        self.assertEqual(
+            body.count("logical_request_id = self._next_logical_request_id"), 1,
+            "logical_request_id must be assigned from the counter EXACTLY "
+            "once, outside the retry/chunk loops -- reassigning it inside "
+            "either loop would defeat the whole point of sharing one ID "
+            "across a poll's chunks/retries",
         )
 
 
@@ -1057,3 +1263,54 @@ class TestBackoffJitterFloor(unittest.TestCase):
         ).group(1))
         self.assertGreater(value, 1.0, "must be wider than the old effective ±1s at base delay")
         self.assertLess(value, 10.0, "must not itself approach the base delay")
+
+
+# ── v2.0.9 (Phase 1.2): BUSY retry telemetry wiring, ICS-15 (both audits) ────
+
+class TestPhase1BusyRetryWiring(unittest.TestCase):
+    """0x06 SLAVE_DEVICE_BUSY retry logic has existed since v1.0.6 with no
+    dedicated telemetry -- confirms record_busy_retry() is actually wired
+    into the live retry branch of _execute_batch(), not just defined and
+    left unused."""
+
+    @staticmethod
+    def _execute_batch_body() -> str:
+        start = _SOURCE.find("async def _execute_batch(")
+        assert start != -1
+        end_candidates = [
+            p for p in (
+                _SOURCE.find("\n    def ", start + 1),
+                _SOURCE.find("\n    async def ", start + 1),
+            ) if p > start
+        ]
+        end = min(end_candidates) if end_candidates else len(_SOURCE)
+        return _SOURCE[start:end]
+
+    def test_record_busy_retry_is_called_in_the_busy_branch(self):
+        body = self._execute_batch_body()
+        busy_idx = body.find("busy_retries += 1")
+        record_idx = body.find("self.telemetry.record_busy_retry()")
+        continue_idx = body.find("continue  # retry this chunk")
+        self.assertGreater(busy_idx, -1, "test setup invalid -- BUSY branch not found")
+        self.assertGreater(
+            record_idx, -1,
+            "record_busy_retry() is not called anywhere in _execute_batch",
+        )
+        self.assertGreater(
+            record_idx, busy_idx,
+            "record_busy_retry() must be called within the BUSY branch, "
+            "after busy_retries is incremented",
+        )
+        self.assertLess(
+            record_idx, continue_idx,
+            "record_busy_retry() must be called before the retry "
+            "continues, not after -- confirms it's on the live path, not "
+            "dead code after a loop exit",
+        )
+
+    def test_record_busy_retry_called_exactly_once_per_busy_event(self):
+        """Adversarial: must appear exactly once in the BUSY branch -- not
+        zero (missing), not duplicated (double-counting a single BUSY
+        event)."""
+        body = self._execute_batch_body()
+        self.assertEqual(body.count("self.telemetry.record_busy_retry()"), 1)

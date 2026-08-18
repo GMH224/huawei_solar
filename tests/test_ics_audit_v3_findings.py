@@ -181,6 +181,277 @@ class TestF01ConfigFlowRoutesThroughGuard(unittest.TestCase):
             assert "ModbusGuard.acquire_endpoint(" in body, f"{name} does not acquire"
             assert "ModbusGuard.release_endpoint(" in body, f"{name} does not release"
 
+
+class TestDEF005SkippedSubDeviceIsSurfaced(unittest.TestCase):
+    """DEF-005 (external ICS quality/defect/architecture audit --
+    confirmed High): a sub-device discovered during the scan step but
+    then failing to connect during finish_network_setup was previously
+    only logged -- never surfaced to the user, never reflected in the
+    returned info. The confirm_setup screen would silently show fewer
+    slave IDs than were actually discovered."""
+
+    @staticmethod
+    def _source() -> str:
+        return _CONFIG_FLOW_SRC.read_text()
+
+    def test_skipped_sub_unit_ids_tracked_not_just_logged(self):
+        source = self._source()
+        idx = source.find("async def _connect_to_discovered_devices(")
+        assert idx > -1
+        end = source.find("\nasync def validate_network_setup(", idx)
+        body = source[idx: end if end > -1 else idx + 4000]
+        assert "skipped_sub_unit_ids: list[int] = []" in body
+        assert "skipped_sub_unit_ids.append(sub_unit_id)" in body, (
+            "the except block must record the skipped id, not just log it"
+        )
+
+    def test_skipped_ids_included_in_returned_dict(self):
+        source = self._source()
+        idx = source.find("async def _connect_to_discovered_devices(")
+        assert idx > -1
+        end = source.find("\nasync def validate_network_setup(", idx)
+        body = source[idx: end if end > -1 else idx + 4000]
+        assert '"skipped_slave_ids": skipped_sub_unit_ids' in body
+
+    def test_caller_pops_skipped_slave_ids(self):
+        source = self._source()
+        assert 'self._skipped_slave_ids = info.pop("skipped_slave_ids", [])' in source
+
+    def test_confirm_setup_computes_a_visible_notice_when_something_was_skipped(self):
+        source = self._source()
+        idx = source.find("async def async_step_confirm_setup(")
+        assert idx > -1
+        end = source.find("\n    async def ", idx + 10)
+        body = source[idx: end if end > -1 else idx + 2500]
+        assert "skipped_notice" in body
+        assert "if self._skipped_slave_ids:" in body
+
+    def test_confirm_setup_notice_defaults_to_empty_not_always_shown(self):
+        """Negative case: the notice must default to an empty string
+        (rendering as nothing) when nothing was skipped -- this must be
+        a no-op for the common, successful case, not always-visible
+        boilerplate."""
+        source = self._source()
+        idx = source.find("async def async_step_confirm_setup(")
+        assert idx > -1
+        end = source.find("\n    async def ", idx + 10)
+        body = source[idx: end if end > -1 else idx + 2500]
+        empty_idx = body.find('skipped_notice = ""')
+        if_idx = body.find("if self._skipped_slave_ids:")
+        assert empty_idx > -1, "skipped_notice must default to empty string"
+        assert empty_idx < if_idx, (
+            "the empty default must be set BEFORE the conditional override"
+        )
+
+    def test_translation_string_references_the_new_placeholder(self):
+        strings_path = _CONFIG_FLOW_SRC.parent / "strings.json"
+        en_path = _CONFIG_FLOW_SRC.parent / "translations" / "en.json"
+        for path in (strings_path, en_path):
+            assert path.exists(), path
+            content = path.read_text()
+            assert "{skipped_notice}" in content, (
+                f"{path.name}: confirm_setup's description does not "
+                f"reference the new skipped_notice placeholder"
+            )
+
+    def test_json_files_are_still_valid_json(self):
+        import json
+        strings_path = _CONFIG_FLOW_SRC.parent / "strings.json"
+        en_path = _CONFIG_FLOW_SRC.parent / "translations" / "en.json"
+        for path in (strings_path, en_path):
+            json.loads(path.read_text())  # must not raise
+
+
+class TestDEF006AggregateDiscoveryDeadline(unittest.TestCase):
+    """DEF-006 (external ICS quality/defect/architecture audit --
+    confirmed Medium/High): _connect_to_discovered_devices()'s
+    sub-device loop had a per-device DEVICE_CONNECT_TIMEOUT but nothing
+    capped the WHOLE loop -- a daisy-chained setup with many discovered
+    sub-devices, each slow-but-not-quite-timing-out, could extend
+    finish_network_setup's total duration without bound."""
+
+    @staticmethod
+    def _source() -> str:
+        return _CONFIG_FLOW_SRC.read_text()
+
+    def _function_body(self) -> str:
+        source = self._source()
+        idx = source.find("async def _connect_to_discovered_devices(")
+        assert idx > -1
+        end = source.find("\nasync def validate_network_setup(", idx)
+        return source[idx: end if end > -1 else idx + 5000]
+
+    def test_monotonic_deadline_computed_before_the_loop(self):
+        body = self._function_body()
+        deadline_idx = body.find(
+            "loop_deadline = time.monotonic() + DISCOVERY_TOTAL_TIMEOUT.total_seconds()"
+        )
+        loop_idx = body.find("for loop_index, sub_unit_id in enumerate(sub_unit_ids):")
+        assert deadline_idx > -1, "no monotonic deadline computed"
+        assert loop_idx > -1, "loop not converted to enumerate()"
+        assert deadline_idx < loop_idx
+
+    def test_deadline_checked_at_top_of_every_iteration(self):
+        body = self._function_body()
+        loop_idx = body.find("for loop_index, sub_unit_id in enumerate(sub_unit_ids):")
+        check_idx = body.find("if time.monotonic() >= loop_deadline:", loop_idx)
+        assert loop_idx > -1
+        assert check_idx > -1
+        assert check_idx - loop_idx < 200, (
+            "the deadline check must be at the TOP of the loop body, "
+            "not buried after other logic"
+        )
+
+    def test_budget_overrun_extends_skipped_list_not_a_hard_exception(self):
+        """The core design choice: a budget overrun must feed into the
+        SAME graceful mechanism DEF-005 built (skipped_sub_unit_ids),
+        not raise and discard the primary device's already-successful
+        connection."""
+        body = self._function_body()
+        check_idx = body.find("if time.monotonic() >= loop_deadline:")
+        assert check_idx > -1
+        window = body[check_idx: check_idx + 500]
+        assert "skipped_sub_unit_ids.extend(remaining)" in window
+        assert "break" in window
+        assert "raise" not in window.split("break")[0], (
+            "the deadline-exceeded branch must not raise -- it should "
+            "gracefully stop and record the rest as skipped"
+        )
+
+    def test_does_not_use_a_hard_asyncio_timeout_wrap_for_this_loop(self):
+        """Negative case: confirms the deliberate design choice NOT to
+        reuse the asyncio.timeout() context-manager pattern
+        _auto_slave_discovery/_scan_slave_discovery already use --
+        that would raise and discard the primary device's own
+        connection if it fired mid-loop, unlike this function's own
+        explicit monotonic-deadline approach."""
+        body = self._function_body()
+        assert "async with asyncio.timeout(" not in body
+
+    def test_remaining_ids_are_exactly_the_unattempted_slice(self):
+        """Adversarial: 'remaining' must be computed as a genuine slice
+        from the current loop position onward -- not, e.g., the whole
+        original list (which would incorrectly re-mark already-
+        succeeded sub-devices as skipped too)."""
+        body = self._function_body()
+        idx = body.find("remaining = sub_unit_ids[loop_index:]")
+        assert idx > -1, (
+            "remaining must be sliced from loop_index onward, not the "
+            "whole list or some other range"
+        )
+
+    def test_time_module_imported(self):
+        source = self._source()
+        assert "\nimport time\n" in source
+
+
+class TestDEF003ClientCreationInsideTry(unittest.TestCase):
+    """DEF-003 (external ICS quality/defect/architecture audit --
+    confirmed High): client creation previously happened BEFORE the
+    enclosing try/finally began in five functions -- validate_serial_
+    setup and the four discovery wrappers -- so a failure in client
+    creation itself (synchronous, but not guaranteed never to raise)
+    would skip the finally block entirely, including its
+    ModbusGuard.release_endpoint() call, leaking the reference count
+    permanently across repeated failed configuration attempts."""
+
+    def _function_body(self, name: str) -> str:
+        source = _CONFIG_FLOW_SRC.read_text()
+        idx = source.find(f"async def {name}(")
+        assert idx > -1, f"{name} not found in config_flow.py"
+        end = source.find("\nasync def ", idx + 10)
+        return source[idx: end if end > -1 else idx + 8000]
+
+    def test_client_is_none_before_try_for_every_previously_vulnerable_site(self):
+        for name in (
+            "validate_serial_setup", "_tcp_auto_slave_discovery",
+            "_rtu_auto_slave_discovery", "_tcp_scan_slave_discovery",
+            "_rtu_scan_slave_discovery",
+        ):
+            body = self._function_body(name)
+            none_idx = body.find("client = None")
+            try_idx = body.find("\n    try:")
+            assert none_idx > -1, f"{name}: client = None not found"
+            assert try_idx > -1, f"{name}: try: not found"
+            assert none_idx < try_idx, (
+                f"{name}: client must be initialised to None BEFORE the "
+                f"try block, so the finally clause can safely check "
+                f"'if client is not None' regardless of where creation fails"
+            )
+
+    def test_client_assignment_from_create_call_happens_inside_try(self):
+        """The actual fix: the real client-creation call (create_rtu_
+        client/create_scan_tcp_client/create_scan_rtu_client) must be
+        the first thing INSIDE the try block, not before it."""
+        expected_factory = {
+            "validate_serial_setup": "create_rtu_client(",
+            "_tcp_auto_slave_discovery": "create_scan_tcp_client(",
+            "_rtu_auto_slave_discovery": "create_scan_rtu_client(",
+            "_tcp_scan_slave_discovery": "create_scan_tcp_client(",
+            "_rtu_scan_slave_discovery": "create_scan_rtu_client(",
+        }
+        for name, factory in expected_factory.items():
+            body = self._function_body(name)
+            try_idx = body.find("\n    try:")
+            factory_idx = body.find(f"client = {factory}", try_idx)
+            assert try_idx > -1, name
+            assert factory_idx > -1, (
+                f"{name}: 'client = {factory}' not found after try: -- "
+                f"the actual client construction must happen inside the "
+                f"guarded block, not before it"
+            )
+            assert factory_idx > try_idx
+
+    def test_finally_block_guards_disconnect_with_none_check(self):
+        """Adversarial: the finally block's own disconnect() call must be
+        conditional on `client is not None` -- otherwise a client-
+        creation failure (client still None) would hit an
+        UnboundLocalError/AttributeError INSIDE the finally block itself,
+        masking the real, original error entirely."""
+        for name in (
+            "validate_serial_setup", "_tcp_auto_slave_discovery",
+            "_rtu_auto_slave_discovery", "_tcp_scan_slave_discovery",
+            "_rtu_scan_slave_discovery",
+        ):
+            body = self._function_body(name)
+            finally_idx = body.find("\n    finally:")
+            assert finally_idx > -1, f"{name}: no finally block"
+            finally_body = body[finally_idx:]
+            assert "if client is not None:" in finally_body, (
+                f"{name}: finally block must guard client.disconnect() "
+                f"with 'if client is not None' -- a bare client.disconnect() "
+                f"would crash if client creation itself is what failed"
+            )
+
+    def test_release_endpoint_still_reachable_even_when_client_is_none(self):
+        """The actual behavioural guarantee DEF-003 restores: even in the
+        worst case (client creation itself failed), release_endpoint()
+        must be OUTSIDE the 'if client is not None' guard, so it always
+        runs regardless."""
+        for name in (
+            "validate_serial_setup", "_tcp_auto_slave_discovery",
+            "_rtu_auto_slave_discovery", "_tcp_scan_slave_discovery",
+            "_rtu_scan_slave_discovery",
+        ):
+            body = self._function_body(name)
+            finally_idx = body.find("\n    finally:")
+            finally_body = body[finally_idx:]
+            if_idx = finally_body.find("if client is not None:")
+            release_idx = finally_body.find("ModbusGuard.release_endpoint(")
+            assert if_idx > -1 and release_idx > -1, name
+            # release_endpoint must be at LESS indentation than the
+            # disconnect call inside the if-guard -- i.e. it appears
+            # after the if-block's own body, unconditionally.
+            release_line_start = finally_body.rfind("\n", 0, release_idx) + 1
+            indent = len(finally_body[release_line_start:release_idx]) - len(
+                finally_body[release_line_start:release_idx].lstrip()
+            )
+            assert indent == 8, (
+                f"{name}: release_endpoint() must be at the finally "
+                f"block's own top level (8-space indent), not nested "
+                f"inside the 'if client is not None' guard"
+            )
+
     def test_release_is_in_a_finally_block_for_every_acquirer(self):
         """The acquire without a guaranteed matching release is worse than
         no reference counting at all -- it would leak permanently on any

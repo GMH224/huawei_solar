@@ -139,7 +139,20 @@ async def async_setup_entry(
             guard = getattr(coordinator, "guard", None)
             if guard is not None and guard.endpoint not in seen_buses:
                 seen_buses.add(guard.endpoint)
-                diagnostics = BusDiagnostics.get_or_create(hass, guard.endpoint)
+                # v2.0.9 FIX (Phase 4.8, this release -- old DEF-011,
+                # external ICS quality/defect/architecture audit --
+                # confirmed): acquire_endpoint(), not get_or_create() --
+                # this is the entry-level "I am now using this shared
+                # endpoint's diagnostics" declaration, paired with
+                # exactly one release_endpoint() call in __init__.py's
+                # own unload path. Without this, one entry unloading
+                # could remove an instance another entry sharing the
+                # same physical endpoint still actively uses. seen_buses
+                # above already guarantees this runs at most once per
+                # unique endpoint for THIS entry, matching the "exactly
+                # one acquire per entry" contract acquire_endpoint()
+                # itself requires.
+                diagnostics = BusDiagnostics.acquire_endpoint(hass, guard.endpoint)
                 guard.diagnostics = diagnostics
                 learning_switches.append(
                     ModbusDiagnosticsSwitchEntity(diagnostics, ucs)
@@ -152,7 +165,11 @@ async def async_setup_entry(
                 # this entry has one) are threaded through so one snapshot
                 # tick can gather every coordinator on the entry, not just
                 # this one device's own.
-                telemetry_capture = TelemetryCapture.get_or_create(hass, guard.endpoint)
+                # v2.0.9 FIX (Phase 4.8, this release -- old DEF-011):
+                # acquire_endpoint(), not get_or_create() -- see the
+                # diagnostics switch's own comment on this identical fix
+                # just above.
+                telemetry_capture = TelemetryCapture.acquire_endpoint(hass, guard.endpoint)
                 learning_switches.append(
                     ModbusTelemetryCaptureSwitchEntity(
                         telemetry_capture, ucs, device_data,
@@ -312,9 +329,10 @@ class HuaweiSolarSwitchEntity(
             # silent failure, not worth blocking the toggle on).
             # v2.0.0b (MOD-10): entry-scoped via the coordinator now, not a
             # bare self.hass.async_create_task().
-            self.coordinator.create_background_task(
-                self.coordinator.verify_write(self.entity_description.register_name, True),
-                f"{self.coordinator.name}_verify_write_{self.entity_description.register_name}",
+            # v2.0.9 FIX (Phase 4.7, this release -- old DEF-010): routed
+            # through schedule_verify_write() -- see its own docstring.
+            self.coordinator.schedule_verify_write(
+                self.entity_description.register_name, True
             )
 
         await self.coordinator.async_request_refresh()
@@ -329,9 +347,10 @@ class HuaweiSolarSwitchEntity(
         if wrote:
             self._attr_is_on = False
             self.coordinator.invalidate_cache(self.entity_description.register_name)
-            self.coordinator.create_background_task(
-                self.coordinator.verify_write(self.entity_description.register_name, False),
-                f"{self.coordinator.name}_verify_write_{self.entity_description.register_name}",
+            # v2.0.9 FIX (Phase 4.7, this release -- old DEF-010): routed
+            # through schedule_verify_write() -- see its own docstring.
+            self.coordinator.schedule_verify_write(
+                self.entity_description.register_name, False
             )
 
         await self.coordinator.async_request_refresh()

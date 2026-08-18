@@ -71,7 +71,11 @@ MIN_FLUSH_INTERVAL_S = 30.0
 #: Same values as bus_diagnostics.py -- no reasoned basis yet for these
 #: needing to differ, and keeping them identical means one mental model
 #: covers both files' disk behaviour.
-MAX_FILE_BYTES = 5 * 1024 * 1024
+# v2.0.9 (user request, this release): bumped from 5MB to 100MB -- see
+# bus_diagnostics.py's own MAX_FILE_BYTES comment for the full rotation-
+# multiplier reasoning; kept identical between the two files per this
+# comment's own stated intent.
+MAX_FILE_BYTES = 100 * 1024 * 1024
 KEEP_ROTATIONS = 2
 
 # v2.0.2 (TEL-001/TEL-007, external ICS/IQS audit -- confirmed): a batch
@@ -109,6 +113,13 @@ class TelemetryCapture:
     """
 
     _registry: dict[str, "TelemetryCapture"] = {}
+    # v2.0.9 (Phase 4.8, this release -- old DEF-011, external ICS
+    # quality/defect/architecture audit -- confirmed): see BusDiagnostics'
+    # own identical field comment (bus_diagnostics.py) -- same fix,
+    # applied to both together, matching how the original ICS-08/TEL-004
+    # gap (remove() existing but never being called at all) was ALSO
+    # fixed for both together rather than just one.
+    _ref_counts: dict[str, int] = {}
 
     def __init__(self, hass: Any, endpoint: str) -> None:
         self.hass = hass
@@ -196,6 +207,10 @@ class TelemetryCapture:
     # ── registry ────────────────────────────────────────────────────────────
     @classmethod
     def get_or_create(cls, hass: Any, endpoint: str) -> "TelemetryCapture":
+        """Does NOT itself affect the reference count -- see
+        acquire_endpoint()/release_endpoint() below, and BusDiagnostics'
+        own identical get_or_create() docstring for the full reasoning.
+        """
         inst = cls._registry.get(endpoint)
         if inst is None:
             inst = cls(hass, endpoint)
@@ -207,12 +222,41 @@ class TelemetryCapture:
         return cls._registry.get(endpoint)
 
     @classmethod
+    def acquire_endpoint(cls, hass: Any, endpoint: str) -> "TelemetryCapture":
+        """v2.0.9 (Phase 4.8, this release -- old DEF-011): entry-level
+        acquire -- see BusDiagnostics.acquire_endpoint()'s own docstring
+        for the full reasoning, identical here.
+        """
+        inst = cls.get_or_create(hass, endpoint)
+        cls._ref_counts[endpoint] = cls._ref_counts.get(endpoint, 0) + 1
+        return inst
+
+    @classmethod
+    def release_endpoint(cls, endpoint: str) -> None:
+        """v2.0.9 (Phase 4.8, this release -- old DEF-011): entry-level
+        release -- see BusDiagnostics.release_endpoint()'s own docstring
+        for the full reasoning, identical here.
+        """
+        if endpoint not in cls._ref_counts:
+            return
+        cls._ref_counts[endpoint] -= 1
+        if cls._ref_counts[endpoint] <= 0:
+            cls._ref_counts.pop(endpoint, None)
+            cls._registry.pop(endpoint, None)
+
+    @classmethod
     def remove(cls, endpoint: str) -> None:
+        """DEPRECATED (v2.0.9, Phase 4.8 -- old DEF-011): unconditional
+        removal, ignoring reference count -- see BusDiagnostics.remove()'s
+        own docstring for the full reasoning, identical here.
+        """
         cls._registry.pop(endpoint, None)
+        cls._ref_counts.pop(endpoint, None)
 
     @classmethod
     def clear_registry(cls) -> None:
         cls._registry.clear()
+        cls._ref_counts.clear()
 
     # ── control ─────────────────────────────────────────────────────────────
     def set_enabled(self, enabled: bool) -> None:

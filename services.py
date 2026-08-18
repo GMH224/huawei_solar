@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from functools import partial
 import logging
 import re
 from typing import Any, Literal, TypedDict, TypeVar
@@ -797,12 +796,49 @@ def _get_power_control_device_data(
     return get_inverter_data(service_call)
 
 
+@callback
+def _resolve_power_control_device(
+    service_call: ServiceCall,
+) -> tuple[HuaweiSolarDeviceData, PowerControlManagerType]:
+    """v2.0.9 FIX (DEF-004, external ICS quality/defect/architecture audit
+    -- confirmed): resolves the target device ONCE, generically, then
+    determines its real manager_type from the device ITSELF -- rather
+    than the caller needing to already know (and pre-supply) which kind
+    of device it's dealing with, which is what functools.partial()
+    baked in at REGISTRATION time (see async_setup_services()'s own
+    updated comment for the full history of why that was wrong).
+
+    With this, `reset_maximum_feed_grid_power`/`set_zero_power_grid_
+    connection`/`set_maximum_feed_grid_power`/`set_maximum_feed_grid_
+    power_percentage` below no longer need a manager_type parameter
+    supplied by their caller at all -- they resolve it themselves, from
+    the actual target device named in the service call, every time.
+    This is what makes registering each service exactly once (not
+    twice, not order-dependently per entry) both possible and correct:
+    dispatch now depends on the SERVICE CALL'S OWN target, never on
+    which entry happened to register last.
+    """
+    dd = _get_device_data(service_call)
+    if isinstance(dd.device, EMMADevice):
+        return dd, "emma"
+    if isinstance(dd.device, SUN2000Device):
+        return dd, "inverter"
+    raise ServiceValidationError(
+        translation_domain=DOMAIN,
+        translation_key="wrong_device_type",
+        translation_placeholders={
+            "device_id": service_call.data[ATTR_DEVICE_ID],
+            "expected_type": f"{EMMADevice.__name__} or {SUN2000Device.__name__}",
+            "actual_type": type(dd.device).__name__,
+        },
+    )
+
+
 async def reset_maximum_feed_grid_power(
-    manager_type: PowerControlManagerType,
     service_call: ServiceCall,
 ) -> None:
     """Set Active Power Control to 'Unlimited'."""
-    dd = _get_power_control_device_data(manager_type, service_call)
+    dd, manager_type = _resolve_power_control_device(service_call)
 
     async with _get_device_write_lock(dd.device.serial_number):
         # v2.0.0b (MOD-19, external ICS audit -- confirmed): see
@@ -837,11 +873,10 @@ async def set_di_active_power_scheduling(service_call: ServiceCall) -> None:
 
 
 async def set_zero_power_grid_connection(
-    manager_type: PowerControlManagerType,
     service_call: ServiceCall,
 ) -> None:
     """Set Active Power Control to 'Zero-Power Grid Connection'."""
-    dd = _get_power_control_device_data(manager_type, service_call)
+    dd, manager_type = _resolve_power_control_device(service_call)
     async with _get_device_write_lock(dd.device.serial_number):
         async with _set_and_invalidate_sequence(dd) as write:
             await write(
@@ -856,11 +891,10 @@ async def set_zero_power_grid_connection(
 
 
 async def set_maximum_feed_grid_power(
-    manager_type: PowerControlManagerType,
     service_call: ServiceCall,
 ) -> None:
     """Set Active Power Control to 'Power-limited grid connection' with the given wattage."""
-    dd = _get_power_control_device_data(manager_type, service_call)
+    dd, manager_type = _resolve_power_control_device(service_call)
     async with _get_device_write_lock(dd.device.serial_number):
         power = await _validate_power_value(service_call.data[DATA_POWER], dd, rn.P_MAX)
 
@@ -876,11 +910,10 @@ async def set_maximum_feed_grid_power(
 
 
 async def set_maximum_feed_grid_power_percentage(
-    manager_type: PowerControlManagerType,
     service_call: ServiceCall,
 ) -> None:
     """Set Active Power Control to 'Power-limited grid connection' with the given percentage."""
-    dd = _get_power_control_device_data(manager_type, service_call)
+    dd, manager_type = _resolve_power_control_device(service_call)
     async with _get_device_write_lock(dd.device.serial_number):
         power_percentage = service_call.data[DATA_POWER_PERCENTAGE]
 
@@ -1165,25 +1198,25 @@ async def async_setup_services(
     if not entry.data.get(CONF_ENABLE_PARAMETER_CONFIGURATION, False):
         return
 
-    # v2.0.3 FIX (ICS-10, external ICS audit -- confirmed): tracked here
-    # so async_unload_services() (below) knows whether THIS was the last
-    # entry with parameter-configuration services enabled, and can
-    # unregister them from Home Assistant entirely once nothing needs
-    # them any more -- previously, services registered by any entry
-    # stayed registered globally forever, even after every relevant
-    # entry was removed.
-    #
     # Deliberately NOT also guarded against re-registration on this same
-    # entry_id already being present: several of the handlers below are
-    # bound via functools.partial() to a device-kind argument ("emma" vs
-    # "inverter") resolved from THIS entry's own devices (has_emma,
-    # below) -- skipping re-registration when multiple entries with
-    # different device kinds coexist would freeze the global handler to
-    # whichever entry happened to register first, silently leaving the
-    # wrong device-kind variant bound for every other entry's own calls
-    # of that service. Re-registration (last setup wins) is the
-    # correct, existing behaviour for that reason; only the "never
-    # unregistered at all" half of ICS-10 is fixed here.
+    # entry_id already being present -- see async_unload_services() for
+    # the reference-counted unregistration this pairs with.
+    #
+    # v2.0.9 FIX (DEF-004, external ICS quality/defect/architecture audit
+    # -- confirmed): this comment used to explain why re-registration
+    # ("last setup wins") was accepted as correct behaviour for the four
+    # power-control services below, because their handlers were bound
+    # via functools.partial() to a FIXED device-kind ("emma" vs
+    # "inverter") resolved from whichever entry happened to register
+    # last -- multiple entries with different device kinds coexisting
+    # meant dispatch depended on registration ORDER, not on the actual
+    # target device named in each individual service call. That
+    # dependency is now eliminated at its root: _resolve_power_control_
+    # device() (see its own docstring) resolves the real device kind
+    # from the SERVICE CALL's own target, every time, so these four
+    # services are now registered exactly once each, unconditionally,
+    # regardless of which entry sets up first or what device kinds any
+    # given entry happens to have.
     _entries_with_services.add(entry.entry_id)
 
     hsucs: list[HuaweiSolarDeviceData] = entry.runtime_data[DATA_DEVICE_DATAS]
@@ -1206,67 +1239,45 @@ async def async_setup_services(
     )
     has_emma = any(isinstance(uc.device, EMMADevice) for uc in hsucs)
 
-    # Register functions that are available on all inverters, no battery/emma required
-    if has_emma:
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_RESET_MAXIMUM_FEED_GRID_POWER,
-            partial(reset_maximum_feed_grid_power, "emma"),
-            schema=EMMA_DEVICE_SCHEMA,
-        )
+    # v2.0.9 FIX (DEF-004, same audit -- confirmed): registered exactly
+    # once each, unconditionally -- not gated on has_emma, and not
+    # duplicated with two different functools.partial() bindings. Both
+    # EMMA_DEVICE_SCHEMA and INVERTER_DEVICE_SCHEMA are identical
+    # (DATA_DEVICE_ID only); INVERTER_DEVICE_SCHEMA is used here simply
+    # as the one consistent choice, not because it privileges either
+    # device kind -- device-kind resolution now happens entirely inside
+    # the handler, from the service call's own target.
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_RESET_MAXIMUM_FEED_GRID_POWER,
+        reset_maximum_feed_grid_power,
+        schema=INVERTER_DEVICE_SCHEMA,
+    )
 
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_SET_ZERO_POWER_GRID_CONNECTION,
-            partial(set_zero_power_grid_connection, "emma"),
-            schema=EMMA_DEVICE_SCHEMA,
-        )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_SET_ZERO_POWER_GRID_CONNECTION,
+        set_zero_power_grid_connection,
+        schema=INVERTER_DEVICE_SCHEMA,
+    )
 
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_SET_MAXIMUM_FEED_GRID_POWER,
-            partial(set_maximum_feed_grid_power, "emma"),
-            schema=EMMA_DEVICE_SCHEMA.extend(MAXIMUM_FEED_GRID_POWER_SCHEMA),
-        )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_SET_MAXIMUM_FEED_GRID_POWER,
+        set_maximum_feed_grid_power,
+        schema=INVERTER_DEVICE_SCHEMA.extend(MAXIMUM_FEED_GRID_POWER_SCHEMA),
+    )
 
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_SET_MAXIMUM_FEED_GRID_POWER_PERCENT,
-            partial(set_maximum_feed_grid_power_percentage, "emma"),
-            schema=EMMA_DEVICE_SCHEMA.extend(MAXIMUM_FEED_GRID_POWER_PERCENTAGE_SCHEMA),
-        )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_SET_MAXIMUM_FEED_GRID_POWER_PERCENT,
+        set_maximum_feed_grid_power_percentage,
+        schema=INVERTER_DEVICE_SCHEMA.extend(
+            MAXIMUM_FEED_GRID_POWER_PERCENTAGE_SCHEMA
+        ),
+    )
 
-    else:
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_RESET_MAXIMUM_FEED_GRID_POWER,
-            partial(reset_maximum_feed_grid_power, "inverter"),
-            schema=INVERTER_DEVICE_SCHEMA,
-        )
-
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_SET_ZERO_POWER_GRID_CONNECTION,
-            partial(set_zero_power_grid_connection, "inverter"),
-            schema=INVERTER_DEVICE_SCHEMA,
-        )
-
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_SET_MAXIMUM_FEED_GRID_POWER,
-            partial(set_maximum_feed_grid_power, "inverter"),
-            schema=INVERTER_DEVICE_SCHEMA.extend(MAXIMUM_FEED_GRID_POWER_SCHEMA),
-        )
-
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_SET_MAXIMUM_FEED_GRID_POWER_PERCENT,
-            partial(set_maximum_feed_grid_power_percentage, "inverter"),
-            schema=INVERTER_DEVICE_SCHEMA.extend(
-                MAXIMUM_FEED_GRID_POWER_PERCENTAGE_SCHEMA
-            ),
-        )
-
+    if not has_emma:
         # this service is only available on inverters, not on EMMA
         hass.services.async_register(
             DOMAIN,

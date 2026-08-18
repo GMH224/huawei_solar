@@ -44,6 +44,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from .const import (
     CONF_BH_ENABLED,
     CONF_SLOW_TIER_TTL_S,
+    CONF_SYNC_POWER_DEDICATED_READS,
     DEFAULT_SLOW_TIER_TTL_S,
     CONF_ENABLE_PARAMETER_CONFIGURATION,
     CONF_SLAVE_IDS,
@@ -266,6 +267,47 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
         #  │ SLAVE X │     │ SLAVE Y │    │SLAVE ...│
         #  └─────────┘     └─────────┘    └─────────┘
 
+        # v2.0.9 FIX (DEF-001, external ICS quality/defect/architecture
+        # audit -- confirmed Critical): bus_endpoint only ever needed
+        # entry.data (confirmed by reading endpoint_for()'s own
+        # signature) -- it never needed the client or device object at
+        # all, so there was no real reason for this to run AFTER the
+        # client/device were created rather than before. Moved to the
+        # very top of connection setup, before any Modbus I/O whatsoever
+        # (including the identification read below), so the guard is
+        # acquired -- and the identification read itself is genuinely
+        # serialized against any OTHER entry already using this same
+        # physical endpoint -- before this entry ever touches the bus.
+        # Previously, a second entry starting on the same endpoint while
+        # an existing entry was polling could produce genuinely unguarded
+        # concurrent Modbus traffic during exactly this identification
+        # window.
+        bus_endpoint = ModbusGuard.endpoint_for(dict(entry.data))
+        _LOGGER.debug("Bus endpoint: %s", bus_endpoint)
+
+        # v2.0.0a (F04, external ICS audit): acquire this entry's reference
+        # to the endpoint's guard HERE, once, before any coordinator is
+        # constructed -- not implicitly via each coordinator's own
+        # get_or_create() call, which does not affect the reference count.
+        # Every coordinator below shares this SAME acquired guard for the
+        # duration of this entry's lifetime; the matching release_endpoint()
+        # call happens exactly once, in async_unload_entry, regardless of
+        # how many coordinators this entry created on this endpoint.
+        guard = ModbusGuard.acquire_endpoint(bus_endpoint)
+        # Registered via the SAME cleanup mechanism Defect U already built
+        # for exactly this situation: HA does not guarantee
+        # async_unload_entry() runs after a failed async_setup_entry(), so
+        # a setup attempt that acquires the endpoint and then fails partway
+        # through (e.g. a second daisy-chained device timing out) must still
+        # release its reference, or the count leaks permanently and the
+        # guard for this endpoint can never be cleaned up even after every
+        # real entry using it is gone. Registered FIRST, immediately after
+        # the acquire -- _run_cleanup_callbacks tears down in REVERSE
+        # registration order, so this correctly runs LAST, after every
+        # other cleanup (e.g. stopping keep-alive tasks) that might still
+        # need the guard to exist while it does its own teardown.
+        cleanup_callbacks.append(lambda: ModbusGuard.release_endpoint(bus_endpoint))
+
         if entry.data[CONF_HOST] is None:
             client = create_rtu_client(
                 port=entry.data[CONF_PORT], unit_id=entry.data[CONF_SLAVE_IDS][0]
@@ -281,11 +323,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
         # cleanly, before Home Assistant's own external setup timeout can
         # cancel us mid-connection (see const.DEVICE_CONNECT_TIMEOUT for
         # the full reasoning and the field evidence behind this bound).
+        #
+        # v2.0.9 FIX (DEF-001, same audit -- confirmed): the actual
+        # identification I/O now happens inside `async with guard.
+        # request(...)` -- the fix described above; this is the point
+        # where it actually takes effect. A one-time setup cost (holding
+        # the guard for this whole call, rather than per-request pacing)
+        # is appropriate here since nothing else on THIS entry could
+        # possibly be contending for the bus yet -- no coordinator exists
+        # until after this succeeds.
         try:
-            primary_device = await asyncio.wait_for(
-                create_device_instance(client),
-                timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
-            )
+            async with guard.request(label="setup_identify"):
+                primary_device = await asyncio.wait_for(
+                    create_device_instance(client),
+                    timeout=DEVICE_CONNECT_TIMEOUT.total_seconds(),
+                )
         except TimeoutError as err:
             host = entry.data.get(CONF_HOST) or entry.data.get(CONF_PORT)
             _LOGGER.warning(
@@ -295,41 +347,31 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
                 "will be retried automatically",
                 host, DEVICE_CONNECT_TIMEOUT.total_seconds(),
             )
+            # v2.0.9 FIX (DEF-002, same audit -- confirmed): the raw
+            # client -- which may already hold a genuinely open TCP/
+            # serial connection at this point -- was previously never
+            # explicitly disconnected on this failure path, left to
+            # eventual garbage collection instead of a deterministic
+            # close. For an RTU/serial port specifically, an unreleased
+            # handle can block every subsequent connection attempt to
+            # that same port, not just this one's own retry.
+            await _bounded_client_disconnect(client)
             raise ConfigEntryNotReady(
                 f"Timed out connecting to and identifying the inverter at "
                 f"{host} after {DEVICE_CONNECT_TIMEOUT.total_seconds():.0f}s. "
                 "It may still be finishing its own reconnect; this will be "
                 "retried automatically."
             ) from err
-
-        # Derive the bus endpoint once from the config entry.
-        # All inverters on the same physical RS485 bus share this endpoint
-        # and will therefore share one ModbusGuard (bus-level serialisation).
-        bus_endpoint = ModbusGuard.endpoint_for(dict(entry.data))
-        _LOGGER.debug("Bus endpoint: %s", bus_endpoint)
-
-        # v2.0.0a (F04, external ICS audit): acquire this entry's reference
-        # to the endpoint's guard HERE, once, before any coordinator is
-        # constructed -- not implicitly via each coordinator's own
-        # get_or_create() call, which does not affect the reference count.
-        # Every coordinator below shares this SAME acquired guard for the
-        # duration of this entry's lifetime; the matching release_endpoint()
-        # call happens exactly once, in async_unload_entry, regardless of
-        # how many coordinators this entry created on this endpoint.
-        ModbusGuard.acquire_endpoint(bus_endpoint)
-        # Registered via the SAME cleanup mechanism Defect U already built
-        # for exactly this situation: HA does not guarantee
-        # async_unload_entry() runs after a failed async_setup_entry(), so
-        # a setup attempt that acquires the endpoint and then fails partway
-        # through (e.g. a second daisy-chained device timing out) must still
-        # release its reference, or the count leaks permanently and the
-        # guard for this endpoint can never be cleaned up even after every
-        # real entry using it is gone. Registered FIRST, immediately after
-        # the acquire -- _run_cleanup_callbacks tears down in REVERSE
-        # registration order, so this correctly runs LAST, after every
-        # other cleanup (e.g. stopping keep-alive tasks) that might still
-        # need the guard to exist while it does its own teardown.
-        cleanup_callbacks.append(lambda: ModbusGuard.release_endpoint(bus_endpoint))
+        except Exception:
+            # v2.0.9 FIX (DEF-002, same audit -- confirmed): any OTHER
+            # failure from the identification read (a connection error,
+            # not specifically a timeout) previously propagated with the
+            # same unreleased-raw-client gap as the TimeoutError case
+            # above -- this method had no catch-all at all before this
+            # fix, so a non-timeout failure skipped client cleanup
+            # entirely rather than merely handling it differently.
+            await _bounded_client_disconnect(client)
+            raise
 
         if entry.data.get(CONF_ENABLE_PARAMETER_CONFIGURATION):
             if (
@@ -446,6 +488,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
                     has_battery=has_battery,
                     update_interval=SYNC_POWER_UPDATE_INTERVAL,
                     bus_endpoint=bus_endpoint,
+                    # v2.0.9 (Phase 3.1, this release): see const.py's
+                    # own CONF_SYNC_POWER_DEDICATED_READS comment.
+                    dedicated_reads_enabled=entry.options.get(
+                        CONF_SYNC_POWER_DEDICATED_READS, True
+                    ),
                     # v2.0.0 (V2_ARCHITECTURE_DESIGN.md §8.2): the regular
                     # per-device coordinators' own caches, checked for a
                     # cheap shortcut before this coordinator's dedicated
@@ -863,7 +910,24 @@ def _async_setup_battery_health(
             if create_task is not None:
                 create_task(hass, _initialize(), f"battery_health_init_{serial}")
             else:  # pragma: no cover — older HA cores
-                hass.async_create_task(_initialize())
+                # v2.0.9 FIX (Phase 4.10, this release -- found during a
+                # log review, not either external audit): this fallback
+                # previously had no tie to the entry's own lifecycle at
+                # all -- unlike the async_create_background_task() branch
+                # above, a task started here could survive an entry
+                # unload/reload and attempt a delayed Modbus read against
+                # already-torn-down state (the transport disconnected,
+                # the guard already released) -- exactly the class of
+                # problem async_create_background_task() itself exists to
+                # prevent. entry.async_on_unload() is a much older, more
+                # universally-available HA API than async_create_
+                # background_task() (already relied on elsewhere in this
+                # same function -- see the update-listener registration
+                # above), so it can provide the same entry-lifecycle-tied
+                # cancellation even on HA cores old enough to lack the
+                # newer API this fallback exists for.
+                task = hass.async_create_task(_initialize())
+                entry.async_on_unload(task.cancel)
         except Exception:  # noqa: BLE001
             _LOGGER.exception(
                 "battery_health[%s]: could not schedule initialisation", serial
@@ -892,6 +956,34 @@ async def _bounded_device_stop(device: Any) -> None:
     except Exception:  # noqa: BLE001 — never let a stuck stop() block setup-failure cleanup
         _LOGGER.exception(
             "Error stopping the inverter device during setup-failure "
+            "cleanup; continuing regardless"
+        )
+
+
+async def _bounded_client_disconnect(client: Any) -> None:
+    """Disconnect a raw, not-yet-wrapped Modbus client with the same
+    bounded, fault-isolated pattern _bounded_device_stop() already uses
+    for the (later-stage) device object.
+
+    v2.0.9 FIX (DEF-002, external ICS quality/defect/architecture audit
+    -- confirmed): before this fix, a raw client that had already opened
+    a genuine transport connection, but then failed during
+    create_device_instance() (device identification), was never
+    explicitly disconnected -- left entirely to eventual garbage
+    collection instead of a deterministic close. For an RTU/serial
+    endpoint specifically, an unreleased OS-level handle can block every
+    subsequent connection attempt to that same port, not just this
+    entry's own retry -- a materially worse failure mode than the
+    already-fixed device-level case _bounded_device_stop() covers.
+    """
+    disconnect = getattr(client, "disconnect", None)
+    if disconnect is None:
+        return
+    try:
+        await asyncio.wait_for(disconnect(), timeout=DISCONNECT_TIMEOUT.total_seconds())
+    except Exception:  # noqa: BLE001 — never let a stuck disconnect mask the real error
+        _LOGGER.exception(
+            "Error disconnecting the raw Modbus client during setup-failure "
             "cleanup; continuing regardless"
         )
 
@@ -985,12 +1077,25 @@ async def async_unload_entry(
             # seen_endpoints avoids a redundant (harmless, but noisy)
             # second remove() call for a second device sharing the same
             # physical bus on this same entry.
+            #
+            # v2.0.9 FIX (Phase 4.8, this release -- old DEF-011,
+            # external ICS quality/defect/architecture audit --
+            # confirmed): remove() itself is now the bug -- it was
+            # unconditional, ignoring whether another entry sharing this
+            # same physical endpoint still holds a reference. Switched
+            # to release_endpoint(), the reference-counted pairing for
+            # switch.py's own acquire_endpoint() call at setup time (see
+            # its own comment) -- mirrors ModbusGuard's own established
+            # acquire/release pattern exactly, including the "no
+            # matching prior acquire is a safe no-op" behaviour, so this
+            # still degrades gracefully if switch.py's own setup ever
+            # failed to run for some reason.
             guard = getattr(device_data.update_coordinator, "guard", None)
             endpoint = getattr(guard, "endpoint", None)
             if endpoint is not None and endpoint not in seen_endpoints:
                 seen_endpoints.add(endpoint)
-                BusDiagnostics.remove(endpoint)
-                TelemetryCapture.remove(endpoint)
+                BusDiagnostics.release_endpoint(endpoint)
+                TelemetryCapture.release_endpoint(endpoint)
 
             # v2.0.0b (MOD-13, external ICS audit): clear this device's
             # cached static number-entity bounds -- a reload can follow a

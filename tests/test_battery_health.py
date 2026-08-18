@@ -2786,6 +2786,49 @@ class TestSectionECurrentShareDeviation(unittest.TestCase):  # v2.0.7
         )
         self.assertIsNone(tracker.current_share_deviation_pct())
 
+    def test_adversarial_small_but_nonzero_mean_no_longer_explodes(self):
+        """ICS-19 (external ICS audit -- confirmed): the OLD guard
+        (abs(mean) < 1e-6) never fired for ordinary small-but-real
+        currents, letting the ratio explode into thousands of percent --
+        field telemetry showed a max around 4,020%. This reproduces that
+        exact scenario: a small, real, near-idle mean current (well
+        above 1e-6, comfortably below the old code's blind spot) with a
+        modest absolute spread between packs."""
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        tracker = bh.PackCapacityTracker(cfg, pack_count=3)
+        # mean = 0.05A, spread = 2.0A -> old code: (2.0/0.05)*100 = 4000%,
+        # matching the field-observed ~4,020% almost exactly.
+        tracker.feed(
+            _sample(0, soc=90.0, power=0.0, chg=0.0, dis=0.0,
+                   packs=[self._pack(90.0, -1.0), self._pack(90.0, 1.0),
+                          self._pack(90.0, 0.15)]),
+            learning=True,
+        )
+        self.assertIsNone(
+            tracker.current_share_deviation_pct(),
+            "a small, near-idle mean current must no longer produce an "
+            "exploding percentage -- this is the exact field-observed "
+            "regression (~4,020%) this fix closes",
+        )
+
+    def test_mean_at_or_above_the_new_floor_still_computes_normally(self):
+        """Negative case: once the mean genuinely clears the new floor,
+        the metric must compute exactly as before -- confirms the fix
+        only changed WHEN the guard fires, not the underlying formula."""
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        tracker = bh.PackCapacityTracker(cfg, pack_count=3)
+        # mean = 10.0A, comfortably above the 2.0A floor.
+        tracker.feed(
+            _sample(0, soc=90.0, power=-2500.0, chg=0.0, dis=0.0,
+                   packs=[self._pack(90.0, -8.0), self._pack(90.0, -12.0),
+                          self._pack(90.0, -10.0)]),
+            learning=True,
+        )
+        # mean=-10, spread=4 -> 4/10*100 = 40%
+        self.assertAlmostEqual(
+            tracker.current_share_deviation_pct(), 40.0, places=1,
+        )
+
     def test_updates_on_every_feed_uses_latest_not_first(self):
         cfg = _cfg(freshness_tau_kwh=1e12)
         tracker = bh.PackCapacityTracker(cfg, pack_count=2)

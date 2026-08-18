@@ -429,6 +429,20 @@ class MockCoordinator:
             self.hass.async_create_task = MagicMock(side_effect=lambda c: c.close())
         self.hass.async_create_task(coro)
 
+    def schedule_verify_write(self, name, expected_value):
+        # v2.0.9 (Phase 4.7, this release -- old DEF-010): same minimal
+        # stand-in role as create_background_task() above -- entity
+        # tests exercise "was schedule_verify_write called with the
+        # right args", not the real coalescing/cancellation behaviour,
+        # which is tested directly against the real implementation in
+        # update_coordinator.py's own test file. Just needs to consume
+        # the coroutine cleanly, same as create_background_task() does.
+        if not hasattr(self, "hass"):
+            self.hass = MagicMock()
+            self.hass.async_create_task = MagicMock(side_effect=lambda c: c.close())
+        coro = self.verify_write(name, expected_value)
+        self.hass.async_create_task(coro)
+
 
 class MockDevice:
     def __init__(self, set_result=True, raises=None, serial_number="MOCKSERIAL001"):

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from pathlib import Path
 from collections.abc import Callable
 from typing import Any
@@ -44,6 +45,7 @@ import homeassistant.helpers.config_validation as cv
 from .const import (
     CONF_BH_AMBIENT_ENTITY,
     CONF_SLOW_TIER_TTL_S,
+    CONF_SYNC_POWER_DEDICATED_READS,
     DEFAULT_SLOW_TIER_TTL_S,
     CONF_BH_ENABLED,
     CONF_BH_INSTALL_DATE,
@@ -88,11 +90,21 @@ async def validate_serial_setup(port: str, unit_ids: list[int]) -> dict[str, Any
     """
     endpoint = ModbusGuard.endpoint_for({"port": port})
     guard = ModbusGuard.acquire_endpoint(endpoint)
-    client = create_rtu_client(
-        port=port,
-        unit_id=unit_ids[0],
-    )
+    # v2.0.9 FIX (DEF-003, external ICS quality/defect/architecture audit
+    # -- confirmed): client creation previously happened BEFORE this
+    # function's own try/finally began, so a failure in create_rtu_client()
+    # itself (synchronous, but not guaranteed never to raise -- e.g. an
+    # invalid port string) would skip the finally block entirely,
+    # including its own guard-release cleanup call -- leaking
+    # the reference permanently. Matches the already-correct pattern used
+    # elsewhere in this same file (see validate_network_setup_login's own
+    # `client = None` + in-try assignment) rather than inventing a new one.
+    client = None
     try:
+        client = create_rtu_client(
+            port=port,
+            unit_id=unit_ids[0],
+        )
         # v2.0.0b (MOD-08, external ICS audit -- confirmed): connection
         # establishment itself had no timeout -- see MODBUS_CONNECT_TIMEOUT's
         # own comment in const.py for why this is a separate, shorter bound
@@ -149,10 +161,15 @@ async def validate_serial_setup(port: str, unit_ids: list[int]) -> dict[str, Any
         # own H-05 fix -- an unbounded disconnect() here could block the
         # configuration flow indefinitely after the actual operation above
         # already completed or failed.
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(
-                client.disconnect(), timeout=DISCONNECT_TIMEOUT.total_seconds(),
-            )
+        # v2.0.9 FIX (DEF-003, same audit -- confirmed): `if client is not
+        # None` guard, matching validate_network_setup's own established
+        # pattern -- client creation now happens inside the try (see
+        # above), so client can genuinely be None here if that failed.
+        if client is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(
+                    client.disconnect(), timeout=DISCONNECT_TIMEOUT.total_seconds(),
+                )
         ModbusGuard.release_endpoint(endpoint)
 
 
@@ -273,8 +290,13 @@ async def _tcp_auto_slave_discovery(
     """
     endpoint = ModbusGuard.endpoint_for({"host": host, "port": port})
     guard = ModbusGuard.acquire_endpoint(endpoint)
-    client = create_scan_tcp_client(host=host, port=port, unit_id=0)
+    # v2.0.9 FIX (DEF-003, external ICS quality/defect/architecture audit
+    # -- confirmed): see validate_serial_setup's own comment on this same
+    # fix -- client creation moved inside try so a failure there can't
+    # skip release_endpoint() in finally.
+    client = None
     try:
+        client = create_scan_tcp_client(host=host, port=port, unit_id=0)
         # v2.0.0b (MOD-08, external ICS audit -- confirmed): see the first
         # call site's own note on this same fix.
         await asyncio.wait_for(client.connect(), timeout=MODBUS_CONNECT_TIMEOUT.total_seconds())
@@ -285,10 +307,11 @@ async def _tcp_auto_slave_discovery(
         # own H-05 fix -- an unbounded disconnect() here could block the
         # configuration flow indefinitely after the actual operation above
         # already completed or failed.
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(
-                client.disconnect(), timeout=DISCONNECT_TIMEOUT.total_seconds(),
-            )
+        if client is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(
+                    client.disconnect(), timeout=DISCONNECT_TIMEOUT.total_seconds(),
+                )
         ModbusGuard.release_endpoint(endpoint)
 
 
@@ -304,8 +327,13 @@ async def _rtu_auto_slave_discovery(
     """
     endpoint = ModbusGuard.endpoint_for({"port": serial_port})
     guard = ModbusGuard.acquire_endpoint(endpoint)
-    client = create_scan_rtu_client(serial_port, unit_id=0)
+    # v2.0.9 FIX (DEF-003, external ICS quality/defect/architecture audit
+    # -- confirmed): see validate_serial_setup's own comment on this same
+    # fix -- client creation moved inside try so a failure there can't
+    # skip release_endpoint() in finally.
+    client = None
     try:
+        client = create_scan_rtu_client(serial_port, unit_id=0)
         # v2.0.0b (MOD-08, external ICS audit -- confirmed): see the first
         # call site's own note on this same fix.
         await asyncio.wait_for(client.connect(), timeout=MODBUS_CONNECT_TIMEOUT.total_seconds())
@@ -316,10 +344,11 @@ async def _rtu_auto_slave_discovery(
         # own H-05 fix -- an unbounded disconnect() here could block the
         # configuration flow indefinitely after the actual operation above
         # already completed or failed.
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(
-                client.disconnect(), timeout=DISCONNECT_TIMEOUT.total_seconds(),
-            )
+        if client is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(
+                    client.disconnect(), timeout=DISCONNECT_TIMEOUT.total_seconds(),
+                )
         ModbusGuard.release_endpoint(endpoint)
 
 
@@ -406,8 +435,13 @@ async def _tcp_scan_slave_discovery(
     """
     endpoint = ModbusGuard.endpoint_for({"host": host, "port": port})
     guard = ModbusGuard.acquire_endpoint(endpoint)
-    client = create_scan_tcp_client(host=host, port=port, unit_id=0)
+    # v2.0.9 FIX (DEF-003, external ICS quality/defect/architecture audit
+    # -- confirmed): see validate_serial_setup's own comment on this same
+    # fix -- client creation moved inside try so a failure there can't
+    # skip release_endpoint() in finally.
+    client = None
     try:
+        client = create_scan_tcp_client(host=host, port=port, unit_id=0)
         # v2.0.0b (MOD-08, external ICS audit -- confirmed): see the first
         # call site's own note on this same fix.
         await asyncio.wait_for(client.connect(), timeout=MODBUS_CONNECT_TIMEOUT.total_seconds())
@@ -418,10 +452,11 @@ async def _tcp_scan_slave_discovery(
         # own H-05 fix -- an unbounded disconnect() here could block the
         # configuration flow indefinitely after the actual operation above
         # already completed or failed.
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(
-                client.disconnect(), timeout=DISCONNECT_TIMEOUT.total_seconds(),
-            )
+        if client is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(
+                    client.disconnect(), timeout=DISCONNECT_TIMEOUT.total_seconds(),
+                )
         ModbusGuard.release_endpoint(endpoint)
 
 
@@ -437,8 +472,13 @@ async def _rtu_scan_slave_discovery(
     """
     endpoint = ModbusGuard.endpoint_for({"port": serial_port})
     guard = ModbusGuard.acquire_endpoint(endpoint)
-    client = create_scan_rtu_client(serial_port, unit_id=0)
+    # v2.0.9 FIX (DEF-003, external ICS quality/defect/architecture audit
+    # -- confirmed): see validate_serial_setup's own comment on this same
+    # fix -- client creation moved inside try so a failure there can't
+    # skip release_endpoint() in finally.
+    client = None
     try:
+        client = create_scan_rtu_client(serial_port, unit_id=0)
         # v2.0.0b (MOD-08, external ICS audit -- confirmed): see the first
         # call site's own note on this same fix.
         await asyncio.wait_for(client.connect(), timeout=MODBUS_CONNECT_TIMEOUT.total_seconds())
@@ -449,10 +489,11 @@ async def _rtu_scan_slave_discovery(
         # own H-05 fix -- an unbounded disconnect() here could block the
         # configuration flow indefinitely after the actual operation above
         # already completed or failed.
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(
-                client.disconnect(), timeout=DISCONNECT_TIMEOUT.total_seconds(),
-            )
+        if client is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(
+                    client.disconnect(), timeout=DISCONNECT_TIMEOUT.total_seconds(),
+                )
         ModbusGuard.release_endpoint(endpoint)
 
 
@@ -533,7 +574,48 @@ async def _connect_to_discovered_devices(
             has_write_permission = elevated_permissions
 
         unit_ids = [primary_unit_id]
-        for sub_unit_id in sub_unit_ids:
+        # v2.0.9 FIX (DEF-005, external ICS quality/defect/architecture
+        # audit -- confirmed): a sub-device DISCOVERED (found responding
+        # during the earlier scan step, hence present in sub_unit_ids at
+        # all) but then failing here was previously only logged --
+        # never surfaced to the user in any way, and never reflected in
+        # the returned info. The user could end up with fewer devices
+        # than were actually discovered, with no indication anything
+        # was skipped, unless they happened to check the HA log. Now
+        # tracked and returned so the caller (async_step_finish_network_
+        # setup, below) can surface it on the confirm_setup screen the
+        # user already reviews before committing -- not a hard failure
+        # (a transient failure on one sub-device during exactly this
+        # window shouldn't block setup of everything else that DID
+        # succeed), but no longer silent either.
+        skipped_sub_unit_ids: list[int] = []
+        # v2.0.9 FIX (DEF-006, external ICS quality/defect/architecture
+        # audit -- confirmed): per-sub-device DEVICE_CONNECT_TIMEOUT
+        # existed, but nothing capped the WHOLE loop -- a daisy-chained
+        # setup with many discovered sub-devices, each slow-but-not-
+        # quite-timing-out, could extend this step's total duration
+        # without bound. A plain `asyncio.timeout()` wrap (matching
+        # _auto_slave_discovery's/_scan_slave_discovery's own existing
+        # pattern) was deliberately NOT used here: that would raise and
+        # discard the primary device's own already-successful
+        # connection too if it fired mid-loop. Using an explicit
+        # monotonic deadline instead lets a budget overrun feed into
+        # the SAME graceful "skipped" mechanism DEF-005 just built --
+        # any sub-device not yet attempted once the budget is exhausted
+        # is treated exactly like a sub-device that failed to connect,
+        # surfaced the same way, not a hard failure of the whole step.
+        loop_deadline = time.monotonic() + DISCOVERY_TOTAL_TIMEOUT.total_seconds()
+        for loop_index, sub_unit_id in enumerate(sub_unit_ids):
+            if time.monotonic() >= loop_deadline:
+                remaining = sub_unit_ids[loop_index:]
+                _LOGGER.warning(
+                    "Discovery total timeout (%.0fs) reached with %d "
+                    "sub-device(s) still unattempted; skipping the rest",
+                    DISCOVERY_TOTAL_TIMEOUT.total_seconds(),
+                    len(remaining),
+                )
+                skipped_sub_unit_ids.extend(remaining)
+                break
             try:
                 async with guard.request(label="config_flow_finish_network"):
                     sub_device = await asyncio.wait_for(
@@ -553,9 +635,11 @@ async def _connect_to_discovered_devices(
                     "Error while connecting to sub device with unit_id %s. Skipping",
                     sub_unit_id,
                 )
+                skipped_sub_unit_ids.append(sub_unit_id)
 
         return {
             "slave_ids": unit_ids,
+            "skipped_slave_ids": skipped_sub_unit_ids,
             "model_name": device.model_name,
             "serial_number": device.serial_number,
             "has_write_permission": has_write_permission,
@@ -827,6 +911,10 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     _serial_port: str | None = None
     _slave_ids: list[int] | None = None
+    # v2.0.9 (DEF-005, this release): sub-devices that were discovered
+    # but then failed to connect during finish_network_setup -- see
+    # _connect_to_discovered_devices()'s own comment on this field.
+    _skipped_slave_ids: list[int] | None = None
 
     _username: str | None = None
     _password: str | None = None
@@ -1605,6 +1693,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return self.async_show_progress_done(next_step_id="cannot_connect")
 
         self._slave_ids = info.pop("slave_ids")
+        self._skipped_slave_ids = info.pop("skipped_slave_ids", [])
         self._inverter_info = info
 
         if self._elevated_permissions and info["has_write_permission"] is False:
@@ -1621,12 +1710,29 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Show discovered device info and ask for confirmation before creating the entry."""
         assert self._inverter_info is not None
         if user_input is None:
+            # v2.0.9 FIX (DEF-005, external ICS quality/defect/architecture
+            # audit -- confirmed): previously, a discovered sub-device that
+            # failed to connect during finish_network_setup was silently
+            # dropped -- the user would see this confirm screen with fewer
+            # slave_ids than were actually discovered, with no indication
+            # anything was skipped. skipped_notice is empty (renders as
+            # nothing) when nothing was skipped, so this is a no-op for
+            # the common case; only shown when it's genuinely relevant.
+            skipped_notice = ""
+            if self._skipped_slave_ids:
+                skipped_notice = (
+                    "\n\n⚠️ Could not connect to discovered slave ID(s): "
+                    + ", ".join(str(sid) for sid in self._skipped_slave_ids)
+                    + ". They will not be added. Check the Home Assistant "
+                    "log for details, or press Submit to continue without them."
+                )
             return self.async_show_form(
                 step_id="confirm_setup",
                 description_placeholders={
                     "model_name": self._inverter_info["model_name"],
                     "serial_number": self._inverter_info["serial_number"],
                     "slave_ids": ", ".join(str(sid) for sid in (self._slave_ids or [])),
+                    "skipped_notice": skipped_notice,
                 },
             )
         return await self._create_or_update_entry(self._inverter_info)
@@ -1790,7 +1896,11 @@ class DeviceException(Exception):
 
 
 class BatteryHealthOptionsFlowHandler(config_entries.OptionsFlow):
-    """Options flow exposing the Battery Health Index tunable constants.
+    """Options flow exposing the Battery Health Index tunable constants,
+    plus other entry-level runtime-tunable options that don't yet
+    warrant their own dedicated flow (v2.0.9: SynchronizedPowerCoordinator's
+    dedicated-reads toggle -- see this class's own async_step_init()
+    schema comment for why it lives here rather than in a new handler).
 
     All values default to the BatteryHealthConfig defaults (battery_health.py)
     so the integration works out-of-the-box without visiting this flow.
@@ -1816,6 +1926,21 @@ class BatteryHealthOptionsFlowHandler(config_entries.OptionsFlow):
                 vol.Optional(
                     CONF_BH_ENABLED,
                     default=options.get(CONF_BH_ENABLED, True),
+                ): bool,
+                # v2.0.9 (Phase 3.1, this release -- ICS-11, both external
+                # ICS audits): defaults True, preserving every existing
+                # installation's current behaviour. See const.py's own
+                # CONF_SYNC_POWER_DEDICATED_READS comment for the full
+                # field-validated reasoning behind offering this at all.
+                # Placed in this same options flow rather than a new
+                # dedicated one -- this integration currently has exactly
+                # one options-flow entry point per config entry, and a
+                # second full flow class for one boolean was judged not
+                # worth the added UI complexity versus one more field
+                # here.
+                vol.Optional(
+                    CONF_SYNC_POWER_DEDICATED_READS,
+                    default=options.get(CONF_SYNC_POWER_DEDICATED_READS, True),
                 ): bool,
                 vol.Optional(
                     CONF_SLOW_TIER_TTL_S,

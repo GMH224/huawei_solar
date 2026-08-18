@@ -140,6 +140,74 @@ class TestLifetimeTotals(unittest.TestCase):
         self.assertEqual(t.total_skipped_polls, 2)
 
 
+# ── v2.0.9 (Phase 1.2): retry/BUSY telemetry, ICS-15 (both external audits) ──
+
+class TestPhase1BusyRetryTelemetry(unittest.TestCase):
+    """0x06 SLAVE_DEVICE_BUSY retry logic has existed since v1.0.6 but had
+    zero dedicated telemetry -- both external audits independently flagged
+    retry amplification as a credible but unquantified risk."""
+
+    def test_busy_retry_increments_busy_and_physical_but_not_logical(self):
+        t = _make()
+        t.record_busy_retry()
+        self.assertEqual(t.total_busy_events, 1)
+        self.assertEqual(t.total_physical_attempts, 1)
+        self.assertEqual(
+            t.total_attempts, 0,
+            "a BUSY retry is not itself a logical/chunk-outcome attempt "
+            "-- only the eventual final outcome (success/failure/timeout) "
+            "is",
+        )
+
+    def test_adversarial_retried_then_succeeded_chunk_is_one_logical_many_physical(self):
+        """The core scenario this closes: a chunk that BUSY-retried twice
+        before succeeding must show as exactly ONE logical attempt but
+        THREE physical attempts (2 BUSY + 1 final success) -- previously
+        this was entirely invisible, looking identical to a chunk that
+        succeeded on the first try."""
+        t = _make()
+        t.record_busy_retry()
+        t.record_busy_retry()
+        t.record_request(batch_size=1)
+        self.assertEqual(t.total_attempts, 1, "exactly one logical attempt")
+        self.assertEqual(t.total_physical_attempts, 3, "two BUSY + one success")
+        self.assertEqual(t.total_busy_events, 2)
+
+    def test_retry_amplification_computed_correctly(self):
+        t = _make()
+        t.record_busy_retry()
+        t.record_request(batch_size=1)  # 1 logical, 2 physical so far
+        t.record_request(batch_size=1)  # 2 logical, 3 physical
+        snap = t.snapshot()
+        self.assertEqual(snap["logical_attempts"], 2)
+        self.assertEqual(snap["total_physical_attempts"], 3)
+        self.assertAlmostEqual(snap["retry_amplification"], 1.5, places=2)
+
+    def test_retry_amplification_is_none_with_zero_attempts(self):
+        t = _make()
+        snap = t.snapshot()
+        self.assertIsNone(snap["retry_amplification"])
+
+    def test_queue_shed_and_admission_timeout_do_not_count_as_physical(self):
+        """Negative case: a request that never reached the physical bus
+        at all (shed or admission timeout) must not inflate physical
+        attempts -- only a genuine 'device' timeout (admitted, sent, no
+        response in time) represents a real wire transaction."""
+        t = _make()
+        t.record_timeout(kind="queue_shed")
+        t.record_timeout(kind="admission")
+        self.assertEqual(t.total_physical_attempts, 0)
+        t.record_timeout(kind="device")
+        self.assertEqual(t.total_physical_attempts, 1)
+
+    def test_logical_attempts_is_a_true_alias_for_total_attempts(self):
+        t = _make()
+        t.record_request()
+        t.record_failure()
+        snap = t.snapshot()
+        self.assertEqual(snap["logical_attempts"], snap["total_attempts"])
+
+
 # ── v2.0.3: F-03 -- failure-rate metric blind to timeout-only failures ──────
 
 class TestF03TimeoutInclusiveRates(unittest.TestCase):

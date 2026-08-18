@@ -60,7 +60,12 @@ FLUSH_THRESHOLD = 100
 MIN_FLUSH_INTERVAL_S = 30.0
 
 #: Hard cap per file before rotation, and how many rotations to keep.
-MAX_FILE_BYTES = 5 * 1024 * 1024
+# v2.0.9 (user request, this release): bumped from 5MB to 100MB -- with
+# KEEP_ROTATIONS=2, worst case is (current + 2 rotated) x 100MB = 300MB
+# for this mechanism alone, 600MB combined with telemetry_capture.py's
+# own identical bump below -- flagged explicitly since "100MB each"
+# multiplies by the rotation count, not a single flat total.
+MAX_FILE_BYTES = 100 * 1024 * 1024
 KEEP_ROTATIONS = 2
 
 # v2.0.3 (ICS-08, external ICS audit -- confirmed): the exact same defect
@@ -118,6 +123,14 @@ class BusDiagnostics:
     """
 
     _registry: dict[str, "BusDiagnostics"] = {}
+    # v2.0.9 (Phase 4.8, this release -- old DEF-011, external ICS
+    # quality/defect/architecture audit -- confirmed): mirrors ModbusGuard's
+    # own _ref_counts exactly (modbus_guard.py) -- see acquire_endpoint()/
+    # release_endpoint() below for the full reasoning. remove() alone had
+    # no concept of "how many entries still need this instance", so one
+    # entry unloading could remove a still-in-use instance out from under
+    # another entry sharing the same physical endpoint.
+    _ref_counts: dict[str, int] = {}
 
     def __init__(self, hass: Any, endpoint: str) -> None:
         self.hass = hass
@@ -158,6 +171,13 @@ class BusDiagnostics:
     # ── registry ────────────────────────────────────────────────────────────
     @classmethod
     def get_or_create(cls, hass: Any, endpoint: str) -> "BusDiagnostics":
+        """Return the instance for *endpoint*, creating it if absent.
+
+        Does NOT itself affect the reference count -- matches ModbusGuard's
+        own get_or_create() contract exactly (modbus_guard.py): callers
+        that own the endpoint's lifecycle must bracket their own usage
+        with acquire_endpoint()/release_endpoint() instead.
+        """
         inst = cls._registry.get(endpoint)
         if inst is None:
             inst = cls(hass, endpoint)
@@ -169,12 +189,54 @@ class BusDiagnostics:
         return cls._registry.get(endpoint)
 
     @classmethod
+    def acquire_endpoint(cls, hass: Any, endpoint: str) -> "BusDiagnostics":
+        """v2.0.9 (Phase 4.8, this release -- old DEF-011, external ICS
+        quality/defect/architecture audit -- confirmed): entry-level
+        acquire, mirroring ModbusGuard.acquire_endpoint() exactly --
+        creates the instance if needed and increments its reference
+        count by one. Must be paired with exactly one later
+        release_endpoint() call for the same endpoint.
+        """
+        inst = cls.get_or_create(hass, endpoint)
+        cls._ref_counts[endpoint] = cls._ref_counts.get(endpoint, 0) + 1
+        return inst
+
+    @classmethod
+    def release_endpoint(cls, endpoint: str) -> None:
+        """v2.0.9 (Phase 4.8, this release -- old DEF-011, external ICS
+        quality/defect/architecture audit -- confirmed): entry-level
+        release, mirroring ModbusGuard.release_endpoint() exactly --
+        decrements the endpoint's reference count, removing the
+        instance from the registry only once the count reaches zero
+        (every entry that acquired it has released it). A release with
+        no matching prior acquire is a safe no-op, not an error --
+        matches ModbusGuard's own reasoning for the same design choice.
+        """
+        if endpoint not in cls._ref_counts:
+            return
+        cls._ref_counts[endpoint] -= 1
+        if cls._ref_counts[endpoint] <= 0:
+            cls._ref_counts.pop(endpoint, None)
+            cls._registry.pop(endpoint, None)
+
+    @classmethod
     def remove(cls, endpoint: str) -> None:
+        """DEPRECATED (v2.0.9, Phase 4.8 -- old DEF-011): unconditional
+        removal, ignoring reference count -- mirrors ModbusGuard.remove()'s
+        own deprecation exactly (modbus_guard.py), which documents this
+        as the exact class of bug DEF-011 describes. Retained only so
+        any external/legacy caller does not hard-fail; production code
+        must use release_endpoint() instead. Calling this directly will
+        remove the instance even if another entry sharing the same
+        physical endpoint still holds a reference to it.
+        """
         cls._registry.pop(endpoint, None)
+        cls._ref_counts.pop(endpoint, None)
 
     @classmethod
     def clear_registry(cls) -> None:
         cls._registry.clear()
+        cls._ref_counts.clear()
 
     # ── control ─────────────────────────────────────────────────────────────
     def set_enabled(self, enabled: bool) -> None:
@@ -245,6 +307,21 @@ class BusDiagnostics:
         outcome: str,
         registers: int | None = None,
         priority: str | None = None,
+        # v2.0.9 (Phase 2.1/2.4, this release -- ICS-16, Architecture R3/
+        # R4, both external ICS audits -- confirmed): the exact fields
+        # both audits' own "Priority 0" recommendation asked for, added
+        # to this ALREADY-EXISTING capture mechanism rather than a new
+        # parallel system -- see this module's own docstring; the ring
+        # buffer, pseudonymisation, bounded-file, never-blocks-the-loop
+        # properties are all unchanged, just three more optional fields
+        # per record. All default to None so any caller not yet passing
+        # them (there should be none left after this release, but kept
+        # defensive) degrades cleanly.
+        chunk_index: int | None = None,
+        chunk_count: int | None = None,
+        retry_count: int | None = None,
+        logical_request_id: int | None = None,
+        transition_reason: str | None = None,
     ) -> None:
         """Record one completed request. Cheap no-op when disabled."""
         if not self.enabled:
@@ -262,6 +339,17 @@ class BusDiagnostics:
             "out": outcome,
             "regs": registers,
             "prio": priority,
+            # v2.0.9 (Phase 2.1/2.4, this release): short keys, matching
+            # this record's own existing convention (qd/out/regs/prio),
+            # not the longer names used in the Python-level API above --
+            # this dict is what actually gets serialised to disk, and
+            # every existing key here is already abbreviated for the
+            # same file-size reason MAX_FILE_BYTES/rotation exist at all.
+            "chunk_idx": chunk_index,
+            "chunk_n": chunk_count,
+            "retries": retry_count,
+            "req_id": logical_request_id,
+            "transition": transition_reason,
         }
         self._buffer.append((self._next_seq, record))
         self._next_seq += 1

@@ -176,6 +176,24 @@ DISCOVERY_TOTAL_TIMEOUT = timedelta(seconds=90)
 # headroom without meaningfully delaying unload in the normal case.
 DISCONNECT_TIMEOUT = timedelta(seconds=10)
 
+# v2.0.9 (Phase 4.9, this release -- old DEF-012, external ICS quality/
+# defect/architecture audit -- confirmed): both AdaptiveModbusController.
+# async_load() and BatteryHealthManager.async_initialize() call self.
+# _store.async_load() on the config-entry setup critical path (await'ed
+# directly from __init__.py's own async_setup_entry) with no timeout of
+# their own -- each already has an `except Exception` broad enough to
+# treat a load failure as "start fresh" gracefully, but nothing bounded
+# how long the awaited load itself could take. A genuinely stalled HA
+# Store read (disk contention, a wedged filesystem) would block entry
+# setup indefinitely, for what's explicitly optional, best-effort
+# persisted state -- exactly the class of problem DISCONNECT_TIMEOUT
+# above already exists to prevent for the analogous disconnect case.
+# A plain local HA Store read of a small JSON file should be near-
+# instant; 10s (matching DISCONNECT_TIMEOUT's own value and reasoning)
+# is generous headroom without meaningfully delaying setup in the
+# normal case.
+STORAGE_LOAD_TIMEOUT = timedelta(seconds=10)
+
 # v1.3.19 (Defect V/Finding 8, independent ICS audit): bound for the
 # maximum-power validation read in services.py's _validate_power_value(),
 # performed BEFORE any write, while the per-device write lock (Defect R,
@@ -405,7 +423,15 @@ KEEPALIVE_REGISTER = "model_id"
 # prevents a single Modbus burst from occupying the inverter CPU for > ~300 ms,
 # which is a primary trigger for 0x06 BUSY responses during high-load windows.
 BATCH_CHUNK_SIZE: int = 40
-# Pause inserted between chunks (inside the guard lock — gap enforced by guard).
+# v2.0.9 FIX (today's ICS audit, §21/Priority 3 -- confirmed): this
+# comment previously said "inside the guard lock (gap enforced by
+# guard)" -- stale and wrong. The actual pause (update_coordinator.py,
+# where BATCH_INTER_CHUNK_PAUSE is used) runs OUTSIDE the guard lock,
+# deliberately, so other queued clients can be served between chunks of
+# the same logical poll rather than being blocked out for the pause's
+# own duration too. Confirmed directly against the real call site's own
+# comment, which was already correct -- only this constant's definition
+# site had drifted out of sync with it.
 BATCH_INTER_CHUNK_PAUSE = timedelta(milliseconds=80)
 
 # v2.0.0a (F03, external ICS audit -- confirmed): the whole-poll deadline.
@@ -541,6 +567,24 @@ REGISTER_STARVATION_PROMOTIONS_PER_CYCLE: int = 1
 # Master kill switch (v1.1.7): lets a user disable the entire battery-health
 # subsystem from the UI without editing files, if it ever misbehaves.
 CONF_BH_ENABLED = "bh_enabled"
+
+# v2.0.9 (Phase 3.1, this release): SynchronizedPowerCoordinator's own
+# dedicated physical reads, made optional. Confirmed against two
+# independent full-day field telemetry captures (2.0.7 and 2.0.8): the
+# temporal alignment this coordinator's dedicated reads exist to
+# guarantee is achieved essentially never in practice (96.5%-97.09%
+# "temporally uncertain" across both captures) -- and separately
+# confirmed that hourly/daily energy accuracy already comes entirely
+# from accumulated device counters (ACCUMULATED_YIELD_ENERGY, GRID_
+# ACCUMULATED_ENERGY, STORAGE_TOTAL_CHARGE/DISCHARGE), independent of
+# this coordinator's own instantaneous-power alignment work. Defaults to
+# True (dedicated reads ON), preserving today's behaviour for every
+# existing installation unless a user explicitly opts out -- this
+# integration serves more installations than the one this specific
+# finding was field-validated against, and the live power-flow card
+# some installations genuinely want is still a legitimate use case this
+# default protects.
+CONF_SYNC_POWER_DEDICATED_READS = "sync_power_dedicated_reads"
 
 CONF_BH_RATED_CAPACITY_KWH = "bh_rated_capacity_kwh"
 #: Finding D: true battery install/commissioning date (ISO yyyy-mm-dd).

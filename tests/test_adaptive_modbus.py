@@ -117,9 +117,17 @@ def _make_ctrl() -> AdaptiveModbusController:
     # hit repeatedly this session for every object.__new__()-based test
     # fixture.
     ctrl._granularity_counts = {}
+    # v2.0.9 (Phase 2.2, this release): _make_ctrl() bypasses __init__
+    # entirely, so this needs setting explicitly, matching __init__'s
+    # own default -- same class of gap hit repeatedly across this
+    # project's own object.__new__()-based test fixtures.
+    ctrl._last_transition_reason = ""
+    ctrl._last_transition_ts = None
     # v1.2.3 instrumentation (diagnostics only)
     ctrl.last_batch_ms = 0.0
     ctrl.last_chunk_count = 0
+    # v2.0.9 (Phase 2.3, this release): same object.__new__() fixture gap.
+    ctrl.last_batch_deadline_margin_ms = None
     ctrl.shed_count = 0
     # v2.0.0b (MOD-09, external ICS audit): _make_ctrl() bypasses __init__
     # entirely, so this needs setting explicitly, matching __init__'s own
@@ -413,6 +421,40 @@ class TestNotifyTransition(unittest.TestCase):
         p = ctrl.get_params()
         self.assertFalse(p.in_transition)
         self.assertFalse(ctrl._in_transition)
+
+    def test_reason_recorded_and_exposed_in_snapshot(self):
+        """Phase 2.2 (this release -- ICS-13/ICS-14, both external ICS
+        audits): the reason string used to be logged at DEBUG and
+        discarded -- never retained as state, so telemetry could see
+        THAT a transition was active but never WHY."""
+        ctrl = _make_ctrl()
+        ctrl.notify_transition("night→day")
+        self.assertEqual(ctrl._last_transition_reason, "night→day")
+        self.assertIsNotNone(ctrl._last_transition_ts)
+        snap = ctrl.snapshot()
+        self.assertEqual(snap["last_transition_reason"], "night→day")
+        self.assertIsNotNone(snap["last_transition_ts"])
+
+    def test_empty_reason_recorded_as_unknown(self):
+        ctrl = _make_ctrl()
+        ctrl.notify_transition()  # no reason given
+        self.assertEqual(ctrl._last_transition_reason, "unknown")
+
+    def test_no_transition_yet_reports_none_not_empty_string(self):
+        ctrl = _make_ctrl()
+        snap = ctrl.snapshot()
+        self.assertIsNone(snap["last_transition_reason"])
+        self.assertIsNone(snap["last_transition_ts"])
+
+    def test_adversarial_reason_updates_on_each_new_transition(self):
+        """A second, different transition must overwrite the first --
+        this is 'most recent', not 'first ever'."""
+        ctrl = _make_ctrl()
+        ctrl.notify_transition("day→night")
+        first_ts = ctrl._last_transition_ts
+        ctrl.notify_transition("0x06 SLAVE_DEVICE_BUSY")
+        self.assertEqual(ctrl._last_transition_reason, "0x06 SLAVE_DEVICE_BUSY")
+        self.assertGreaterEqual(ctrl._last_transition_ts, first_ts)
 
 
 # ── Persistence ───────────────────────────────────────────────────────────────
@@ -848,6 +890,117 @@ class TestMOD02GranularityTelemetry(unittest.TestCase):  # v2.0.7
         self.assertEqual(snap["poll_level_requests"], 1)
         self.assertEqual(snap["transaction_level_requests"], 0)
 
+
+class TestPhase32PollConfidenceSeparation(unittest.TestCase):  # v2.0.9
+    """Phase 3.2, this release -- ICS-08/MOD-02, both external ICS
+    audits: confidence (transaction-based, drives gap/timeout/queue_depth
+    blending) and poll_confidence (genuinely poll-level, drives ONLY
+    poll_interval blending) are now separate signals that can diverge --
+    confirmed necessary by real field data showing confidence saturating
+    to 100% within hours from per-chunk observations alone."""
+
+    def test_transaction_only_traffic_never_grows_poll_confidence(self):
+        """The core scenario both audits found in the field: many
+        chunk-level (transaction) observations, almost no genuine polls
+        -- confidence (transaction-based) should climb normally while
+        poll_confidence stays near zero."""
+        ctrl = _make_ctrl()
+        for _ in range(500):
+            ctrl.record_request(50.0, success=True, timeout=False,
+                                granularity="transaction")
+        slot = ctrl._slots[ctrl._current_slot_index()]
+        self.assertGreater(
+            slot.confidence, 0.5,
+            "transaction-based confidence must still climb from these "
+            "observations -- that part of the design is correct and "
+            "unchanged",
+        )
+        self.assertEqual(
+            slot.poll_confidence, 0.0,
+            "poll_confidence must NOT be affected by transaction-only "
+            "traffic at all -- this is the exact conflation MOD-02 "
+            "identified, now closed",
+        )
+
+    def test_genuine_poll_traffic_grows_both_confidences_together(self):
+        """Negative case: an installation using ONLY the default 'poll'
+        granularity (no chunking) must see confidence and poll_confidence
+        grow identically -- confirms this fix is fully backward-
+        compatible for any caller not using chunked transactions."""
+        ctrl = _make_ctrl()
+        for _ in range(200):
+            ctrl.record_request(50.0, success=True, timeout=False)  # default: poll
+        slot = ctrl._slots[ctrl._current_slot_index()]
+        self.assertEqual(slot.confidence, slot.poll_confidence)
+
+    def test_adversarial_poll_interval_blend_uses_poll_confidence_not_confidence(self):
+        """The actual behavioural fix: with heavy transaction traffic but
+        zero genuine polls, poll_interval must still blend toward the
+        CONSERVATIVE cold-start baseline (poll_confidence ~0), even
+        though transaction-based confidence is saturated -- this is what
+        was field-observed as broken and is the whole point of Phase 3.2."""
+        ctrl = _make_ctrl()
+        for _ in range(2000):
+            ctrl.record_request(50.0, success=True, timeout=False,
+                                granularity="transaction")
+        params = ctrl.get_params()
+        self.assertAlmostEqual(params.confidence, 1.0, places=2)
+        self.assertEqual(params.poll_confidence, 0.0)
+        cold_start_s = ADAPTIVE_POLL_COLD_START.total_seconds()
+        self.assertAlmostEqual(
+            params.poll_interval.total_seconds(), cold_start_s, delta=1.0,
+            msg="poll_interval must stay at the cold-start baseline -- "
+                "not the fully-learned value -- since genuinely zero "
+                "polls have been observed, regardless of how many "
+                "transactions have",
+        )
+
+    def test_gap_and_timeout_still_use_transaction_confidence_unaffected(self):
+        """Negative case confirming the SPLIT, not a blanket switch:
+        gap_ms/timeout_s/queue_depth must still respond to transaction-
+        level confidence exactly as before -- only poll_interval changed
+        which confidence it blends against."""
+        ctrl = _make_ctrl()
+        for _ in range(2000):
+            ctrl.record_request(50.0, success=True, timeout=False,
+                                granularity="transaction")
+        params = ctrl.get_params()
+        # At full transaction confidence, gap/timeout/queue_depth should
+        # be fully slot-derived, not blended toward their cold baselines.
+        self.assertGreater(params.max_queue_depth, 1)
+
+    def test_poll_confidence_persists_and_restores(self):
+        ctrl = _make_ctrl()
+        # Realistic: poll_n/poll_failures are always a subset of n's own
+        # growth (record_poll() is only ever called alongside record()),
+        # so n must be set too for this slot to be considered non-empty.
+        ctrl._slots[5].n = 40.0
+        ctrl._slots[5].poll_n = 40.0
+        ctrl._slots[5].poll_failures = 3.0
+        data = ctrl._serialize()
+        self.assertEqual(data["slots"]["5"]["poll_n"], 40.0)
+        self.assertEqual(data["slots"]["5"]["poll_f"], 3.0)
+
+    def test_old_persisted_data_without_poll_fields_defaults_cleanly(self):
+        """Backward compatibility: persisted data from before this
+        release has no poll_n/poll_f keys at all -- must default to 0.0,
+        not raise."""
+        old_slot_dict = {"n": 100.0, "f": 5.0, "t": 2.0, "rtt_p95": 250.0}
+        restored = TimeSlotStats.from_dict(old_slot_dict, slot_index=3)
+        self.assertEqual(restored.poll_n, 0.0)
+        self.assertEqual(restored.poll_failures, 0.0)
+        self.assertEqual(restored.n, 100.0, "existing fields must restore normally")
+
+    def test_snapshot_exposes_both_confidences_distinctly(self):
+        ctrl = _make_ctrl()
+        for _ in range(300):
+            ctrl.record_request(50.0, success=True, timeout=False,
+                                granularity="transaction")
+        snap = ctrl.snapshot()
+        self.assertIn("confidence_pct", snap)
+        self.assertIn("poll_confidence_pct", snap)
+        self.assertGreater(snap["confidence_pct"], snap["poll_confidence_pct"])
+
     def test_transaction_granularity_is_counted_separately(self):
         ctrl = _make_ctrl()
         for _ in range(5):
@@ -1111,12 +1264,31 @@ class TestStoreLoadFaultIsolation(unittest.TestCase):
 
     def test_store_load_is_guarded(self):
         src = (pathlib.Path(__file__).parent.parent / "adaptive_modbus.py").read_text()
-        idx = src.find("await self._store.async_load()")
-        self.assertGreater(idx, -1)
+        # v2.0.9 (Phase 4.9, this release -- old DEF-012): the load is now
+        # wrapped in asyncio.wait_for(..., timeout=STORAGE_LOAD_TIMEOUT)
+        # rather than called bare -- updated to match, while still
+        # confirming the underlying try/except guarantee this test exists
+        # to check is unchanged.
+        idx = src.find("self._store.async_load(), timeout=STORAGE_LOAD_TIMEOUT")
+        self.assertGreater(idx, -1, "the Store load is no longer timeout-bounded")
         window = src[max(0, idx - 400):idx]
         self.assertIn("try:", window,
                       "the Store load must be inside a try/except so a corrupt "
                       "or version-incompatible store cannot abort entry setup")
+
+    def test_store_load_is_timeout_bounded(self):
+        """Phase 4.9 (this release -- old DEF-012, external ICS quality/
+        defect/architecture audit -- confirmed): a genuinely stalled
+        Store read must not be able to block entry setup indefinitely --
+        confirms asyncio.wait_for() actually wraps the load, not just
+        that a timeout constant exists somewhere unused."""
+        src = (pathlib.Path(__file__).parent.parent / "adaptive_modbus.py").read_text()
+        idx = src.find("async def async_load(self)")
+        assert idx > -1
+        end = src.find("\n    def ", idx + 10)
+        body = src[idx: end if end > -1 else idx + 2000]
+        self.assertIn("asyncio.wait_for(", body)
+        self.assertIn("timeout=STORAGE_LOAD_TIMEOUT.total_seconds()", body)
 
     def test_load_failure_leaves_controller_usable(self):
         """A failed load must yield working defaults, not a broken object."""

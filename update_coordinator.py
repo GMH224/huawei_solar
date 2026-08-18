@@ -419,6 +419,21 @@ class HuaweiSolarUpdateCoordinator(
         #: instead of having to be back-solved from saturated parameters.
         self._last_batch_ms: float = 0.0
         self._last_chunk_count: int = 0
+        # v2.0.9 (Phase 2.1/2.4, this release): see _execute_batch()'s own
+        # comment for the full reasoning.
+        self._next_logical_request_id: int = 0
+        # v2.0.9 (Phase 4.7, this release -- old DEF-010, external ICS
+        # quality/defect/architecture audit -- confirmed): tracks the
+        # in-flight write-verification task per register, so a NEW write
+        # to the same register can cancel a STILL-RUNNING verification
+        # of an already-superseded value rather than letting it complete
+        # -- a wasted Modbus read verifying something no longer true.
+        # See schedule_verify_write() below for the actual coalescing
+        # logic; this dict is deliberately separate from create_
+        # background_task()'s own generic HA-entry task tracking (used
+        # for other, unrelated background work like the deferred first-
+        # poll task) rather than extending that shared mechanism.
+        self._verify_write_tasks: dict[RegisterName, asyncio.Task] = {}
 
     # ── wiring ────────────────────────────────────────────────────────────────
 
@@ -722,6 +737,18 @@ class HuaweiSolarUpdateCoordinator(
         for group in _address_group(sorted_names):
             chunks.extend(_chunk(group, BATCH_CHUNK_SIZE))
         merged: dict[RegisterName, Result[Any]] = {}
+        # v2.0.9 (Phase 2.1/2.4, this release -- ICS-16/Architecture R3/R4,
+        # both external ICS audits -- confirmed): one ID shared by every
+        # physical attempt (every chunk, every BUSY retry of every chunk)
+        # within THIS poll -- the single biggest gap both audits
+        # identified: aggregate telemetry could show that a 102.47s/
+        # 8-chunk batch happened, but nothing tied its rows together, so
+        # it couldn't be distinguished from 8 unrelated chunk attempts
+        # spread across the capture. A plain per-coordinator monotonic
+        # counter, not a UUID -- this only ever needs to be unique within
+        # one BusDiagnostics ring buffer/capture file, not globally.
+        self._next_logical_request_id += 1
+        logical_request_id = self._next_logical_request_id
         # DEFECT A (v1.2.3) — two DIFFERENT quantities, previously conflated.
         #
         # ``total_batch_ms`` is how long the whole poll cycle spent talking to
@@ -783,6 +810,23 @@ class HuaweiSolarUpdateCoordinator(
                                 # a stall can be correlated with register count/tier.
                                 _req.registers = len(chunk)
                                 _req.priority_tier = _chunk_tier(chunk)
+                                # v2.0.9 (Phase 2.1/2.4, this release --
+                                # ICS-16, both external ICS audits --
+                                # confirmed): these five fields are what
+                                # let a diagnostics capture actually
+                                # attribute an extreme event (e.g. a
+                                # 102s/8-chunk batch) to a SPECIFIC poll,
+                                # chunk, and retry sequence -- previously
+                                # every row was an anonymous data point,
+                                # indistinguishable from any other.
+                                _req.chunk_index = chunk_idx
+                                _req.chunk_count = len(chunks)
+                                _req.retry_count = busy_retries
+                                _req.logical_request_id = logical_request_id
+                                _req.transition_reason = (
+                                    self._adaptive.current_transition_reason()
+                                    if self._adaptive else None
+                                )
                                 t0 = time.monotonic()
                                 async with asyncio.timeout(effective_timeout.total_seconds()):
                                     chunk_result = await self.device.batch_update(chunk)
@@ -834,6 +878,15 @@ class HuaweiSolarUpdateCoordinator(
                                 and busy_retries < BUSY_MAX_RETRIES
                             ):
                                 busy_retries += 1
+                                # v2.0.9 (Phase 1.2, this release --
+                                # ICS-15, both external ICS audits --
+                                # confirmed): this exact event -- a real
+                                # physical exchange that came back BUSY,
+                                # triggering a real physical retry -- was
+                                # previously invisible to telemetry
+                                # entirely. See ModbusTelemetry.
+                                # record_busy_retry()'s own docstring.
+                                self.telemetry.record_busy_retry()
                                 _LOGGER.debug(
                                     "%s: 0x06 SLAVE_DEVICE_BUSY on chunk %d/%d "
                                     "(retry %d/%d in %.0f ms)",
@@ -1047,6 +1100,59 @@ class HuaweiSolarUpdateCoordinator(
             create_task(self.hass, coro, name)
         else:  # pragma: no cover — no entry provided, or an older HA core
             self.hass.async_create_task(coro)
+
+    def schedule_verify_write(self, name: RegisterName, expected_value: Any) -> None:
+        """Schedule verify_write(name, expected_value) as a coalesced,
+        per-register background task.
+
+        v2.0.9 FIX (Phase 4.7, this release -- old DEF-010, external ICS
+        quality/defect/architecture audit -- confirmed): rapid repeated
+        writes to the SAME register (e.g. dragging a number entity's
+        slider, each intermediate value triggering its own write) used
+        to leave every earlier write's own verify_write() task running
+        to completion -- each one sleeping WRITE_VERIFY_DELAY, then
+        performing a real Modbus read, to verify a value that a NEWER
+        write had already superseded before the read even happened.
+        Only the LATEST write's own verification is ever meaningful;
+        every earlier one is wasted bus traffic by the time it runs.
+
+        Cancelling the previous task for this same register (if any,
+        and if still running) before starting the new one is safe
+        regardless of exactly where the old task was in its own
+        lifecycle (still sleeping, mid Modbus-read, or already
+        finished) -- asyncio.Task.cancel() on an already-done task is a
+        harmless no-op, and cancelling a task that's genuinely still
+        running raises CancelledError inside it at its next await
+        point, which propagates out and is not caught by verify_write()
+        itself, so no stale/incorrect success or failure is ever
+        logged for the cancelled attempt.
+
+        Reuses create_background_task()'s own entry-scoped lifecycle
+        (see its own comment) via the SAME entry.async_create_
+        background_task() call -- which, confirmed directly against the
+        real, installed homeassistant.config_entries source, returns
+        the created asyncio.Task -- so no second, separate task needs
+        to be created just to obtain a cancellable handle.
+        """
+        previous = self._verify_write_tasks.get(name)
+        if previous is not None and not previous.done():
+            previous.cancel()
+
+        coro = self.verify_write(name, expected_value)
+        task_name = f"{self.name}_verify_write_{name}"
+        create_task = getattr(self._entry, "async_create_background_task", None)
+        if self._entry is not None and create_task is not None:
+            task = create_task(self.hass, coro, task_name)
+        else:  # pragma: no cover — no entry provided, or an older HA core
+            task = self.hass.async_create_task(coro)
+
+        self._verify_write_tasks[name] = task
+        task.add_done_callback(
+            lambda t, n=name: (
+                self._verify_write_tasks.pop(n, None)
+                if self._verify_write_tasks.get(n) is t else None
+            )
+        )
 
     async def _async_update_data(self) -> dict[RegisterName, Result[Any]]:
         # ── 0. First-poll stagger ─────────────────────────────────────────────
@@ -1462,7 +1568,16 @@ class HuaweiSolarUpdateCoordinator(
         if self._adaptive:
             # One observation per POLL (unchanged): n, failures, confidence and
             # the daily decay factor are all tuned against a per-poll rate.
-            self._adaptive.note_batch(self._last_batch_ms, self._last_chunk_count)
+            # v2.0.9 (Phase 2.3, this release): deadline_margin_ms is the
+            # remaining headroom against BATCH_POLL_DEADLINE at the
+            # moment this batch completed -- see note_batch()'s own
+            # comment for why this matters.
+            self._adaptive.note_batch(
+                self._last_batch_ms, self._last_chunk_count,
+                deadline_margin_ms=(
+                    BATCH_POLL_DEADLINE.total_seconds() * 1000.0 - self._last_batch_ms
+                ),
+            )
             # Bus-level metrics live on the shared guard (per endpoint) but are
             # surfaced through each controller (per serial) for visibility.
             try:

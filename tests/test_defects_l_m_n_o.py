@@ -239,7 +239,14 @@ class TestDeviceConnectBound(unittest.IsolatedAsyncioTestCase):
         # exists, without over-fitting to exact line numbers.
         idx = source.find("primary_device = await asyncio.wait_for")
         assert idx != -1, "the bounded create_device_instance call was not found"
-        window = source[idx: idx + 1200]
+        # v2.0.9 (DEF-001/DEF-002, external ICS quality/defect/
+        # architecture audit): widened from 1200 -- the fix for those
+        # two findings added real, substantive comment blocks explaining
+        # the guard-acquisition reordering and the new client-cleanup
+        # calls between this point and the ConfigEntryNotReady raise,
+        # pushing it past the old window. The check itself (conversion
+        # exists near the bounded call) is unchanged.
+        window = source[idx: idx + 2200]
         assert "except TimeoutError" in window, (
             "No except TimeoutError handler found near the bounded "
             "create_device_instance() call."
@@ -247,6 +254,120 @@ class TestDeviceConnectBound(unittest.IsolatedAsyncioTestCase):
         assert "ConfigEntryNotReady" in window, (
             "The TimeoutError handler near create_device_instance() does "
             "not raise ConfigEntryNotReady -- this reintroduces Defect M."
+        )
+
+
+class TestDEF001GuardAcquiredBeforeIdentification(unittest.TestCase):
+    """DEF-001 (external ICS quality/defect/architecture audit --
+    confirmed Critical): device construction previously happened before
+    ModbusGuard endpoint acquisition -- a second entry starting on the
+    same physical endpoint while an existing entry was polling could
+    produce genuinely unguarded concurrent Modbus traffic during the
+    identification window."""
+
+    def test_endpoint_derivation_happens_before_client_creation(self):
+        source = _INIT_SRC.read_text()
+        idx = source.find("async def async_setup_entry(")
+        assert idx != -1
+        endpoint_idx = source.find("ModbusGuard.endpoint_for(dict(entry.data))", idx)
+        client_idx = source.find("client = create_rtu_client(", idx)
+        assert endpoint_idx != -1, "endpoint_for() call not found"
+        assert client_idx != -1, "create_rtu_client() call not found"
+        assert endpoint_idx < client_idx, (
+            "bus_endpoint must be derived BEFORE the client is created -- "
+            "it only ever needs entry.data, confirmed against endpoint_"
+            "for()'s own signature, so there is no reason for this to "
+            "happen after client/device construction"
+        )
+
+    def test_guard_acquired_before_client_creation(self):
+        source = _INIT_SRC.read_text()
+        idx = source.find("async def async_setup_entry(")
+        assert idx != -1
+        acquire_idx = source.find("ModbusGuard.acquire_endpoint(bus_endpoint)", idx)
+        client_idx = source.find("client = create_rtu_client(", idx)
+        assert acquire_idx != -1
+        assert client_idx != -1
+        assert acquire_idx < client_idx, (
+            "the guard must be acquired BEFORE the client is created, "
+            "and therefore before any Modbus I/O whatsoever"
+        )
+
+    def test_identification_read_is_wrapped_in_guard_request(self):
+        """The core fix: create_device_instance() -- the actual physical
+        identification read -- must run inside `async with guard.
+        request(...)`, not as raw, unguarded I/O."""
+        source = _INIT_SRC.read_text()
+        idx = source.find("async def async_setup_entry(")
+        assert idx != -1
+        guard_request_idx = source.find("async with guard.request(", idx)
+        device_instance_idx = source.find("create_device_instance(client)", idx)
+        assert guard_request_idx != -1, "identification read is not guard-wrapped"
+        assert device_instance_idx != -1
+        assert guard_request_idx < device_instance_idx < (
+            source.find("\n\n", device_instance_idx)
+        ), (
+            "create_device_instance() must be called INSIDE the guard."
+            "request() context, not merely somewhere after it opens"
+        )
+
+
+class TestDEF002RawClientCleanupOnFailure(unittest.TestCase):
+    """DEF-002 (external ICS quality/defect/architecture audit --
+    confirmed High): a raw client that already opened a real transport
+    connection was never explicitly disconnected if create_device_
+    instance() subsequently failed -- left to eventual garbage
+    collection instead of a deterministic close. For RTU/serial
+    specifically, an unreleased handle can block every later connection
+    attempt to that same port."""
+
+    def test_bounded_client_disconnect_helper_exists(self):
+        source = _INIT_SRC.read_text()
+        assert "async def _bounded_client_disconnect(" in source
+
+    def test_timeout_path_calls_client_disconnect(self):
+        source = _INIT_SRC.read_text()
+        idx = source.find("except TimeoutError as err:")
+        assert idx != -1
+        window = source[idx: idx + 1500]
+        assert "_bounded_client_disconnect(client)" in window, (
+            "the TimeoutError handler for create_device_instance() must "
+            "disconnect the raw client before raising ConfigEntryNotReady"
+        )
+
+    def test_generic_exception_path_also_calls_client_disconnect(self):
+        """Adversarial: a non-timeout failure (e.g. a connection error)
+        must ALSO trigger client cleanup -- confirms there's a genuine
+        catch-all, not just the TimeoutError-specific handler."""
+        source = _INIT_SRC.read_text()
+        idx = source.find("async def async_setup_entry(")
+        assert idx != -1
+        # Find the bare `except Exception:` that follows the TimeoutError
+        # handler for create_device_instance specifically.
+        timeout_idx = source.find("except TimeoutError as err:", idx)
+        assert timeout_idx != -1
+        generic_idx = source.find("except Exception:", timeout_idx)
+        assert generic_idx != -1, (
+            "no catch-all exception handler found after the TimeoutError "
+            "handler -- a non-timeout identification failure would skip "
+            "client cleanup entirely"
+        )
+        window = source[generic_idx: generic_idx + 600]
+        assert "_bounded_client_disconnect(client)" in window
+
+    def test_disconnect_helper_is_bounded_and_fault_isolated(self):
+        source = _INIT_SRC.read_text()
+        idx = source.find("async def _bounded_client_disconnect(")
+        assert idx != -1
+        end = source.find("\n\n\n", idx)
+        body = source[idx: end if end != -1 else idx + 1200]
+        assert "asyncio.wait_for(" in body, (
+            "disconnect must be bounded by a timeout -- a wedged "
+            "disconnect must not block setup-failure cleanup indefinitely"
+        )
+        assert "except Exception" in body, (
+            "a disconnect failure must be swallowed (logged, not raised) "
+            "so it never masks the real error that triggered cleanup"
         )
 
 

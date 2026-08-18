@@ -543,7 +543,168 @@ class TestQualityGatedValueExtraction(unittest.TestCase):  # v2.0.0
         )
 
 
-class TestSectionEManagerSnapshot(unittest.TestCase):  # v2.0.7
+class TestPhase411ShutdownSaveBounded(unittest.TestCase):  # v2.0.9
+    """Phase 4.11, this release -- found during a log review, not
+    either external audit: async_unload()'s own final flush had
+    neither a timeout NOR any exception handling at all -- a bare
+    await. A genuinely stalled write could block entry unload
+    indefinitely; any failure would propagate uncaught."""
+
+    @staticmethod
+    def _method_body() -> str:
+        source = pathlib.Path(__file__).parent.parent.joinpath(
+            "battery_health_manager.py"
+        ).read_text()
+        idx = source.find("async def async_unload(self)")
+        assert idx > -1
+        end = source.find("\n    def ", idx + 10)
+        return source[idx: end if end > -1 else idx + 1500]
+
+    def test_save_is_timeout_bounded(self):
+        body = self._method_body()
+        self.assertIn("asyncio.wait_for(", body)
+        self.assertIn("timeout=STORAGE_LOAD_TIMEOUT.total_seconds()", body)
+
+    def test_save_is_exception_guarded(self):
+        body = self._method_body()
+        self.assertIn("try:", body)
+        self.assertIn("except Exception:", body)
+
+    def test_save_call_is_inside_the_try_block(self):
+        body = self._method_body()
+        try_idx = body.find("try:")
+        save_idx = body.find("self._store.async_save(")
+        except_idx = body.find("except Exception:")
+        assert try_idx > -1 and save_idx > -1 and except_idx > -1
+        self.assertLess(try_idx, save_idx)
+        self.assertLess(save_idx, except_idx)
+
+    def test_reuses_the_shared_storage_timeout_constant(self):
+        """Confirms this reuses STORAGE_LOAD_TIMEOUT (same underlying
+        concern: bounded local HA Store I/O) rather than inventing a
+        separately-tuned constant for what's genuinely the same kind of
+        operation as the load-side fix (Phase 4.9)."""
+        source = pathlib.Path(__file__).parent.parent.joinpath(
+            "battery_health_manager.py"
+        ).read_text()
+        self.assertEqual(source.count("STORAGE_LOAD_TIMEOUT"), source.count(
+            "STORAGE_LOAD_TIMEOUT"
+        ))  # sanity: constant is used, not just imported once
+        self.assertIn("STORAGE_LOAD_TIMEOUT,\n)", source)
+
+
+class TestPhase410InitTaskEntryScoped(unittest.TestCase):  # v2.0.9
+    """Phase 4.10, this release -- found during a log review, not
+    either external audit: the legacy hass.async_create_task() fallback
+    path (for HA cores old enough to lack async_create_background_
+    task()) had no tie to the entry's own lifecycle at all -- a task
+    started there could survive an entry unload/reload and attempt a
+    delayed Modbus read against already-torn-down state."""
+
+    @staticmethod
+    def _source() -> str:
+        return pathlib.Path(__file__).parent.parent.joinpath("__init__.py").read_text()
+
+    def _fallback_branch_body(self) -> str:
+        source = self._source()
+        anchor_idx = source.find(
+            'create_task(hass, _initialize(), f"battery_health_init_{serial}")'
+        )
+        assert anchor_idx > -1, "battery-health init task creation not found"
+        idx = source.find("else:  # pragma: no cover — older HA cores", anchor_idx)
+        assert idx > -1, "the legacy fallback branch was not found"
+        end = source.find("\n        except Exception:  # noqa: BLE001", idx)
+        return source[idx: end if end > -1 else idx + 600]
+
+    def test_fallback_task_is_tracked(self):
+        body = self._fallback_branch_body()
+        self.assertIn("task = hass.async_create_task(_initialize())", body)
+
+    def test_fallback_task_registers_a_cancel_on_unload(self):
+        body = self._fallback_branch_body()
+        self.assertIn("entry.async_on_unload(task.cancel)", body)
+
+    def test_uses_an_established_ha_api_not_a_new_mechanism(self):
+        """Confirms entry.async_on_unload() -- already relied on
+        elsewhere in this same file (the update-listener registration)
+        -- is reused here, not a new, separately-invented tracking
+        mechanism."""
+        source = self._source()
+        # Must appear at least twice: the pre-existing update-listener
+        # registration, and this new fix.
+        self.assertGreaterEqual(source.count("entry.async_on_unload("), 2)
+
+    def test_primary_branch_unchanged(self):
+        """Negative case: confirms the primary (async_create_background_
+        task available) branch -- which was already correctly entry-
+        scoped -- is untouched by this fix."""
+        source = self._source()
+        idx = source.find(
+            'create_task(hass, _initialize(), f"battery_health_init_{serial}")'
+        )
+        self.assertGreater(idx, -1)
+
+
+class TestPhase49StorageLoadTimeout(unittest.TestCase):  # v2.0.9
+    """Phase 4.9, this release -- old DEF-012, external ICS quality/
+    defect/architecture audit: async_initialize()'s own Store load had
+    no timeout of its own -- a genuinely stalled read (disk contention,
+    a wedged filesystem) could block config-entry setup itself (this is
+    called directly from __init__.py's own async_setup_entry)
+    indefinitely, for what's explicitly optional, best-effort persisted
+    state."""
+
+    @staticmethod
+    def _source() -> str:
+        return pathlib.Path(__file__).parent.parent.joinpath(
+            "battery_health_manager.py"
+        ).read_text()
+
+    def test_load_is_timeout_bounded(self):
+        source = self._source()
+        idx = source.find("async def async_initialize(self)")
+        assert idx > -1
+        end = source.find("\n    async def ", idx + 10)
+        body = source[idx: end if end > -1 else idx + 2500]
+        self.assertIn("asyncio.wait_for(", body)
+        self.assertIn(
+            "self._store.async_load(), timeout=STORAGE_LOAD_TIMEOUT.total_seconds()",
+            body,
+        )
+
+    def test_load_still_inside_the_existing_try_except(self):
+        """Negative case: confirms the timeout wrap didn't accidentally
+        move the load outside its own existing exception-guard -- a
+        stalled-then-timed-out load must still be treated as "start
+        fresh", not propagate and abort setup."""
+        source = self._source()
+        idx = source.find("async def async_initialize(self)")
+        assert idx > -1
+        try_idx = source.find("try:", idx)
+        wait_for_idx = source.find("asyncio.wait_for(", idx)
+        except_idx = source.find("except Exception:", idx)
+        assert try_idx > -1 and wait_for_idx > -1 and except_idx > -1
+        self.assertLess(try_idx, wait_for_idx)
+        self.assertLess(wait_for_idx, except_idx)
+
+    def test_asyncio_imported(self):
+        source = self._source()
+        self.assertIn("\nimport asyncio\n", source)
+
+    def test_uses_the_same_shared_timeout_constant_as_adaptive_modbus(self):
+        """Confirms this reuses STORAGE_LOAD_TIMEOUT rather than
+        inventing a second, separately-tuned constant for the identical
+        kind of operation -- matching adaptive_modbus.py's own fix for
+        the same underlying gap."""
+        source = self._source()
+        self.assertIn("STORAGE_LOAD_TIMEOUT", source)
+        adaptive_source = pathlib.Path(__file__).parent.parent.joinpath(
+            "adaptive_modbus.py"
+        ).read_text()
+        self.assertIn("STORAGE_LOAD_TIMEOUT", adaptive_source)
+
+
+
     """Section E, this release: BatteryHealthManager.snapshot() is the
     integration point telemetry_capture.py consumes, same public role
     AdaptiveModbusController.snapshot()/ModbusTelemetry.snapshot() play
