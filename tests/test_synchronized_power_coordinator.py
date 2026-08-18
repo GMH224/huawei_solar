@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import pathlib
 import types
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -138,7 +139,21 @@ class _FakeGuard:
             self._guard = guard
 
         async def __aenter__(self):
-            pass
+            # v2.0.10 (finer-grained instrumentation, this release): the
+            # real ModbusGuard.request() context manager yields a
+            # _RequestContext with settable attributes (registers,
+            # priority_tier, chunk_index, logical_request_id,
+            # register_names, ...) -- callers now set some of these
+            # (e.g. _read_one() in synchronized_power_coordinator.py)
+            # via `async with guard.request(...) as _req: _req.foo =
+            # ...`. Returning None here (as before) made any such
+            # assignment raise AttributeError, silently swallowed by
+            # the caller's own broad except Exception and misreported
+            # as a failed read -- not a deliberate test of failure
+            # handling, just this fake never having needed to support
+            # attribute assignment before. SimpleNamespace is the
+            # minimal, dependency-free stand-in that does.
+            return types.SimpleNamespace()
 
         async def __aexit__(self, *args):
             pass
@@ -387,6 +402,9 @@ def _make_coordinator(inv1=None, inv2=None, has_meter=True, has_battery=True):
     # default (dedicated reads ON, preserving existing behaviour).
     coord._dedicated_reads_enabled = True
     coord.cache_only_snapshots = 0
+    # v2.0.10 (finer-grained instrumentation, this release): same
+    # __new__-bypasses-__init__ fixture gap as every other field above.
+    coord._next_logical_request_id = 0
     return coord
 
 
@@ -1103,3 +1121,110 @@ class TestPhase31CacheOnlyMode:
         snap = coord.snapshot()
         assert snap["dedicated_reads_enabled"] is False
         assert snap["cache_only_snapshots"] == 3
+
+
+class TestPhase210SyncPowerAttribution:
+    """v2.0.10 (finer-grained instrumentation, this release): SyncPower's
+    own dedicated reads previously carried none of the logical_request_
+    id/register_names attribution the main coordinator's own
+    _execute_batch() already provides -- confirmed as a real, 45%-of-
+    all-traffic gap in a live field capture."""
+
+    @pytest.mark.asyncio
+    async def test_next_logical_request_id_initialized(self):
+        coord = _make_coordinator(has_meter=False, has_battery=False)
+        assert coord._next_logical_request_id == 0
+
+    @pytest.mark.asyncio
+    async def test_id_increments_once_per_update_cycle_not_per_read(self):
+        inv1 = _make_device("SN1", pv_power=3000)
+        inv2 = _make_device("SN2", pv_power=1000)
+        coord = _make_coordinator(inv1=inv1, inv2=inv2, has_meter=True, has_battery=True)
+
+        await coord._async_update_data()
+        first_id = coord._next_logical_request_id
+        assert first_id == 1, (
+            "one update cycle with 4 dedicated reads must increment the "
+            "counter exactly once, not once per read -- all 4 reads "
+            "within this cycle must share the SAME id"
+        )
+
+        await coord._async_update_data()
+        assert coord._next_logical_request_id == 2
+
+    @pytest.mark.asyncio
+    async def test_all_four_reads_in_one_cycle_share_the_same_id(self):
+        """The core guarantee: every one of the 4 dedicated reads within
+        ONE update cycle must be attributed the SAME logical_request_id,
+        so a diagnostics capture can group them as belonging to the same
+        logical poll -- matching the main coordinator's own convention
+        exactly."""
+        captured_ctxs = []
+        real_ctx_enter = _FakeGuard._Ctx.__aenter__
+
+        async def _capturing_enter(self):
+            ctx = await real_ctx_enter(self)
+            captured_ctxs.append(ctx)
+            return ctx
+
+        with patch.object(_FakeGuard._Ctx, "__aenter__", _capturing_enter):
+            inv1 = _make_device("SN1", pv_power=3000)
+            inv2 = _make_device("SN2", pv_power=1000)
+            coord = _make_coordinator(inv1=inv1, inv2=inv2, has_meter=True, has_battery=True)
+            await coord._async_update_data()
+
+        ids = [getattr(c, "logical_request_id", None) for c in captured_ctxs]
+        assert len(ids) == 4, "expected all 4 dedicated reads to set logical_request_id"
+        assert all(i is not None for i in ids), ids
+        assert len(set(ids)) == 1, (
+            f"all 4 reads within one update cycle must share ONE id, got {ids}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_register_names_set_to_the_actual_register_read(self):
+        captured_ctxs = []
+        real_ctx_enter = _FakeGuard._Ctx.__aenter__
+
+        async def _capturing_enter(self):
+            ctx = await real_ctx_enter(self)
+            captured_ctxs.append(ctx)
+            return ctx
+
+        with patch.object(_FakeGuard._Ctx, "__aenter__", _capturing_enter):
+            inv1 = _make_device("SN1", pv_power=3000)
+            coord = _make_coordinator(inv1=inv1, has_meter=False, has_battery=False)
+            await coord._async_update_data()
+
+        names = [getattr(c, "register_names", None) for c in captured_ctxs]
+        assert len(names) == 1  # only INV1 PV read (no meter/battery)
+        assert names[0] == [str(rn.INPUT_POWER)]
+
+    def test_source_confirms_id_generated_once_before_the_four_reads(self):
+        source = pathlib.Path(__file__).parent.parent.joinpath(
+            "synchronized_power_coordinator.py"
+        ).read_text()
+        gen_idx = source.find("self._next_logical_request_id += 1")
+        read1_idx = source.find("# ── read 1: INV1 PV power")
+        assert gen_idx > -1
+        assert read1_idx > -1
+        assert gen_idx < read1_idx, (
+            "the id must be generated once, BEFORE any of the four reads, "
+            "not per-read"
+        )
+
+    def test_source_confirms_cache_hits_do_not_get_a_new_id_context(self):
+        """Negative case: a cache hit (no physical read at all) must not
+        need any of this attribution -- it's purely about the guard.
+        request() context for genuine physical reads."""
+        source = pathlib.Path(__file__).parent.parent.joinpath(
+            "synchronized_power_coordinator.py"
+        ).read_text()
+        idx = source.find("if quality == Quality.GOOD:")
+        end = source.find("# MOD-02: don't start a new physical read", idx)
+        cache_hit_branch = source[idx:end]
+        self_check = "logical_request_id" not in cache_hit_branch
+        assert self_check, (
+            "the cache-hit branch must not reference logical_request_id "
+            "-- that attribution only applies to the physical-read path"
+        )
+

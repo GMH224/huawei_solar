@@ -1314,3 +1314,107 @@ class TestPhase1BusyRetryWiring(unittest.TestCase):
         event)."""
         body = self._execute_batch_body()
         self.assertEqual(body.count("self.telemetry.record_busy_retry()"), 1)
+
+
+# ── v2.0.10 (production defect fix): NORMAL-tier energy counter starvation ──
+
+class TestProductionDefectNormalTierEnergyCounterStarvation(unittest.TestCase):
+    """v2.0.10 FIX, this release -- found via a real field-observed
+    stair-step pattern on an energy-counter sensor (power_meter_
+    consumption, ~44 minute gaps between updates). NORMAL-tier
+    registers had no starvation protection at all -- only SLOW/STATIC
+    tracked overdue-ness and promoted a starved register past its own
+    deferral. Moving six energy counters from SLOW to NORMAL in 2.0.9
+    (for fresher data under normal conditions) unintentionally removed
+    them from that protection during back-off specifically."""
+
+    def _starvation_loop_body(self) -> str:
+        idx = _SOURCE.find("for n in stale_names:")
+        assert idx > -1
+        end = _SOURCE.find("\n            if starved:", idx)
+        return _SOURCE[idx: end if end > -1 else idx + 3000]
+
+    def test_normal_tier_checks_energy_counter_when_not_its_own_cycle(self):
+        body = self._starvation_loop_body()
+        normal_idx = body.find("elif tier == RegisterTier.NORMAL:")
+        assert normal_idx > -1
+        cycle_idx = body.find(
+            "if self._backoff_cycle % BACKOFF_NORMAL_DIVISOR == 0:", normal_idx
+        )
+        elif_energy_idx = body.find("elif is_energy_counter(n):", normal_idx)
+        assert cycle_idx > -1
+        assert elif_energy_idx > -1, (
+            "NORMAL-tier branch does not check is_energy_counter() at all "
+            "-- the production defect fix is missing"
+        )
+        self.assertLess(
+            cycle_idx, elif_energy_idx,
+            "the energy-counter starvation check must be the ELIF of the "
+            "normal 1-in-4 cycle check -- only relevant on a cycle where "
+            "this register would otherwise be skipped",
+        )
+
+    def test_normal_tier_energy_counter_starvation_uses_the_tight_ceiling(self):
+        """Must use ENERGY_PROMOTION_CEILING_S (90s, tight), not
+        REGISTER_STARVATION_CEILING_S (300s, generic) -- matching the
+        SAME ceiling SLOW-tier energy counters already get, not a
+        separately-invented one."""
+        body = self._starvation_loop_body()
+        idx = body.find("elif is_energy_counter(n):")
+        assert idx > -1
+        window = body[idx: idx + 2400]
+        self.assertIn("overdue >= ENERGY_PROMOTION_CEILING_S", window)
+        self.assertNotIn("REGISTER_STARVATION_CEILING_S", window)
+
+    def test_normal_tier_never_read_at_all_is_treated_as_infinitely_overdue(self):
+        """Adversarial: a NORMAL-tier energy counter that has NEVER been
+        successfully read (overdue_by returns None) must be treated as
+        maximally starved (inf), not silently skipped -- matching the
+        SAME handling the SLOW/STATIC branch already has for this exact
+        case."""
+        body = self._starvation_loop_body()
+        idx = body.find("elif is_energy_counter(n):")
+        assert idx > -1
+        window = body[idx: idx + 2400]
+        self.assertIn('starved.append((float("inf"), n))', window)
+
+    def test_normal_tier_energy_counters_share_the_same_starved_pool(self):
+        """The core design choice: NORMAL-tier energy counters append to
+        the SAME `starved` list SLOW-tier ones use, sharing the same
+        REGISTER_STARVATION_PROMOTIONS_PER_CYCLE cap -- not a second,
+        separate promotion budget that could double promotion traffic
+        during back-off."""
+        body = self._starvation_loop_body()
+        # Only one `starved: list[...]` declaration should exist -- a
+        # second, separate list would indicate a duplicated mechanism
+        # instead of a shared one.
+        self.assertEqual(_SOURCE.count("starved: list[tuple[float, RegisterName]] = []"), 1)
+
+    def test_ordinary_normal_tier_registers_unaffected(self):
+        """Negative case: a NORMAL-tier register that is NOT an energy
+        counter must be completely unaffected by this fix -- still just
+        skipped on off-cycles, no starvation tracking added for it.
+        Ordinary NORMAL-tier values don't carry the freshness
+        expectation that justified this fix for energy counters
+        specifically."""
+        body = self._starvation_loop_body()
+        normal_idx = body.find("elif tier == RegisterTier.NORMAL:")
+        else_idx = body.find("\n                else:", normal_idx)
+        assert normal_idx > -1 and else_idx > -1
+        normal_branch = body[normal_idx:else_idx]
+        # The branch must still be exactly: cycle check (append), energy
+        # counter check (starved) -- nothing else added for the general
+        # NORMAL case.
+        self.assertEqual(normal_branch.count("priority_names.append(n)"), 1)
+
+    def test_stale_comment_claiming_normal_tier_was_already_protected_is_corrected(self):
+        """The v2.0.0 comment previously claimed NORMAL-tier energy
+        counters were 'still protected by the same lengthened
+        availability ceiling regardless of which path they take' --
+        that claim was never actually enforced by any code. Confirms
+        the stale claim is gone, not just that new code was added
+        alongside it."""
+        self.assertNotIn(
+            "still protected by the same lengthened\n                    # availability ceiling regardless of which path they\n                    # take",
+            _SOURCE,
+        )
