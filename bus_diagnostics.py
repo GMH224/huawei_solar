@@ -322,6 +322,14 @@ class BusDiagnostics:
         retry_count: int | None = None,
         logical_request_id: int | None = None,
         transition_reason: str | None = None,
+        # v2.0.10 (finer-grained instrumentation, this release --
+        # confirmed genuinely needed while investigating a real
+        # production defect): registers above only ever gave a COUNT,
+        # never WHICH ones -- meaning even a perfect capture couldn't
+        # answer "was register X actually included in this slow chunk"
+        # without this. Optional, same reasoning/defaulting as every
+        # other field here.
+        register_names: list[str] | None = None,
     ) -> None:
         """Record one completed request. Cheap no-op when disabled."""
         if not self.enabled:
@@ -350,6 +358,13 @@ class BusDiagnostics:
             "retries": retry_count,
             "req_id": logical_request_id,
             "transition": transition_reason,
+            # v2.0.10 (finer-grained instrumentation, this release):
+            # short key "regs_l" (registers, list) to distinguish from
+            # the existing "regs" (a plain count) without renaming/
+            # breaking that established field. Deliberately the full
+            # list, not a hash/summary -- the whole point is being able
+            # to see exactly which register was in a slow chunk.
+            "regs_l": register_names,
         }
         self._buffer.append((self._next_seq, record))
         self._next_seq += 1

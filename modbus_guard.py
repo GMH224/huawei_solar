@@ -439,6 +439,15 @@ class ModbusGuard:
             self.retry_count: int | None = None
             self.logical_request_id: int | None = None
             self.transition_reason: str | None = None
+            # v2.0.10 (finer-grained instrumentation, this release --
+            # added while investigating a real production defect): the
+            # fields above attribute a stall to a specific chunk/poll,
+            # but not to WHAT was actually being read. A full list, not
+            # just registers' own count above -- see the real call
+            # site's own comment (update_coordinator.py) for the full
+            # reasoning on why a count alone proved insufficient in
+            # practice.
+            self.register_names: list[str] | None = None
             self._t_submit: float = 0.0
             self._t_admitted: float = 0.0
             #: Time spent waiting for admission (lock + inter-request gap).
@@ -636,6 +645,10 @@ class ModbusGuard:
                         retry_count=self.retry_count,
                         logical_request_id=self.logical_request_id,
                         transition_reason=self.transition_reason,
+                        # v2.0.10 (finer-grained instrumentation, this
+                        # release): see _RequestContext's own
+                        # register_names field comment.
+                        register_names=self.register_names,
                     )
                 except Exception:  # noqa: BLE001 — diagnostics must never break I/O
                     _LOGGER.exception("ModbusGuard[%s]: diagnostics sink failed",

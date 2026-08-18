@@ -313,6 +313,13 @@ class SynchronizedPowerCoordinator(DataUpdateCoordinator[SynchronizedPowerData])
         # evaluation, so the two modes' own activity stays distinguishable
         # in a snapshot rather than one silently masquerading as the other.
         self.cache_only_snapshots: int = 0
+        # v2.0.10 (finer-grained instrumentation, this release): one ID
+        # shared by all four of THIS coordinator's own dedicated reads
+        # within one update cycle -- same "one ID per logical poll"
+        # convention the main coordinator's own _next_logical_request_id
+        # already established (update_coordinator.py), so a diagnostics
+        # capture can group SyncPower's own reads together the same way.
+        self._next_logical_request_id: int = 0
 
         # v1.3.11 FIX (Defect J, reported by an independent ICS audit and
         # confirmed against source): guards were keyed on inv1/inv2's own
@@ -663,6 +670,12 @@ class SynchronizedPowerCoordinator(DataUpdateCoordinator[SynchronizedPowerData])
         if not self._dedicated_reads_enabled:
             return self._cache_only_snapshot()
 
+        # v2.0.10 (finer-grained instrumentation, this release): one ID
+        # for this whole update cycle, shared by every _read_one() call
+        # below -- see self._next_logical_request_id's own comment.
+        self._next_logical_request_id += 1
+        logical_request_id = self._next_logical_request_id
+
         shortcut = self._try_cache_shortcut()
         if shortcut is not None:
             return shortcut
@@ -756,7 +769,19 @@ class SynchronizedPowerCoordinator(DataUpdateCoordinator[SynchronizedPowerData])
                 # coordinator's traffic on the same bus -- found to be a
                 # real gap while assessing whether enough telemetry
                 # existed to answer the architecture question.
-                async with guard.request(label=label):
+                #
+                # v2.0.10 (finer-grained instrumentation, this release):
+                # `as _req` added so this coordinator's own reads can
+                # carry the same logical_request_id/register_names
+                # attribution the main coordinator's _execute_batch()
+                # already provides -- confirmed as a real, 45%-of-all-
+                # traffic gap in a live field capture: every one of
+                # SyncPower's own dedicated reads previously showed up
+                # in a diagnostics capture with none of this attribution
+                # at all, only distinguishable by their own label string.
+                async with guard.request(label=label) as _req:
+                    _req.logical_request_id = logical_request_id
+                    _req.register_names = [str(register)]
                     async with asyncio.timeout(timeout):
                         result = await device.batch_update([register])
                         value = _extract_w(result, register)

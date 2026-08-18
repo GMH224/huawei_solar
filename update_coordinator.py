@@ -823,6 +823,22 @@ class HuaweiSolarUpdateCoordinator(
                                 _req.chunk_count = len(chunks)
                                 _req.retry_count = busy_retries
                                 _req.logical_request_id = logical_request_id
+                                # v2.0.10 (finer-grained instrumentation,
+                                # this release -- added while investigating
+                                # a real production defect): the fields
+                                # above tell you WHICH chunk of WHICH poll
+                                # was slow, but not WHAT was actually being
+                                # read -- confirmed as a genuine limitation
+                                # while tracing a real field-observed
+                                # staleness defect (couldn't tell from a
+                                # capture alone whether a specific register
+                                # was actually included in a given chunk).
+                                # A full list, not just a count -- chunks
+                                # are capped at BATCH_CHUNK_SIZE (40)
+                                # registers, so this is bounded and cheap
+                                # for what's already an opt-in diagnostic
+                                # capture with its own file-size cap.
+                                _req.register_names = list(chunk)
                                 _req.transition_reason = (
                                     self._adaptive.current_transition_reason()
                                     if self._adaptive else None
@@ -1325,6 +1341,38 @@ class HuaweiSolarUpdateCoordinator(
                 elif tier == RegisterTier.NORMAL:
                     if self._backoff_cycle % BACKOFF_NORMAL_DIVISOR == 0:
                         priority_names.append(n)
+                    elif is_energy_counter(n):
+                        # v2.0.10 FIX (production defect, this release --
+                        # found via a real field-observed stair-step
+                        # pattern on an energy-counter sensor, ~44 minute
+                        # gaps between updates): NORMAL-tier registers had
+                        # NO starvation protection at all -- only the
+                        # SLOW/STATIC branch below tracks overdue-ness and
+                        # promotes a starved register past its own
+                        # ordinary deferral. When six energy counters were
+                        # moved from SLOW to NORMAL (2.0.9, for fresher
+                        # data under normal conditions), they were
+                        # unintentionally removed from that protection --
+                        # during back-off specifically, a NORMAL-tier
+                        # register is simply skipped on 3 of every 4
+                        # cycles with nothing to rescue it if it keeps
+                        # missing, unlike a SLOW-tier energy counter's own
+                        # 90s ceiling. Checked ONLY when this register
+                        # would otherwise be skipped this cycle (the
+                        # `elif`, not `if`) -- no need to also check
+                        # starvation on a cycle where it's already being
+                        # read. Deliberately scoped to energy counters
+                        # specifically, not every NORMAL-tier register --
+                        # ordinary NORMAL-tier values don't carry the same
+                        # freshness expectation that justified adding this
+                        # register to NORMAL in the first place, and
+                        # extending this to all of NORMAL would blur the
+                        # tier boundary this whole mechanism depends on.
+                        overdue = self.cache.overdue_by(n)
+                        if overdue is None:
+                            starved.append((float("inf"), n))
+                        elif overdue >= ENERGY_PROMOTION_CEILING_S:
+                            starved.append((overdue, n))
                 else:
                     # SLOW/STATIC: deferred by default, but track how overdue
                     # each one is so the worst offender(s) can still break
@@ -1338,15 +1386,25 @@ class HuaweiSolarUpdateCoordinator(
                     # ever has to matter. Scoped to this SLOW/STATIC path
                     # deliberately: most energy counters (accumulated/daily/
                     # monthly yield, etc.) classify as SLOW tier and are
-                    # reachable here. A few (storage_total_charge/discharge)
-                    # are NORMAL tier and go through the "every
-                    # BACKOFF_NORMAL_DIVISOR-th cycle" branch above instead
-                    # -- already meaningfully less deferred than SLOW/STATIC
-                    # by design, and still protected by the same lengthened
-                    # availability ceiling regardless of which path they
-                    # take. Extending BACKOFF_NORMAL_DIVISOR itself to be
-                    # register-type-aware would be a different, more
-                    # invasive change not covered by this design pass.
+                    # reachable here.
+                    #
+                    # v2.0.10 FIX (production defect, this release): the
+                    # sentence that used to be here claimed NORMAL-tier
+                    # energy counters were "still protected by the same
+                    # lengthened availability ceiling regardless of which
+                    # path they take" -- that claim was never actually
+                    # true; no code anywhere enforced it. Confirmed via a
+                    # real field-observed defect (a NORMAL-tier energy
+                    # counter going up to ~44 minutes between updates,
+                    # traced to exactly this gap) before this comment was
+                    # corrected. NORMAL-tier energy counters now get their
+                    # own starvation check in the `elif is_energy_counter`
+                    # branch just above, sharing this same starved/
+                    # promotion pool and its per-cycle cap -- not a
+                    # separate mechanism, so the "only promote a few at a
+                    # time" discipline this whole design depends on still
+                    # holds regardless of which tier a starved energy
+                    # counter came from.
                     overdue = self.cache.overdue_by(n)
                     ceiling = (
                         ENERGY_PROMOTION_CEILING_S
