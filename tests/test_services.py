@@ -480,24 +480,42 @@ class TestPhase5BSetPackInstallDate:
         assert "if bh_manager is None:" in body
         assert "battery_health_not_enabled" in body
 
-    def test_writes_into_pack_install_dates_keyed_by_serial(self):
+    def test_writes_via_the_shared_manager_method(self):
+        """v2.0.12 (Battery Phase 5B UI restructuring, this release):
+        updated to check the shared write path, not the old inline
+        implementation -- see BatteryHealthManager.set_pack_install_
+        date()'s own docstring for why this was refactored (keeps this
+        service and the new per-pack date entity from drifting out of
+        sync)."""
         source = self._source()
         idx = source.find("async def set_pack_install_date(")
         assert idx > -1
         body = source[idx: idx + 2700]
-        assert "bh_manager.engine.pack_capacity.pack_install_dates[serial] = install_ts" in body
+        assert "bh_manager.set_pack_install_date(serial, install_ts)" in body
 
-    def test_marks_dirty_and_triggers_a_save(self):
-        """Adversarial: without this, the write would only ever persist
-        on the NEXT unrelated engine tick that happens to mark dirty --
-        an explicit, deliberate, infrequent user action deserves
-        prompt, deterministic persistence, not a coincidental save."""
+    def test_no_longer_duplicates_the_dirty_and_save_calls_inline(self):
+        """Negative case: confirms the OLD, duplicated three-line
+        implementation is genuinely gone from this call site, not
+        merely that the new one-liner was added alongside it."""
         source = self._source()
         idx = source.find("async def set_pack_install_date(")
         assert idx > -1
         body = source[idx: idx + 2700]
-        assert "bh_manager.engine.dirty = True" in body
-        assert "bh_manager._maybe_save()" in body
+        assert "bh_manager.engine.pack_capacity.pack_install_dates[serial] = install_ts" not in body
+
+    def test_dirty_and_save_now_live_in_the_shared_manager_method(self):
+        """v2.0.12 (Battery Phase 5B UI restructuring, this release):
+        the dirty-flag-plus-prompt-save logic moved into BatteryHealth
+        Manager.set_pack_install_date() itself -- checked there
+        directly (test_battery_health_manager.py-style), not here.
+        This test confirms services.py's own call site no longer
+        needs to know about dirty/save at all."""
+        source = self._source()
+        idx = source.find("async def set_pack_install_date(")
+        assert idx > -1
+        body = source[idx: idx + 2700]
+        assert "bh_manager.engine.dirty" not in body
+        assert "bh_manager._maybe_save()" not in body
 
     def test_registered_inside_the_has_battery_gate(self):
         """Confirms this is registered alongside the rest of the

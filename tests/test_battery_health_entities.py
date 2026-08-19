@@ -454,39 +454,42 @@ class TestPhase5BAttributesActuallyReachTheUI(unittest.TestCase):  # v2.0.12
         attrs = self._soh_capacity_attrs(report)
         self.assertEqual(attrs.get("retired_pack_history"), [entry])
 
-    def test_pack_age_days_and_source_reach_the_entity(self):
+    def test_pack_age_days_and_source_no_longer_on_the_aggregate_entity(self):
+        """v2.0.12 FIX (Battery Phase 5B UI restructuring, this
+        release): these are now individual per-pack entities (see
+        TestPhase512PerPackEntities below), not aggregate-entity
+        attributes -- confirms they're genuinely gone from here, not
+        just duplicated."""
         report = BH.HealthReport()
         report.attributes["pack_age_days"] = [120.5, None, 30.0]
         report.attributes["pack_age_source"] = [
             "unit_install_date", "unknown", "first_detected",
         ]
         attrs = self._soh_capacity_attrs(report)
-        self.assertEqual(attrs.get("pack_age_days"), [120.5, None, 30.0])
-        self.assertEqual(
-            attrs.get("pack_age_source"),
-            ["unit_install_date", "unknown", "first_detected"],
-        )
+        self.assertNotIn("pack_age_days", attrs)
+        self.assertNotIn("pack_age_source", attrs)
 
-    def test_pack_replaced_count_and_slot_labels_also_reach_the_entity(self):
-        """The pre-existing gap found in the same pass -- these two
-        fields predate this release but had never been in any
-        allowlist either."""
+    def test_pack_replaced_count_no_longer_on_the_aggregate_entity_but_slot_labels_stay(self):
+        """pack_replaced_count is now per-pack (see below); pack_slot_
+        labels deliberately stays here as index-reference context
+        alongside weakest_pack_slot."""
         report = BH.HealthReport()
         report.attributes["pack_slot_labels"] = ["u1p1", "u1p2", "u1p3"]
         report.attributes["pack_replaced_count"] = [0, 1, 0]
         attrs = self._soh_capacity_attrs(report)
         self.assertEqual(attrs.get("pack_slot_labels"), ["u1p1", "u1p2", "u1p3"])
-        self.assertEqual(attrs.get("pack_replaced_count"), [0, 1, 0])
+        self.assertNotIn("pack_replaced_count", attrs)
 
-    def test_original_per_pack_breakdown_still_reaches_the_entity_too(self):
-        """Negative case / non-regression: confirms the ORIGINAL,
-        pre-existing per-pack breakdown (which WAS already correctly
-        wired) still works after this fix -- the new keys were added
-        alongside it, not accidentally replacing it."""
+    def test_original_per_pack_breakdown_moved_off_the_aggregate_entity(self):
+        """v2.0.12 FIX (Battery Phase 5B UI restructuring, this
+        release): pack_capacity_soh_percent is now individual per-pack
+        entities, matching how every OTHER per-pack value in this
+        integration is exposed -- confirmed removed from the aggregate
+        soh_capacity entity's own attributes, not merely supplemented."""
         report = BH.HealthReport()
         report.attributes["pack_capacity_soh_percent"] = [100.0, 90.0, 95.0]
         attrs = self._soh_capacity_attrs(report)
-        self.assertEqual(attrs.get("pack_capacity_soh_percent"), [100.0, 90.0, 95.0])
+        self.assertNotIn("pack_capacity_soh_percent", attrs)
 
     def test_all_new_attribute_values_pass_ha_state_validation(self):
         """Ties into this file's own core purpose (see the module
@@ -501,12 +504,137 @@ class TestPhase5BAttributesActuallyReachTheUI(unittest.TestCase):  # v2.0.12
             "soh_capacity_unit_independent": 97.2,
             "capacity_cross_check_diverged": True,
             "retired_pack_history": [{"slot_label": "u1p1", "serial_number": "SN-OLD"}],
-            "pack_age_days": [120.5, None, 30.0],
-            "pack_age_source": ["unit_install_date", "unknown", "first_detected"],
         })
         ent = next(e for e in _entities(report=report) if e._attr_key == "soh_capacity")
         ent._apply(report)
         ha_sensor_state(ent)  # must not raise
+
+
+class TestPhase512PerPackEntities(unittest.TestCase):  # v2.0.12
+    """Battery Phase 5B UI restructuring, this release: individual
+    per-pack entities, one set per physical pack, attached to that
+    pack's own storage-unit device -- correcting a real placement
+    mismatch found and confirmed with the user directly (the original
+    per-pack list-attributes on the aggregate soh_capacity entity
+    didn't match how every other per-pack value in this integration is
+    exposed)."""
+
+    @staticmethod
+    def _battery_device_info(unit: int):
+        return {"identifiers": {("huawei_solar", f"TESTSERIAL/battery_{unit}")}}
+
+    def _pack_entities(self, report, slot_labels=("u1p1", "u1p2", "u1p3")):
+        manager = _StubManager(report=report)
+        manager.engine = types.SimpleNamespace(
+            report=report,
+            pack_capacity=types.SimpleNamespace(slot_labels=list(slot_labels)),
+        )
+        return _ENT.create_battery_health_pack_entities(
+            manager, self._battery_device_info(1), self._battery_device_info(2),
+        )
+
+    def test_one_entity_per_pack_per_sensor_type(self):
+        report = BH.HealthReport()
+        entities = self._pack_entities(report)
+        # 3 packs x 5 sensor types each = 15
+        self.assertEqual(len(entities), 15)
+
+    def test_entity_reads_the_correct_index_from_the_list(self):
+        report = BH.HealthReport()
+        report.attributes["pack_capacity_soh_percent"] = [100.0, 90.0, 95.0]
+        entities = self._pack_entities(report)
+        pack2_soh = next(
+            e for e in entities
+            if e._report_key == "pack_capacity_soh_percent" and e._pack_index == 1
+        )
+        pack2_soh._apply(report)
+        self.assertEqual(pack2_soh._attr_native_value, 90.0)
+
+    def test_entity_name_includes_the_pack_number(self):
+        """Adversarial: without the pack number in the name, two packs
+        sharing the same device (e.g. u1p1 and u1p2, both under
+        'Battery 1') would collide on an identical display name."""
+        report = BH.HealthReport()
+        entities = self._pack_entities(report)
+        pack2_soh = next(
+            e for e in entities
+            if e._report_key == "pack_capacity_soh_percent" and e._pack_index == 1
+        )
+        self.assertEqual(pack2_soh._attr_name, "Pack 2 SOH capacity")
+
+    def test_unit_1_packs_attached_to_battery_1_device(self):
+        report = BH.HealthReport()
+        entities = self._pack_entities(report)
+        pack1 = next(
+            e for e in entities
+            if e._report_key == "pack_capacity_soh_percent" and e._pack_index == 0
+        )
+        self.assertEqual(pack1._attr_device_info, self._battery_device_info(1))
+
+    def test_unit_2_packs_attached_to_battery_2_device(self):
+        report = BH.HealthReport()
+        entities = self._pack_entities(report, slot_labels=("u1p1", "u2p1"))
+        unit2_pack = next(
+            e for e in entities
+            if e._report_key == "pack_capacity_soh_percent" and e._pack_index == 1
+        )
+        self.assertEqual(unit2_pack._attr_device_info, self._battery_device_info(2))
+
+    def test_missing_device_info_skips_that_units_packs_gracefully(self):
+        """Negative case: if battery_2_device_info is None (no second
+        unit detected), unit-2 packs must be skipped, not create
+        entities with no device to attach to."""
+        report = BH.HealthReport()
+        manager = _StubManager(report=report)
+        manager.engine = types.SimpleNamespace(
+            report=report,
+            pack_capacity=types.SimpleNamespace(slot_labels=["u1p1", "u2p1"]),
+        )
+        entities = _ENT.create_battery_health_pack_entities(
+            manager, self._battery_device_info(1), None,
+        )
+        # Only unit 1's pack should produce entities (5 sensor types).
+        self.assertEqual(len(entities), 5)
+
+    def test_unparseable_slot_label_is_skipped_not_raised(self):
+        report = BH.HealthReport()
+        entities = self._pack_entities(report, slot_labels=("u1p1", "not-a-slot-label"))
+        self.assertEqual(len(entities), 5)  # only u1p1's own 5 entities
+
+    def test_missing_list_value_reports_none_not_an_exception(self):
+        """Negative case: a pack index beyond the current list length
+        (e.g. after a topology shrink mid-restart) must report
+        unknown, not raise and break the rest of the update batch."""
+        report = BH.HealthReport()
+        report.attributes["pack_capacity_soh_percent"] = [100.0]  # only 1 value, 3 packs
+        entities = self._pack_entities(report)
+        pack3_soh = next(
+            e for e in entities
+            if e._report_key == "pack_capacity_soh_percent" and e._pack_index == 2
+        )
+        pack3_soh._apply(report)  # must not raise
+        self.assertIsNone(pack3_soh._attr_native_value)
+
+    def test_pack_age_source_is_declared_string_valued_not_numeric(self):
+        """The exact bug class this whole test file exists to catch
+        (see the module docstring's own WHY THIS FILE EXISTS section):
+        pack_age_source is a string enum and must never receive a
+        numeric precision hint."""
+        report = BH.HealthReport()
+        report.attributes["pack_age_source"] = ["install_date", "unknown", "first_detected"]
+        entities = self._pack_entities(report)
+        age_source_ent = next(
+            e for e in entities
+            if e._report_key == "pack_age_source" and e._pack_index == 0
+        )
+        age_source_ent._apply(report)
+        ha_sensor_state(age_source_ent)  # must not raise
+
+    def test_unique_ids_are_distinct_across_packs_and_sensor_types(self):
+        report = BH.HealthReport()
+        entities = self._pack_entities(report)
+        unique_ids = [e._attr_unique_id for e in entities]
+        self.assertEqual(len(unique_ids), len(set(unique_ids)))
 
 
 if __name__ == "__main__":
