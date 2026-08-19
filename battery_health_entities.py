@@ -304,6 +304,34 @@ class HuaweiSolarBatteryHealthSensorEntity(SensorEntity):
                     # entities for a single addition.
                     "pack_capacity_soh_percent", "pack_capacity_segment_count",
                     "pack_capacity_spread_pct",
+                    # v2.0.12 (Battery Phase 5B, this release -- pack-
+                    # level promotion): a real gap caught and fixed
+                    # before shipping -- these four keys were already
+                    # computed and present in report.attributes, but
+                    # this allowlist (not "show everything in the
+                    # report") never included them, so none were
+                    # actually visible in the HA UI despite existing
+                    # internally. soh_capacity_source and weakest_pack_
+                    # slot are exactly what explains WHY the headline
+                    # number is what it is; soh_capacity_unit_
+                    # independent and capacity_cross_check_diverged are
+                    # the cross-check the architecture review's own
+                    # recommendation #6 exists to make visible, not
+                    # just computed.
+                    "soh_capacity_source", "weakest_pack_slot",
+                    "soh_capacity_unit_independent", "capacity_cross_check_diverged",
+                    # v2.0.12 (Battery Phase 5B, this release -- another
+                    # gap caught in the same pass): pack_replaced_count/
+                    # pack_slot_labels were pre-existing, computed
+                    # fields that turned out to have this SAME "never
+                    # in any allowlist" gap already, unrelated to this
+                    # release's own new work -- fixed together here
+                    # since they're the same "what's the story on my
+                    # packs" narrative as everything else in this
+                    # group, not a separate concern worth a separate
+                    # fix later.
+                    "pack_slot_labels", "pack_replaced_count",
+                    "retired_pack_history", "pack_age_days", "pack_age_source",
                 )
             }
         elif self._attr_key == "soh_balance":

@@ -1155,6 +1155,9 @@
     }
   },
   "exceptions": {
+    "battery_health_not_enabled": {
+      "message": "Battery health is not enabled for device: {device_id}"
+    },
     "config_entry_not_found": {
       "message": "Entry not found for device: {device_id}"
     },
@@ -1166,6 +1169,9 @@
     },
     "invalid_device_id": {
       "message": "Invalid device ID specified: {device_id}"
+    },
+    "invalid_pack_install_date": {
+      "message": "Could not parse pack install date: {install_date}. Use an ISO format date, e.g. 2026-01-15"
     },
     "wrong_device_type": {
       "message": "Got wrong Huawei Solar device type for ID {device_id}: expected {expected_type}, got {actual_type}"
@@ -1343,6 +1349,24 @@
         }
       },
       "name": "Set Active Power Control to 'Zero power grid connection'"
+    },
+    "set_pack_install_date": {
+      "description": "Set the install date for one specific battery pack, identified by its own serial number",
+      "fields": {
+        "device_id": {
+          "description": "Must be a 'Batteries' device",
+          "name": "Battery"
+        },
+        "pack_serial_number": {
+          "description": "The serial number of the specific pack (not a slot label -- see the pack's own diagnostic sensor for its current serial)",
+          "name": "Pack serial number"
+        },
+        "install_date": {
+          "description": "The date this pack was installed, in ISO format (e.g. 2026-01-15)",
+          "name": "Install date"
+        }
+      },
+      "name": "Set battery pack install date"
     },
     "stop_forcible_charge": {
       "description": "Cancel the running forcible charge command",

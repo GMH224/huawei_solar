@@ -88,6 +88,23 @@ forcible_discharge_soc:
       selector:
         text:
 
+set_pack_install_date:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: huawei_solar
+          model: "Batteries"
+    pack_serial_number:
+      required: true
+      selector:
+        text:
+    install_date:
+      required: true
+      selector:
+        date:
+
 stop_forcible_charge:
   fields:
     device_id:

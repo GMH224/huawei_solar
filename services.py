@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import re
+from datetime import datetime, timezone
 from typing import Any, Literal, TypedDict, TypeVar
 
 from huawei_solar import (
@@ -32,6 +33,8 @@ from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import device_registry as dr
 import homeassistant.helpers.config_validation as cv
 
+from .battery_health_manager import BatteryHealthManager
+
 from .const import (
     CONF_ENABLE_PARAMETER_CONFIGURATION,
     DATA_DEVICE_DATAS,
@@ -46,6 +49,7 @@ from .const import (
     SERVICE_SET_FIXED_CHARGE_PERIODS,
     SERVICE_SET_MAXIMUM_FEED_GRID_POWER,
     SERVICE_SET_MAXIMUM_FEED_GRID_POWER_PERCENT,
+    SERVICE_SET_PACK_INSTALL_DATE,
     SERVICE_SET_TOU_PERIODS,
     SERVICE_SET_ZERO_POWER_GRID_CONNECTION,
     SERVICE_STOP_FORCIBLE_CHARGE,
@@ -71,6 +75,7 @@ ALL_SERVICES = [
     SERVICE_SET_FIXED_CHARGE_PERIODS,
     SERVICE_SET_MAXIMUM_FEED_GRID_POWER,
     SERVICE_SET_MAXIMUM_FEED_GRID_POWER_PERCENT,
+    SERVICE_SET_PACK_INSTALL_DATE,
     SERVICE_SET_TOU_PERIODS,
     SERVICE_SET_ZERO_POWER_GRID_CONNECTION,
     SERVICE_STOP_FORCIBLE_CHARGE,
@@ -211,6 +216,77 @@ def get_battery_device_data(call: ServiceCall) -> HuaweiSolarInverterData:
 
 
 BATTERY_DEVICE_SCHEMA = vol.Schema({DATA_DEVICE_ID: vol.All(cv.string, str)})
+
+# v2.0.12 (Battery Phase 5B, this release -- per-pack install dates):
+# a genuinely separate identifier from DATA_DEVICE_ID above -- the
+# battery DEVICE's own device_id resolves WHICH physical unit/inverter
+# to look up (matches every other battery service's own schema), while
+# this identifies WHICH of its (up to 3, or 6 across two units) packs
+# the date applies to, by that pack's own serial number -- not a slot
+# label, matching effective_pack_install_ts()'s own reasoning
+# (battery_health.py) for why this is serial-keyed throughout.
+DATA_PACK_SERIAL_NUMBER = "pack_serial_number"
+DATA_INSTALL_DATE = "install_date"
+
+SET_PACK_INSTALL_DATE_SCHEMA = BATTERY_DEVICE_SCHEMA.extend({
+    vol.Required(DATA_PACK_SERIAL_NUMBER): cv.string,
+    vol.Required(DATA_INSTALL_DATE): cv.string,
+})
+
+
+async def set_pack_install_date(service_call: ServiceCall) -> None:
+    """Set the install date for one specific battery pack, identified by
+    its own serial number (not a slot label -- a pack's own age is a
+    property of the physical pack, not whichever wiring slot it
+    currently occupies).
+
+    v2.0.12 (Battery Phase 5B, this release): the primary intended use
+    is recording a REPLACEMENT pack's own real install date, since the
+    unit-level CONF_BH_INSTALL_DATE option is actively wrong for a pack
+    installed later than the unit itself was -- see effective_pack_
+    install_ts()'s own docstring (battery_health.py) for the full
+    three-tier fallback this feeds into. Not restricted to only
+    currently-installed packs' own serials -- setting a date for a
+    serial this engine has never seen is accepted without error (it
+    simply has no effect until/unless that serial is later observed),
+    matching this integration's general preference for permissive,
+    forward-compatible service inputs over rejecting a call that isn't
+    actually harmful.
+    """
+    dd = get_battery_device_data(service_call)
+    serial = service_call.data[DATA_PACK_SERIAL_NUMBER]
+    install_date_str = service_call.data[DATA_INSTALL_DATE]
+
+    try:
+        install_ts = (
+            datetime.fromisoformat(install_date_str)
+            .replace(tzinfo=timezone.utc)
+            .timestamp()
+        )
+    except (TypeError, ValueError) as err:
+        raise ServiceValidationError(
+            translation_domain=DOMAIN,
+            translation_key="invalid_pack_install_date",
+            translation_placeholders={"install_date": install_date_str},
+        ) from err
+
+    bh_manager = BatteryHealthManager.get(dd.device.serial_number)
+    if bh_manager is None:
+        raise ServiceValidationError(
+            translation_domain=DOMAIN,
+            translation_key="battery_health_not_enabled",
+            translation_placeholders={"device_id": service_call.data[DATA_DEVICE_ID]},
+        )
+
+    bh_manager.engine.pack_capacity.pack_install_dates[serial] = install_ts
+    # v2.0.12: an explicit, deliberate, infrequent user action -- worth
+    # persisting promptly rather than waiting on the engine's own
+    # normal dirty-flag-plus-5-minute-debounce cycle (_maybe_save(),
+    # battery_health_manager.py), which exists to avoid excessive write
+    # churn from routine per-tick engine activity, not from something
+    # like this.
+    bh_manager.engine.dirty = True
+    bh_manager._maybe_save()
 
 
 @callback
@@ -1339,6 +1415,16 @@ async def async_setup_services(
                 SERVICE_STOP_FORCIBLE_CHARGE,
                 stop_forcible_charge,
                 schema=BATTERY_DEVICE_SCHEMA,
+            )
+            # v2.0.12 (Battery Phase 5B, this release): registered
+            # inside the SAME has_battery gate as the rest of this
+            # cluster -- a genuinely battery-specific service, not
+            # meaningful for a device with no battery at all.
+            hass.services.async_register(
+                DOMAIN,
+                SERVICE_SET_PACK_INSTALL_DATE,
+                set_pack_install_date,
+                schema=SET_PACK_INSTALL_DATE_SCHEMA,
             )
 
     if has_lg_battery:

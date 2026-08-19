@@ -286,6 +286,21 @@ class BatteryHealthConfig:
     # current, not tuned against a specific validated threshold.
     pack_current_share_min_mean_a: float = 2.0
 
+    # v2.0.12 (Battery Phase 5B, this release -- pack-level promotion):
+    # threshold for flagging a meaningful disagreement between the
+    # PACK-fused capacity estimate (now the primary, reported number --
+    # see _evaluate()'s own comment on this reordering) and the unit-
+    # level estimator's own INDEPENDENT measurement (retained
+    # specifically as a cross-check, per the architecture review's own
+    # recommendation #6: "Retain the unit-level capacity estimator as
+    # an independent cross-check"). A judgment call, not a derived
+    # constant -- SOH estimates carry inherent measurement noise (both
+    # estimators are already trimmed-mean aggregations over a handful
+    # of segments each), so this is set comfortably above ordinary
+    # estimation noise, not at zero. Flag if a different value is
+    # wanted once real divergence (if any) has actually been observed.
+    capacity_cross_check_divergence_threshold_pct: float = 10.0
+
     def normalized_weights(self) -> tuple[float, float, float]:
         """Return (w_cap, w_eff, w_bal) normalized to sum to 1.0."""
         w = (self.weight_capacity, self.weight_efficiency, self.weight_balance)
@@ -1481,6 +1496,48 @@ class PackCapacityTracker:
         # forget the previously-known identity for a whole polling cycle.
         self.pack_replaced_count: list[int] = [0] * pack_count
         self._last_serial: list[str | None] = [None] * pack_count
+        # v2.0.12 (Battery Phase 5B, this release -- preserve-on-
+        # replacement): a genuine, live risk confirmed directly against
+        # this exact class before building this -- when a replacement is
+        # detected below, the outgoing pack's ENTIRE accumulated
+        # SegmentTracker (segments, measured reference capacity,
+        # everything this engine has learned about that specific
+        # physical pack over its whole service life) was being silently
+        # discarded via Python garbage collection the moment the new
+        # tracker overwrote it, with only pack_replaced_count's own bare
+        # integer surviving. Unlike Modbus telemetry, which can be
+        # recaptured any time, a physically-removed pack's own history
+        # cannot be recovered after the fact -- this list is where that
+        # final snapshot is archived, one entry per detected
+        # replacement, before the fresh tracker is built. Persisted in
+        # to_dict()/restore() below, same as everything else in this
+        # class.
+        self.retired_pack_history: list[dict[str, Any]] = []
+        # v2.0.12 (Battery Phase 5B, this release -- per-pack install
+        # dates): keyed by SERIAL NUMBER, not slot label -- same
+        # reasoning already established for retired_pack_history and
+        # the replacement-detection logic itself ("age/SOH is per
+        # physical pack, not per wiring slot"). Two separate dicts,
+        # matching the SAME two-tier pattern BatteryHealthConfig.
+        # battery_install_ts already uses at unit level (an explicit,
+        # user-provided date takes priority; an automatic "first
+        # observed" timestamp is the fallback when no explicit date
+        # exists) -- see effective_pack_install_ts() below for how
+        # these two combine, and battery_install_ts's own Finding D
+        # comment for why the distinction matters (an already-aged
+        # pack otherwise models as brand new from the moment this
+        # integration first saw it).
+        #
+        # pack_first_detected: automatic, populated the moment ANY new
+        # serial is first observed in ANY slot -- whether that's the
+        # very first pack this engine has ever seen there, or a
+        # replacement. Always available, no user action needed.
+        self.pack_first_detected: dict[str, float] = {}
+        # pack_install_dates: explicit, user-provided override -- set
+        # via the set_pack_install_date service (services.py), keyed by
+        # the same serial number. Takes priority over pack_first_
+        # detected when present.
+        self.pack_install_dates: dict[str, float] = {}
         # v2.0.7 (Section E, this release): latest per-pack current
         # reading, purely observational -- feeds current_share_deviation
         # telemetry only (see soh_capacity_per_pack's own caller,
@@ -1532,6 +1589,39 @@ class PackCapacityTracker:
                     "slot, previous pack's history discarded",
                     self.slot_labels[i], self._last_serial[i], pack.serial_number,
                 )
+                # v2.0.12 (Battery Phase 5B, this release -- preserve-on-
+                # replacement): capture the outgoing tracker's own final
+                # state BEFORE it's overwritten below. soh_capacity() is
+                # the exact same, already-tested aggregation this engine
+                # already uses for a live pack -- reused here rather
+                # than reimplemented, so this final snapshot means the
+                # same thing a live reading would have. first_segment_ts/
+                # last_segment_ts derived from the tracker's own segments
+                # list directly (SegmentTracker itself does not track its
+                # own creation time -- see this method's own docstring
+                # if that's ever added) -- None if the outgoing pack was
+                # replaced before accumulating even one qualifying
+                # segment, which is itself useful information (a very
+                # short service life), not an error case to hide.
+                outgoing_soh, _outgoing_attrs = self.trackers[i].soh_capacity()
+                outgoing_segments = self.trackers[i].segments
+                self.retired_pack_history.append({
+                    "slot_label": self.slot_labels[i],
+                    "serial_number": self._last_serial[i],
+                    "replaced_at": time_module.time(),
+                    "replaced_by_serial": pack.serial_number,
+                    "final_soh_capacity_pct": outgoing_soh,
+                    "final_segment_count": len(outgoing_segments),
+                    "final_reference_capacity_kwh": self.trackers[i].reference_capacity_kwh,
+                    "first_segment_ts": (
+                        min(s.start_ts for s in outgoing_segments)
+                        if outgoing_segments else None
+                    ),
+                    "last_segment_ts": (
+                        max(s.end_ts for s in outgoing_segments)
+                        if outgoing_segments else None
+                    ),
+                })
                 self.trackers[i] = SegmentTracker(self._pack_cfg)
                 self._charge_counters[i] = CounterMonitor(
                     f"pack_{self.slot_labels[i]}_charge"
@@ -1542,6 +1632,12 @@ class PackCapacityTracker:
                 self.pack_replaced_count[i] += 1
             if pack.serial_number is not None:
                 self._last_serial[i] = pack.serial_number
+                # v2.0.12 (Battery Phase 5B, this release): setdefault,
+                # not a plain assignment -- must only record the FIRST
+                # time this specific serial is ever observed, not
+                # overwrite it on every subsequent poll of the same,
+                # still-installed pack.
+                self.pack_first_detected.setdefault(pack.serial_number, time_module.time())
             pre = (
                 self._charge_counters[i].reset_count
                 + self._discharge_counters[i].reset_count
@@ -1622,6 +1718,48 @@ class PackCapacityTracker:
         for t in self.trackers:
             t.prune(now)
 
+    def effective_pack_install_ts(self, slot_index: int) -> tuple[float | None, str]:
+        """v2.0.12 (Battery Phase 5B, this release): the best-available
+        install timestamp for the pack CURRENTLY in *slot_index*, and a
+        string naming which of the three tiers produced it -- mirrors
+        BatteryHealthConfig.battery_install_ts's own two-tier fallback
+        (explicit date, else first-observed) at unit level, extended to
+        a third tier here because a REPLACED pack's own unit-level date
+        would be actively wrong (it reflects when the UNIT was
+        installed, not when this specific replacement pack was):
+
+        1. An explicit, user-provided date for this pack's own serial
+           (pack_install_dates) -- highest priority, sourced from
+           set_pack_install_date (services.py).
+        2. If this slot has NEVER been replaced (pack_replaced_count
+           for it is still 0), the pack currently in it is presumed to
+           be one of the ORIGINAL packs installed alongside the unit --
+           falls back to the unit-level battery_install_ts (self.
+           _pack_cfg inherits this unchanged from the original config;
+           only the capacity-magnitude fields are pack-scaled).
+        3. Otherwise (a replaced pack with no explicit override yet):
+           pack_first_detected for this serial -- the automatic
+           "first observed" timestamp, same understating-calendar-age
+           caveat unit level's own equivalent fallback already
+           documents (Finding D), better than nothing.
+
+        Returns (None, "unknown") only if the slot has been replaced
+        AND this serial was somehow never recorded in pack_first_
+        detected at all (should not happen in practice -- feed()
+        always populates it -- kept as a defensive default, not a
+        reachable-in-normal-operation case).
+        """
+        serial = self._last_serial[slot_index]
+        if serial is not None and serial in self.pack_install_dates:
+            return self.pack_install_dates[serial], "install_date"
+        if self.pack_replaced_count[slot_index] == 0:
+            unit_ts = self._pack_cfg.battery_install_ts
+            if unit_ts is not None:
+                return unit_ts, "unit_install_date"
+        if serial is not None and serial in self.pack_first_detected:
+            return self.pack_first_detected[serial], "first_detected"
+        return None, "unknown"
+
     def soh_capacity_per_pack(self) -> list[tuple[float | None, dict[str, Any]]]:
         """One (soh_percent, attrs) pair per pack, same shape as
         SegmentTracker.soh_capacity() itself, in pack order (1, 2, 3...)."""
@@ -1669,6 +1807,16 @@ class PackCapacityTracker:
             "last_serial": list(self._last_serial),
             "pack_replaced_count": list(self.pack_replaced_count),
             "slot_labels": list(self.slot_labels),
+            # v2.0.12 (Battery Phase 5B, this release): see
+            # retired_pack_history's own __init__ comment. A plain list
+            # of plain dicts -- no custom (de)serialization needed
+            # beyond what json/HA Store already handle for the
+            # primitives each entry is made of.
+            "retired_pack_history": list(self.retired_pack_history),
+            # v2.0.12 (Battery Phase 5B, this release): see
+            # effective_pack_install_ts()'s own docstring.
+            "pack_first_detected": dict(self.pack_first_detected),
+            "pack_install_dates": dict(self.pack_install_dates),
             # last_current_a is deliberately NOT persisted -- it is a
             # "most recent live reading" value, and restoring a
             # potentially hours-old value across a restart would present
@@ -1709,6 +1857,21 @@ class PackCapacityTracker:
                 self._last_serial[i] = last_serial_data[i]
             if i < len(replaced_data):
                 self.pack_replaced_count[i] = int(replaced_data[i])
+        # v2.0.12 (Battery Phase 5B, this release): restored
+        # unconditionally, unlike last_serial above -- retired_pack_
+        # history is a historical LOG (append-only, each entry stamped
+        # with its own slot_label at the time of that specific
+        # replacement), not current per-slot state, so a topology
+        # change since the last save has no bearing on whether these
+        # past entries are still valid to keep.
+        self.retired_pack_history = list(data.get("retired_pack_history", []))
+        # v2.0.12 (Battery Phase 5B, this release): restored
+        # unconditionally, same reasoning as retired_pack_history just
+        # above -- both are keyed by serial number, not slot, so a
+        # topology change since the last save has no bearing on
+        # whether these entries are still valid.
+        self.pack_first_detected = dict(data.get("pack_first_detected", {}))
+        self.pack_install_dates = dict(data.get("pack_install_dates", {}))
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -2721,22 +2884,18 @@ class BatteryHealthEngine:
         cfg = self.cfg
         r = HealthReport()
 
-        r.soh_capacity, cap_attrs = self.segments.soh_capacity()
-        r.soh_efficiency, eff_attrs = self.efficiency.soh_efficiency()
-        r.soh_balance, bal_attrs = self.balance.soh_balance()
-        r.attributes.update(cap_attrs)
-        r.attributes.update(eff_attrs)
-        r.attributes.update(bal_attrs)
-
-        # v2.0.6 (Tier 3, battery health architecture review): per-pack
-        # capacity is informational, never part of the BHI composite
-        # below -- the composite is already defined as capacity/
-        # efficiency/balance, and this is a diagnostic BREAKDOWN of the
-        # unit-level capacity term above, not a fourth term. Directly
-        # answers this tracker's own original motivation ("is one pack
-        # degrading faster than the others") with a measured spread,
-        # not just three separate numbers a user would have to compare
-        # by eye.
+        # v2.0.12 FIX (Battery Phase 5B, this release -- pack-level
+        # promotion): per-pack capacity computed FIRST now, because it
+        # DRIVES the primary soh_capacity below -- reordered from its
+        # previous position (after the unit-level computation, purely
+        # informational) to before it. Matches the architecture
+        # review's own recommendation #1 ("Make pack health first-
+        # class state") and #5 ("Aggregate eligible pack capacities
+        # into a system capacity estimate") -- independently confirmed
+        # by that document's own target architecture explicitly naming
+        # "weakest pack" as a system-health output, and explicitly
+        # warning that a naive average of pack percentages is LESS
+        # defensible than evidence-fused, worst-pack-aware reporting.
         pack_results = self.pack_capacity.soh_capacity_per_pack()
         pack_soh = [v for v, _attrs in pack_results]
         r.attributes["pack_capacity_soh_percent"] = [
@@ -2750,6 +2909,73 @@ class BatteryHealthEngine:
             round(max(known_soh) - min(known_soh), 1)
             if len(known_soh) >= 2 else None
         )
+
+        # v2.0.12 (Battery Phase 5B, this release): the actual fusion --
+        # the WORST (minimum) among eligible (non-None) packs, not a
+        # weighted average. A weaker pack's own true health must never
+        # be diluted/hidden behind healthier siblings in the headline
+        # number -- both the more chemically honest answer (usable
+        # system capacity is, in practice, gated by the weakest pack,
+        # not the mean) and the one that actually serves the "catch a
+        # bad pack early, including for a warranty case" goal this
+        # whole promotion was motivated by.
+        soh_capacity_fused: float | None = None
+        weakest_pack_slot: str | None = None
+        if known_soh:
+            worst_idx = min(
+                (i for i, v in enumerate(pack_soh) if v is not None),
+                key=lambda i: pack_soh[i],
+            )
+            soh_capacity_fused = pack_soh[worst_idx]
+            weakest_pack_slot = self.pack_capacity.slot_labels[worst_idx]
+        r.attributes["weakest_pack_slot"] = weakest_pack_slot
+
+        # v2.0.12 (Battery Phase 5B, this release): the ORIGINAL
+        # unit-level estimator, computed EXACTLY as before -- but now
+        # as the independent cross-check the architecture review's own
+        # recommendation #6 calls for, not the primary source. A
+        # genuinely separate measurement path (the unit's own total
+        # charge/discharge counters, not derived from summing/comparing
+        # the three pack estimates above), so a disagreement between
+        # the two is real, actionable information -- either the pack-
+        # fusion model has a flaw, or something inconsistent is
+        # happening at the unit level that per-pack data alone
+        # wouldn't catch.
+        soh_capacity_unit_independent, cap_attrs = self.segments.soh_capacity()
+        r.attributes["soh_capacity_unit_independent"] = (
+            round(soh_capacity_unit_independent, 1)
+            if soh_capacity_unit_independent is not None else None
+        )
+        r.attributes.update(cap_attrs)
+
+        # v2.0.12 (Battery Phase 5B, this release): the actual
+        # promotion -- soh_capacity (the number BHI's own composite
+        # below actually uses) is now the pack-fused value, falling
+        # back to the unit-level independent estimate ONLY when no
+        # pack has accumulated enough data yet (a brand-new install, or
+        # a persisted state from before this feature existed) -- never
+        # silently reporting nothing when a perfectly good unit-level
+        # number is available.
+        if soh_capacity_fused is not None:
+            r.soh_capacity = soh_capacity_fused
+            r.attributes["soh_capacity_source"] = "pack_fused"
+        else:
+            r.soh_capacity = soh_capacity_unit_independent
+            r.attributes["soh_capacity_source"] = "unit_independent_fallback"
+
+        r.attributes["capacity_cross_check_diverged"] = (
+            abs(soh_capacity_fused - soh_capacity_unit_independent)
+            > cfg.capacity_cross_check_divergence_threshold_pct
+            if soh_capacity_fused is not None
+            and soh_capacity_unit_independent is not None
+            else None
+        )
+
+        r.soh_efficiency, eff_attrs = self.efficiency.soh_efficiency()
+        r.soh_balance, bal_attrs = self.balance.soh_balance()
+        r.attributes.update(eff_attrs)
+        r.attributes.update(bal_attrs)
+
 
         # Composite over available measured terms only (renormalized weights;
         # a missing term must never crater the composite as an implicit 0).
@@ -2850,8 +3076,26 @@ class BatteryHealthEngine:
                 r.health_divergence = round(r.soh_capacity - r.predicted_soh, 1)
 
         # Confidence
-        seg_count = len(self.segments.segments)
-        last_seg = self.segments.last_segment_ts
+        # v2.0.12 FIX (Battery Phase 5B, this release -- confidence as a
+        # first-class output, tied to whatever is ACTUALLY driving the
+        # reported number): previously always used the unit-level
+        # estimator's own segment count/staleness, even after soh_capacity
+        # was promoted above to reflect the pack-fused (worst-pack) value
+        # -- a genuine mismatch between the reported number's own
+        # evidence quality and what confidence claimed to represent.
+        # Matches the architecture review's own recommendation #10
+        # ("Make confidence and uncertainty first-class outputs").
+        # Guarded by BOTH the source check and `known_soh` (redundant --
+        # source can only be "pack_fused" when known_soh was truthy in
+        # the first place -- kept as a defensive belt-and-suspenders
+        # check against a future refactor accidentally decoupling the
+        # two, matching this project's own established style).
+        if r.attributes["soh_capacity_source"] == "pack_fused" and known_soh:
+            seg_count = pack_results[worst_idx][1].get("segment_count", 0) or 0
+            last_seg = self.pack_capacity.trackers[worst_idx].last_segment_ts
+        else:
+            seg_count = len(self.segments.segments)
+            last_seg = self.segments.last_segment_ts
         if last_seg is not None and (now - last_seg) > cfg.stale_after_days * SECONDS_PER_DAY:
             r.confidence = "stale"
         elif (
@@ -2894,6 +3138,28 @@ class BatteryHealthEngine:
         # own index order exactly (both built from the same slot list).
         r.attributes["pack_slot_labels"] = list(self.pack_capacity.slot_labels)
         r.attributes["pack_replaced_count"] = list(self.pack_capacity.pack_replaced_count)
+        # v2.0.12 FIX (Battery Phase 5B, this release -- completeness
+        # gap caught before shipping): retired_pack_history and
+        # effective_pack_install_ts() were both built and tested this
+        # release, but NEITHER was ever actually wired into the report
+        # -- meaning a user could set a pack's own install date via the
+        # new service, but the resulting age was never surfaced
+        # anywhere, and an outgoing pack's own archived history was
+        # never visible outside a raw persisted-state dump. Both
+        # genuinely finished now, not just computed and forgotten.
+        r.attributes["retired_pack_history"] = list(
+            self.pack_capacity.retired_pack_history
+        )
+        pack_ages_days: list[float | None] = []
+        pack_age_sources: list[str] = []
+        for i in range(len(self.pack_capacity.slot_labels)):
+            ts, source = self.pack_capacity.effective_pack_install_ts(i)
+            pack_ages_days.append(
+                round((now - ts) / SECONDS_PER_DAY, 1) if ts is not None else None
+            )
+            pack_age_sources.append(source)
+        r.attributes["pack_age_days"] = pack_ages_days
+        r.attributes["pack_age_source"] = pack_age_sources
         r.attributes["pack_current_share_deviation_pct"] = (
             self.pack_capacity.current_share_deviation_pct()
         )

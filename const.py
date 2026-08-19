@@ -267,6 +267,9 @@ SERVICE_SET_MAXIMUM_FEED_GRID_POWER_PERCENT = "set_maximum_feed_grid_power_perce
 SERVICE_SET_TOU_PERIODS = "set_tou_periods"
 SERVICE_SET_CAPACITY_CONTROL_PERIODS = "set_capacity_control_periods"
 SERVICE_SET_FIXED_CHARGE_PERIODS = "set_fixed_charge_periods"
+# v2.0.12 (Battery Phase 5B, this release): see set_pack_install_date's
+# own docstring (services.py).
+SERVICE_SET_PACK_INSTALL_DATE = "set_pack_install_date"
 
 SERVICES = (
     SERVICE_FORCIBLE_CHARGE,
@@ -282,6 +285,12 @@ SERVICES = (
     SERVICE_SET_TOU_PERIODS,
     SERVICE_SET_CAPACITY_CONTROL_PERIODS,
     SERVICE_SET_FIXED_CHARGE_PERIODS,
+    # v2.0.12 (Battery Phase 5B, this release): a real gap this exact
+    # completeness test caught before shipping -- without this, the
+    # service would have registered correctly but never been
+    # unregistered on integration unload, a genuine (if minor) resource
+    # leak this test exists specifically to prevent.
+    SERVICE_SET_PACK_INSTALL_DATE,
 )
 
 # ── Adaptive Modbus learning ──────────────────────────────────────────────────
