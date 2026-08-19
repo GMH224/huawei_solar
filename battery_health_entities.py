@@ -9,18 +9,22 @@ into the sensor platform via ``create_battery_health_entities`` in
 from __future__ import annotations
 
 import logging
-from typing import Any
+import re
+from typing import Any, TYPE_CHECKING
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
     SensorStateClass,
 )
-from homeassistant.const import PERCENTAGE, EntityCategory
+from homeassistant.const import PERCENTAGE, UnitOfTime, EntityCategory
 from homeassistant.core import callback
 
 from .battery_health import HealthReport
 from .battery_health_manager import BatteryHealthManager
+
+if TYPE_CHECKING:
+    from homeassistant.helpers.device_registry import DeviceInfo
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -295,43 +299,30 @@ class HuaweiSolarBatteryHealthSensorEntity(SensorEntity):
                     "capacity_reference_captured", "capacity_reference_epochs",
                     "segment_soc_midpoint_mean", "segment_charge_ceiling_mean",
                     "segment_count",
-                    # v2.0.6 (Tier 3, battery health architecture review):
-                    # per-pack capacity, from PackCapacityTracker -- a
-                    # direct, measured per-pack signal, grouped here
-                    # alongside the unit-level capacity diagnostics it's
-                    # a breakdown of, matching this file's own
-                    # established pattern rather than new top-level
-                    # entities for a single addition.
-                    "pack_capacity_soh_percent", "pack_capacity_segment_count",
+                    # v2.0.12 FIX (Battery Phase 5B UI restructuring, this
+                    # release): the genuinely PER-PACK values that used
+                    # to live here (pack_capacity_soh_percent, pack_
+                    # capacity_segment_count, pack_replaced_count,
+                    # pack_age_days, pack_age_source) have been removed
+                    # -- confirmed with the user directly that this
+                    # placement didn't match how every OTHER per-pack
+                    # value in this integration is exposed (individual
+                    # entities under that pack's own "Battery 1"/
+                    # "Battery 2" device, per sensor.py's own
+                    # BATTERY_TEMPLATE_SENSOR_DESCRIPTIONS convention).
+                    # See create_battery_health_pack_entities() below
+                    # for where they live now. Only genuinely AGGREGATE
+                    # values -- ones with no single pack they belong to
+                    # -- remain here.
                     "pack_capacity_spread_pct",
-                    # v2.0.12 (Battery Phase 5B, this release -- pack-
-                    # level promotion): a real gap caught and fixed
-                    # before shipping -- these four keys were already
-                    # computed and present in report.attributes, but
-                    # this allowlist (not "show everything in the
-                    # report") never included them, so none were
-                    # actually visible in the HA UI despite existing
-                    # internally. soh_capacity_source and weakest_pack_
-                    # slot are exactly what explains WHY the headline
-                    # number is what it is; soh_capacity_unit_
-                    # independent and capacity_cross_check_diverged are
-                    # the cross-check the architecture review's own
-                    # recommendation #6 exists to make visible, not
-                    # just computed.
                     "soh_capacity_source", "weakest_pack_slot",
                     "soh_capacity_unit_independent", "capacity_cross_check_diverged",
-                    # v2.0.12 (Battery Phase 5B, this release -- another
-                    # gap caught in the same pass): pack_replaced_count/
-                    # pack_slot_labels were pre-existing, computed
-                    # fields that turned out to have this SAME "never
-                    # in any allowlist" gap already, unrelated to this
-                    # release's own new work -- fixed together here
-                    # since they're the same "what's the story on my
-                    # packs" narrative as everything else in this
-                    # group, not a separate concern worth a separate
-                    # fix later.
-                    "pack_slot_labels", "pack_replaced_count",
-                    "retired_pack_history", "pack_age_days", "pack_age_source",
+                    # pack_slot_labels retained here as index-reference
+                    # context (which slot is index 0, 1, 2 -- useful
+                    # alongside weakest_pack_slot above); retired_pack_
+                    # history retained here since a retired pack has no
+                    # live slot to attach an individual entity to.
+                    "pack_slot_labels", "retired_pack_history",
                 )
             }
         elif self._attr_key == "soh_balance":
@@ -355,3 +346,244 @@ class HuaweiSolarBatteryHealthSensorEntity(SensorEntity):
                     "efficiency_charge_ceiling",
                 )
             }
+
+
+# ── Per-pack entities (v2.0.12, Battery Phase 5B UI restructuring) ──────────
+#
+# The sensors above are all attached to the aggregate "Batteries" device
+# (manager.device_info) and read a single scalar off the report -- correct
+# for genuinely aggregate/cross-pack values (BHI, confidence, which pack is
+# weakest, the spread between packs). But several values that were also
+# being exposed that way are genuinely PER-PACK (one value belonging to one
+# specific physical pack, not the whole system) -- pack_capacity_soh_percent,
+# pack_capacity_segment_count, pack_replaced_count, pack_age_days, and
+# pack_age_source were all list-valued attributes bundled onto the
+# aggregate soh_capacity sensor, which does not match how every OTHER
+# per-pack value in this integration is exposed: sensor.py's own
+# BATTERY_TEMPLATE_SENSOR_DESCRIPTIONS creates one individual entity per
+# pack (translation keys like "pack_1_state_of_capacity"), attached to
+# that pack's own physical storage-unit device ("Battery 1"/"Battery 2"),
+# not a separate aggregate device. This section corrects that mismatch,
+# found and confirmed directly with the user rather than assumed --
+# real per-pack sensors moved here, genuinely aggregate ones (weakest_
+# pack_slot, pack_capacity_spread_pct, soh_capacity_source, soh_capacity_
+# unit_independent, capacity_cross_check_diverged) deliberately left on
+# the existing soh_capacity sensor above, where they still belong.
+
+#: Public (no leading underscore, deliberately): shared across modules --
+#: date.py's own create_battery_health_pack_date_entities() imports this
+#: directly rather than duplicating it, so the slot-label parsing used
+#: to decide which physical device a pack's entities attach to can
+#: never drift between the sensor and date platforms.
+SLOT_LABEL_RE = re.compile(r"^u(\d+)p(\d+)$")
+
+#: pack_age_source is STRING-valued, like confidence above -- must never
+#: receive a numeric precision hint (see _STRING_VALUED_KEYS's own comment
+#: for the exact bug class this prevents).
+_STRING_VALUED_PACK_KEYS: frozenset[str] = frozenset({"pack_age_source"})
+
+_PACK_AGE_SOURCE_OPTIONS: list[str] = [
+    "install_date", "unit_install_date", "first_detected", "unknown",
+]
+
+# (report_attribute_key, name_suffix, unit, icon, extra_attrs)
+_PACK_HEALTH_SENSORS: list[tuple[str, str, str | None, str, dict[str, Any]]] = [
+    (
+        "pack_capacity_soh_percent",
+        "SOH capacity",
+        PERCENTAGE,
+        "mdi:battery-charging-100",
+        {
+            "state_class": SensorStateClass.MEASUREMENT,
+            "entity_category": EntityCategory.DIAGNOSTIC,
+        },
+    ),
+    (
+        "pack_capacity_segment_count",
+        "SOH capacity segment count",
+        None,
+        "mdi:counter",
+        {
+            "entity_category": EntityCategory.DIAGNOSTIC,
+            # Diagnostic/evidence-quality detail, not a health value
+            # itself -- matches this integration's own convention of
+            # disabling secondary diagnostic detail by default (see
+            # sensor.py's own BATTERY_TEMPLATE_SENSOR_DESCRIPTIONS,
+            # entity_registry_enabled_default=False throughout).
+            "entity_registry_enabled_default": False,
+        },
+    ),
+    (
+        "pack_replaced_count",
+        "Replaced count",
+        None,
+        "mdi:swap-horizontal",
+        {"entity_category": EntityCategory.DIAGNOSTIC},
+    ),
+    (
+        "pack_age_days",
+        "Age",
+        UnitOfTime.DAYS,
+        "mdi:calendar-clock",
+        {
+            "state_class": SensorStateClass.MEASUREMENT,
+            "entity_category": EntityCategory.DIAGNOSTIC,
+        },
+    ),
+    (
+        "pack_age_source",
+        "Age source",
+        None,
+        "mdi:information-outline",
+        {
+            "device_class": SensorDeviceClass.ENUM,
+            "options": _PACK_AGE_SOURCE_OPTIONS,
+            "entity_category": EntityCategory.DIAGNOSTIC,
+        },
+    ),
+]
+
+
+def create_battery_health_pack_entities(
+    manager: BatteryHealthManager,
+    battery_1_device_info: "DeviceInfo | None",
+    battery_2_device_info: "DeviceInfo | None",
+) -> list["HuaweiSolarBatteryHealthPackSensorEntity"]:
+    """Create per-pack Battery Health sensor entities, one set per pack,
+    each attached to that specific pack's own physical storage-unit
+    device -- NOT the aggregate "Batteries" device the rest of this
+    module's entities use. See this section's own module-level comment
+    for the full reasoning.
+
+    Slot labels are parsed (not string-prefix-matched) to find each
+    pack's own unit number and pack number -- robust to any pack count,
+    not assuming single-digit unit numbers stay single-digit forever.
+    A slot whose corresponding storage-unit device_info is unavailable
+    (or a slot_label that doesn't parse, which should not happen in
+    practice) is skipped rather than raising -- matches the same fault-
+    isolation posture already used for the aggregate entities' own
+    setup path in sensor.py.
+    """
+    slot_labels = manager.engine.pack_capacity.slot_labels
+    entities: list[HuaweiSolarBatteryHealthPackSensorEntity] = []
+    for i, slot_label in enumerate(slot_labels):
+        match = SLOT_LABEL_RE.match(slot_label)
+        if match is None:
+            continue
+        unit_number, pack_number = match.group(1), match.group(2)
+        if unit_number == "1":
+            device_info = battery_1_device_info
+        elif unit_number == "2":
+            device_info = battery_2_device_info
+        else:
+            device_info = None
+        if device_info is None:
+            continue
+        for report_key, name_suffix, unit, icon, extra in _PACK_HEALTH_SENSORS:
+            entities.append(
+                HuaweiSolarBatteryHealthPackSensorEntity(
+                    manager, device_info, i, slot_label, pack_number,
+                    report_key, name_suffix, unit, icon, extra,
+                )
+            )
+    return entities
+
+
+class HuaweiSolarBatteryHealthPackSensorEntity(SensorEntity):
+    """Push-based per-pack sensor, backed by the SAME BatteryHealthManager
+    as the aggregate sensors above, but reading one specific index out
+    of a list-valued report attribute, and attached to that pack's own
+    physical storage-unit device instead of the aggregate one.
+    """
+
+    _attr_has_entity_name = True
+    _attr_should_poll = False
+
+    def __init__(
+        self,
+        manager: BatteryHealthManager,
+        device_info: "DeviceInfo",
+        pack_index: int,
+        slot_label: str,
+        pack_number: str,
+        report_key: str,
+        name_suffix: str,
+        unit: str | None,
+        icon: str,
+        extra: dict[str, Any],
+    ) -> None:
+        self._manager = manager
+        self._pack_index = pack_index
+        self._report_key = report_key
+        # e.g. "Pack 2 SOH capacity" -- pack number in the name is
+        # required, not cosmetic: multiple packs can share the same
+        # device (e.g. u1p1 and u1p2 both under "Battery 1"), so
+        # without it every pack's own entity would collide on the same
+        # display name within that device.
+        self._attr_name = f"Pack {pack_number} {name_suffix}"
+        self._attr_native_unit_of_measurement = unit
+        if report_key not in _STRING_VALUED_PACK_KEYS:
+            self._attr_suggested_display_precision = 1
+        self._attr_icon = icon
+        self._attr_device_info = device_info
+        self._attr_unique_id = (
+            f"{manager.serial_number}_battery_health_pack_{slot_label}_{report_key}"
+        )
+        self._attr_native_value: Any = None
+        self._attr_available = True
+
+        for k, v in extra.items():
+            setattr(self, f"_attr_{k}", v)
+
+        self._cb = self._on_health_update
+
+    async def async_added_to_hass(self) -> None:
+        """Register with the manager and populate from the last report.
+
+        Fault isolation, matching the aggregate entity class's own
+        established pattern: registration and the initial value read
+        are guarded so a manager in an unexpected state can never
+        prevent this entity -- or the rest of the sensor platform --
+        from being added.
+        """
+        try:
+            self._manager.add_listener(self._cb)
+            self._apply(self._manager.engine.report)
+        except Exception:  # noqa: BLE001 — never block platform setup
+            _LOGGER.exception(
+                "battery_health: failed to initialise entity %s; it will "
+                "report unknown until the next successful update",
+                self._attr_unique_id,
+            )
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Deregister callback."""
+        self._manager.remove_listener(self._cb)
+
+    @callback
+    def _on_health_update(self, report: HealthReport) -> None:
+        """Apply a new report and write state.
+
+        Guarded, matching the aggregate entity class's own established
+        pattern: a failure here must never leave the entity holding a
+        value HA cannot serialise.
+        """
+        try:
+            self._apply(report)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception(
+                "battery_health: failed to apply report to %s", self._attr_unique_id
+            )
+            return
+        self.async_write_ha_state()
+
+    def _apply(self, report: HealthReport) -> None:
+        values = report.attributes.get(self._report_key)
+        # Deliberately defensive against a list shorter than expected
+        # (e.g. a topology change mid-restart) -- reports unknown for
+        # this one pack rather than raising and losing every other
+        # entity's own update in the same batch.
+        if values is not None and self._pack_index < len(values):
+            self._attr_native_value = values[self._pack_index]
+        else:
+            self._attr_native_value = None

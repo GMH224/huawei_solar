@@ -50,7 +50,10 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DATA_DEVICE_DATAS, DATA_SYNC_POWER_COORDINATOR, WRITE_PERMISSION_CHECK_TIMEOUT
 from .adaptive_modbus import AdaptiveModbusController, create_adaptive_entities
-from .battery_health_entities import create_battery_health_entities
+from .battery_health_entities import (
+    create_battery_health_entities,
+    create_battery_health_pack_entities,
+)
 from .battery_health_manager import BatteryHealthManager
 from .modbus_telemetry import ModbusTelemetry, create_telemetry_entities
 from .synchronized_power_coordinator import SynchronizedPowerCoordinator, SynchronizedPowerData
@@ -2364,6 +2367,21 @@ async def async_setup_entry(
             if bh_manager:
                 battery_health_entities.extend(
                     create_battery_health_entities(bh_manager)
+                )
+                # v2.0.12 (Battery Phase 5B UI restructuring, this
+                # release): per-pack entities, attached to that pack's
+                # own physical storage-unit device (ucs.battery_1/
+                # ucs.battery_2 -- the SAME device_info objects the
+                # existing raw per-pack sensors already use, per
+                # BATTERY_TEMPLATE_SENSOR_DESCRIPTIONS above), not the
+                # aggregate device the rest of create_battery_health_
+                # entities()'s own sensors attach to. Inside the SAME
+                # try/except as the aggregate entities -- a failure
+                # here must be just as contained.
+                battery_health_entities.extend(
+                    create_battery_health_pack_entities(
+                        bh_manager, ucs.battery_1, ucs.battery_2,
+                    )
                 )
     except Exception:  # noqa: BLE001
         _LOGGER.exception(

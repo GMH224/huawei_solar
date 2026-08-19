@@ -278,15 +278,13 @@ async def set_pack_install_date(service_call: ServiceCall) -> None:
             translation_placeholders={"device_id": service_call.data[DATA_DEVICE_ID]},
         )
 
-    bh_manager.engine.pack_capacity.pack_install_dates[serial] = install_ts
-    # v2.0.12: an explicit, deliberate, infrequent user action -- worth
-    # persisting promptly rather than waiting on the engine's own
-    # normal dirty-flag-plus-5-minute-debounce cycle (_maybe_save(),
-    # battery_health_manager.py), which exists to avoid excessive write
-    # churn from routine per-tick engine activity, not from something
-    # like this.
-    bh_manager.engine.dirty = True
-    bh_manager._maybe_save()
+    # v2.0.12 (Battery Phase 5B UI restructuring, this release): now
+    # goes through the shared BatteryHealthManager.set_pack_install_date()
+    # write path -- see that method's own docstring. Keeps this service
+    # and the new per-pack date entity (date.py) from being able to
+    # drift out of sync by each reimplementing the same three steps
+    # separately.
+    bh_manager.set_pack_install_date(serial, install_ts)
 
 
 @callback

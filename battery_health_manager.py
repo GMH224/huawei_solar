@@ -791,6 +791,20 @@ class BatteryHealthManager:
             except Exception:  # noqa: BLE001 — one bad entity must not break the rest
                 _LOGGER.exception("battery_health[%s]: listener failed", self.serial_number)
 
+    def set_pack_install_date(self, serial: str, install_ts: float) -> None:
+        """v2.0.12 (Battery Phase 5B UI restructuring, this release):
+        shared write path for a pack's own explicit install date --
+        used by BOTH the set_pack_install_date service (services.py)
+        and the new per-pack date entity (date.py), so the two can
+        never drift out of sync by duplicating this logic separately.
+        An explicit, deliberate, infrequent user action -- persisted
+        promptly (see _maybe_save()'s own docstring for why this
+        doesn't wait on the normal engine-tick debounce).
+        """
+        self.engine.pack_capacity.pack_install_dates[serial] = install_ts
+        self.engine.dirty = True
+        self._maybe_save()
+
     def _maybe_save(self) -> None:
         """Debounced persistence: on engine 'dirty' events (segment closed,
         baseline captured, counter reset) but at most every 5 minutes."""

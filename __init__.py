@@ -226,6 +226,11 @@ async def _run_cleanup_callbacks(callbacks: list[Callable[[], object]]) -> None:
 
 PLATFORMS: list[Platform] = [
     Platform.BUTTON,
+    # v2.0.12 (Battery Phase 5B UI restructuring, this release): new
+    # platform, holding exactly one entity type -- the writable
+    # per-pack install-date entities (date.py). This integration did
+    # not previously have any date.py platform at all.
+    Platform.DATE,
     Platform.NUMBER,
     Platform.SELECT,
     Platform.SENSOR,
