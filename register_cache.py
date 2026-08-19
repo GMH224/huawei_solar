@@ -924,6 +924,52 @@ class RegisterCache:
         age = time.monotonic() - entry.ts
         return age - self._effective_ttl(entry)
 
+    def worst_overdue(self, n: int = 5) -> list[tuple[RegisterName, float | None]]:
+        """v2.0.11 (Phase 5.4, this release -- freshness-debt
+        observability): the N registers currently most overdue (by
+        overdue_by()'s own value -- extra time past due-date, not raw
+        age), worst first.
+
+        Built specifically because a real field investigation this
+        project went through (a register that turned out to be
+        perfectly healthy -- benign staircase from genuine meter
+        accuracy at its own resolution, not a bug) required manually
+        reconstructing this exact picture from raw diagnostic captures,
+        taking far longer than it should have. Exposing it directly
+        (see telemetry_capture.py's own consumption of this method)
+        means the NEXT time a register's own freshness is in question,
+        the answer is a number in a capture, not another multi-hour
+        investigation.
+
+        Deliberately observational only, like Phase 5.2's bus-health
+        signal -- surfaces the SAME overdue_by() value the existing
+        back-off promotion logic already uses internally, without
+        changing that logic's own behaviour at all.
+
+        Honest limitation, confirmed directly before shipping this
+        (not assumed): this can only surface registers that have been
+        read at least ONCE -- a register that has NEVER been
+        successfully read at all has no entry in this cache to
+        iterate, so it cannot appear here no matter how overdue it
+        conceptually is. Catching THAT case would need the caller's
+        own expected register set (all_names/async_contexts()), which
+        this cache -- deliberately agnostic of what SHOULD be in it,
+        only what IS -- doesn't have. The None-sentinel handling below
+        is retained as a defensive default for exactly that future
+        case, not because it is reachable through this method's
+        current single call site.
+        """
+        scored: list[tuple[RegisterName, float | None]] = []
+        for name in self._store:
+            scored.append((name, self.overdue_by(name)))
+        # Sort key uses float("inf") as a sentinel for None (never
+        # observed), rather than a tuple-based None-safe trick -- two
+        # registers that were BOTH never read would otherwise compare
+        # None against None during sort, which raises TypeError in
+        # Python 3 (only equality, not ordering, is defined for None).
+        scored.sort(key=lambda item: item[1] if item[1] is not None else float("inf"), reverse=True)
+        return scored[:n]
+
     @property
     def size(self) -> int:
         return len(self._store)

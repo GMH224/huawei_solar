@@ -105,6 +105,18 @@ class ModbusAdmissionTimeout(asyncio.TimeoutError):
     """
 MAX_QUEUE_DEPTH = 3
 
+# v2.0.11 (Phase 5.2, this release): per-event EWMA decay factor for the
+# bus-health admission signal (ModbusGuard._bus_admission_ewma_n/
+# _bus_admission_ewma_failures). Chosen so the signal's effective memory
+# spans roughly the last 30-70 admission attempts -- a few minutes to
+# ~10 minutes of recent history at this system's own typical admission
+# rate (confirmed against real field telemetry: ~11 requests/minute
+# across both devices combined) -- responsive to genuinely current bus
+# conditions without being jumpy on any single event. A judgment call,
+# not a derived constant; flag if a different responsiveness is wanted
+# once this has been observed running for a while.
+BUS_HEALTH_EWMA_DECAY = 0.98
+
 # v2.0.0a (F18, external ICS audit -- confirmed): the priority lane's own
 # bound, independent of MAX_QUEUE_DEPTH above. Deliberately small --
 # realistically at most a handful of independent keep-alive tasks could
@@ -277,6 +289,30 @@ class ModbusGuard:
         #: Exposed so internal contention is observable rather than silently
         #: mixed into the inverter's failure statistics.
         self.shed_count: int = 0
+        # v2.0.11 (Phase 5.2, this release -- separate device-health from
+        # bus-health learning models): a genuine, decaying BUS-level
+        # health signal, deliberately kept observational only -- it does
+        # NOT alter admission/scheduling behaviour (that's Phase 5.1's
+        # own, deliberately deferred scope). Confirmed before building
+        # this that the device-health signal (AdaptiveModbusController's
+        # own TimeSlotStats.failure_rate/confidence) was ALREADY cleanly
+        # isolated from bus congestion -- record_request() is only ever
+        # called for requests that were genuinely admitted and got a
+        # real device-level outcome; shed/admission-timeout events route
+        # to note_shed()/note_admission_timeout() instead, explicitly
+        # marked "diagnostics only". What was actually missing was the
+        # OTHER half: a bus-health signal with the SAME rigor (a real,
+        # recency-weighted rate, not just a lifetime counter that
+        # becomes less sensitive to current conditions the longer the
+        # bus has been running) -- shed_count/priority_shed_count above
+        # are lifetime totals, not a rate, and were never fed into
+        # anything. EWMA-decayed, matching this project's own
+        # established pattern (ADAPTIVE_DECAY_FACTOR) rather than a
+        # fixed-window rolling average, which would need its own
+        # separate history buffer.
+        self._bus_admission_ewma_n: float = 0.0
+        self._bus_admission_ewma_failures: float = 0.0
+        self.admission_timeout_count: int = 0
         # v2.0.0a (F18, external ICS audit -- confirmed): priority=True
         # requests (keep-alive) bypass the normal queue-depth shedding
         # check entirely -- correct, that's the whole point of priority --
@@ -495,6 +531,9 @@ class ModbusGuard:
                     guard.endpoint, guard._queue_depth, guard._max_queue_depth,
                 )
                 guard.shed_count += 1
+                # v2.0.11 (Phase 5.2, this release): see guard's own
+                # _record_bus_admission_outcome() docstring.
+                guard._record_bus_admission_outcome(failed=True)
                 raise ModbusQueueShed(
                     f"ModbusGuard[{guard.endpoint}] queue full "
                     f"({guard._queue_depth}/{guard._max_queue_depth})"
@@ -516,6 +555,7 @@ class ModbusGuard:
                     guard.endpoint, guard._priority_queue_depth, MAX_PRIORITY_QUEUE_DEPTH,
                 )
                 guard.priority_shed_count += 1
+                guard._record_bus_admission_outcome(failed=True)
                 raise ModbusQueueShed(
                     f"ModbusGuard[{guard.endpoint}] priority lane full "
                     f"({guard._priority_queue_depth}/{MAX_PRIORITY_QUEUE_DEPTH})"
@@ -546,6 +586,11 @@ class ModbusGuard:
                 guard.total_wait_ms += self.wait_ms
                 if self.wait_ms > 1000.0:
                     guard.requests_waited += 1
+                # v2.0.11 (Phase 5.2, this release): genuine admission
+                # success -- past both the shed check and the admission-
+                # wait timeout. See guard's own
+                # _record_bus_admission_outcome() docstring.
+                guard._record_bus_admission_outcome(failed=False)
 
             except BaseException as exc:
                 # MUST be BaseException, not Exception: asyncio.CancelledError is a
@@ -594,6 +639,14 @@ class ModbusGuard:
                     and isinstance(exc, TimeoutError)
                     and not isinstance(exc, (ModbusQueueShed, ModbusAdmissionTimeout))
                 ):
+                    # v2.0.11 (Phase 5.2, this release): see guard's own
+                    # _record_bus_admission_outcome() docstring. Lifetime
+                    # counter mirrors shed_count's own role above --
+                    # never previously tracked at all on ModbusGuard
+                    # itself (only as a per-device ModbusTelemetry
+                    # counter, one level up).
+                    guard.admission_timeout_count += 1
+                    guard._record_bus_admission_outcome(failed=True)
                     raise ModbusAdmissionTimeout(
                         f"ModbusGuard[{guard.endpoint}] admission wait exceeded "
                         f"{QUEUE_WAIT_TIMEOUT.total_seconds():.0f}s"
@@ -730,6 +783,43 @@ class ModbusGuard:
             # never suppressed by this check.
             return float("inf")
         return time.monotonic() - self._last_request_end
+
+    def _record_bus_admission_outcome(self, *, failed: bool) -> None:
+        """v2.0.11 (Phase 5.2, this release): update the bus-health EWMA
+        with one admission outcome -- called from every one of the four
+        places admission is actually decided (normal shed, priority-lane
+        shed, admission timeout, and successful admission), so the
+        signal reflects the SAME event population those counters do,
+        just as a recency-weighted rate instead of a lifetime count.
+
+        Deliberately observational only -- see this class's own
+        _bus_admission_ewma_n field comment for why this doesn't (yet)
+        feed back into admission control itself.
+        """
+        self._bus_admission_ewma_n = (
+            self._bus_admission_ewma_n * BUS_HEALTH_EWMA_DECAY + 1.0
+        )
+        self._bus_admission_ewma_failures = (
+            self._bus_admission_ewma_failures * BUS_HEALTH_EWMA_DECAY
+            + (1.0 if failed else 0.0)
+        )
+
+    def bus_health_pct(self) -> float | None:
+        """v2.0.11 (Phase 5.2, this release): 0-100, the EWMA-weighted
+        percentage of RECENT admission attempts on this endpoint that
+        succeeded (were neither shed nor timed out waiting for
+        admission) -- the bus-level counterpart to AdaptiveModbusController's
+        own device-level confidence, deliberately computed from a
+        completely separate signal (admission outcomes on the shared
+        guard, not any one device's own RTT/failure history) so the two
+        never get conflated. None until at least one admission attempt
+        has been observed -- a fresh/idle endpoint has no bus-health
+        opinion yet, not a fake 100%.
+        """
+        if self._bus_admission_ewma_n < 1e-9:
+            return None
+        rate_failed = self._bus_admission_ewma_failures / self._bus_admission_ewma_n
+        return round(max(0.0, min(1.0, 1.0 - rate_failed)) * 100.0, 1)
 
     def wait_service_split(self) -> tuple[float, float]:
         """Return (p95 wait ms, p95 service ms) over the rolling window.

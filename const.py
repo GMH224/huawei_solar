@@ -434,6 +434,50 @@ BATCH_CHUNK_SIZE: int = 40
 # site had drifted out of sync with it.
 BATCH_INTER_CHUNK_PAUSE = timedelta(milliseconds=80)
 
+# v2.0.11 (Phase 5.3, this release -- service-time-aware chunking):
+# confirmed via real field data across three independent captures
+# (2h/6h/8.9h/20.5h, spanning a full day-night cycle) that certain
+# register groups are structurally slow regardless of chunk size --
+# battery per-pack telemetry, second-inverter status registers, and
+# storage-config parameters together were only ~44% of total traffic
+# but accounted for over 80% of all service-time-tail events (>3s).
+# BATCH_CHUNK_SIZE above is a single, uniform cap applied regardless
+# of what a chunk actually contains -- this pair of constants lets
+# chunking respond to EMPIRICAL, per-register service-time history
+# instead: a register with a learned EWMA service time (see
+# HuaweiSolarUpdateCoordinator._register_service_ewma) above the
+# threshold below gets a smaller chunk cap, so a chunk built around it
+# is both cheaper to retry and blocks the rest of the poll for less
+# time if it IS slow.
+#
+# SERVICE_TIME_SLOW_THRESHOLD_MS matches the exact 3000ms ">3s" bar
+# already used consistently throughout this whole investigation's own
+# analysis (both external ICS audits and this project's own field
+# reviews), not a newly-invented number.
+SERVICE_TIME_SLOW_THRESHOLD_MS: float = 3000.0
+# SERVICE_TIME_AWARE_CHUNK_SIZE is a judgment call, not derived from
+# the field data the way the threshold above is -- chosen as a
+# meaningfully smaller fraction of BATCH_CHUNK_SIZE (roughly a
+# quarter) so a known-slow group's own chunks are genuinely cheaper to
+# retry and block less of the poll, without being so small that a
+# structurally slow group needs an excessive number of separate
+# chunks (each with its own admission/gap overhead) to get through.
+# Flag if a different value is wanted once this has been observed
+# running for a while.
+SERVICE_TIME_AWARE_CHUNK_SIZE: int = 10
+# Per-observation EWMA decay for the register service-time tracker.
+# Deliberately a DIFFERENT value from BUS_HEALTH_EWMA_DECAY (0.98,
+# modbus_guard.py, Phase 5.2) -- that signal updates on every admission
+# (~11/minute in real field data), so a slow decay still reflects
+# recent minutes. A given register is read far less often (once per
+# its own tier's TTL, often every 30s-several minutes), so the SAME
+# 0.98 would give this tracker an effective memory spanning multiple
+# hours to keep a "recent" character -- too slow to reflect a register
+# group's own current behaviour. A faster decay (shorter observation-
+# count half-life) keeps this responsive on a comparable WALL-CLOCK
+# timescale despite far fewer observations per register.
+REGISTER_SERVICE_TIME_EWMA_DECAY: float = 0.9
+
 # v2.0.0a (F03, external ICS audit -- confirmed): the whole-poll deadline.
 # Each chunk already has its own timeout (effective_timeout, adaptive,
 # 15-60s) and BUSY retries add further delay on top -- but nothing bounded

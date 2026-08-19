@@ -508,6 +508,11 @@ class AdaptiveModbusController:
         self._bus_service_p95: float = 0.0
         self._bus_requests_waited: int = 0
         self._bus_total_wait_s: float = 0.0
+        # v2.0.11 (Phase 5.2, this release): see note_bus_metrics()'s
+        # own comment. None until the coordinator has pushed at least
+        # one real value through -- matches ModbusGuard.bus_health_pct()'s
+        # own "None until observed" semantics rather than a fake default.
+        self._bus_health_pct: float | None = None
         self._first_data_date: date | None = None
         self._dirty: bool = False
         # v2.0.3 FIX (ICS-02, external ICS audit -- confirmed): a
@@ -767,6 +772,7 @@ class AdaptiveModbusController:
         service_p95_ms: float,
         requests_waited: int = 0,
         total_wait_s: float = 0.0,
+        bus_health_pct: float | None = None,
     ) -> None:
         """Diagnostics only — bus-level counters.
 
@@ -775,12 +781,24 @@ class AdaptiveModbusController:
         reports something more useful than before: with address-aware
         chunking it is the real count of physical Modbus exchanges a poll
         needed, so a falling value is direct evidence the fix is working.
+
+        v2.0.11 (Phase 5.2, this release): bus_health_pct is
+        ModbusGuard.bus_health_pct()'s own EWMA-based admission-success
+        rate -- see that method's own docstring for the full reasoning.
+        Added here, not as a separate note_ method, because it's the
+        same kind of thing everything else in this method already is:
+        a bus-level metric pushed through for visibility, storage only,
+        never consumed by this class's own parameter derivation.
+        Optional/defaults to None so this stays backward compatible
+        with any caller not yet passing it.
         """
         self._bus_occupancy_pct = occupancy_pct
         self._bus_wait_p95 = wait_p95_ms
         self._bus_service_p95 = service_p95_ms
         self._bus_requests_waited = requests_waited
         self._bus_total_wait_s = total_wait_s
+        if bus_health_pct is not None:
+            self._bus_health_pct = bus_health_pct
 
     def note_shed(self) -> None:
         """Diagnostics only — a request shed by the shared bus guard."""
@@ -1008,6 +1026,12 @@ class AdaptiveModbusController:
             "bus_service_p95_ms": round(self._bus_service_p95, 1),
             "bus_requests_waited": self._bus_requests_waited,
             "bus_total_wait_s": round(self._bus_total_wait_s, 1),
+            # v2.0.11 (Phase 5.2, this release): see note_bus_metrics()'s
+            # own comment for the full reasoning -- deliberately
+            # separate from confidence_pct/poll_confidence_pct above,
+            # which are both device-level signals; this one is purely
+            # bus-level.
+            "bus_health_pct": self._bus_health_pct,
             # v1.2.2 learning gate visibility
             "learning_enabled": self.learning_enabled,
             "learning_active": self.learning_active(),

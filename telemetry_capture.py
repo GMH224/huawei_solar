@@ -674,6 +674,22 @@ def build_telemetry_snapshot(
         if telemetry is not None:
             section["telemetry"] = telemetry.snapshot()
 
+        # v2.0.11 (Phase 5.4, this release -- freshness-debt
+        # observability): see RegisterCache.worst_overdue()'s own
+        # docstring for the full reasoning. getattr-guarded the same
+        # way the register-overlap block below already guards
+        # dd.update_coordinator -- not every device_data has one (or a
+        # cache) at every point in an entry's own lifecycle.
+        coordinator = getattr(dd, "update_coordinator", None)
+        cache = getattr(coordinator, "cache", None)
+        if cache is not None:
+            section["freshness"] = {
+                "worst_overdue": [
+                    {"register": str(name), "overdue_s": round(overdue, 1) if overdue is not None else None}
+                    for name, overdue in cache.worst_overdue(5)
+                ],
+            }
+
         if battery_health_manager_cls is not None:
             bh_manager = battery_health_manager_cls.get(serial)
             if bh_manager is not None:

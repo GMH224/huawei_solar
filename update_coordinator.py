@@ -78,6 +78,9 @@ from .const import (
     REGISTER_STARVATION_PROMOTIONS_PER_CYCLE,
     BATCH_CHUNK_SIZE,
     BATCH_INTER_CHUNK_PAUSE,
+    SERVICE_TIME_SLOW_THRESHOLD_MS,
+    SERVICE_TIME_AWARE_CHUNK_SIZE,
+    REGISTER_SERVICE_TIME_EWMA_DECAY,
     BATCH_POLL_DEADLINE,
     BUSY_MAX_RETRIES,
     BUSY_RETRY_PAUSE,
@@ -434,6 +437,18 @@ class HuaweiSolarUpdateCoordinator(
         # for other, unrelated background work like the deferred first-
         # poll task) rather than extending that shared mechanism.
         self._verify_write_tasks: dict[RegisterName, asyncio.Task] = {}
+        # v2.0.11 (Phase 5.3, this release -- service-time-aware
+        # chunking): per-register EWMA of observed chunk service time,
+        # in milliseconds. Keyed by register name, not by chunk
+        # composition -- a chunk's own membership shifts poll to poll
+        # (which registers are stale changes), but a register's own
+        # structural cost (e.g. "this is a per-pack calibration-status
+        # read that requires the device to aggregate before
+        # responding") is a property of the register, not of whichever
+        # chunk happened to contain it on a given poll. See
+        # _service_aware_chunk_size()/_record_chunk_service_time()
+        # below for how this is read and updated.
+        self._register_service_ewma: dict[RegisterName, float] = {}
 
     # ── wiring ────────────────────────────────────────────────────────────────
 
@@ -651,6 +666,65 @@ class HuaweiSolarUpdateCoordinator(
         # silently leaving the entry's quality stale.
         return Quality.UNCERTAIN, Reason.LINK_DOWN
 
+    def _service_aware_chunk_size(self, group: list[RegisterName]) -> int:
+        """v2.0.11 (Phase 5.3, this release): the effective chunk-size
+        cap for *group* -- BATCH_CHUNK_SIZE normally, or the smaller
+        SERVICE_TIME_AWARE_CHUNK_SIZE if any register in this group has
+        a learned EWMA service time above SERVICE_TIME_SLOW_THRESHOLD_MS.
+
+        Deliberately "any register triggers the smaller cap for the
+        WHOLE group", not a per-register decision within the group --
+        _chunk() below still needs one single size to split by, and a
+        chunk is only as fast as its slowest member regardless of how
+        many OTHER registers share it (matching _chunk_tier()'s own
+        established "cost follows the slowest content" reasoning, just
+        applied to sizing instead of labelling).
+
+        No observations yet for every register in the group is treated
+        as "not (yet) known to be slow" -- BATCH_CHUNK_SIZE, not the
+        smaller cap. A register only earns the smaller cap once it has
+        actually demonstrated being slow, never by default.
+        """
+        for name in group:
+            if self._register_service_ewma.get(name, 0.0) >= SERVICE_TIME_SLOW_THRESHOLD_MS:
+                return SERVICE_TIME_AWARE_CHUNK_SIZE
+        return BATCH_CHUNK_SIZE
+
+    def _record_chunk_service_time(
+        self, chunk: list[RegisterName], service_ms: float,
+    ) -> None:
+        """v2.0.11 (Phase 5.3, this release): feed one real, completed
+        chunk's own observed service time into the EWMA for every
+        register it contained.
+
+        Deliberately called ONLY on genuine success (see this method's
+        own call site in _execute_batch()) -- a timed-out or retried
+        chunk's own "duration" reflects the timeout/retry budget, not a
+        real measurement of how long the device actually took to
+        respond, and would corrupt this tracker with an artificial
+        value rather than a genuine observation.
+
+        Attributing the WHOLE chunk's service time to EVERY register in
+        it (not attempting to isolate a per-register share) is a
+        deliberate, reasoned approximation, not a shortcut taken for
+        convenience: individual per-register timing within one
+        multi-register Modbus exchange isn't observable at all (the
+        wire protocol returns one exchange's total duration, not a
+        breakdown). A register that is consistently grouped into slow
+        chunks will still show a robustly high EWMA over many
+        observations; one that's only occasionally paired with a slow
+        neighbour will regress toward its own true typical cost as
+        chunk composition varies across polls -- the same statistical
+        reasoning that makes this kind of proxy attribution valid over
+        enough observations, not just a convenient guess.
+        """
+        for name in chunk:
+            prev = self._register_service_ewma.get(name, service_ms)
+            self._register_service_ewma[name] = (
+                prev * REGISTER_SERVICE_TIME_EWMA_DECAY
+                + service_ms * (1.0 - REGISTER_SERVICE_TIME_EWMA_DECAY)
+            )
+
     async def _execute_batch(
         self,
         names: list[RegisterName],
@@ -733,9 +807,21 @@ class HuaweiSolarUpdateCoordinator(
         # against risks trading a confirmed problem for an unconfirmed
         # fix. Deliberately deferred, not silently dropped -- see
         # AUDIT_2.0.0b.md.
+        #
+        # v2.0.11 FIX (Phase 5.3, this release -- service-time-aware
+        # chunking): the field data this was waiting for now exists,
+        # confirmed across four independent captures spanning a full
+        # day-night cycle -- BATCH_CHUNK_SIZE itself stays 40 as the
+        # DEFAULT (still correctly validated for the general case), but
+        # is no longer applied uniformly: _service_aware_chunk_size()
+        # gives a smaller cap specifically to groups containing a
+        # register with a demonstrated (not assumed) history of slow
+        # service time. This is the register-aware refinement the
+        # deferred question asked for, not a blanket change to the
+        # validated default.
         chunks: list[list[RegisterName]] = []
         for group in _address_group(sorted_names):
-            chunks.extend(_chunk(group, BATCH_CHUNK_SIZE))
+            chunks.extend(_chunk(group, self._service_aware_chunk_size(group)))
         merged: dict[RegisterName, Result[Any]] = {}
         # v2.0.9 (Phase 2.1/2.4, this release -- ICS-16/Architecture R3/R4,
         # both external ICS audits -- confirmed): one ID shared by every
@@ -859,6 +945,18 @@ class HuaweiSolarUpdateCoordinator(
                             total_batch_ms += chunk_ms
                             max_chunk_rtt_ms = max(max_chunk_rtt_ms, chunk_ms)
                             chunk_count += 1
+                            # v2.0.11 (Phase 5.3, this release): feeds
+                            # THIS chunk's real, successful service time
+                            # into the per-register tracker that
+                            # _service_aware_chunk_size() reads when
+                            # building the NEXT poll's chunks -- see
+                            # that method's own docstring for the full
+                            # reasoning. Called here specifically
+                            # (genuine success, not a timeout/retry
+                            # outcome) for the same reason
+                            # _record_chunk_service_time() itself
+                            # documents.
+                            self._record_chunk_service_time(chunk, chunk_ms)
                             # v2.0.0a FIX (F15, external ICS audit -- confirmed):
                             # record_request()'s own docstring says "record ONE
                             # completed Modbus request" and delegates to a
@@ -1646,6 +1744,10 @@ class HuaweiSolarUpdateCoordinator(
                     service_p95,
                     requests_waited=self.guard.requests_waited,
                     total_wait_s=self.guard.total_wait_ms / 1000.0,
+                    # v2.0.11 (Phase 5.2, this release): pushed through
+                    # alongside the other bus-level metrics above -- see
+                    # ModbusGuard.bus_health_pct()'s own docstring.
+                    bus_health_pct=self.guard.bus_health_pct(),
                 )
             except Exception:  # noqa: BLE001 — instrumentation is never critical
                 _LOGGER.debug("%s: bus metric update failed", self.name, exc_info=True)
