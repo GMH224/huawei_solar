@@ -301,6 +301,11 @@ def _fresh_guard(endpoint="e"):
     g._priority_window_start = time.monotonic()
     g._priority_busy_s = 0.0
     g.priority_budget_exceeded_count = 0
+    # v2.0.11 (Phase 5.2, this release): same class of gap, this file's
+    # own separate copy.
+    g._bus_admission_ewma_n = 0.0
+    g._bus_admission_ewma_failures = 0.0
+    g.admission_timeout_count = 0
     return g
 
 

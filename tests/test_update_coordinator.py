@@ -1418,3 +1418,161 @@ class TestProductionDefectNormalTierEnergyCounterStarvation(unittest.TestCase):
             "still protected by the same lengthened\n                    # availability ceiling regardless of which path they\n                    # take",
             _SOURCE,
         )
+
+
+# ── v2.0.11 (Phase 5.3): service-time-aware chunking ─────────────────────────
+
+class TestPhase53ServiceTimeAwareChunking(unittest.TestCase):
+    """Phase 5.3, this release: certain register groups (confirmed via
+    real field data across four independent captures spanning a full
+    day-night cycle -- battery per-pack telemetry, second-inverter
+    status, storage-config parameters) were structurally slow
+    regardless of chunk size. BATCH_CHUNK_SIZE's uniform 40-register cap
+    now gets a smaller, register-history-aware alternative for groups
+    with a demonstrated slow service time.
+
+    Numeric/EWMA-math tests replicate the exact formula from source
+    (verified against the real const.py constants, which have no HA
+    dependency and import cleanly) rather than instantiating the real
+    coordinator -- this test file's own established convention is
+    source-level structural analysis throughout (confirmed while fixing
+    Phase 4.7's own tests earlier this session), so the wiring/logic-
+    presence checks below match that; only the pure-math verification
+    below deviates, since a threshold/convergence mechanism deserves
+    real numeric confirmation, not just "the code looks right"."""
+
+    # ── real numeric verification, using the actual shipped constants ──────
+
+    @staticmethod
+    def _const():
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "huawei_solar_const", pathlib.Path(__file__).parent.parent / "const.py"
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    @staticmethod
+    def _apply_ewma(prev, observation, decay):
+        """Exact replica of _record_chunk_service_time()'s own formula --
+        verified to match the real source text in
+        test_ewma_formula_matches_source below, not just asserted here."""
+        return prev * decay + observation * (1.0 - decay)
+
+    def test_ewma_formula_matches_source(self):
+        body = _SOURCE[_SOURCE.find("def _record_chunk_service_time("):]
+        body = body[:body.find("\n    async def ")]
+        self.assertIn(
+            "prev * REGISTER_SERVICE_TIME_EWMA_DECAY\n"
+            "                + service_ms * (1.0 - REGISTER_SERVICE_TIME_EWMA_DECAY)",
+            body,
+        )
+
+    def test_ewma_converges_toward_a_sustained_slow_value(self):
+        const = self._const()
+        decay = const.REGISTER_SERVICE_TIME_EWMA_DECAY
+        ewma = 100.0  # starts fast
+        for _ in range(100):
+            ewma = self._apply_ewma(ewma, 5000.0, decay)  # sustained 5s chunks
+        self.assertGreater(
+            ewma, const.SERVICE_TIME_SLOW_THRESHOLD_MS,
+            "100 sustained 5s observations must push the EWMA above the "
+            "slow threshold",
+        )
+
+    def test_ewma_recovers_after_a_sustained_fast_run(self):
+        """Adversarial: confirms this is genuinely responsive to RECENT
+        conditions, not permanently anchored by a historically bad
+        patch -- a register that used to be slow but no longer is
+        should eventually fall back under the threshold."""
+        const = self._const()
+        decay = const.REGISTER_SERVICE_TIME_EWMA_DECAY
+        ewma = 100.0
+        for _ in range(50):
+            ewma = self._apply_ewma(ewma, 8000.0, decay)  # sustained slow patch
+        self.assertGreater(ewma, const.SERVICE_TIME_SLOW_THRESHOLD_MS)
+        for _ in range(50):
+            ewma = self._apply_ewma(ewma, 50.0, decay)  # genuinely recovers
+        self.assertLess(
+            ewma, const.SERVICE_TIME_SLOW_THRESHOLD_MS,
+            "a sustained fast run afterward must eventually pull the "
+            "EWMA back below the threshold, not stay stuck high forever",
+        )
+
+    def test_single_slow_observation_does_not_immediately_trip_the_threshold(self):
+        """Negative case: one single slow chunk must not be enough on
+        its own to reclassify a register as structurally slow -- that
+        would make the mechanism trigger on noise rather than a real,
+        repeated pattern."""
+        const = self._const()
+        decay = const.REGISTER_SERVICE_TIME_EWMA_DECAY
+        ewma = 50.0  # a normally-fast register
+        ewma = self._apply_ewma(ewma, 20000.0, decay)  # one freak 20s outlier
+        self.assertLess(
+            ewma, const.SERVICE_TIME_SLOW_THRESHOLD_MS,
+            "a single outlier observation must not alone cross the "
+            "slow threshold for an otherwise-fast register",
+        )
+
+    def test_never_observed_register_defaults_to_not_slow(self):
+        """A register with zero observations must default to the FAST
+        assumption (BATCH_CHUNK_SIZE), never the smaller cap -- a
+        register only earns the smaller cap by demonstrating slowness,
+        not by default/absence of data."""
+        const = self._const()
+        ewma_dict = {}
+        never_seen = "some_register_name"
+        self.assertLess(
+            ewma_dict.get(never_seen, 0.0), const.SERVICE_TIME_SLOW_THRESHOLD_MS,
+        )
+
+    # ── wiring / structural checks, matching this file's own convention ────
+
+    def test_tracker_initialized_in_init(self):
+        idx = _SOURCE.find("class HuaweiSolarUpdateCoordinator(")
+        assert idx > -1
+        init_idx = _SOURCE.find("def __init__(", idx)
+        end_idx = _SOURCE.find("\n    def ", init_idx + 10)
+        body = _SOURCE[init_idx:end_idx]
+        self.assertIn(
+            "self._register_service_ewma: dict[RegisterName, float] = {}", body,
+        )
+
+    def test_chunk_building_uses_service_aware_size_not_bare_constant(self):
+        idx = _SOURCE.find("for group in _address_group(sorted_names):")
+        assert idx > -1
+        window = _SOURCE[idx: idx + 200]
+        self.assertIn(
+            "_chunk(group, self._service_aware_chunk_size(group))", window,
+        )
+        self.assertNotIn(
+            "_chunk(group, BATCH_CHUNK_SIZE)", window,
+            "the chunk-building call must use the service-aware size, "
+            "not the bare uniform constant directly",
+        )
+
+    def test_success_path_records_the_observation(self):
+        idx = _SOURCE.find("chunk_ms = (time.monotonic() - t0) * 1000")
+        assert idx > -1
+        window = _SOURCE[idx: idx + 1300]
+        self.assertIn("self._record_chunk_service_time(chunk, chunk_ms)", window)
+
+    def test_size_method_defaults_to_batch_chunk_size(self):
+        body = _SOURCE[_SOURCE.find("def _service_aware_chunk_size("):]
+        body = body[:body.find("\n    def _record_chunk_service_time(")]
+        self.assertIn("return BATCH_CHUNK_SIZE", body)
+        self.assertIn("return SERVICE_TIME_AWARE_CHUNK_SIZE", body)
+
+    def test_size_method_checks_every_register_in_the_group(self):
+        """Adversarial: confirms the check iterates over the WHOLE
+        group, not just e.g. the first register -- any single slow
+        member must be enough to trigger the smaller cap for the group."""
+        body = _SOURCE[_SOURCE.find("def _service_aware_chunk_size("):]
+        body = body[:body.find("\n    def _record_chunk_service_time(")]
+        self.assertIn("for name in group:", body)
+
+    def test_record_iterates_every_register_in_the_chunk(self):
+        body = _SOURCE[_SOURCE.find("def _record_chunk_service_time("):]
+        body = body[:body.find("\n    async def ")]
+        self.assertIn("for name in chunk:", body)

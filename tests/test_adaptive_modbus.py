@@ -140,6 +140,10 @@ def _make_ctrl() -> AdaptiveModbusController:
     ctrl._bus_service_p95 = 0.0
     ctrl._bus_requests_waited = 0
     ctrl._bus_total_wait_s = 0.0
+    # v2.0.11 (Phase 5.2, this release): _make_ctrl() bypasses __init__
+    # entirely, so this needs setting explicitly, matching __init__'s
+    # own default -- same class of gap hit repeatedly this session.
+    ctrl._bus_health_pct = None
     ctrl._coalesce_events = 0
     ctrl._coalesced_registers = 0
     return ctrl
@@ -891,7 +895,48 @@ class TestMOD02GranularityTelemetry(unittest.TestCase):  # v2.0.7
         self.assertEqual(snap["transaction_level_requests"], 0)
 
 
-class TestPhase32PollConfidenceSeparation(unittest.TestCase):  # v2.0.9
+class TestPhase52BusHealthWiring(unittest.TestCase):  # v2.0.11
+    """Phase 5.2, this release: confirms bus_health_pct actually flows
+    from note_bus_metrics() through to snapshot(), and that the real
+    coordinator call site passes it through from ModbusGuard.
+    bus_health_pct() -- not just that the field exists in isolation."""
+
+    def test_none_by_default(self):
+        ctrl = _make_ctrl()
+        snap = ctrl.snapshot()
+        self.assertIsNone(snap["bus_health_pct"])
+
+    def test_note_bus_metrics_updates_it(self):
+        ctrl = _make_ctrl()
+        ctrl.note_bus_metrics(10.0, 50.0, 30.0, bus_health_pct=87.5)
+        snap = ctrl.snapshot()
+        self.assertEqual(snap["bus_health_pct"], 87.5)
+
+    def test_omitting_the_argument_leaves_previous_value_intact(self):
+        """Negative case: a caller not yet passing bus_health_pct (the
+        default None) must not reset an already-known value back to
+        unknown -- matches this method's own stated backward-
+        compatibility intent."""
+        ctrl = _make_ctrl()
+        ctrl.note_bus_metrics(10.0, 50.0, 30.0, bus_health_pct=87.5)
+        ctrl.note_bus_metrics(20.0, 60.0, 40.0)  # no bus_health_pct this time
+        snap = ctrl.snapshot()
+        self.assertEqual(
+            snap["bus_health_pct"], 87.5,
+            "an omitted bus_health_pct must not silently reset a "
+            "previously-known value",
+        )
+
+    def test_real_call_site_passes_guard_bus_health_pct_through(self):
+        import pathlib as _pathlib
+        src = _pathlib.Path(__file__).parent.parent.joinpath("update_coordinator.py").read_text()
+        idx = src.find("self._adaptive.note_bus_metrics(")
+        assert idx > -1
+        call_body = src[idx: idx + 700]
+        self.assertIn("bus_health_pct=self.guard.bus_health_pct()", call_body)
+
+
+
     """Phase 3.2, this release -- ICS-08/MOD-02, both external ICS
     audits: confidence (transaction-based, drives gap/timeout/queue_depth
     blending) and poll_confidence (genuinely poll-level, drives ONLY

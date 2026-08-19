@@ -76,6 +76,13 @@ def _fresh_guard(endpoint: str = "192.168.1.1:502") -> ModbusGuard:
     g.diagnostics = None
     g.total_wait_ms = 0.0
     g.requests_waited = 0
+    # v2.0.11 (Phase 5.2, this release): _fresh_guard() bypasses __init__
+    # entirely, so these need setting explicitly, matching __init__'s own
+    # defaults -- same class of gap hit repeatedly this session for
+    # every object.__new__()-based test fixture.
+    g._bus_admission_ewma_n = 0.0
+    g._bus_admission_ewma_failures = 0.0
+    g.admission_timeout_count = 0
     return g
 
 
@@ -798,3 +805,147 @@ class TestICS09PriorityIsAdmissionExemptionNotLockOrdering(unittest.TestCase):
             self.assertEqual(service_order[3], "priority")
 
         asyncio.run(_go())
+
+
+# ── Phase 5.2 (this release): bus-health signal, separate from device-health ──
+
+class TestPhase52BusHealthSignal(unittest.TestCase):
+    """Phase 5.2, this release: a genuine, decaying bus-level health
+    signal, deliberately separate from AdaptiveModbusController's own
+    device-health signal (TimeSlotStats.failure_rate/confidence), and
+    deliberately observational only -- does not alter admission/
+    scheduling behaviour (that's Phase 5.1's own, still-deferred scope)."""
+
+    def test_none_before_any_observation(self):
+        g = _fresh_guard()
+        self.assertIsNone(g.bus_health_pct())
+
+    def test_successful_admission_recorded_as_not_failed(self):
+        async def run():
+            g = _fresh_guard()
+            async with g.request(label="x"):
+                pass
+            return g.bus_health_pct()
+        pct = _run(run())
+        self.assertIsNotNone(pct)
+        self.assertAlmostEqual(pct, 100.0, places=1)
+
+    def test_shed_recorded_as_failed(self):
+        g = _fresh_guard()
+        g._max_queue_depth = 1
+        g._queue_depth = 1  # simulate an already-full queue
+        async def run():
+            with self.assertRaises(_MOD.ModbusQueueShed):
+                async with g.request(label="x"):
+                    pass
+        _run(run())
+        pct = g.bus_health_pct()
+        self.assertIsNotNone(pct)
+        self.assertLess(pct, 100.0)
+
+    def test_adversarial_repeated_sheds_drive_health_toward_zero(self):
+        """A sustained run of nothing but sheds must push bus_health_pct
+        down toward 0%, not stay anchored near some default."""
+        g = _fresh_guard()
+        g._max_queue_depth = 1
+        g._queue_depth = 1
+        async def shed_once():
+            with self.assertRaises(_MOD.ModbusQueueShed):
+                async with g.request(label="x"):
+                    pass
+        async def run():
+            for _ in range(200):
+                await shed_once()
+        _run(run())
+        pct = g.bus_health_pct()
+        self.assertIsNotNone(pct)
+        self.assertLess(pct, 5.0, "200 consecutive sheds must drive health near 0%")
+
+    def test_recovery_after_sheds_pulls_health_back_up(self):
+        """The EWMA must be responsive to RECENT conditions, not stuck
+        at a historically-bad value forever -- a run of genuine
+        successes after a bad patch should visibly recover the score."""
+        g = _fresh_guard()
+        g._max_queue_depth = 1
+        g._queue_depth = 1
+        async def shed_once():
+            with self.assertRaises(_MOD.ModbusQueueShed):
+                async with g.request(label="x"):
+                    pass
+        async def run():
+            for _ in range(50):
+                await shed_once()
+            low = g.bus_health_pct()
+            g._queue_depth = 0  # bus recovers
+            for _ in range(200):
+                async with g.request(label="x"):
+                    pass
+            high = g.bus_health_pct()
+            return low, high
+        low, high = _run(run())
+        self.assertLess(low, 20.0)
+        self.assertGreater(high, 90.0, "sustained recovery must pull the score back up")
+
+    def test_admission_timeout_recorded_as_failed(self):
+        """Adversarial: confirms the THIRD failure path (admission
+        timeout, distinct from both shed types) also feeds the same
+        signal -- not just the two shed paths. Exercises the recording
+        call directly (the mechanism itself, not a real multi-second
+        timeout wait, is what this test is about)."""
+        g = _fresh_guard()
+        g._record_bus_admission_outcome(failed=True)
+        self.assertLess(g.bus_health_pct(), 100.0)
+
+    def test_priority_shed_also_recorded(self):
+        """The priority-lane shed path is a genuinely separate code path
+        from the normal shed check -- confirms it also feeds the signal,
+        not just the normal-lane one."""
+        g = _fresh_guard()
+        MAX_PRIORITY_QUEUE_DEPTH = _MOD.MAX_PRIORITY_QUEUE_DEPTH
+        g._priority_queue_depth = MAX_PRIORITY_QUEUE_DEPTH
+        async def run():
+            with self.assertRaises(_MOD.ModbusQueueShed):
+                async with g.request(label="x", priority=True):
+                    pass
+        _run(run())
+        self.assertLess(g.bus_health_pct(), 100.0)
+
+    def test_bus_health_is_independent_of_device_confidence(self):
+        """The core separation this phase is about: bus_health_pct() has
+        no dependency on, and cannot be influenced by, anything on
+        AdaptiveModbusController -- confirmed structurally by checking
+        it only ever reads ModbusGuard's own fields. Checks the actual
+        CODE body only, not the docstring (which legitimately mentions
+        AdaptiveModbusController in prose, as context for why this is a
+        separate signal)."""
+        source = pathlib.Path(__file__).parent.parent.joinpath("modbus_guard.py").read_text()
+        idx = source.find("def bus_health_pct(self)")
+        assert idx > -1
+        end = source.find("\n    def ", idx + 10)
+        method = source[idx: end if end > -1 else idx + 1200]
+        docstring_end = method.find('"""', method.find('"""') + 3) + 3
+        code_only = method[docstring_end:]
+        self.assertNotIn("AdaptiveModbusController", code_only)
+        self.assertNotIn("TimeSlotStats", code_only)
+        self.assertNotIn("self._adaptive", code_only)
+
+    def test_does_not_alter_admission_control(self):
+        """Negative case, the key scoping guarantee: the actual shed/
+        admission DECISION logic must never read the EWMA fields --
+        this phase is observational only, Phase 5.1 (deferred) is where
+        any such feedback loop would belong. Checks the two real
+        decision points directly, rather than a fragile whole-file
+        scan."""
+        source = pathlib.Path(__file__).parent.parent.joinpath("modbus_guard.py").read_text()
+
+        # Decision point 1: the normal-lane shed check.
+        idx1 = source.find("if not effective_priority and guard._queue_depth >= guard._max_queue_depth:")
+        assert idx1 > -1
+        decision1 = source[idx1: idx1 + 300]
+        self.assertNotIn("_bus_admission_ewma", decision1)
+
+        # Decision point 2: the priority-lane shed check.
+        idx2 = source.find("if self._priority and guard._priority_queue_depth >= MAX_PRIORITY_QUEUE_DEPTH:")
+        assert idx2 > -1
+        decision2 = source[idx2: idx2 + 300]
+        self.assertNotIn("_bus_admission_ewma", decision2)

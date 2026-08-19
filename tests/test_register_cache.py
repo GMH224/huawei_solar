@@ -568,3 +568,89 @@ class TestNightMode(unittest.TestCase):
         self.assertFalse(c.night_mode)
         c.set_night_mode(True)
         self.assertTrue(c.night_mode)
+
+
+# ── v2.0.11 (Phase 5.4): freshness-debt observability ────────────────────────
+
+class TestPhase54WorstOverdue(unittest.TestCase):
+    """Phase 5.4, this release: worst_overdue() surfaces overdue_by()'s
+    own value for the N most-stale registers, built because a real
+    field investigation this project went through required manually
+    reconstructing this exact picture from raw diagnostic captures --
+    the next time a register's own freshness is in question, this
+    should be a number in a capture instead."""
+
+    def test_empty_cache_returns_empty(self):
+        c = RegisterCache()
+        self.assertEqual(c.worst_overdue(5), [])
+
+    def test_single_entry_returned(self):
+        c = RegisterCache()
+        c.update({"soc": _r(80)})
+        result = c.worst_overdue(5)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0][0], "soc")
+
+    def test_worst_first_ordering(self):
+        """The core guarantee: results must be sorted worst (most
+        overdue) first."""
+        c = RegisterCache()
+        c.update({"soc": _r(80), "power": _r(100)})
+        # Manually age one entry far more than the other by rewinding
+        # its own stored timestamp -- avoids a real sleep() in a test.
+        import time as _time
+        c._store["soc"].ts = _time.monotonic() - 10000.0
+        c._store["power"].ts = _time.monotonic()
+        result = c.worst_overdue(5)
+        self.assertEqual(result[0][0], "soc", "the far-more-stale entry must sort first")
+
+    def test_n_limits_the_result_count(self):
+        c = RegisterCache()
+        for i in range(10):
+            c.update({f"reg_{i}": _r(i)})
+        result = c.worst_overdue(3)
+        self.assertEqual(len(result), 3)
+
+    def test_n_larger_than_store_size_returns_everything(self):
+        c = RegisterCache()
+        c.update({"soc": _r(80), "power": _r(100)})
+        result = c.worst_overdue(100)
+        self.assertEqual(len(result), 2)
+
+    def test_adversarial_multiple_never_read_entries_do_not_raise(self):
+        """Regression test for a real bug caught before shipping: a
+        naive (item[1] is not None, item[1]) tuple sort key would raise
+        TypeError comparing None against None once two entries in the
+        SAME sort both had that value -- confirms the actual
+        float('inf') sentinel approach handles this without error, even
+        though this specific method's own current call pattern can't
+        produce a None in practice (see its own docstring)."""
+        c = RegisterCache()
+        c.update({"a": _r(1), "b": _r(2), "c": _r(3)})
+        try:
+            result = c.worst_overdue(5)
+        except TypeError:
+            self.fail("worst_overdue() must not raise even in principle "
+                      "when comparing multiple equally-ranked entries")
+        self.assertEqual(len(result), 3)
+
+    def test_fresh_entry_shows_negative_overdue(self):
+        """A just-read register is NOT YET due -- overdue_s should be
+        negative (time remaining until due), not zero or positive."""
+        c = RegisterCache()
+        c.update({"soc": _r(80)})
+        result = c.worst_overdue(1)
+        self.assertLess(result[0][1], 0.0)
+
+
+class TestPhase54TelemetryWiring(unittest.TestCase):
+    """Confirms build_telemetry_snapshot() actually surfaces
+    worst_overdue() per device, not just that the cache method exists
+    in isolation."""
+
+    def test_source_references_worst_overdue(self):
+        source = pathlib.Path(__file__).parent.parent.joinpath(
+            "telemetry_capture.py"
+        ).read_text()
+        self.assertIn("cache.worst_overdue(5)", source)
+        self.assertIn('section["freshness"]', source)
