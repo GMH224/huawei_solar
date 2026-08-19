@@ -425,3 +425,97 @@ class TestDEF004ServiceDispatchIsTargetResolved:
         body = source[idx: idx + 500]
         assert "get_inverter_data(service_call)" in body
         assert "_resolve_power_control_device" not in body
+
+
+class TestPhase5BSetPackInstallDate:
+    """Battery Phase 5B, this release: a new service letting the user
+    record a specific pack's own real install date, identified by its
+    own serial number (not a slot label -- see effective_pack_install_
+    ts()'s own docstring, battery_health.py, for the full three-tier
+    fallback this feeds into)."""
+
+    @staticmethod
+    def _source() -> str:
+        return _SERVICES_SRC.read_text()
+
+    def test_handler_function_exists(self):
+        source = self._source()
+        assert "async def set_pack_install_date(" in source
+
+    def test_schema_requires_serial_and_date_not_just_device_id(self):
+        source = self._source()
+        idx = source.find("SET_PACK_INSTALL_DATE_SCHEMA = BATTERY_DEVICE_SCHEMA.extend(")
+        assert idx > -1
+        window = source[idx: idx + 300]
+        assert "DATA_PACK_SERIAL_NUMBER" in window
+        assert "DATA_INSTALL_DATE" in window
+        assert "vol.Required" in window
+
+    def test_handler_resolves_device_via_get_battery_device_data(self):
+        """Confirms this reuses the SAME battery-device resolution every
+        other battery service already uses, not a new mechanism."""
+        source = self._source()
+        idx = source.find("async def set_pack_install_date(")
+        assert idx > -1
+        body = source[idx: idx + 2700]
+        assert "get_battery_device_data(service_call)" in body
+
+    def test_invalid_date_raises_service_validation_error(self):
+        source = self._source()
+        idx = source.find("async def set_pack_install_date(")
+        assert idx > -1
+        body = source[idx: idx + 2700]
+        assert "except (TypeError, ValueError) as err:" in body
+        assert "raise ServiceValidationError(" in body
+        assert "invalid_pack_install_date" in body
+
+    def test_missing_battery_health_manager_raises_service_validation_error(self):
+        """Negative case: a device with battery health not enabled at
+        all must produce a clear, actionable error, not an
+        AttributeError from calling .engine on None."""
+        source = self._source()
+        idx = source.find("async def set_pack_install_date(")
+        assert idx > -1
+        body = source[idx: idx + 2700]
+        assert "if bh_manager is None:" in body
+        assert "battery_health_not_enabled" in body
+
+    def test_writes_into_pack_install_dates_keyed_by_serial(self):
+        source = self._source()
+        idx = source.find("async def set_pack_install_date(")
+        assert idx > -1
+        body = source[idx: idx + 2700]
+        assert "bh_manager.engine.pack_capacity.pack_install_dates[serial] = install_ts" in body
+
+    def test_marks_dirty_and_triggers_a_save(self):
+        """Adversarial: without this, the write would only ever persist
+        on the NEXT unrelated engine tick that happens to mark dirty --
+        an explicit, deliberate, infrequent user action deserves
+        prompt, deterministic persistence, not a coincidental save."""
+        source = self._source()
+        idx = source.find("async def set_pack_install_date(")
+        assert idx > -1
+        body = source[idx: idx + 2700]
+        assert "bh_manager.engine.dirty = True" in body
+        assert "bh_manager._maybe_save()" in body
+
+    def test_registered_inside_the_has_battery_gate(self):
+        """Confirms this is registered alongside the rest of the
+        battery-only service cluster, not unconditionally (which would
+        register it even for a device with no battery at all)."""
+        source = self._source()
+        cluster_idx = source.find("SERVICE_STOP_FORCIBLE_CHARGE,\n                stop_forcible_charge,")
+        assert cluster_idx > -1
+        window = source[cluster_idx: cluster_idx + 700]
+        assert "SERVICE_SET_PACK_INSTALL_DATE" in window
+
+    def test_service_listed_in_all_services_registry(self):
+        source = self._source()
+        idx = source.find("ALL_SERVICES = [")
+        assert idx > -1
+        end = source.find("]", idx)
+        assert "SERVICE_SET_PACK_INSTALL_DATE" in source[idx:end]
+
+    def test_battery_health_manager_imported_at_module_level(self):
+        source = self._source()
+        assert "from .battery_health_manager import BatteryHealthManager" in source

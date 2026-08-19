@@ -1151,6 +1151,9 @@
     }
   },
   "exceptions": {
+    "battery_health_not_enabled": {
+      "message": "Battery health is not enabled for device: {device_id}"
+    },
     "config_entry_not_found": {
       "message": "Entry not found for device: {device_id}"
     },
@@ -1162,6 +1165,9 @@
     },
     "invalid_device_id": {
       "message": "Invalid device ID specified: {device_id}"
+    },
+    "invalid_pack_install_date": {
+      "message": "Could not parse pack install date: {install_date}. Use an ISO format date, e.g. 2026-01-15"
     },
     "wrong_device_type": {
       "message": "Got wrong Huawei Solar device type for ID {device_id}: expected {expected_type}, got {actual_type}"

@@ -2483,6 +2483,564 @@ class TestTopologyPackReplacementDetection(unittest.TestCase):  # v2.0.7 (TOPO-0
         )
 
 
+class TestPhase5BPreserveOnReplacement(unittest.TestCase):  # v2.0.12
+    """Battery Phase 5B, this release: a confirmed, live risk -- before
+    this fix, an outgoing pack's entire accumulated history was
+    silently discarded on replacement, with only a bare integer
+    (pack_replaced_count) surviving. Unlike Modbus telemetry, a
+    physically-removed pack's own history cannot be recovered after
+    the fact."""
+
+    @staticmethod
+    def _pack(soc, dis, serial, online=True):
+        return bh.PackSample(voltage=53.0, temp_max=25.0, temp_min=24.0,
+                              online=online, soc=soc, power_w=-2500.0,
+                              lifetime_discharge_kwh=dis, serial_number=serial)
+
+    def test_no_archival_on_first_ever_observation(self):
+        """Negative case: seeing a serial for the first time must not
+        create a retired-pack entry -- there is no OUTGOING pack yet."""
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        tracker = bh.PackCapacityTracker(cfg, pack_count=1)
+        tracker.feed(
+            _sample(0, soc=90.0, power=-2500.0, chg=0.0, dis=0.0,
+                   packs=[self._pack(90.0, 0.0, "SN-AAA")]),
+            learning=True,
+        )
+        self.assertEqual(tracker.retired_pack_history, [])
+
+    def test_adversarial_replacement_archives_the_outgoing_pack(self):
+        """The core guarantee: a genuine replacement must produce
+        exactly one retired_pack_history entry, capturing the outgoing
+        pack's own final state before its tracker is discarded."""
+        cfg = _cfg(freshness_tau_kwh=1e12, capacity_reference_min_segments=2,
+                   capacity_reference_min_span_days=1.0)
+        tracker = bh.PackCapacityTracker(cfg, pack_count=1, slot_labels=["u1p1"])
+        t = 0.0
+        for cycle in range(2):
+            dis0 = cycle * 1.6
+            dis1 = (cycle + 1) * 1.6
+            for i in range(21):
+                frac = i / 20
+                soc = 100.0 - 20.0 * frac
+                dis = dis0 + (dis1 - dis0) * frac
+                tracker.feed(_sample(t, soc=soc, power=-2500.0, chg=0.0, dis=0.0,
+                                     packs=[self._pack(soc, dis, "SN-OLD")]),
+                            learning=True)
+                t += 60
+            tracker.feed(_sample(t, soc=80.0, power=CLOSE_POWER, chg=0.0, dis=0.0,
+                                 packs=[self._pack(80.0, dis1, "SN-OLD")]),
+                        learning=True)
+            t += 3600 * 6
+        old_segment_count = len(tracker.trackers[0].segments)
+        self.assertGreater(old_segment_count, 0, "test setup invalid")
+
+        tracker.feed(
+            _sample(t, soc=90.0, power=-2500.0, chg=0.0, dis=0.0,
+                   packs=[self._pack(90.0, 0.0, "SN-NEW")]),
+            learning=True,
+        )
+
+        self.assertEqual(len(tracker.retired_pack_history), 1)
+        entry = tracker.retired_pack_history[0]
+        self.assertEqual(entry["slot_label"], "u1p1")
+        self.assertEqual(entry["serial_number"], "SN-OLD")
+        self.assertEqual(entry["replaced_by_serial"], "SN-NEW")
+        self.assertEqual(entry["final_segment_count"], old_segment_count)
+        self.assertIsNotNone(
+            entry["final_soh_capacity_pct"],
+            "the archived entry must capture a real SOH value, not None, "
+            "given real segments were accumulated before replacement",
+        )
+        self.assertIsNotNone(entry["first_segment_ts"])
+        self.assertIsNotNone(entry["last_segment_ts"])
+        self.assertLessEqual(entry["first_segment_ts"], entry["last_segment_ts"])
+
+    def test_replaced_before_any_segment_archives_with_none_timestamps(self):
+        """Negative case: a pack replaced before accumulating even one
+        qualifying segment must still produce an archive entry (a very
+        short service life is itself useful information), with None
+        timestamps rather than a crash or a fabricated value."""
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        tracker = bh.PackCapacityTracker(cfg, pack_count=1, slot_labels=["u1p1"])
+        tracker.feed(
+            _sample(0, soc=90.0, power=-2500.0, chg=0.0, dis=0.0,
+                   packs=[self._pack(90.0, 0.0, "SN-BRIEF")]),
+            learning=True,
+        )
+        tracker.feed(
+            _sample(60, soc=90.0, power=-2500.0, chg=0.0, dis=0.0,
+                   packs=[self._pack(90.0, 0.0, "SN-REPLACEMENT")]),
+            learning=True,
+        )
+        self.assertEqual(len(tracker.retired_pack_history), 1)
+        entry = tracker.retired_pack_history[0]
+        self.assertEqual(entry["final_segment_count"], 0)
+        self.assertIsNone(entry["first_segment_ts"])
+        self.assertIsNone(entry["last_segment_ts"])
+
+    def test_multiple_replacements_each_get_their_own_entry(self):
+        """Adversarial: a slot replaced twice must produce TWO separate
+        archive entries, not one overwritten by the other."""
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        tracker = bh.PackCapacityTracker(cfg, pack_count=1, slot_labels=["u1p1"])
+        tracker.feed(
+            _sample(0, soc=90.0, power=-2500.0, chg=0.0, dis=0.0,
+                   packs=[self._pack(90.0, 0.0, "SN-1")]),
+            learning=True,
+        )
+        tracker.feed(
+            _sample(60, soc=90.0, power=-2500.0, chg=0.0, dis=0.0,
+                   packs=[self._pack(90.0, 0.0, "SN-2")]),
+            learning=True,
+        )
+        tracker.feed(
+            _sample(120, soc=90.0, power=-2500.0, chg=0.0, dis=0.0,
+                   packs=[self._pack(90.0, 0.0, "SN-3")]),
+            learning=True,
+        )
+        self.assertEqual(len(tracker.retired_pack_history), 2)
+        self.assertEqual(
+            [e["serial_number"] for e in tracker.retired_pack_history],
+            ["SN-1", "SN-2"],
+        )
+
+    def test_persistence_round_trip_preserves_retired_history(self):
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        tracker = bh.PackCapacityTracker(cfg, pack_count=1, slot_labels=["u1p1"])
+        tracker.feed(
+            _sample(0, soc=90.0, power=-2500.0, chg=0.0, dis=0.0,
+                   packs=[self._pack(90.0, 0.0, "SN-OLD")]),
+            learning=True,
+        )
+        tracker.feed(
+            _sample(60, soc=90.0, power=-2500.0, chg=0.0, dis=0.0,
+                   packs=[self._pack(90.0, 0.0, "SN-NEW")]),
+            learning=True,
+        )
+        data = tracker.to_dict()
+
+        tracker2 = bh.PackCapacityTracker(cfg, pack_count=1, slot_labels=["u1p1"])
+        tracker2.restore(data)
+        self.assertEqual(len(tracker2.retired_pack_history), 1)
+        self.assertEqual(tracker2.retired_pack_history[0]["serial_number"], "SN-OLD")
+
+    def test_retired_history_survives_a_topology_change_unlike_last_serial(self):
+        """Negative case, deliberately contrasted with last_serial's own
+        topology-mismatch handling above: retired_pack_history is a
+        historical LOG (each entry self-describing via its own
+        slot_label), not current per-slot state, so it must restore
+        unconditionally even when the topology has changed since the
+        last save."""
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        old = bh.PackCapacityTracker(cfg, pack_count=1, slot_labels=["u1p1"])
+        old.feed(
+            _sample(0, soc=90.0, power=-2500.0, chg=0.0, dis=0.0,
+                   packs=[self._pack(90.0, 0.0, "SN-A")]),
+            learning=True,
+        )
+        old.feed(
+            _sample(60, soc=90.0, power=-2500.0, chg=0.0, dis=0.0,
+                   packs=[self._pack(90.0, 0.0, "SN-B")]),
+            learning=True,
+        )
+        data = old.to_dict()
+
+        new = bh.PackCapacityTracker(cfg, pack_count=2, slot_labels=["u1p1", "u2p1"])
+        new.restore(data)
+        self.assertEqual(
+            len(new.retired_pack_history), 1,
+            "retired_pack_history must restore even though slot_labels "
+            "changed, unlike last_serial",
+        )
+
+
+class TestPhase5BPackFusionPromotion(unittest.TestCase):  # v2.0.12
+    """Battery Phase 5B, this release -- the core promotion: soh_capacity
+    (the number BHI's own composite actually uses) is now the WORST
+    eligible pack's own SOH, not the unit-level estimate, with the
+    unit-level estimator retained as an independent cross-check.
+    Matches the architecture review's own target: 'weakest pack' as a
+    first-class system-health output, explicitly warning that a naive
+    average is less defensible."""
+
+    @staticmethod
+    def _pack(soc, dis, serial, online=True):
+        return bh.PackSample(voltage=53.0, temp_max=25.0, temp_min=24.0,
+                              online=online, soc=soc, power_w=-2500.0,
+                              lifetime_discharge_kwh=dis, serial_number=serial)
+
+    def _engine_with_hand_built_pack_soh(self, soh_values: list[float]):
+        """Construct a real BatteryHealthEngine, then inject hand-built
+        segments directly into each pack's own tracker -- matching this
+        file's own established _seg()-style pattern for isolating
+        formula behaviour from segment-detection mechanics. Each pack
+        gets exactly one segment whose implied_capacity_kwh, combined
+        with a matching reference_capacity_kwh, produces EXACTLY the
+        requested SOH% for that pack."""
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        engine = bh.BatteryHealthEngine(
+            cfg, pack_count=len(soh_values),
+            pack_slot_labels=[f"u1p{i+1}" for i in range(len(soh_values))],
+        )
+        engine.first_seen_ts = 0.0
+        for i, soh in enumerate(soh_values):
+            tracker = engine.pack_capacity.trackers[i]
+            tracker.reference_capacity_kwh = 10.0
+            tracker.segments = [bh.DischargeSegment(
+                start_ts=0.0, end_ts=3600.0, soc_start=95.0, soc_end=75.0,
+                energy_kwh=10.0 * soh / 100.0, implied_capacity_kwh=10.0 * soh / 100.0,
+                freshness=1.0, exclude_calibration=False, avg_temp_c=25.0,
+            )]
+        return engine
+
+    def test_fused_capacity_is_the_worst_pack_not_the_average(self):
+        """The core guarantee: with packs at 100%, 90%, 95%, the fused
+        value must be 90% (the worst), not ~95% (a naive average)."""
+        engine = self._engine_with_hand_built_pack_soh([100.0, 90.0, 95.0])
+        report = engine._evaluate(0.0)
+        self.assertEqual(report.attributes["pack_capacity_soh_percent"], [100.0, 90.0, 95.0])
+        self.assertAlmostEqual(report.soh_capacity, 90.0, places=1)
+        self.assertEqual(report.attributes["soh_capacity_source"], "pack_fused")
+        self.assertEqual(report.attributes["weakest_pack_slot"], "u1p2")
+
+    def test_all_packs_equal_fused_equals_that_value(self):
+        engine = self._engine_with_hand_built_pack_soh([98.0, 98.0, 98.0])
+        report = engine._evaluate(0.0)
+        self.assertAlmostEqual(report.soh_capacity, 98.0, places=1)
+
+    def test_no_pack_data_falls_back_to_unit_independent_estimate(self):
+        """Negative case, the backward-compatibility guarantee: a fresh
+        install (or a persisted state from before this feature existed)
+        with zero pack segments must fall back to the unit-level
+        estimate, not report nothing."""
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        engine = bh.BatteryHealthEngine(cfg, pack_count=3)
+        engine.first_seen_ts = 0.0
+        engine.segments.reference_capacity_kwh = 20.7
+        engine.segments.segments = [bh.DischargeSegment(
+            start_ts=0.0, end_ts=3600.0, soc_start=95.0, soc_end=75.0,
+            energy_kwh=20.0, implied_capacity_kwh=20.0,
+            freshness=1.0, exclude_calibration=False, avg_temp_c=25.0,
+        )]
+        report = engine._evaluate(0.0)
+        self.assertEqual(report.attributes["soh_capacity_source"], "unit_independent_fallback")
+        self.assertIsNotNone(report.soh_capacity)
+        self.assertAlmostEqual(
+            report.soh_capacity, report.attributes["soh_capacity_unit_independent"],
+            places=1,  # the attribute is intentionally rounded for display;
+                       # soh_capacity itself keeps full precision
+        )
+
+    def test_partial_pack_data_excludes_packs_with_no_estimate_yet(self):
+        """Adversarial: if only SOME packs have accumulated enough data,
+        the fusion must consider only those -- a pack with no estimate
+        yet must not be treated as 0% (which would wrongly dominate the
+        minimum) or otherwise skew the result."""
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        engine = bh.BatteryHealthEngine(
+            cfg, pack_count=3, pack_slot_labels=["u1p1", "u1p2", "u1p3"],
+        )
+        engine.first_seen_ts = 0.0
+        # Only pack 0 (index 0) has data; packs 1 and 2 have none.
+        tracker0 = engine.pack_capacity.trackers[0]
+        tracker0.reference_capacity_kwh = 10.0
+        tracker0.segments = [bh.DischargeSegment(
+            start_ts=0.0, end_ts=3600.0, soc_start=95.0, soc_end=75.0,
+            energy_kwh=9.5, implied_capacity_kwh=9.5,
+            freshness=1.0, exclude_calibration=False, avg_temp_c=25.0,
+        )]
+        report = engine._evaluate(0.0)
+        self.assertEqual(
+            report.attributes["pack_capacity_soh_percent"], [95.0, None, None],
+        )
+        self.assertAlmostEqual(report.soh_capacity, 95.0, places=1)
+        self.assertEqual(report.attributes["weakest_pack_slot"], "u1p1")
+
+    def test_unit_independent_estimate_always_exposed_when_available(self):
+        """Even when pack-fused drives the reported number, the unit-
+        level independent estimate must still be visible as its own
+        attribute -- that's the whole point of keeping it as a
+        cross-check, not just an internal, invisible computation."""
+        engine = self._engine_with_hand_built_pack_soh([95.0, 95.0, 95.0])
+        engine.segments.reference_capacity_kwh = 20.7
+        engine.segments.segments = [bh.DischargeSegment(
+            start_ts=0.0, end_ts=3600.0, soc_start=95.0, soc_end=75.0,
+            energy_kwh=19.0, implied_capacity_kwh=19.0,
+            freshness=1.0, exclude_calibration=False, avg_temp_c=25.0,
+        )]
+        report = engine._evaluate(0.0)
+        self.assertIsNotNone(report.attributes["soh_capacity_unit_independent"])
+        self.assertEqual(report.attributes["soh_capacity_source"], "pack_fused")
+
+    def test_divergence_flagged_when_pack_fused_and_unit_disagree_meaningfully(self):
+        engine = self._engine_with_hand_built_pack_soh([70.0, 95.0, 98.0])
+        engine.segments.reference_capacity_kwh = 20.7
+        # Unit-level independently reports ~98% -- far from the fused
+        # (worst-pack) value of 70%, well beyond the 10-point threshold.
+        engine.segments.segments = [bh.DischargeSegment(
+            start_ts=0.0, end_ts=3600.0, soc_start=95.0, soc_end=75.0,
+            energy_kwh=20.3, implied_capacity_kwh=20.3,
+            freshness=1.0, exclude_calibration=False, avg_temp_c=25.0,
+        )]
+        report = engine._evaluate(0.0)
+        self.assertTrue(report.attributes["capacity_cross_check_diverged"])
+
+    def test_no_divergence_flagged_when_estimates_agree(self):
+        engine = self._engine_with_hand_built_pack_soh([96.0, 97.0, 95.0])
+        engine.segments.reference_capacity_kwh = 20.7
+        engine.segments.segments = [bh.DischargeSegment(
+            start_ts=0.0, end_ts=3600.0, soc_start=95.0, soc_end=75.0,
+            energy_kwh=19.8, implied_capacity_kwh=19.8,  # ~95.7%, close to 95% fused
+            freshness=1.0, exclude_calibration=False, avg_temp_c=25.0,
+        )]
+        report = engine._evaluate(0.0)
+        self.assertFalse(report.attributes["capacity_cross_check_diverged"])
+
+    def test_divergence_is_none_when_either_side_is_unavailable(self):
+        """Negative case: with no pack data at all (pure fallback path),
+        there is nothing to compare -- diverged must be None, not
+        False (which would incorrectly imply a real comparison found
+        agreement)."""
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        engine = bh.BatteryHealthEngine(cfg, pack_count=3)
+        engine.first_seen_ts = 0.0
+        report = engine._evaluate(0.0)
+        self.assertIsNone(report.attributes["capacity_cross_check_diverged"])
+
+    def test_bhi_composite_uses_the_fused_value_not_the_unit_one(self):
+        """End-to-end confirmation: the promoted soh_capacity actually
+        flows into the BHI composite, not just sitting unused in
+        attributes."""
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        engine_low = self._engine_with_hand_built_pack_soh([60.0, 95.0, 98.0])
+        engine_low.cfg.weight_capacity = 1.0
+        engine_low.cfg.weight_efficiency = 0.0
+        engine_low.cfg.weight_balance = 0.0
+        report_low = engine_low._evaluate(0.0)
+
+        engine_high = self._engine_with_hand_built_pack_soh([96.0, 97.0, 98.0])
+        engine_high.cfg.weight_capacity = 1.0
+        engine_high.cfg.weight_efficiency = 0.0
+        engine_high.cfg.weight_balance = 0.0
+        report_high = engine_high._evaluate(0.0)
+
+        self.assertLess(
+            report_low.bhi, report_high.bhi,
+            "a lower WORST-pack SOH must produce a lower BHI -- confirms "
+            "the fused (not averaged) value genuinely drives the composite",
+        )
+
+    def test_confidence_follows_the_worst_packs_own_segment_count_not_units(self):
+        """The core confidence-tying guarantee: with the worst pack
+        having enough segments for 'normal' confidence but the
+        UNIT-level estimator having very few, confidence must still be
+        'normal' -- following whichever evidence actually drives the
+        reported number, not the unrelated unit-level count."""
+        cfg = _cfg(freshness_tau_kwh=1e12, confidence_min_segments=5)
+        engine = bh.BatteryHealthEngine(
+            cfg, pack_count=1, pack_slot_labels=["u1p1"],
+        )
+        engine.first_seen_ts = 0.0
+        engine.efficiency.baseline = 0.95  # satisfy the OTHER confidence gate
+        tracker = engine.pack_capacity.trackers[0]
+        tracker.reference_capacity_kwh = 10.0
+        tracker.segments = [
+            bh.DischargeSegment(
+                start_ts=float(i * 3600), end_ts=float(i * 3600 + 3600),
+                soc_start=95.0, soc_end=75.0, energy_kwh=9.5,
+                implied_capacity_kwh=9.5, freshness=1.0,
+                exclude_calibration=False, avg_temp_c=25.0,
+            )
+            for i in range(5)  # exactly at confidence_min_segments
+        ]
+        # Unit-level has almost no evidence -- would be "low" on its own.
+        engine.segments.reference_capacity_kwh = 20.7
+        engine.segments.segments = []
+
+        report = engine._evaluate(18000.0)  # after the 5th segment's own end_ts
+        self.assertEqual(report.attributes["soh_capacity_source"], "pack_fused")
+        self.assertEqual(
+            report.confidence, "normal",
+            "confidence must follow the pack's own 5 segments (>= "
+            "confidence_min_segments), not the unit-level estimator's "
+            "own near-empty segment list",
+        )
+
+    def test_confidence_stays_low_when_the_worst_pack_itself_lacks_evidence(self):
+        """Negative case, the inverse of the above: even if the UNIT-
+        level estimator happens to have plenty of segments, confidence
+        must be 'low' when pack-fused is active and the worst pack
+        itself has too few -- not borrow the unit's own (irrelevant,
+        once pack-fused is driving the number) evidence."""
+        cfg = _cfg(freshness_tau_kwh=1e12, confidence_min_segments=5)
+        engine = self._engine_with_hand_built_pack_soh([95.0])  # only 1 segment
+        engine.efficiency.baseline = 0.95
+        # Unit-level has AMPLE evidence -- would be "normal" on its own.
+        engine.segments.reference_capacity_kwh = 20.7
+        engine.segments.segments = [
+            bh.DischargeSegment(
+                start_ts=float(i * 3600), end_ts=float(i * 3600 + 3600),
+                soc_start=95.0, soc_end=75.0, energy_kwh=19.5,
+                implied_capacity_kwh=19.5, freshness=1.0,
+                exclude_calibration=False, avg_temp_c=25.0,
+            )
+            for i in range(10)
+        ]
+        report = engine._evaluate(0.0)
+        self.assertEqual(report.attributes["soh_capacity_source"], "pack_fused")
+        self.assertEqual(
+            report.confidence, "low",
+            "confidence must follow the worst pack's own single segment "
+            "(< confidence_min_segments), not the unit-level estimator's "
+            "own ample evidence",
+        )
+
+    def test_confidence_uses_unit_level_evidence_on_the_fallback_path(self):
+        """Negative case confirming the split is genuinely conditional:
+        when soh_capacity_source is the unit-independent fallback (no
+        pack data at all), confidence must correctly use the UNIT-
+        level segment count -- the ORIGINAL, still-correct behaviour
+        for that case, unchanged by this fix."""
+        cfg = _cfg(freshness_tau_kwh=1e12, confidence_min_segments=5)
+        engine = bh.BatteryHealthEngine(cfg, pack_count=3)
+        engine.first_seen_ts = 0.0
+        engine.efficiency.baseline = 0.95
+        engine.segments.reference_capacity_kwh = 20.7
+        engine.segments.segments = [
+            bh.DischargeSegment(
+                start_ts=float(i * 3600), end_ts=float(i * 3600 + 3600),
+                soc_start=95.0, soc_end=75.0, energy_kwh=19.5,
+                implied_capacity_kwh=19.5, freshness=1.0,
+                exclude_calibration=False, avg_temp_c=25.0,
+            )
+            for i in range(5)
+        ]
+        report = engine._evaluate(18000.0)
+        self.assertEqual(report.attributes["soh_capacity_source"], "unit_independent_fallback")
+        self.assertEqual(report.confidence, "normal")
+
+
+class TestPhase5BEffectivePackInstallDate(unittest.TestCase):  # v2.0.12
+    """Battery Phase 5B, this release: the three-tier fallback for a
+    pack's own effective install date -- explicit override, else
+    unit-level date (for never-replaced packs), else automatic
+    first-detected timestamp (for replaced packs)."""
+
+    @staticmethod
+    def _pack(soc, dis, serial, online=True):
+        return bh.PackSample(voltage=53.0, temp_max=25.0, temp_min=24.0,
+                              online=online, soc=soc, power_w=-2500.0,
+                              lifetime_discharge_kwh=dis, serial_number=serial)
+
+    def test_never_replaced_pack_falls_back_to_unit_install_date(self):
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        cfg.battery_install_ts = 1_000_000.0
+        tracker = bh.PackCapacityTracker(cfg, pack_count=1, slot_labels=["u1p1"])
+        tracker.feed(
+            _sample(0, soc=90.0, power=-2500.0, chg=0.0, dis=0.0,
+                   packs=[self._pack(90.0, 0.0, "SN-ORIGINAL")]),
+            learning=True,
+        )
+        ts, source = tracker.effective_pack_install_ts(0)
+        self.assertEqual(ts, 1_000_000.0)
+        self.assertEqual(source, "unit_install_date")
+
+    def test_replaced_pack_does_not_use_unit_install_date(self):
+        """The core guarantee: a REPLACED pack must NOT inherit the
+        unit's own install date -- that would be actively wrong (it
+        reflects when the unit was installed, not this specific
+        replacement pack)."""
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        cfg.battery_install_ts = 1_000_000.0
+        tracker = bh.PackCapacityTracker(cfg, pack_count=1, slot_labels=["u1p1"])
+        tracker.feed(
+            _sample(0, soc=90.0, power=-2500.0, chg=0.0, dis=0.0,
+                   packs=[self._pack(90.0, 0.0, "SN-ORIGINAL")]),
+            learning=True,
+        )
+        tracker.feed(
+            _sample(500_000, soc=90.0, power=-2500.0, chg=0.0, dis=0.0,
+                   packs=[self._pack(90.0, 0.0, "SN-REPLACEMENT")]),
+            learning=True,
+        )
+        ts, source = tracker.effective_pack_install_ts(0)
+        self.assertNotEqual(ts, 1_000_000.0)
+        self.assertEqual(source, "first_detected")
+
+    def test_explicit_override_takes_priority_over_everything(self):
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        cfg.battery_install_ts = 1_000_000.0
+        tracker = bh.PackCapacityTracker(cfg, pack_count=1, slot_labels=["u1p1"])
+        tracker.feed(
+            _sample(0, soc=90.0, power=-2500.0, chg=0.0, dis=0.0,
+                   packs=[self._pack(90.0, 0.0, "SN-ORIGINAL")]),
+            learning=True,
+        )
+        tracker.pack_install_dates["SN-ORIGINAL"] = 42.0
+        ts, source = tracker.effective_pack_install_ts(0)
+        self.assertEqual(ts, 42.0)
+        self.assertEqual(source, "install_date")
+
+    def test_no_unit_install_date_and_never_replaced_falls_through_to_first_detected(self):
+        """Negative case: if the unit-level date was never configured
+        at all (None), a never-replaced pack must still fall through
+        to first_detected rather than returning None outright."""
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        cfg.battery_install_ts = None
+        tracker = bh.PackCapacityTracker(cfg, pack_count=1, slot_labels=["u1p1"])
+        tracker.feed(
+            _sample(0, soc=90.0, power=-2500.0, chg=0.0, dis=0.0,
+                   packs=[self._pack(90.0, 0.0, "SN-ORIGINAL")]),
+            learning=True,
+        )
+        ts, source = tracker.effective_pack_install_ts(0)
+        self.assertIsNotNone(ts)
+        self.assertEqual(source, "first_detected")
+
+    def test_unreplaced_slot_that_has_never_seen_any_pack_returns_unknown(self):
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        cfg.battery_install_ts = None
+        tracker = bh.PackCapacityTracker(cfg, pack_count=1, slot_labels=["u1p1"])
+        ts, source = tracker.effective_pack_install_ts(0)
+        self.assertIsNone(ts)
+        self.assertEqual(source, "unknown")
+
+    def test_pack_first_detected_records_only_the_first_observation(self):
+        """Adversarial: pack_first_detected must not be overwritten on
+        every subsequent poll of the SAME, still-installed pack."""
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        tracker = bh.PackCapacityTracker(cfg, pack_count=1, slot_labels=["u1p1"])
+        tracker.feed(
+            _sample(0, soc=90.0, power=-2500.0, chg=0.0, dis=0.0,
+                   packs=[self._pack(90.0, 0.0, "SN-A")]),
+            learning=True,
+        )
+        first_recorded = tracker.pack_first_detected["SN-A"]
+        tracker.feed(
+            _sample(1000, soc=90.0, power=-2500.0, chg=0.0, dis=0.1,
+                   packs=[self._pack(90.0, 0.1, "SN-A")]),
+            learning=True,
+        )
+        self.assertEqual(tracker.pack_first_detected["SN-A"], first_recorded)
+
+    def test_persistence_round_trip_preserves_both_dicts(self):
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        tracker = bh.PackCapacityTracker(cfg, pack_count=1, slot_labels=["u1p1"])
+        tracker.feed(
+            _sample(0, soc=90.0, power=-2500.0, chg=0.0, dis=0.0,
+                   packs=[self._pack(90.0, 0.0, "SN-A")]),
+            learning=True,
+        )
+        tracker.pack_install_dates["SN-A"] = 555.0
+        data = tracker.to_dict()
+
+        tracker2 = bh.PackCapacityTracker(cfg, pack_count=1, slot_labels=["u1p1"])
+        tracker2.restore(data)
+        self.assertIn("SN-A", tracker2.pack_first_detected)
+        self.assertEqual(tracker2.pack_install_dates["SN-A"], 555.0)
+
+
 class TestTier3CapacityNormalization(unittest.TestCase):  # v2.0.6, battery health architecture review
     """Temperature/rate normalization, from PHASE1_BATTERY_HEALTH_DESIGN
     .md's own §6.2. Formula tested directly against DischargeSegment.

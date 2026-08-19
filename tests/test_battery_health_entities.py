@@ -410,5 +410,104 @@ class TestRegressionGuard(unittest.TestCase):  # T18
             ha_sensor_state(ent)
 
 
+class TestPhase5BAttributesActuallyReachTheUI(unittest.TestCase):  # v2.0.12
+    """Battery Phase 5B, this release: a real gap caught and fixed
+    before shipping -- the internal report already computed these
+    fields correctly, but the soh_capacity entity's own
+    extra_state_attributes were built from an explicit allowlist (not
+    'show everything in the report'), and that allowlist was never
+    updated. Constructs a REAL entity via the same _entities() helper
+    every other test in this file uses, and calls the REAL _apply()
+    method -- not just checking the allowlist source text -- so this
+    would have caught the original gap directly."""
+
+    def _soh_capacity_attrs(self, report):
+        ent = next(e for e in _entities(report=report) if e._attr_key == "soh_capacity")
+        ent._apply(report)
+        return ent._attr_extra_state_attributes
+
+    def test_weakest_pack_slot_reaches_the_entity(self):
+        report = BH.HealthReport()
+        report.soh_capacity = 90.0
+        report.attributes["weakest_pack_slot"] = "u1p2"
+        attrs = self._soh_capacity_attrs(report)
+        self.assertEqual(attrs.get("weakest_pack_slot"), "u1p2")
+
+    def test_soh_capacity_source_reaches_the_entity(self):
+        report = BH.HealthReport()
+        report.attributes["soh_capacity_source"] = "pack_fused"
+        attrs = self._soh_capacity_attrs(report)
+        self.assertEqual(attrs.get("soh_capacity_source"), "pack_fused")
+
+    def test_unit_independent_cross_check_reaches_the_entity(self):
+        report = BH.HealthReport()
+        report.attributes["soh_capacity_unit_independent"] = 97.2
+        report.attributes["capacity_cross_check_diverged"] = True
+        attrs = self._soh_capacity_attrs(report)
+        self.assertEqual(attrs.get("soh_capacity_unit_independent"), 97.2)
+        self.assertTrue(attrs.get("capacity_cross_check_diverged"))
+
+    def test_retired_pack_history_reaches_the_entity(self):
+        report = BH.HealthReport()
+        entry = {"slot_label": "u1p1", "serial_number": "SN-OLD"}
+        report.attributes["retired_pack_history"] = [entry]
+        attrs = self._soh_capacity_attrs(report)
+        self.assertEqual(attrs.get("retired_pack_history"), [entry])
+
+    def test_pack_age_days_and_source_reach_the_entity(self):
+        report = BH.HealthReport()
+        report.attributes["pack_age_days"] = [120.5, None, 30.0]
+        report.attributes["pack_age_source"] = [
+            "unit_install_date", "unknown", "first_detected",
+        ]
+        attrs = self._soh_capacity_attrs(report)
+        self.assertEqual(attrs.get("pack_age_days"), [120.5, None, 30.0])
+        self.assertEqual(
+            attrs.get("pack_age_source"),
+            ["unit_install_date", "unknown", "first_detected"],
+        )
+
+    def test_pack_replaced_count_and_slot_labels_also_reach_the_entity(self):
+        """The pre-existing gap found in the same pass -- these two
+        fields predate this release but had never been in any
+        allowlist either."""
+        report = BH.HealthReport()
+        report.attributes["pack_slot_labels"] = ["u1p1", "u1p2", "u1p3"]
+        report.attributes["pack_replaced_count"] = [0, 1, 0]
+        attrs = self._soh_capacity_attrs(report)
+        self.assertEqual(attrs.get("pack_slot_labels"), ["u1p1", "u1p2", "u1p3"])
+        self.assertEqual(attrs.get("pack_replaced_count"), [0, 1, 0])
+
+    def test_original_per_pack_breakdown_still_reaches_the_entity_too(self):
+        """Negative case / non-regression: confirms the ORIGINAL,
+        pre-existing per-pack breakdown (which WAS already correctly
+        wired) still works after this fix -- the new keys were added
+        alongside it, not accidentally replacing it."""
+        report = BH.HealthReport()
+        report.attributes["pack_capacity_soh_percent"] = [100.0, 90.0, 95.0]
+        attrs = self._soh_capacity_attrs(report)
+        self.assertEqual(attrs.get("pack_capacity_soh_percent"), [100.0, 90.0, 95.0])
+
+    def test_all_new_attribute_values_pass_ha_state_validation(self):
+        """Ties into this file's own core purpose (see the module
+        docstring) -- confirms these new values don't trip HA's
+        numeric-vs-string state validation rule, the same class of bug
+        this whole test file exists to catch."""
+        report = BH.HealthReport()
+        report.soh_capacity = 90.0
+        report.attributes.update({
+            "weakest_pack_slot": "u1p2",
+            "soh_capacity_source": "pack_fused",
+            "soh_capacity_unit_independent": 97.2,
+            "capacity_cross_check_diverged": True,
+            "retired_pack_history": [{"slot_label": "u1p1", "serial_number": "SN-OLD"}],
+            "pack_age_days": [120.5, None, 30.0],
+            "pack_age_source": ["unit_install_date", "unknown", "first_detected"],
+        })
+        ent = next(e for e in _entities(report=report) if e._attr_key == "soh_capacity")
+        ent._apply(report)
+        ha_sensor_state(ent)  # must not raise
+
+
 if __name__ == "__main__":
     unittest.main()
