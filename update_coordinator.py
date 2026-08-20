@@ -265,6 +265,126 @@ def _chunk_tier(chunk: list[RegisterName]) -> str:
 _ADDRESS_GROUP_MAX_GAP = 16
 _ADDRESS_GROUP_MAX_SPAN = 64
 
+# v2.0.14 (Battery Pack Physical Grouping study, this release): protected
+# physical groups for battery-pack registers, per the architecture study
+# document's own recommendation -- built and confirmed BEFORE any new
+# deployment, via a retroactive classification of ~31h of real, already-
+# captured field telemetry (four independent captures, one predating this
+# session's own Phase 5.3 chunking work). That analysis found MIXED
+# transactions containing BOTH a DYNAMIC register (working status, SOC,
+# power, voltage, current) AND an ENERGY register (total charge/discharge)
+# in the SAME physical exchange show a ~458x higher median service time
+# (2,291ms vs 5ms) and ~5.9x higher error rate (1.99% vs 0.34%) than
+# transactions containing ONLY DYNAMIC registers -- at n=4,922 real
+# transactions, consistent across every capture checked individually.
+#
+# Note this is a DIFFERENT mechanism from DEFECT E's own finding just
+# above: DEFECT E is about exchange COUNT (a group forced into 2+
+# physical exchanges costs a fixed toll per exchange, independent of
+# content). DYNAMIC+ENERGY registers are address-adjacent enough to
+# ALREADY fit in a single exchange under the existing gap/span rule --
+# the cost here tracks specific REGISTER CONTENT within one exchange,
+# not exchange count. Both mechanisms are real; this is additive to
+# DEFECT E's fix, not a replacement for it.
+#
+# This is Phase A+B of that study's own proposed plan, combined into one
+# pass rather than a separate observation-only deployment first (the
+# retroactive analysis already serves that purpose, at a larger sample
+# than a few fresh days would give quickly). Deliberately limited to
+# grouping only -- no register's own tier/freshness cadence changes here
+# (that is the study's own separate, later Phase C, held back
+# specifically so a future capture can isolate whether separation ALONE
+# already improves the BUSY/error rate, before cadence is also changed).
+_PACK_DYNAMIC_SUFFIXES = frozenset({
+    "working_status", "state_of_capacity", "charge_discharge_power",
+    "voltage", "current",
+})
+_PACK_ENERGY_SUFFIXES = frozenset({"total_charge", "total_discharge"})
+_PACK_DIAGNOSTIC_SUFFIXES = frozenset({
+    "soh_calibration_status", "maximum_temperature", "minimum_temperature",
+    "serial_number",
+})
+
+
+def physical_group_for(name: RegisterName) -> str | None:
+    """Return a protected physical-group id for a battery-pack register in
+    one of the three known categories (DYNAMIC/ENERGY/DIAGNOSTIC), or None
+    for any register with no such protection -- every non-battery
+    register, and any battery-pack register whose own suffix isn't in one
+    of the three known sets above (falls through to plain address-aware
+    grouping, unchanged; deliberately conservative rather than guessing at
+    an unrecognized suffix's own category).
+
+    Parsed directly from the register's own name, matching battery_health_
+    manager.py's own "storage_unit_{unit}_battery_pack_{pack}_{suffix}"
+    construction (_pack_register_name) rather than a second, hand-
+    maintained list of addresses per pack/unit that could drift from the
+    real topology -- this project's own established convention (see also
+    battery_health_entities.py's own SLOT_LABEL_RE) for exactly this
+    reason. Plain string parsing, not regex, matching this specific
+    naming helper's own existing style rather than introducing a new
+    dependency for this one function.
+    """
+    s = str(name)
+    marker = "battery_pack_"
+    idx = s.find(marker)
+    if idx == -1:
+        return None
+    prefix = s[:idx]
+    rest = s[idx + len(marker):]
+    if not prefix.startswith("storage_unit_") or not prefix.endswith("_"):
+        return None
+    unit = prefix[len("storage_unit_"):-1]
+    if not unit.isdigit():
+        return None
+    parts = rest.split("_", 1)
+    if len(parts) != 2:
+        return None
+    pack_num, suffix = parts
+    if not pack_num.isdigit():
+        return None
+    if suffix in _PACK_DYNAMIC_SUFFIXES:
+        category = "DYNAMIC"
+    elif suffix in _PACK_ENERGY_SUFFIXES:
+        category = "ENERGY"
+    elif suffix in _PACK_DIAGNOSTIC_SUFFIXES:
+        category = "DIAGNOSTIC"
+    else:
+        return None
+    return f"BATTERY_PACK_u{unit}p{pack_num}_{category}"
+
+
+def _split_by_physical_group(
+    names: list[RegisterName],
+) -> list[list[RegisterName]]:
+    """Partition address-sorted names into address-order-preserving runs
+    that share the same physical_group_for() result -- None counts as its
+    own "no protection" group, so a contiguous run of ordinary,
+    unprotected registers stays together for _address_group() to process
+    exactly as before.
+
+    A simple, order-preserving partition (not a full group-by) is
+    correct here specifically because registers sharing one protected
+    group are already naturally address-adjacent (confirmed directly
+    against the real register address map) -- two runs of the SAME
+    group id never need to be merged back together.
+
+    Names must already be address-sorted (see _sort_by_modbus_address),
+    same precondition as _address_group() itself.
+    """
+    if not names:
+        return []
+    runs: list[list[RegisterName]] = [[names[0]]]
+    current_group = physical_group_for(names[0])
+    for name in names[1:]:
+        g = physical_group_for(name)
+        if g == current_group:
+            runs[-1].append(name)
+        else:
+            runs.append([name])
+            current_group = g
+    return runs
+
 
 def _address_group(names: list[RegisterName]) -> list[list[RegisterName]]:
     """Partition ADDRESS-SORTED registers into contiguous groups.
@@ -820,8 +940,22 @@ class HuaweiSolarUpdateCoordinator(
         # deferred question asked for, not a blanket change to the
         # validated default.
         chunks: list[list[RegisterName]] = []
-        for group in _address_group(sorted_names):
-            chunks.extend(_chunk(group, self._service_aware_chunk_size(group)))
+        # v2.0.14 (Battery Pack Physical Grouping study, this release):
+        # protected battery-pack groups (DYNAMIC/ENERGY/DIAGNOSTIC) are
+        # carved out FIRST, so a DYNAMIC register can never be coalesced
+        # into the same physical exchange as an ENERGY or DIAGNOSTIC one
+        # for the same pack -- see physical_group_for()'s own docstring
+        # for the full evidence and reasoning. _address_group()'s own
+        # gap/span rule then runs independently WITHIN each resulting
+        # run, unchanged -- this only changes where a run boundary is
+        # drawn before that rule ever sees the list, not how the rule
+        # itself works. For every non-battery register, and any battery-
+        # pack register outside the three known categories, this is a
+        # complete no-op: _split_by_physical_group() returns exactly the
+        # same single run _address_group() would have received directly.
+        for protected_run in _split_by_physical_group(sorted_names):
+            for group in _address_group(protected_run):
+                chunks.extend(_chunk(group, self._service_aware_chunk_size(group)))
         merged: dict[RegisterName, Result[Any]] = {}
         # v2.0.9 (Phase 2.1/2.4, this release -- ICS-16/Architecture R3/R4,
         # both external ICS audits -- confirmed): one ID shared by every
