@@ -232,7 +232,14 @@ class TestCreatePackDateEntities(unittest.TestCase):
 
 
 class TestPackInstallDateEntityReading(unittest.TestCase):
-    """_apply() -- reconstructing a date from pack_age_days."""
+    """_apply() -- reads the raw install timestamp directly.
+
+    v2.0.13 FIX (BH-016, external ICS quality/defect/architecture audit
+    -- confirmed): previously reconstructed a date from pack_age_days,
+    already rounded to 1 decimal day by the engine -- up to +-72
+    minutes of lost precision, which could display the wrong calendar
+    day near a UTC midnight boundary. Now binds directly to the raw
+    pack_install_ts the report exposes for exactly this reason."""
 
     def _entity(self, manager=None):
         manager = manager or _StubManager()
@@ -240,33 +247,52 @@ class TestPackInstallDateEntityReading(unittest.TestCase):
             manager, _battery_device_info(1), 0, "u1p1", "1",
         )
 
-    def test_none_when_no_age_data_at_all(self):
+    def test_none_when_no_timestamp_data_at_all(self):
         report = BH.HealthReport()
         ent = self._entity()
         ent._apply(report)
         self.assertIsNone(ent._attr_native_value)
 
-    def test_none_when_this_packs_own_age_is_none(self):
+    def test_none_when_this_packs_own_timestamp_is_none(self):
         report = BH.HealthReport()
-        report.attributes["pack_age_days"] = [None, 30.0, 30.0]
+        report.attributes["pack_install_ts"] = [None, 1700000000.0, 1700000000.0]
         ent = self._entity()
         ent._apply(report)
         self.assertIsNone(ent._attr_native_value)
 
-    def test_reconstructs_a_real_date_from_age_days(self):
-        report = BH.HealthReport()
-        report.attributes["pack_age_days"] = [10.0]
-        ent = self._entity()
-        ent._apply(report)
-        self.assertIsInstance(ent._attr_native_value, date)
+    def test_reads_the_correct_date_from_a_real_timestamp(self):
         from datetime import datetime, timezone
-        expected = (datetime.now(timezone.utc).date())
-        from datetime import timedelta
-        self.assertEqual(ent._attr_native_value, expected - timedelta(days=10))
+        ts = datetime(2026, 1, 15, 8, 0, tzinfo=timezone.utc).timestamp()
+        report = BH.HealthReport()
+        report.attributes["pack_install_ts"] = [ts]
+        ent = self._entity()
+        ent._apply(report)
+        self.assertEqual(ent._attr_native_value, date(2026, 1, 15))
+
+    def test_regression_bh016_no_precision_loss_near_midnight_boundary(self):
+        """The exact bug this fix closes: a pack installed at 23:50 UTC
+        (0.007 days before a UTC midnight rollover) must show the date
+        it was actually installed, not the following day -- the old,
+        buggy implementation reconstructed from an age ALREADY rounded
+        to 1 decimal day, which could round 0.007 down to 0.0 and
+        therefore show "today" (the day after installation) instead of
+        the real install date."""
+        from datetime import datetime, timezone
+        # Installed at 23:50 UTC on Jan 14 -- 10 minutes before midnight.
+        install_ts = datetime(2026, 1, 14, 23, 50, tzinfo=timezone.utc).timestamp()
+        report = BH.HealthReport()
+        report.attributes["pack_install_ts"] = [install_ts]
+        ent = self._entity()
+        ent._apply(report)
+        self.assertEqual(
+            ent._attr_native_value, date(2026, 1, 14),
+            "must show the real install date (Jan 14), not be shifted "
+            "by rounding to the following day",
+        )
 
     def test_index_beyond_list_length_is_none_not_an_exception(self):
         report = BH.HealthReport()
-        report.attributes["pack_age_days"] = [10.0]  # only 1 value
+        report.attributes["pack_install_ts"] = [1700000000.0]  # only 1 value
         manager = _StubManager()
         ent = DATE.HuaweiSolarPackInstallDateEntity(
             manager, _battery_device_info(1), 2, "u1p3", "3",  # index 2
@@ -330,7 +356,7 @@ class TestPushUpdateLifecycle(unittest.TestCase):
 
     def test_added_to_hass_registers_listener_and_applies_current_report(self):
         report = BH.HealthReport()
-        report.attributes["pack_age_days"] = [5.0]
+        report.attributes["pack_install_ts"] = [1700000000.0]
         manager = _StubManager(report=report)
         ent = DATE.HuaweiSolarPackInstallDateEntity(
             manager, _battery_device_info(1), 0, "u1p1", "1",

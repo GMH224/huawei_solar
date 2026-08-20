@@ -2483,7 +2483,325 @@ class TestTopologyPackReplacementDetection(unittest.TestCase):  # v2.0.7 (TOPO-0
         )
 
 
-class TestPhase5BPreserveOnReplacement(unittest.TestCase):  # v2.0.12
+class TestRetiredPackLifetimeDischargeArchived(unittest.TestCase):  # v2.0.13
+    """Found during this session's own independent review, not either
+    external audit: an outgoing pack's own lifetime discharge total
+    was being silently discarded on replacement -- directly warranty-
+    relevant, since Huawei's own actual warranty terms are throughput-
+    based."""
+
+    def _pack(self, soc, dis, serial, online=True):
+        return bh.PackSample(voltage=53.0, temp_max=25.0, temp_min=24.0,
+                              online=online, soc=soc, power_w=-2500.0,
+                              lifetime_discharge_kwh=dis, serial_number=serial)
+
+    def test_lifetime_discharge_captured_in_the_archive(self):
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        tracker = bh.PackCapacityTracker(cfg, pack_count=1, slot_labels=["u1p1"])
+        # Feed a genuinely increasing discharge total for the outgoing pack.
+        tracker.feed(
+            _sample(0, soc=90.0, power=-2500.0, chg=0.0, dis=0.0,
+                   packs=[self._pack(90.0, 0.0, "SN-OLD")]),
+            learning=True,
+        )
+        tracker.feed(
+            _sample(3600, soc=80.0, power=-2500.0, chg=0.0, dis=1.5,
+                   packs=[self._pack(80.0, 1.5, "SN-OLD")]),
+            learning=True,
+        )
+        tracker.feed(
+            _sample(7200, soc=70.0, power=-2500.0, chg=0.0, dis=3.2,
+                   packs=[self._pack(70.0, 3.2, "SN-OLD")]),
+            learning=True,
+        )
+        # Trigger a replacement.
+        tracker.feed(
+            _sample(7260, soc=90.0, power=-2500.0, chg=0.0, dis=0.0,
+                   packs=[self._pack(90.0, 0.0, "SN-NEW")]),
+            learning=True,
+        )
+        self.assertEqual(len(tracker.retired_pack_history), 1)
+        entry = tracker.retired_pack_history[0]
+        self.assertIn("final_lifetime_discharge_kwh", entry)
+        self.assertAlmostEqual(entry["final_lifetime_discharge_kwh"], 3.2, places=1)
+
+    def test_zero_discharge_pack_archives_as_zero_not_none_or_missing(self):
+        """Negative case: a pack replaced with genuinely zero
+        accumulated discharge (a very short service life) must still
+        record 0.0, not None or an absent key -- distinguishing "really
+        zero" from "never measured" matters for this field."""
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        tracker = bh.PackCapacityTracker(cfg, pack_count=1, slot_labels=["u1p1"])
+        tracker.feed(
+            _sample(0, soc=90.0, power=-2500.0, chg=0.0, dis=0.0,
+                   packs=[self._pack(90.0, 0.0, "SN-OLD")]),
+            learning=True,
+        )
+        tracker.feed(
+            _sample(60, soc=90.0, power=-2500.0, chg=0.0, dis=0.0,
+                   packs=[self._pack(90.0, 0.0, "SN-NEW")]),
+            learning=True,
+        )
+        entry = tracker.retired_pack_history[0]
+        self.assertEqual(entry["final_lifetime_discharge_kwh"], 0.0)
+
+    def test_captured_before_the_counter_resets_not_after(self):
+        """Adversarial: confirms the archived value reflects the
+        OUTGOING pack's own total, not the fresh (zeroed) counter that
+        replaces it -- would fail if the read and the reset were ever
+        accidentally reordered."""
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        tracker = bh.PackCapacityTracker(cfg, pack_count=1, slot_labels=["u1p1"])
+        tracker.feed(
+            _sample(0, soc=90.0, power=-2500.0, chg=0.0, dis=5.0,
+                   packs=[self._pack(90.0, 5.0, "SN-OLD")]),
+            learning=True,
+        )
+        tracker.feed(
+            _sample(60, soc=90.0, power=-2500.0, chg=0.0, dis=0.0,
+                   packs=[self._pack(90.0, 0.0, "SN-NEW")]),
+            learning=True,
+        )
+        entry = tracker.retired_pack_history[0]
+        self.assertGreater(
+            entry["final_lifetime_discharge_kwh"], 0.0,
+            "archived value must reflect the OUTGOING pack's real total, "
+            "not the fresh counter that replaced it",
+        )
+        # The NEW pack's own counter must genuinely be fresh/reset,
+        # confirming the two are not somehow the same object.
+        self.assertEqual(tracker._discharge_counters[0].value, 0.0)
+
+
+
+    """BH-015, external ICS quality/defect/architecture audit --
+    confirmed: retired_pack_history, pack_first_detected, and pack_
+    install_dates grew without bound, forever, with no retention limit.
+    Pre-populates a large synthetic history directly (bypassing feeding
+    50+ real replacements through the full mechanism) to test the prune
+    method itself in isolation, plus one end-to-end test confirming
+    it's genuinely wired into the real replacement path."""
+
+    def _pack(self, soc, dis, serial, online=True):
+        return bh.PackSample(voltage=53.0, temp_max=25.0, temp_min=24.0,
+                              online=online, soc=soc, power_w=-2500.0,
+                              lifetime_discharge_kwh=dis, serial_number=serial)
+
+    def test_history_capped_at_max_entries(self):
+        cfg = _cfg()
+        tracker = bh.PackCapacityTracker(cfg, pack_count=1, slot_labels=["u1p1"])
+        tracker.retired_pack_history = [
+            {"slot_label": "u1p1", "serial_number": f"SN-{i}", "replaced_at": float(i)}
+            for i in range(bh.MAX_RETIRED_PACK_HISTORY + 10)
+        ]
+        tracker._prune_retired_history_and_stale_serials()
+        self.assertEqual(len(tracker.retired_pack_history), bh.MAX_RETIRED_PACK_HISTORY)
+
+    def test_oldest_entries_dropped_first_not_newest(self):
+        cfg = _cfg()
+        tracker = bh.PackCapacityTracker(cfg, pack_count=1, slot_labels=["u1p1"])
+        tracker.retired_pack_history = [
+            {"slot_label": "u1p1", "serial_number": f"SN-{i}", "replaced_at": float(i)}
+            for i in range(bh.MAX_RETIRED_PACK_HISTORY + 10)
+        ]
+        tracker._prune_retired_history_and_stale_serials()
+        remaining_serials = {e["serial_number"] for e in tracker.retired_pack_history}
+        # The 10 OLDEST (SN-0 through SN-9) must be gone; the most
+        # recent MAX_RETIRED_PACK_HISTORY must remain.
+        self.assertNotIn("SN-0", remaining_serials)
+        self.assertNotIn("SN-9", remaining_serials)
+        self.assertIn(f"SN-{bh.MAX_RETIRED_PACK_HISTORY + 9}", remaining_serials)
+
+    def test_history_below_the_cap_is_untouched(self):
+        """Negative case: a history well under the cap must not be
+        trimmed at all."""
+        cfg = _cfg()
+        tracker = bh.PackCapacityTracker(cfg, pack_count=1, slot_labels=["u1p1"])
+        tracker.retired_pack_history = [
+            {"slot_label": "u1p1", "serial_number": "SN-1", "replaced_at": 1.0},
+            {"slot_label": "u1p1", "serial_number": "SN-2", "replaced_at": 2.0},
+        ]
+        tracker._prune_retired_history_and_stale_serials()
+        self.assertEqual(len(tracker.retired_pack_history), 2)
+
+    def test_stale_serial_pruned_from_first_detected_and_install_dates(self):
+        """The core guarantee: a serial that is NEITHER currently live
+        NOR referenced by any RETAINED history entry must be removed
+        from both dicts."""
+        cfg = _cfg()
+        tracker = bh.PackCapacityTracker(cfg, pack_count=1, slot_labels=["u1p1"])
+        tracker._last_serial = ["SN-CURRENT"]
+        tracker.retired_pack_history = []  # nothing retained references SN-OLD
+        tracker.pack_first_detected = {"SN-CURRENT": 100.0, "SN-OLD": 50.0}
+        tracker.pack_install_dates = {"SN-OLD": 42.0}
+        tracker._prune_retired_history_and_stale_serials()
+        self.assertNotIn("SN-OLD", tracker.pack_first_detected)
+        self.assertNotIn("SN-OLD", tracker.pack_install_dates)
+
+    def test_currently_live_serial_is_preserved(self):
+        cfg = _cfg()
+        tracker = bh.PackCapacityTracker(cfg, pack_count=1, slot_labels=["u1p1"])
+        tracker._last_serial = ["SN-CURRENT"]
+        tracker.pack_first_detected = {"SN-CURRENT": 100.0}
+        tracker._prune_retired_history_and_stale_serials()
+        self.assertIn("SN-CURRENT", tracker.pack_first_detected)
+
+    def test_serial_referenced_by_retained_history_is_preserved(self):
+        """Negative case: a serial with no LIVE slot but still
+        referenced by a RETAINED retired_pack_history entry must be
+        kept -- the archive should stay self-consistent, not have a
+        history entry whose own first-detected/install-date info was
+        separately deleted out from under it."""
+        cfg = _cfg()
+        tracker = bh.PackCapacityTracker(cfg, pack_count=1, slot_labels=["u1p1"])
+        tracker._last_serial = [None]  # no live pack right now
+        tracker.retired_pack_history = [
+            {"slot_label": "u1p1", "serial_number": "SN-RETIRED", "replaced_at": 1.0},
+        ]
+        tracker.pack_first_detected = {"SN-RETIRED": 50.0}
+        tracker._prune_retired_history_and_stale_serials()
+        self.assertIn("SN-RETIRED", tracker.pack_first_detected)
+
+    def test_prune_is_genuinely_wired_into_the_real_replacement_path(self):
+        """End-to-end confirmation: not just that the prune method works
+        in isolation, but that a REAL, detected replacement actually
+        triggers it -- feeds a stale serial in beforehand, then a real
+        replacement, and confirms the stale one is gone afterward."""
+        cfg = _cfg()
+        tracker = bh.PackCapacityTracker(cfg, pack_count=1, slot_labels=["u1p1"])
+        tracker.pack_first_detected["SN-LONG-GONE"] = 1.0  # pre-existing stale entry
+        tracker.feed(
+            _sample(0, soc=90.0, power=-2500.0, chg=0.0, dis=0.0,
+                   packs=[self._pack(90.0, 0.0, "SN-A")]),
+            learning=True,
+        )
+        tracker.feed(
+            _sample(60, soc=90.0, power=-2500.0, chg=0.0, dis=0.0,
+                   packs=[self._pack(90.0, 0.0, "SN-B")]),  # triggers replacement
+            learning=True,
+        )
+        self.assertNotIn("SN-LONG-GONE", tracker.pack_first_detected)
+
+
+
+    """BH-014, external ICS quality/defect/architecture audit --
+    confirmed: PackCapacityTracker used to scale cfg.rated_capacity_kwh
+    (documented as ONE unit's own nameplate capacity) by the TOTAL pack
+    count across ALL units, not packs-per-unit. A two-unit installation
+    therefore divided one unit's worth of capacity across both units'
+    packs -- a healthy pack could read close to 200% SOH before the
+    configured clip."""
+
+    def test_single_unit_three_packs_unaffected(self):
+        cfg = _cfg()
+        tracker = bh.PackCapacityTracker(
+            cfg, pack_count=3, slot_labels=["u1p1", "u1p2", "u1p3"],
+        )
+        self.assertAlmostEqual(
+            tracker._pack_cfg.rated_capacity_kwh, cfg.rated_capacity_kwh / 3,
+        )
+
+    def test_two_units_six_packs_divides_by_packs_per_unit_not_total(self):
+        """The core regression this fix closes: a two-unit, 3-pack-each
+        topology must scale by 3 (packs per unit), not 6 (total packs
+        across both units)."""
+        cfg = _cfg()
+        tracker = bh.PackCapacityTracker(
+            cfg, pack_count=6,
+            slot_labels=["u1p1", "u1p2", "u1p3", "u2p1", "u2p2", "u2p3"],
+        )
+        self.assertAlmostEqual(
+            tracker._pack_cfg.rated_capacity_kwh, cfg.rated_capacity_kwh / 3,
+        )
+        self.assertNotAlmostEqual(
+            tracker._pack_cfg.rated_capacity_kwh, cfg.rated_capacity_kwh / 6,
+        )
+
+    def test_two_units_also_corrects_the_plausibility_band_fields(self):
+        """Negative case: confirms the SAME fix applies to implied_
+        capacity_min_kwh/max_kwh (the plausibility-band fields this
+        class's own docstring says must be scaled identically to
+        rated_capacity_kwh), not just the one field that happened to
+        be checked above."""
+        cfg = _cfg()
+        tracker = bh.PackCapacityTracker(
+            cfg, pack_count=6,
+            slot_labels=["u1p1", "u1p2", "u1p3", "u2p1", "u2p2", "u2p3"],
+        )
+        self.assertAlmostEqual(
+            tracker._pack_cfg.implied_capacity_min_kwh,
+            cfg.implied_capacity_min_kwh / 3,
+        )
+        self.assertAlmostEqual(
+            tracker._pack_cfg.implied_capacity_max_kwh,
+            cfg.implied_capacity_max_kwh / 3,
+        )
+
+    def test_legacy_non_unit_labels_fall_back_to_total_pack_count(self):
+        """The documented, deliberate fallback: slot_labels that don't
+        parse as 'uNpM' (the plain "1".."pack_count" backward-
+        compatible default this class's own __init__ docstring
+        describes) use the ORIGINAL, pre-fix behaviour -- total
+        pack_count -- since that format represents a single unit and
+        needs no correction."""
+        cfg = _cfg()
+        tracker = bh.PackCapacityTracker(
+            cfg, pack_count=3, slot_labels=["1", "2", "3"],
+        )
+        self.assertAlmostEqual(
+            tracker._pack_cfg.rated_capacity_kwh, cfg.rated_capacity_kwh / 3,
+        )
+
+    def test_no_slot_labels_at_all_falls_back_to_total_pack_count(self):
+        """Negative case: the None default (no slot_labels passed at
+        all) must not raise, and must use the same safe fallback."""
+        cfg = _cfg()
+        tracker = bh.PackCapacityTracker(cfg, pack_count=3, slot_labels=None)
+        self.assertAlmostEqual(
+            tracker._pack_cfg.rated_capacity_kwh, cfg.rated_capacity_kwh / 3,
+        )
+
+    def test_unparseable_slot_labels_fall_back_safely_not_raise(self):
+        """Adversarial: a genuinely malformed slot_labels list (neither
+        the 'uNpM' format nor the plain numeric fallback) must not
+        raise -- falls back to the safe, original total-pack_count
+        behaviour."""
+        cfg = _cfg()
+        tracker = bh.PackCapacityTracker(
+            cfg, pack_count=4, slot_labels=["u1p1", "garbage", "u1p3", "u1p4"],
+        )
+        self.assertAlmostEqual(
+            tracker._pack_cfg.rated_capacity_kwh, cfg.rated_capacity_kwh / 4,
+        )
+
+    def test_reference_capacity_learning_still_overrides_the_fallback(self):
+        """End-to-end sanity check: once a pack has accumulated real
+        segments and learned its own measured reference capacity, THAT
+        value is used (via soh_capacity()'s own reference_capacity_kwh
+        precedence) rather than the corrected fallback -- confirms this
+        fix only affects the EARLY-LIFE / no-data-yet fallback, not the
+        steady-state learned behaviour."""
+        cfg = _cfg(freshness_tau_kwh=1e12)
+        tracker = bh.PackCapacityTracker(
+            cfg, pack_count=6,
+            slot_labels=["u1p1", "u1p2", "u1p3", "u2p1", "u2p2", "u2p3"],
+        )
+        # Directly set a measured reference, bypassing full segment
+        # accumulation -- matches this file's own established pattern
+        # for isolating this specific precedence behaviour.
+        tracker.trackers[0].reference_capacity_kwh = 6.5
+        tracker.trackers[0].segments = [bh.DischargeSegment(
+            start_ts=0.0, end_ts=3600.0, soc_start=95.0, soc_end=75.0,
+            energy_kwh=6.2, implied_capacity_kwh=6.2,
+            freshness=1.0, exclude_calibration=False, avg_temp_c=25.0,
+        )]
+        soh, _attrs = tracker.trackers[0].soh_capacity()
+        # 6.2/6.5 ~= 95.4% -- driven by the LEARNED reference (6.5),
+        # not the corrected fallback (6.9) or the old buggy one (3.45).
+        self.assertAlmostEqual(soh, 100.0 * 6.2 / 6.5, places=0)
+
+
+
     """Battery Phase 5B, this release: a confirmed, live risk -- before
     this fix, an outgoing pack's entire accumulated history was
     silently discarded on replacement, with only a bare integer

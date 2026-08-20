@@ -1520,3 +1520,81 @@ class TestSnapshotPublicMethod(unittest.TestCase):
             "private name",
         )
         self.assertIn("self.snapshot()", source)
+
+
+# ── v2.0.13 (MOD-022): circadian slots use HA's own configured timezone ─────
+
+class TestMOD022UsesHomeAssistantTimezoneNotHostLocal(unittest.TestCase):
+    """MOD-022, external ICS quality/defect/architecture audit --
+    confirmed: _current_slot_index() (and, found in the same pass,
+    every date.today() call in this file) used naive, HOST-local wall-
+    clock time instead of Home Assistant's own configured timezone
+    (homeassistant.util.dt.now()). If the host OS timezone doesn't
+    match HA's own configured one (common in a containerized/cloud
+    deployment defaulting to UTC), the whole circadian learning model
+    would key its slots off the wrong local time."""
+
+    def test_slot_index_uses_dt_util_now_not_datetime_now(self):
+        with patch.object(_MOD.dt_util, "now") as mock_now:
+            from datetime import datetime, timezone
+            mock_now.return_value = datetime(2026, 1, 1, 14, 37, tzinfo=timezone.utc)
+            idx = AdaptiveModbusController._current_slot_index()
+        mock_now.assert_called_once()
+        # 14:37 -> minute-of-day 877 -> // 15 = 58
+        self.assertEqual(idx, 877 // _cmod.ADAPTIVE_SLOT_MINUTES)
+
+    def test_slot_index_reflects_ha_timezone_not_a_different_host_timezone(self):
+        """The core regression this closes: two different timezones for
+        the SAME real moment must produce DIFFERENT slot indices --
+        confirming the slot genuinely follows whichever tzinfo dt_util.
+        now() is configured to return, not a fixed, host-local
+        interpretation of it."""
+        from datetime import datetime, timezone, timedelta as _td
+        # Same real instant, expressed in two different local offsets.
+        utc_time = datetime(2026, 1, 1, 23, 30, tzinfo=timezone.utc)
+        cet_time = utc_time.astimezone(timezone(_td(hours=1)))  # 00:30 local
+        with patch.object(_MOD.dt_util, "now", return_value=utc_time):
+            idx_utc = AdaptiveModbusController._current_slot_index()
+        with patch.object(_MOD.dt_util, "now", return_value=cet_time):
+            idx_cet = AdaptiveModbusController._current_slot_index()
+        self.assertNotEqual(
+            idx_utc, idx_cet,
+            "the same real moment expressed in two different "
+            "configured timezones must map to different slots -- "
+            "confirms the slot genuinely depends on dt_util.now()'s "
+            "own returned tzinfo, not a fixed host interpretation",
+        )
+
+    def test_days_of_data_uses_dt_util_now_not_date_today(self):
+        ctrl = _make_ctrl()
+        from datetime import date, datetime, timezone
+        ctrl._first_data_date = date(2026, 1, 1)
+        with patch.object(_MOD.dt_util, "now") as mock_now:
+            mock_now.return_value = datetime(2026, 1, 11, 12, 0, tzinfo=timezone.utc)
+            days = ctrl.days_of_data
+        mock_now.assert_called_once()
+        self.assertEqual(days, 11)
+
+    def test_no_bare_datetime_now_or_date_today_remain_in_source(self):
+        """Negative case: confirms every call site found during this
+        fix's own review was actually changed, not just the one the
+        audit originally named -- source-level sweep for any
+        survivors. Tracks triple-quote docstring state so explanatory
+        prose describing the OLD, now-fixed behaviour (which correctly
+        still mentions these names in comments/docstrings) isn't
+        mistaken for a live call site."""
+        source = _SRC.read_text()
+        in_docstring = False
+        for line in source.splitlines():
+            stripped = line.strip()
+            if stripped.count('"""') % 2 == 1:
+                in_docstring = not in_docstring
+                continue
+            if in_docstring or stripped.startswith("#"):
+                continue
+            self.assertNotIn("datetime.now()", line)
+            self.assertNotIn("date.today()", line)
+
+    def test_dt_util_imported_from_homeassistant_util(self):
+        source = _SRC.read_text()
+        self.assertIn("from homeassistant.util import dt as dt_util", source)

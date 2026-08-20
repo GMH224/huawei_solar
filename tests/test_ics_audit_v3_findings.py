@@ -1151,5 +1151,82 @@ class TestFinding10AdaptiveDeterministicFlush(unittest.IsolatedAsyncioTestCase):
         )
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# v2.0.13: NEW-002 -- manual multi-slave config validation had no
+# aggregate deadline (external ICS quality/defect/architecture audit)
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestNEW002ManualValidationAggregateDeadline(unittest.TestCase):
+    """NEW-002, external ICS quality/defect/architecture audit --
+    confirmed: validate_serial_setup()/validate_network_setup() bounded
+    each individual sub-device connection (DEVICE_CONNECT_TIMEOUT), but
+    the WHOLE loop had no aggregate deadline -- an arbitrarily long,
+    manually-supplied slave/unit-ID list could take roughly
+    len(ids) x DEVICE_CONNECT_TIMEOUT, unbounded as a function of user
+    input. _connect_to_discovered_devices() already had this exact
+    protection (DEF-006, this project's own earlier fix) -- these two
+    manual-entry paths were missed at the time."""
+
+    def _function_body(self, name: str) -> str:
+        source = _CONFIG_FLOW_SRC.read_text()
+        idx = source.find(f"async def {name}(")
+        assert idx > -1, f"{name} not found in config_flow.py"
+        end = source.find("\nasync def ", idx + 10)
+        return source[idx: end if end > -1 else idx + 8000]
+
+    def test_validate_serial_setup_has_an_aggregate_deadline(self):
+        body = self._function_body("validate_serial_setup")
+        assert "loop_deadline = time.monotonic() + DISCOVERY_TOTAL_TIMEOUT.total_seconds()" in body
+        assert "if time.monotonic() >= loop_deadline:" in body
+
+    def test_validate_network_setup_has_an_aggregate_deadline(self):
+        body = self._function_body("validate_network_setup")
+        assert "loop_deadline = time.monotonic() + DISCOVERY_TOTAL_TIMEOUT.total_seconds()" in body
+        assert "if time.monotonic() >= loop_deadline:" in body
+
+    def test_reuses_discovery_total_timeout_not_a_new_constant(self):
+        """Confirms this reuses the SAME budget as DEF-006's own fix
+        for the auto-discovery path, not a separately-tuned constant
+        for what's genuinely the same kind of aggregate operation."""
+        for name in ("validate_serial_setup", "validate_network_setup"):
+            body = self._function_body(name)
+            assert "DISCOVERY_TOTAL_TIMEOUT" in body
+
+    def test_deadline_check_is_inside_the_loop_not_only_before_it(self):
+        """Adversarial: the deadline check must be evaluated on EVERY
+        iteration (inside the for loop), not just once before the loop
+        starts -- otherwise a slow-but-not-yet-timed-out first few
+        sub-devices could still let the total run unbounded."""
+        loop_headers = {
+            "validate_serial_setup": "for slave_id in unit_ids[1:]:",
+            "validate_network_setup": "for unit_id in unit_ids[1:]:",
+        }
+        for name, loop_header in loop_headers.items():
+            body = self._function_body(name)
+            for_idx = body.find(loop_header)
+            deadline_check_idx = body.find("if time.monotonic() >= loop_deadline:")
+            deadline_def_idx = body.find("loop_deadline = time.monotonic()")
+            assert deadline_def_idx > -1 and for_idx > -1 and deadline_check_idx > -1
+            assert deadline_def_idx < for_idx, (
+                f"{name}: loop_deadline must be computed BEFORE the loop starts"
+            )
+            assert deadline_check_idx > for_idx, (
+                f"{name}: the deadline check must be INSIDE the loop body, "
+                "evaluated on every iteration"
+            )
+
+    def test_overrun_raises_device_exception_matching_each_functions_own_style(self):
+        """Negative case: confirms an overrun is surfaced via the SAME
+        DeviceException each function already raises for an individual
+        connection failure -- not a new, different exception type or a
+        silent partial-success path this function was never designed
+        for."""
+        for name in ("validate_serial_setup", "validate_network_setup"):
+            body = self._function_body(name)
+            deadline_idx = body.find("if time.monotonic() >= loop_deadline:")
+            window = body[deadline_idx: deadline_idx + 700]
+            assert "raise DeviceException(" in window
+
+
 if __name__ == "__main__":
     unittest.main()

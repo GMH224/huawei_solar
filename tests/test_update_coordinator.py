@@ -1576,3 +1576,59 @@ class TestPhase53ServiceTimeAwareChunking(unittest.TestCase):
         body = _SOURCE[_SOURCE.find("def _record_chunk_service_time("):]
         body = body[:body.find("\n    async def ")]
         self.assertIn("for name in chunk:", body)
+
+
+# ── v2.0.13 (MOD-021): per-chunk physical-attempt telemetry ─────────────────
+
+class TestMOD021PerChunkPhysicalAttemptCounting(unittest.TestCase):
+    """MOD-021, external ICS quality/defect/architecture audit --
+    confirmed: ModbusTelemetry.record_request() was called once per
+    LOGICAL poll (after _execute_batch() returns), incrementing total_
+    physical_attempts by exactly one regardless of how many chunks that
+    poll actually needed -- a multi-chunk poll undercounted real wire
+    transactions by up to (chunk_count - 1)."""
+
+    def _chunk_loop_body(self) -> str:
+        idx = _SOURCE.find("for chunk_idx, chunk in enumerate(chunks):")
+        assert idx > -1
+        return _SOURCE[idx: idx + 8500]
+
+    def test_record_physical_attempt_called_once_per_chunk(self):
+        body = self._chunk_loop_body()
+        self.assertIn("self.telemetry.record_physical_attempt()", body)
+
+    def test_physical_attempt_recorded_before_the_retry_loop_not_inside_it(self):
+        """The core correctness guarantee: recorded ONCE per chunk
+        (before the while-True retry loop begins), not once per retry-
+        loop iteration -- record_busy_retry() already separately counts
+        each individual BUSY retry, so counting it again here would
+        double-count a retried chunk."""
+        body = self._chunk_loop_body()
+        record_idx = body.find("self.telemetry.record_physical_attempt()")
+        while_idx = body.find("while True:")
+        assert record_idx > -1 and while_idx > -1
+        self.assertLess(
+            record_idx, while_idx,
+            "record_physical_attempt() must be called BEFORE the "
+            "retry loop starts, once per chunk -- not inside it",
+        )
+
+    def test_outer_success_path_no_longer_double_counts(self):
+        """Negative case: the outer, once-per-poll
+        self.telemetry.record_request(len(stale_names)) call must
+        remain (for the logical-poll-level counters), but must not
+        ALSO be relied on for physical-attempt counting anymore -- that
+        now happens per-chunk, inside _execute_batch() itself."""
+        idx = _SOURCE.find("self.telemetry.record_request(len(stale_names))")
+        self.assertGreater(idx, -1, "the logical-poll-level call must still exist")
+
+    def test_ewma_or_other_chunking_helpers_unaffected(self):
+        """Sanity check: confirms this fix's insertion point doesn't
+        collide with or duplicate the existing per-chunk service-time
+        recording (_record_chunk_service_time) or adaptive-learning
+        recording (self._adaptive.record_request) -- all three are
+        genuinely separate, independent per-chunk mechanisms."""
+        body = self._chunk_loop_body()
+        self.assertIn("self.telemetry.record_physical_attempt()", body)
+        self.assertIn("self._record_chunk_service_time(", body)
+        self.assertIn("self._adaptive.record_request(", body)

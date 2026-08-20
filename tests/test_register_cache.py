@@ -572,7 +572,33 @@ class TestNightMode(unittest.TestCase):
 
 # ── v2.0.11 (Phase 5.4): freshness-debt observability ────────────────────────
 
-class TestPhase54WorstOverdue(unittest.TestCase):
+class TestOptimization2StateRegistersMovedToSlow(unittest.TestCase):  # v2.0.13
+    """Optimization 2, this release -- field-data-driven (5.7h real
+    capture, cross-validated by two independent analyses): state_1/
+    state_2/state_3 (the second inverter's own status/fault registers)
+    measured a median service time of 2.63s, P95 9.4s, max 20.5s --
+    an extremely poor cost/freshness ratio at NORMAL tier's own ~30s
+    cadence. Moved to SLOW."""
+
+    def test_state_1_2_3_are_slow_tier(self):
+        for name in ("state_1", "state_2", "state_3"):
+            self.assertEqual(_classify(name), RegisterTier.SLOW)
+
+    def test_only_these_three_state_registers_moved_not_others(self):
+        """Negative case: confirms this override is narrowly scoped to
+        the exact three registers the field data measured, not a
+        broader 'state' substring match that could silently sweep in
+        unrelated registers."""
+        # A register merely containing "state" as a substring, but not
+        # one of the three exact overridden names, must be unaffected.
+        self.assertNotEqual(_classify("storage_working_state"), RegisterTier.SLOW)
+
+    def test_case_insensitive_like_every_other_override(self):
+        for name in ("STATE_1", "State_2", "sTaTe_3"):
+            self.assertEqual(_classify(name), RegisterTier.SLOW)
+
+
+
     """Phase 5.4, this release: worst_overdue() surfaces overdue_by()'s
     own value for the N most-stale registers, built because a real
     field investigation this project went through required manually

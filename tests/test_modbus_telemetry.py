@@ -164,19 +164,27 @@ class TestPhase1BusyRetryTelemetry(unittest.TestCase):
         before succeeding must show as exactly ONE logical attempt but
         THREE physical attempts (2 BUSY + 1 final success) -- previously
         this was entirely invisible, looking identical to a chunk that
-        succeeded on the first try."""
+        succeeded on the first try.
+
+        v2.0.13 (MOD-021, this release): record_physical_attempt() is
+        now called explicitly, matching the real call site in
+        _execute_batch() (once per chunk, not implicitly by
+        record_request()) -- see that method's own docstring."""
         t = _make()
+        t.record_physical_attempt()  # the chunk's own initial attempt
         t.record_busy_retry()
         t.record_busy_retry()
         t.record_request(batch_size=1)
         self.assertEqual(t.total_attempts, 1, "exactly one logical attempt")
-        self.assertEqual(t.total_physical_attempts, 3, "two BUSY + one success")
+        self.assertEqual(t.total_physical_attempts, 3, "one initial + two BUSY retries")
         self.assertEqual(t.total_busy_events, 2)
 
     def test_retry_amplification_computed_correctly(self):
         t = _make()
+        t.record_physical_attempt()
         t.record_busy_retry()
         t.record_request(batch_size=1)  # 1 logical, 2 physical so far
+        t.record_physical_attempt()
         t.record_request(batch_size=1)  # 2 logical, 3 physical
         snap = t.snapshot()
         self.assertEqual(snap["logical_attempts"], 2)
@@ -192,12 +200,27 @@ class TestPhase1BusyRetryTelemetry(unittest.TestCase):
         """Negative case: a request that never reached the physical bus
         at all (shed or admission timeout) must not inflate physical
         attempts -- only a genuine 'device' timeout (admitted, sent, no
-        response in time) represents a real wire transaction."""
+        response in time) represents a real wire transaction.
+
+        v2.0.13 (MOD-021, this release): record_timeout(kind="device")
+        no longer counts the physical attempt implicitly -- the caller
+        (_execute_batch(), or the optimizer coordinator's own explicit
+        call alongside this method) does. Confirms record_timeout()
+        alone, WITHOUT an explicit record_physical_attempt(), no longer
+        moves the counter at all -- the real behavioural change this
+        release makes."""
         t = _make()
         t.record_timeout(kind="queue_shed")
         t.record_timeout(kind="admission")
         self.assertEqual(t.total_physical_attempts, 0)
         t.record_timeout(kind="device")
+        self.assertEqual(
+            t.total_physical_attempts, 0,
+            "record_timeout(kind='device') alone must no longer "
+            "implicitly count a physical attempt -- the caller must "
+            "do so explicitly now",
+        )
+        t.record_physical_attempt()
         self.assertEqual(t.total_physical_attempts, 1)
 
     def test_logical_attempts_is_a_true_alias_for_total_attempts(self):
@@ -206,6 +229,27 @@ class TestPhase1BusyRetryTelemetry(unittest.TestCase):
         t.record_failure()
         snap = t.snapshot()
         self.assertEqual(snap["logical_attempts"], snap["total_attempts"])
+
+    def test_mod021_regression_record_request_alone_no_longer_inflates_physical(self):
+        """Direct regression test for MOD-021 itself: record_request()
+        called on its own (no explicit record_physical_attempt()) must
+        no longer move total_physical_attempts at all -- confirms the
+        implicit counting this whole fix removes is genuinely gone,
+        not just supplemented."""
+        t = _make()
+        t.record_request(batch_size=5)
+        self.assertEqual(
+            t.total_physical_attempts, 0,
+            "record_request() alone must not implicitly count a "
+            "physical attempt after this fix",
+        )
+        self.assertEqual(t.total_requests, 1, "the logical-poll counter is unaffected")
+
+    def test_mod021_regression_record_failure_alone_no_longer_inflates_physical(self):
+        t = _make()
+        t.record_failure()
+        self.assertEqual(t.total_physical_attempts, 0)
+        self.assertEqual(t.total_failures, 1, "the logical-poll counter is unaffected")
 
 
 # ── v2.0.3: F-03 -- failure-rate metric blind to timeout-only failures ──────
