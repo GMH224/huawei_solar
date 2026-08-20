@@ -70,7 +70,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 import logging
 import math
 import time
@@ -82,6 +82,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.storage import Store
+from homeassistant.util import dt as dt_util
 
 from .const import (
     ADAPTIVE_DECAY_FACTOR,
@@ -1053,14 +1054,34 @@ class AdaptiveModbusController:
         if self._first_data_date is None:
             return 0
         # BUG-7 FIX: clamp to 0 so clock-skew/drift never returns a negative value
-        return max(0, (date.today() - self._first_data_date).days + 1)
+        # v2.0.13 FIX (MOD-022, external ICS quality/defect/architecture
+        # audit -- confirmed): date.today() used the HOST's own naive
+        # local date, not Home Assistant's own configured timezone --
+        # see _current_slot_index()'s own comment for the full
+        # reasoning, identical here.
+        return max(0, (dt_util.now().date() - self._first_data_date).days + 1)
 
     # ── internal helpers ──────────────────────────────────────────────────────
 
     @staticmethod
     def _current_slot_index() -> int:
-        """Map the current wall-clock time to a slot index (0–95)."""
-        now = datetime.now()
+        """Map the current wall-clock time to a slot index (0–95).
+
+        v2.0.13 FIX (MOD-022, external ICS quality/defect/architecture
+        audit -- confirmed): previously used datetime.now() -- naive,
+        HOST-local wall-clock time, not Home Assistant's own configured
+        timezone. This controller's whole architecture is explicitly
+        circadian (learning conditions around sunrise, midday, sunset,
+        night transitions); if the host OS timezone doesn't match HA's
+        own configured timezone (common in a containerized/cloud
+        deployment defaulting to UTC regardless of the user's actual
+        location), every learned slot would be shifted by the timezone
+        offset, applying parameters learned for one local operating
+        period to a different one. dt_util.now() returns HA's own
+        configured local time, exactly the "local civil time" this
+        model is meant to key off of.
+        """
+        now = dt_util.now()
         return (now.hour * 60 + now.minute) // ADAPTIVE_SLOT_MINUTES
 
     @staticmethod
@@ -1280,7 +1301,10 @@ class AdaptiveModbusController:
         # future mutation to eventually trigger a save cycle that
         # includes it.
         if self._first_data_date is None:
-            self._first_data_date = date.today()
+            # v2.0.13 FIX (MOD-022, this release): see _current_slot_
+            # index()'s own comment for the full reasoning, identical
+            # here.
+            self._first_data_date = dt_util.now().date()
         while True:
             save_generation = self._generation
             await self._store.async_save(self._serialize())
@@ -1299,15 +1323,20 @@ class AdaptiveModbusController:
         )
 
     def _serialize(self) -> dict[str, Any]:
+        # v2.0.13 FIX (MOD-022, this release): computed once and reused
+        # below for both fallbacks -- see _current_slot_index()'s own
+        # comment for the full reasoning on why this is dt_util.now().
+        # date() rather than date.today().
+        _today = dt_util.now().date()
         return {
             "version": _STORAGE_VERSION,
             "data_schema": _DATA_SCHEMA_VERSION,
             "serial": self.serial_number,
-            "last_decay_date": (self._last_decay_date or date.today()).isoformat(),
+            "last_decay_date": (self._last_decay_date or _today).isoformat(),
             "learning_enabled": self.learning_enabled,
             "suppressed_observations": self.suppressed_observations,
             "settling_events": self.settling_events,
-            "first_data_date": (self._first_data_date or date.today()).isoformat(),
+            "first_data_date": (self._first_data_date or _today).isoformat(),
             "slots": {
                 str(i): s.to_dict()
                 for i, s in enumerate(self._slots)
@@ -1367,7 +1396,9 @@ class AdaptiveModbusController:
 
     def _apply_startup_decay(self) -> None:
         """Apply accumulated daily decay since the last save."""
-        today = date.today()
+        # v2.0.13 FIX (MOD-022, this release): see _current_slot_
+        # index()'s own comment for the full reasoning.
+        today = dt_util.now().date()
         if self._last_decay_date is None:
             self._last_decay_date = today
             return

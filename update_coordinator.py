@@ -889,6 +889,23 @@ class HuaweiSolarUpdateCoordinator(
                         await asyncio.sleep(BATCH_INTER_CHUNK_PAUSE.total_seconds())
 
                     busy_retries = 0
+                    # v2.0.13 FIX (MOD-021, external ICS quality/defect/
+                    # architecture audit -- confirmed): one real
+                    # physical wire transaction is about to be
+                    # attempted for THIS chunk -- recorded here,
+                    # unconditionally, before the outcome is known, so
+                    # it's counted regardless of whether this chunk
+                    # ultimately succeeds, times out, or fails outright.
+                    # Once per CHUNK, not once per retry-loop iteration
+                    # below -- record_busy_retry() already separately
+                    # counts each individual BUSY retry as its own
+                    # additional physical attempt, matching the audit's
+                    # own recommended model exactly: N chunks -> N
+                    # physical attempts (+ each BUSY retry). See
+                    # ModbusTelemetry.record_physical_attempt()'s own
+                    # docstring for the full reasoning.
+                    if self.telemetry:
+                        self.telemetry.record_physical_attempt()
                     while True:
                         try:
                             async with self.guard.request(label=self.name) as _req:
@@ -1867,6 +1884,12 @@ class HuaweiSolarOptimizerUpdateCoordinator(
         self._consecutive_failures += 1
         if self.telemetry:
             self.telemetry.record_failure()
+            # v2.0.13 FIX (MOD-021, this release): this coordinator
+            # has no chunking of its own (one optimizer read = one
+            # genuine physical attempt) -- explicit now that record_
+            # failure() no longer counts it implicitly. See ModbusTelemetry.
+            # record_request()'s own docstring for the full reasoning.
+            self.telemetry.record_physical_attempt()
         if self._adaptive:
             self._adaptive.record_request(0.0, success=False, timeout=False)
 
@@ -1891,6 +1914,11 @@ class HuaweiSolarOptimizerUpdateCoordinator(
                 async with asyncio.timeout(effective_timeout.total_seconds()):
                     if self.telemetry:
                         self.telemetry.record_request(1)
+                        # v2.0.13 FIX (MOD-021, this release): see
+                        # _record_optimizer_failure's own identical
+                        # fix, same reasoning -- one physical attempt,
+                        # no chunking on this coordinator's own path.
+                        self.telemetry.record_physical_attempt()
                     result = await self.device.get_latest_optimizer_history_data()
                 rtt_ms = (time.monotonic() - t0) * 1000
 
@@ -1924,6 +1952,15 @@ class HuaweiSolarOptimizerUpdateCoordinator(
                     self.telemetry.record_timeout(kind="admission")
                 else:
                     self.telemetry.record_timeout(kind="device")
+                    # v2.0.13 FIX (MOD-021, this release): only the
+                    # "device" kind represents a genuine physical
+                    # attempt (queue_shed/admission never reached the
+                    # bus at all -- matches record_timeout()'s own,
+                    # unchanged reasoning for excluding those two).
+                    # Explicit now that record_timeout() no longer
+                    # counts it implicitly for this non-chunked
+                    # coordinator's own path.
+                    self.telemetry.record_physical_attempt()
             if self._adaptive:
                 if is_shed:
                     # Internal contention — diagnostics only, never learning.

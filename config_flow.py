@@ -133,7 +133,40 @@ async def validate_serial_setup(port: str, unit_ids: list[int]) -> dict[str, Any
         }
 
         # Also validate the other slave-ids
+        # v2.0.13 FIX (NEW-002, external ICS quality/defect/architecture
+        # audit -- confirmed): each individual sub-device connection was
+        # already bounded (DEVICE_CONNECT_TIMEOUT), but the WHOLE loop
+        # had no aggregate deadline of its own -- an arbitrarily long,
+        # manually-supplied slave-ID list could therefore take roughly
+        # len(unit_ids) x DEVICE_CONNECT_TIMEOUT in the worst case,
+        # unbounded as a function of user input. _connect_to_discovered_
+        # devices() already received this exact protection for the
+        # newer auto-discovery path (DEF-006, this project's own
+        # earlier fix) -- this manual-entry path was missed at the
+        # time. Reuses the SAME DISCOVERY_TOTAL_TIMEOUT budget for
+        # consistency, rather than inventing a second, separately-tuned
+        # constant for what's genuinely the same kind of aggregate
+        # operation. Unlike DEF-006's own "skip gracefully" mechanism
+        # (built for a step with an existing partial-success UI path),
+        # this function already fails hard on any single sub-device
+        # failure -- a deadline overrun is therefore surfaced the same
+        # way, via the same DeviceException this function already
+        # raises for an individual connection failure, not a new
+        # partial-success path this function was never designed for.
+        loop_deadline = time.monotonic() + DISCOVERY_TOTAL_TIMEOUT.total_seconds()
         for slave_id in unit_ids[1:]:
+            if time.monotonic() >= loop_deadline:
+                _LOGGER.error(
+                    "Validation total timeout (%.0fs) reached with slave "
+                    "%s and %d further slave(s) still unvalidated",
+                    DISCOVERY_TOTAL_TIMEOUT.total_seconds(), slave_id,
+                    len(unit_ids) - unit_ids.index(slave_id) - 1,
+                )
+                raise DeviceException(
+                    f"Validation of slave IDs {unit_ids} exceeded the "
+                    f"overall {DISCOVERY_TOTAL_TIMEOUT.total_seconds():.0f}s "
+                    "configuration budget"
+                )
             try:
                 async with guard.request(label="config_flow_validation"):
                     slave_bridge = await asyncio.wait_for(
@@ -736,7 +769,25 @@ async def validate_network_setup(
         else:
             has_write_permission = elevated_permissions
 
+        # v2.0.13 FIX (NEW-002, external ICS quality/defect/architecture
+        # audit -- confirmed): same gap, same fix, as validate_serial_
+        # setup's own identical loop -- see that function's own comment
+        # for the full reasoning.
+        loop_deadline = time.monotonic() + DISCOVERY_TOTAL_TIMEOUT.total_seconds()
         for unit_id in unit_ids[1:]:
+            if time.monotonic() >= loop_deadline:
+                _LOGGER.error(
+                    "Validation total timeout (%.0fs) reached with unit "
+                    "%s and %d further unit(s) still unvalidated",
+                    DISCOVERY_TOTAL_TIMEOUT.total_seconds(), unit_id,
+                    len(unit_ids) - unit_ids.index(unit_id) - 1,
+                )
+                raise DeviceException(
+                    f"Validation of unit IDs {unit_ids} exceeded the "
+                    f"overall {DISCOVERY_TOTAL_TIMEOUT.total_seconds():.0f}s "
+                    "configuration budget",
+                    unit_id=unit_id,
+                )
             try:
                 async with guard.request(label="config_flow_validation"):
                     sub_device = await asyncio.wait_for(

@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import time as time_module
 from collections import deque
 from dataclasses import asdict, dataclass, field, replace
@@ -79,6 +80,19 @@ POWER_LIMIT_W = 15_750.0                              # 1.5 × 10.5 kW hw limit
 COUNTER_RESET_TOLERANCE_KWH = 1.0                     # decrease > this = reset
 
 SECONDS_PER_DAY = 86_400.0
+
+# v2.0.13 (BH-015, external ICS quality/defect/architecture audit --
+# confirmed): retired_pack_history (PackCapacityTracker) grows by one
+# entry per detected physical pack replacement, forever, with no
+# retention limit -- a genuine, if slow-growing, unbounded persistent-
+# state risk for a long-lived installation or a fleet deployment. A
+# real residential system sees at most a handful of replacements over
+# its whole service life; this bound is deliberately generous rather
+# than tight -- comfortably covers even an unusually replacement-heavy
+# multi-decade or multi-unit installation while still being a genuine,
+# enforced bound rather than no bound at all. A judgment call, not a
+# derived constant.
+MAX_RETIRED_PACK_HISTORY = 50
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1463,11 +1477,45 @@ class PackCapacityTracker:
         # above, not a fresh, unreasoned choice -- and matches this
         # project's own confirmed register map (no per-pack rated-
         # capacity register exists to read instead).
+        # v2.0.13 FIX (BH-014, external ICS quality/defect/architecture
+        # audit -- confirmed): the scaling below used to divide by
+        # pack_count -- the TOTAL pack count across ALL storage units
+        # (6 for a two-unit, 3-pack-each topology) -- against cfg.
+        # rated_capacity_kwh, which the comment just below already
+        # documents as representing ONE unit's own nameplate capacity,
+        # not the whole system's. For a two-unit installation this
+        # divided one unit's worth of capacity across BOTH units' own
+        # packs (20.7/6 ~= 3.45 kWh/pack) instead of each unit's own
+        # 20.7 kWh across its own 3 packs (20.7/3 ~= 6.9 kWh/pack) -- a
+        # healthy pack could read close to 200% SOH before the
+        # configured clip. Derived from slot_labels itself (parsing the
+        # "uNpM" format TOPO-01 already establishes) rather than
+        # importing PACK_COUNT from battery_health_manager.py, which
+        # would create a circular import (that module already imports
+        # FROM this one). Falls back to the whole pack_count (this
+        # class's own original, pre-fix behaviour) only when
+        # slot_labels don't parse as "uNpM" at all -- the plain
+        # "1".."pack_count" backward-compatible default this class's
+        # own __init__ docstring documents above, which represents a
+        # single unit and therefore needs no correction in the first
+        # place.
+        packs_per_unit = pack_count
+        if slot_labels:
+            unit_numbers: set[str] = set()
+            all_parsed = True
+            for label in slot_labels:
+                match = re.match(r"^u(\d+)p\d+$", label)
+                if match is None:
+                    all_parsed = False
+                    break
+                unit_numbers.add(match.group(1))
+            if all_parsed and unit_numbers:
+                packs_per_unit = max(1, pack_count // len(unit_numbers))
         pack_cfg = replace(
             cfg,
-            implied_capacity_min_kwh=cfg.implied_capacity_min_kwh / pack_count,
-            implied_capacity_max_kwh=cfg.implied_capacity_max_kwh / pack_count,
-            rated_capacity_kwh=cfg.rated_capacity_kwh / pack_count,
+            implied_capacity_min_kwh=cfg.implied_capacity_min_kwh / packs_per_unit,
+            implied_capacity_max_kwh=cfg.implied_capacity_max_kwh / packs_per_unit,
+            rated_capacity_kwh=cfg.rated_capacity_kwh / packs_per_unit,
         )
         self._pack_cfg = pack_cfg  # kept for rebuilding a tracker on replacement, below
         self.slot_labels: list[str] = (
@@ -1613,6 +1661,26 @@ class PackCapacityTracker:
                     "final_soh_capacity_pct": outgoing_soh,
                     "final_segment_count": len(outgoing_segments),
                     "final_reference_capacity_kwh": self.trackers[i].reference_capacity_kwh,
+                    # v2.0.13 FIX (found during this session's own
+                    # independent review, not either external audit):
+                    # the outgoing pack's own lifetime discharge total
+                    # was being silently discarded here -- the
+                    # DISCHARGE COUNTER gets replaced with a fresh,
+                    # zeroed one a few lines below, same as the
+                    # SegmentTracker already archived above, but this
+                    # ONE value was never captured first. Directly
+                    # warranty-relevant: Huawei's own actual warranty
+                    # terms are throughput-based (see warranty_
+                    # throughput_kwh's own comment above -- 28.84 MWh
+                    # to 60% retention for CH/EEA by default), so a
+                    # retired pack's own lifetime throughput is exactly
+                    # the number a claim about THAT SPECIFIC pack would
+                    # need. .value (not .last_raw) is deliberate --
+                    # offset-corrected for any counter-reset events
+                    # during the pack's own service life, the same
+                    # continuous lifetime total this class's own
+                    # ordinary per-tick tracking already uses.
+                    "final_lifetime_discharge_kwh": self._discharge_counters[i].value,
                     "first_segment_ts": (
                         min(s.start_ts for s in outgoing_segments)
                         if outgoing_segments else None
@@ -1630,6 +1698,11 @@ class PackCapacityTracker:
                     f"pack_{self.slot_labels[i]}_discharge"
                 )
                 self.pack_replaced_count[i] += 1
+                # v2.0.13 FIX (BH-015, this release): prune right after
+                # a new entry is archived -- the only point this state
+                # actually grows, so the natural, minimal-overhead place
+                # to bound it (not on every ordinary poll).
+                self._prune_retired_history_and_stale_serials()
             if pack.serial_number is not None:
                 self._last_serial[i] = pack.serial_number
                 # v2.0.12 (Battery Phase 5B, this release): setdefault,
@@ -1759,6 +1832,44 @@ class PackCapacityTracker:
         if serial is not None and serial in self.pack_first_detected:
             return self.pack_first_detected[serial], "first_detected"
         return None, "unknown"
+
+    def _prune_retired_history_and_stale_serials(self) -> None:
+        """v2.0.13 FIX (BH-015, external ICS quality/defect/architecture
+        audit -- confirmed): called once, right after a new replacement
+        is archived -- the only point this state actually grows, so the
+        natural place to bound it.
+
+        Two things, matching the audit's own recommended approach:
+        1. Trim retired_pack_history to the most recent
+           MAX_RETIRED_PACK_HISTORY entries (oldest dropped first).
+        2. Prune pack_first_detected/pack_install_dates down to
+           "currently relevant" serials only -- every serial in a LIVE
+           slot right now, plus every serial still referenced by a
+           RETAINED retired_pack_history entry (so the archive stays
+           self-consistent: if a retired pack's own summary is still
+           kept, its first-detected/install-date info remains
+           available alongside it). A serial belonging to an
+           already-pruned-away history entry has nothing left
+           referencing it and is safely removed.
+        """
+        if len(self.retired_pack_history) > MAX_RETIRED_PACK_HISTORY:
+            self.retired_pack_history = self.retired_pack_history[
+                -MAX_RETIRED_PACK_HISTORY:
+            ]
+
+        relevant_serials = {s for s in self._last_serial if s is not None}
+        relevant_serials.update(
+            entry["serial_number"] for entry in self.retired_pack_history
+            if entry.get("serial_number") is not None
+        )
+        self.pack_first_detected = {
+            s: ts for s, ts in self.pack_first_detected.items()
+            if s in relevant_serials
+        }
+        self.pack_install_dates = {
+            s: ts for s, ts in self.pack_install_dates.items()
+            if s in relevant_serials
+        }
 
     def soh_capacity_per_pack(self) -> list[tuple[float | None, dict[str, Any]]]:
         """One (soh_percent, attrs) pair per pack, same shape as
@@ -3152,14 +3263,31 @@ class BatteryHealthEngine:
         )
         pack_ages_days: list[float | None] = []
         pack_age_sources: list[str] = []
+        # v2.0.13 FIX (BH-016, external ICS quality/defect/architecture
+        # audit -- confirmed): this new list is the actual fix -- see
+        # its own comment below, right where date.py's own real gap
+        # was.
+        pack_install_timestamps: list[float | None] = []
         for i in range(len(self.pack_capacity.slot_labels)):
             ts, source = self.pack_capacity.effective_pack_install_ts(i)
             pack_ages_days.append(
                 round((now - ts) / SECONDS_PER_DAY, 1) if ts is not None else None
             )
             pack_age_sources.append(source)
+            # v2.0.13 FIX (BH-016, external ICS quality/defect/
+            # architecture audit -- confirmed): the RAW, unrounded
+            # timestamp, kept alongside pack_age_days above rather than
+            # replacing it (pack_age_days is still useful as a plain
+            # display figure). date.py's own install-date entity
+            # previously reconstructed a date from pack_age_days --
+            # already rounded to 1 decimal day above -- which loses up
+            # to +-72 minutes of precision and could display the wrong
+            # calendar day near a midnight boundary. date.py now binds
+            # directly to this raw value instead.
+            pack_install_timestamps.append(ts)
         r.attributes["pack_age_days"] = pack_ages_days
         r.attributes["pack_age_source"] = pack_age_sources
+        r.attributes["pack_install_ts"] = pack_install_timestamps
         r.attributes["pack_current_share_deviation_pct"] = (
             self.pack_capacity.current_share_deviation_pct()
         )

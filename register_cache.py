@@ -440,6 +440,31 @@ _TIER_OVERRIDES: dict[str, "RegisterTier"] = {
     "grid_accumulated_energy": RegisterTier.NORMAL,
     "inverter_total_energy_yield": RegisterTier.NORMAL,
     "inverter_total_absorbed_energy": RegisterTier.NORMAL,
+    # v2.0.13 (Optimization 2, this release -- field-data-driven,
+    # cross-validated by two independent analyses of the same real
+    # capture): state_1/state_2/state_3 (the second inverter's own
+    # status/fault registers) were classified NORMAL purely by falling
+    # through to the tier default -- no substring match, no deliberate
+    # decision ever made about them. A real 5.7h field capture measured
+    # this exact three-register group at a median service time of
+    # 2.63s, P95 9.4s, maximum 20.5s -- an extremely poor cost/
+    # freshness ratio for a status group being polled at the same
+    # ~30s-base cadence as instantaneous power values. NORMAL's own
+    # starvation-safety-net during back-off, and SLOW's own separate
+    # ceiling, both still apply -- this changes how often the value is
+    # considered fresh enough to skip a re-read under HEALTHY
+    # conditions, not whether it can ever go stale without limit.
+    #
+    # Judgment call, explicitly flagged as one rather than silently
+    # assumed safe: this project has no independent visibility into
+    # whether Huawei's own safety/control logic depends on sub-minute
+    # detection of a state_1/2/3 transition specifically. If that
+    # assumption turns out to be wrong for some fault/control path,
+    # this override should be reverted for the affected register(s)
+    # specifically, not the whole group.
+    "state_1": RegisterTier.SLOW,
+    "state_2": RegisterTier.SLOW,
+    "state_3": RegisterTier.SLOW,
 }
 
 

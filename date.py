@@ -20,7 +20,7 @@ previously have a date.py platform at all.
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from typing import TYPE_CHECKING
 
 from homeassistant.components.date import DateEntity
@@ -189,22 +189,27 @@ class HuaweiSolarPackInstallDateEntity(DateEntity):
         self.async_write_ha_state()
 
     def _apply(self, report: HealthReport) -> None:
-        ages_days = report.attributes.get("pack_age_days")
-        if ages_days is None or self._pack_index >= len(ages_days):
+        # v2.0.13 FIX (BH-016, external ICS quality/defect/architecture
+        # audit -- confirmed): the previous implementation reconstructed
+        # a date from pack_age_days -- already rounded to 1 decimal day
+        # by the engine before this entity ever saw it (see
+        # HealthReport's own comment on pack_install_ts, battery_
+        # health.py). My own original comment here claimed this
+        # "reproduces the same date effective_pack_install_ts() itself
+        # resolved" -- that was wrong: up to +-72 minutes of precision
+        # is lost through the rounding, which can genuinely display the
+        # wrong calendar day for a pack installed close to a UTC
+        # midnight boundary. Binds directly to the raw timestamp now,
+        # which the report exposes for exactly this reason.
+        timestamps = report.attributes.get("pack_install_ts")
+        if timestamps is None or self._pack_index >= len(timestamps):
             self._attr_native_value = None
             return
-        age_days = ages_days[self._pack_index]
-        if age_days is None:
+        ts = timestamps[self._pack_index]
+        if ts is None:
             self._attr_native_value = None
             return
-        # v2.0.12: age_days is derived FROM the effective install
-        # timestamp (now - install_ts), so reconstructing the date from
-        # "now minus age" reproduces the same date effective_pack_
-        # install_ts() itself resolved -- avoids a second call into
-        # PackCapacityTracker internals from this entity, reusing the
-        # value the report already computed and rounded once.
-        install_dt = datetime.now(timezone.utc).date()
-        self._attr_native_value = install_dt - timedelta(days=age_days)
+        self._attr_native_value = datetime.fromtimestamp(ts, tz=timezone.utc).date()
 
     async def async_set_value(self, value: date) -> None:
         """Set this pack's own explicit install date.

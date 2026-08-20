@@ -180,27 +180,72 @@ class ModbusTelemetry:
     # ── event recording (called from coordinators) ────────────────────────────
 
     def record_request(self, batch_size: int = 1) -> None:
-        """Record a successful Modbus request."""
+        """Record a successful Modbus request.
+
+        v2.0.13 FIX (MOD-021, external ICS quality/defect/architecture
+        audit -- confirmed): this used to also increment total_
+        physical_attempts here -- correct for a genuinely single-
+        transaction caller (e.g. the optimizer coordinator's own
+        record_request(1)), but the main coordinator's own
+        _execute_batch() can split ONE logical poll into several
+        physical batch_update() calls, and this method is only called
+        ONCE per poll regardless of chunk count -- undercounting real
+        wire transactions by up to (chunk_count - 1) for every
+        multi-chunk poll. Physical-attempt counting is now explicit
+        (record_physical_attempt(), called once per chunk from
+        _execute_batch() itself) rather than implicitly bundled into
+        this logical-poll-level method. Callers that make exactly one
+        physical attempt per logical request (the optimizer
+        coordinator) now call record_physical_attempt() explicitly
+        alongside this method, preserving their own already-correct
+        1:1 behaviour without this method silently doing it for them.
+        """
         now = time.monotonic()
         self._requests.append(now)
         self._attempts.append(now)
         self._batch_sizes.append(batch_size)
         self.total_requests += 1
         self.total_attempts += 1
-        # v2.0.9 (Phase 1.2, this release): the physical transaction that
-        # actually succeeded -- see total_physical_attempts' own
-        # __init__ comment for the logical-vs-physical distinction.
-        self.total_physical_attempts += 1
         self._evict(now)
 
+    def record_physical_attempt(self) -> None:
+        """v2.0.13 (MOD-021, external ICS quality/defect/architecture
+        audit -- confirmed): record ONE genuine physical wire
+        transaction -- a real batch_update(chunk) invocation that was
+        actually admitted and sent, regardless of its own outcome.
+
+        Deliberately a separate, explicit method rather than bundled
+        into record_request()/record_failure()/record_timeout() (see
+        each of their own docstrings) -- those are logical-poll-level
+        outcomes (once per poll, regardless of how many chunks that
+        poll needed), while THIS is the physical-transaction-level
+        counter the audit's own recommended model calls for:
+        `logical poll -> N chunks -> N physical attempts (+ each
+        BUSY retry)`. Called once per CHUNK from _execute_batch()'s
+        own per-chunk loop -- not once per retry-loop iteration within
+        a chunk, since record_busy_retry() already correctly counts
+        each retry as its own additional physical attempt separately
+        (confirmed directly against that method's own, pre-existing
+        implementation before this fix was designed, specifically to
+        avoid double-counting a retried chunk).
+        """
+        self.total_physical_attempts += 1
+
     def record_failure(self) -> None:
-        """Record a non-timeout failure."""
+        """Record a non-timeout failure.
+
+        v2.0.13 FIX (MOD-021, this release): see record_request()'s
+        own docstring for the full reasoning -- physical-attempt
+        counting moved to the explicit record_physical_attempt(),
+        called once per chunk by callers that chunk (_execute_batch())
+        and explicitly alongside this method by callers that don't
+        (the optimizer coordinator's own single-transaction path).
+        """
         now = time.monotonic()
         self._failures.append(now)
         self._attempts.append(now)
         self.total_failures += 1
         self.total_attempts += 1
-        self.total_physical_attempts += 1
         self._evict(now)
 
     def record_busy_retry(self) -> None:
@@ -256,13 +301,18 @@ class ModbusTelemetry:
         if kind == "device":
             self._device_timeouts.append(now)
             self.total_device_timeouts += 1
-            # v2.0.9 (Phase 1.2, this release): only "device" represents
-            # a genuine physical wire transaction that was actually
-            # admitted and sent -- "queue_shed" and "admission" both
-            # mean the request never reached the physical bus at all, so
-            # counting either as a physical attempt would overstate
-            # real wire traffic.
-            self.total_physical_attempts += 1
+            # v2.0.13 FIX (MOD-021, this release): total_physical_
+            # attempts no longer incremented here -- see record_
+            # request()'s own docstring for the full reasoning. A
+            # device timeout on the main coordinator's own chunked path
+            # is still one real physical attempt (the chunk WAS sent,
+            # it just never got a response in time) -- _execute_batch()
+            # already records that via record_physical_attempt() at the
+            # top of its own per-chunk loop, before the outcome is even
+            # known, so nothing is lost by removing it here. Callers
+            # with no chunking of their own (the optimizer coordinator)
+            # call record_physical_attempt() explicitly alongside this
+            # method instead.
         elif kind == "queue_shed":
             self._queue_sheds.append(now)
             self.total_queue_sheds += 1
