@@ -1540,7 +1540,11 @@ class TestPhase53ServiceTimeAwareChunking(unittest.TestCase):
         )
 
     def test_chunk_building_uses_service_aware_size_not_bare_constant(self):
-        idx = _SOURCE.find("for group in _address_group(sorted_names):")
+        # v2.0.14 (Battery Pack Physical Grouping study, this release):
+        # _address_group() is now called once per protected physical-
+        # group run, not once for the whole sorted_names list directly --
+        # updated to find the actual current call site.
+        idx = _SOURCE.find("for group in _address_group(protected_run):")
         assert idx > -1
         window = _SOURCE[idx: idx + 200]
         self.assertIn(
@@ -1632,3 +1636,190 @@ class TestMOD021PerChunkPhysicalAttemptCounting(unittest.TestCase):
         self.assertIn("self.telemetry.record_physical_attempt()", body)
         self.assertIn("self._record_chunk_service_time(", body)
         self.assertIn("self._adaptive.record_request(", body)
+
+
+# ── v2.0.14 (Battery Pack Physical Grouping study): protected groups ────────
+
+def _load_pure_battery_grouping_functions():
+    """Extract and exec ONLY physical_group_for() / _split_by_physical_
+    group() (plus their own suffix-set constants) in an isolated
+    namespace -- both are genuinely self-contained (stdlib only, no HA
+    or other internal-package imports), so this gives real execution
+    testing of the actual logic without needing this file's own full,
+    heavy import chain (adaptive_modbus, modbus_guard, etc.) that the
+    rest of this test file's own source-level-only convention exists
+    specifically to avoid.
+    """
+    start = _SOURCE.find("_PACK_DYNAMIC_SUFFIXES = frozenset({")
+    end = _SOURCE.find("\n\n\nclass HuaweiSolarUpdateCoordinator")
+    assert start > -1 and end > -1 and end > start
+    snippet = _SOURCE[start:end]
+    ns: dict = {"RegisterName": str}  # only used in a type annotation
+    exec(snippet, ns)
+    return ns["physical_group_for"], ns["_split_by_physical_group"]
+
+
+class TestBatteryPackPhysicalGroupingParsing(unittest.TestCase):
+    """physical_group_for() -- real execution against the actual
+    extracted function body, not just source pattern matching."""
+
+    @classmethod
+    def setUpClass(cls):
+        pgf, split = _load_pure_battery_grouping_functions()
+        cls.physical_group_for = staticmethod(pgf)
+        cls._split = staticmethod(split)
+
+    def test_dynamic_suffixes_grouped_together(self):
+        for suffix in ("working_status", "state_of_capacity",
+                       "charge_discharge_power", "voltage", "current"):
+            name = f"storage_unit_1_battery_pack_2_{suffix}"
+            self.assertEqual(self.physical_group_for(name), "BATTERY_PACK_u1p2_DYNAMIC")
+
+    def test_energy_suffixes_grouped_together(self):
+        for suffix in ("total_charge", "total_discharge"):
+            name = f"storage_unit_1_battery_pack_1_{suffix}"
+            self.assertEqual(self.physical_group_for(name), "BATTERY_PACK_u1p1_ENERGY")
+
+    def test_diagnostic_suffixes_grouped_together(self):
+        for suffix in ("soh_calibration_status", "maximum_temperature",
+                       "minimum_temperature", "serial_number"):
+            name = f"storage_unit_2_battery_pack_3_{suffix}"
+            self.assertEqual(self.physical_group_for(name), "BATTERY_PACK_u2p3_DIAGNOSTIC")
+
+    def test_different_packs_never_share_a_group_even_same_category(self):
+        """Adversarial: pack 1's own DYNAMIC group and pack 2's own
+        DYNAMIC group must be distinct ids -- they're not address-
+        adjacent to each other in the first place, and merging them
+        would be wrong even if it happened to be harmless today."""
+        g1 = self.physical_group_for("storage_unit_1_battery_pack_1_voltage")
+        g2 = self.physical_group_for("storage_unit_1_battery_pack_2_voltage")
+        self.assertNotEqual(g1, g2)
+
+    def test_different_units_never_share_a_group(self):
+        g1 = self.physical_group_for("storage_unit_1_battery_pack_1_voltage")
+        g2 = self.physical_group_for("storage_unit_2_battery_pack_1_voltage")
+        self.assertNotEqual(g1, g2)
+
+    def test_non_battery_register_is_unprotected(self):
+        self.assertIsNone(self.physical_group_for("active_power"))
+        self.assertIsNone(self.physical_group_for("storage_charge_discharge_power"))
+
+    def test_unit_level_battery_register_is_unprotected(self):
+        """Negative case: storage_unit_1_battery_temperature is unit-
+        level (no "_pack_" in the middle), must not be mistaken for a
+        per-pack register."""
+        self.assertIsNone(self.physical_group_for("storage_unit_1_battery_temperature"))
+
+    def test_unrecognized_pack_suffix_falls_through_unprotected(self):
+        """Negative case: a real pack-scoped register whose suffix isn't
+        in any of the three known sets must fall through to None
+        (ordinary address grouping), not be guessed into a category."""
+        self.assertIsNone(
+            self.physical_group_for("storage_unit_1_battery_pack_1_current_day_charge_capacity")
+        )
+
+    def test_malformed_names_do_not_raise(self):
+        for bad in ("battery_pack_", "storage_unit_battery_pack_1_voltage",
+                    "storage_unit_x_battery_pack_1_voltage", "", "battery_pack_1_voltage"):
+            try:
+                self.physical_group_for(bad)  # must not raise
+            except Exception as e:  # noqa: BLE001
+                self.fail(f"physical_group_for({bad!r}) raised {e!r}")
+
+
+class TestSplitByPhysicalGroup(unittest.TestCase):
+    """_split_by_physical_group() -- real execution, order-preservation,
+    and the specific guarantee this whole change exists for: a DYNAMIC
+    register and an ENERGY register for the same pack must never end up
+    in the same output run."""
+
+    @classmethod
+    def setUpClass(cls):
+        pgf, split = _load_pure_battery_grouping_functions()
+        cls.physical_group_for = staticmethod(pgf)
+        cls._split = staticmethod(split)
+
+    def test_empty_input(self):
+        self.assertEqual(self._split([]), [])
+
+    def test_single_name(self):
+        self.assertEqual(self._split(["active_power"]), [["active_power"]])
+
+    def test_dynamic_and_energy_for_same_pack_are_separate_runs(self):
+        """The core guarantee this change exists for."""
+        names = [
+            "storage_unit_1_battery_pack_1_working_status",
+            "storage_unit_1_battery_pack_1_state_of_capacity",
+            "storage_unit_1_battery_pack_1_charge_discharge_power",
+            "storage_unit_1_battery_pack_1_voltage",
+            "storage_unit_1_battery_pack_1_current",
+            "storage_unit_1_battery_pack_1_total_charge",
+            "storage_unit_1_battery_pack_1_total_discharge",
+        ]
+        runs = self._split(names)
+        self.assertEqual(len(runs), 2, f"expected exactly 2 runs, got {runs}")
+        self.assertEqual(len(runs[0]), 5)  # the 5 DYNAMIC registers
+        self.assertEqual(len(runs[1]), 2)  # the 2 ENERGY registers
+        # No cross-contamination.
+        dynamic_run_groups = {self.physical_group_for(n) for n in runs[0]}
+        energy_run_groups = {self.physical_group_for(n) for n in runs[1]}
+        self.assertEqual(dynamic_run_groups, {"BATTERY_PACK_u1p1_DYNAMIC"})
+        self.assertEqual(energy_run_groups, {"BATTERY_PACK_u1p1_ENERGY"})
+
+    def test_order_is_preserved_within_each_run(self):
+        names = [
+            "storage_unit_1_battery_pack_1_working_status",
+            "storage_unit_1_battery_pack_1_state_of_capacity",
+            "storage_unit_1_battery_pack_1_total_charge",
+        ]
+        runs = self._split(names)
+        self.assertEqual(runs[0], names[:2])
+        self.assertEqual(runs[1], [names[2]])
+
+    def test_unprotected_registers_stay_in_one_run_together(self):
+        """Negative case / non-regression: ordinary, non-battery
+        registers (physical_group_for -> None for all of them) must
+        remain a SINGLE run, exactly as _address_group() would have
+        received them directly before this change -- this must be a
+        complete no-op for every register outside the three protected
+        categories."""
+        names = ["active_power", "input_power", "grid_frequency"]
+        runs = self._split(names)
+        self.assertEqual(runs, [names])
+
+    def test_mixed_protected_and_unprotected_registers(self):
+        names = [
+            "active_power",
+            "storage_unit_1_battery_pack_1_voltage",
+            "storage_unit_1_battery_pack_1_total_charge",
+            "input_power",
+        ]
+        runs = self._split(names)
+        self.assertEqual(len(runs), 4)  # each one its own run -- all four differ
+
+    def test_two_packs_back_to_back_produce_separate_runs(self):
+        names = [
+            "storage_unit_1_battery_pack_1_voltage",
+            "storage_unit_1_battery_pack_2_voltage",
+        ]
+        runs = self._split(names)
+        self.assertEqual(len(runs), 2)
+
+
+class TestPhysicalGroupWiredIntoChunkBuilding(unittest.TestCase):
+    """Source-level check that the new split is genuinely wired into the
+    real chunk-building call site, matching this test file's own
+    established convention for the surrounding coordinator class (which
+    has heavy HA/internal-package dependencies unsuitable for the
+    isolated-exec approach used above)."""
+
+    def test_address_group_is_called_once_per_protected_run(self):
+        idx = _SOURCE.find("for protected_run in _split_by_physical_group(sorted_names):")
+        self.assertGreater(idx, -1)
+        window = _SOURCE[idx: idx + 300]
+        self.assertIn("for group in _address_group(protected_run):", window)
+
+    def test_service_aware_chunking_still_applied_after_the_split(self):
+        idx = _SOURCE.find("for protected_run in _split_by_physical_group(sorted_names):")
+        window = _SOURCE[idx: idx + 400]
+        self.assertIn("_chunk(group, self._service_aware_chunk_size(group))", window)
