@@ -146,6 +146,11 @@ def _make_ctrl() -> AdaptiveModbusController:
     ctrl._bus_health_pct = None
     ctrl._coalesce_events = 0
     ctrl._coalesced_registers = 0
+    # v2.0.15 (experimental identification release): _make_ctrl() bypasses
+    # __init__ entirely, so this needs setting explicitly, matching
+    # __init__'s own default -- same class of gap hit repeatedly this
+    # session for every object.__new__()-based test fixture.
+    ctrl._excitation = None
     return ctrl
 
 
