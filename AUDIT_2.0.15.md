@@ -1,0 +1,68 @@
+# huawei_solar 2.0.15 — Release Audit
+
+**Scope:** Experimental identification release. Adds a bounded, deterministic, opt-in GAP/POLL excitation schedule so a future capture can causally test what this session's own load-based controller design (`adaptive_controller_design.md`) could previously only support with observational, non-causal evidence.
+
+**This is explicitly not a production optimization.** Its entire purpose is generating a better-excited dataset — see `excitation_controller.py`'s own module docstring for the full reasoning chain from three uploaded source documents through to this implementation.
+
+**Final verification:** 1,307 passed, 1 skipped — confirmed identically from a fresh, independent extraction of `huawei_solar-2.0.15.zip`, matching the established pre-existing baseline (5 failed / 12 errored, documented since 2.0.7) with zero new regressions. 1,307 = 1,262 (2.0.14 baseline) + 35 (`ExcitationController` tests) + 10 (service-handler tests), exactly.
+
+---
+
+## Background — three independently-verified source documents
+
+Before any code was written, three uploaded analysis documents (`Controller_Redesign_Exact_GAP_TIMEOUT_POLL_Data_Findings.md`, `Adaptive_Modbus_Controller_Experimental_Identification_Release.md`, `ICS_Evidence_Based_Modbus_Telemetry_Analysis_and_Estimator_Design.md`) were checked against the actual 42h capture (`tel_mod_40h_2-0-14(1).zip`) they claimed to analyze. Every checkable headline number — transaction counts, per-device GAP/TIMEOUT/POLL distributions, unique-value counts, medians, error rates, service-time percentiles, unique source+signature classes — was independently recomputed and matched exactly. This gave high confidence in the documents' own field evidence before any of it was acted on.
+
+The core finding these documents establish, and this release exists to fix: across every capture analyzed this project (2.0.12 through 2.0.14, ~90h combined), POLL_INTERVAL sat at its 60s cold-start value 75-98% of the time and GAP was pinned at its 500ms ceiling 46-98% of the time depending on device. Without deliberate variation in these two inputs, `adaptive_controller_design.md`'s own Section 8 (the excitation experiment it flagged as unvalidatable from existing data) remains a hypothesis consistent with observation, not something causally tested. TIMEOUT, by contrast, already showed real natural variation (15-60s, 37-46 distinct values) and is deliberately *not* excited by this release — see below.
+
+## What was implemented
+
+**`excitation_controller.py`** (new module) — `ExcitationController` runs a fixed, reproducible, two-mode schedule: GAP first (150/325/500ms, spanning the existing validated `ADAPTIVE_GAP_MIN`/`MAX` envelope), then POLL (30/60/90/120s, deliberately the narrower 30-120s subset already agreed safe in `IMM_V2_Controller_V1_spec.md`'s own hard bounds, not the full 20-180s envelope this release has no prior safety basis for widening into). Single-input-first discipline is structural, not just documented: the schedule type itself only ever varies one field at a time, matching the uploaded documents' own explicit argument against simultaneous multi-input changes (confounding which input caused an observed effect).
+
+**TIMEOUT is deliberately excluded from excitation** — it already has usable natural variation, and this session's own earlier simulation work (`adaptive_controller_design.md` Section 7.1) found several register classes need timeout ≥25-35s to avoid spurious timeouts. Per explicit confirmation, this release's own safety floor for TIMEOUT is set to 30s (`EXCITATION_TIMEOUT_FLOOR_S`) as a blanket protection against a future schedule revision reintroducing that already-fixed regression, even though no schedule in this release commands TIMEOUT at all.
+
+**Go/no-go safety monitor** (`_GoNoGoMonitor`), not a blind calendar: each level requires both a minimum dwell time (4h) and minimum transaction count (200) before the schedule advances, and is continuously checked against a rolling 100-transaction window for error rate >5% or timeout rate >3%. A breach halts the schedule (reverts every param to normal, adaptive behavior) and does **not** auto-resume — `resume_after_halt()` is a separate, explicit, logged call, matching the "no rollercoaster deployment" requirement this release was commissioned under directly. Resuming restarts the breaching mode from its own first level, not the level that breached, so a breach is never silently re-attempted unchanged.
+
+**The existing transition-detection safety net is never overridden.** `ExcitationController.apply()` takes `in_transition` as an explicit parameter and returns the unmodified base params whenever it's true, regardless of excitation state — an active fault condition is never treated as an excitation opportunity.
+
+**Opt-in only.** `enable_excitation()`/`disable_excitation()` on `AdaptiveModbusController`; `_excitation` defaults to `None`. Every existing deployment upgrading to 2.0.15 sees zero behavior change unless excitation is explicitly turned on. Enabling it also disables learning for the duration (`set_learning_enabled(False)`) so deliberately-perturbed GAP/POLL values are never fed back into the slot-level statistics that drive normal behavior — this release exists to collect data about the plant's own response, not to let the existing learner treat excitation as its own learned conclusion.
+
+**Persistence** mirrors the existing `Store`-based mechanism exactly: excitation state (mode, level position, halt status) is serialized only when excitation was ever enabled (omitted entirely from the stored payload otherwise, keeping pre-2.0.15 deployments' own storage format unchanged). Transaction counts and the go/no-go window are deliberately *not* persisted — a restart mid-experiment should not let pre-restart transactions silently satisfy this run's own count requirement.
+
+## User-facing control — the piece originally missing
+
+The initial implementation shipped `enable_excitation()`/`disable_excitation()` as methods on `AdaptiveModbusController` with no way for a user to actually call them — a real gap, caught only when asked directly "where do I find that." Fixed by adding three proper Home Assistant services, registered unconditionally per-inverter (not gated on battery presence, matching how `reset_maximum_feed_grid_power` and similar generic inverter services already work in this file):
+
+- **`huawei_solar.enable_excitation`** — starts the schedule for one inverter device
+- **`huawei_solar.disable_excitation`** — stops it, discards progress, re-enables learning
+- **`huawei_solar.resume_excitation_after_halt`** — the explicit, human-initiated recovery from a go/no-go halt; deliberately a separate service from "enable", not a parameter on it, so a reviewer can't resume by reflexively re-calling the same service they used to start
+
+Two clean public methods (`excitation_is_enabled()`, `excitation_is_halted()`) were added to `AdaptiveModbusController` after the service handler was first caught reaching into the private `_excitation` field directly — fixed before any test was written, by re-reading the diff.
+
+**A real bug caught before testing**: `excitation_is_halted()` initially referenced `ExcitationMode.HALTED` without importing it in `adaptive_modbus.py`'s own scope (the module only has a deferred import inside `enable_excitation()`, to avoid the circular import with `excitation_controller.py`). Fixed by comparing against the enum's own string value (`"HALTED"`) instead of adding a second deferred import for one boolean check.
+
+**Two pre-existing, unrelated gaps found and documented, not fixed** (out of scope for this addition, but worth recording since they were found in the course of placing these new services correctly):
+- `SERVICE_SET_PACK_INSTALL_DATE` is registered and present in `const.py::SERVICES`, but missing from `services.py::_ALL_SERVICE_NAMES` (the list actually used for unregistration on integration unload) — meaning that specific service may not be cleaned up correctly today.
+- `SERVICE_SET_PACK_INSTALL_DATE`'s own UI strings exist in `strings.json` but are entirely absent from `translations/en.json` — the file HA actually loads for the English locale at runtime — meaning that service has had no UI labels in practice since 2.0.12. A related test (`test_all_services_in_services_py_covered` in `test_const_services.py`) searches for a variable named `ALL_SERVICES` and would have caught the first gap, but a second, unrelated variable of that exact name happens to already exist in `services.py` (defined, but never used anywhere at runtime) — so the test passes without ever checking the list it was actually meant to check. This session's own three new services were added to all three lists correctly, but neither pre-existing gap was fixed, since both are unrelated to this addition's own scope.
+
+
+
+Wiring the go/no-go monitor into `record_request()` initially placed it *after* the existing `learning_active()` early-return. Since `enable_excitation()` disables learning for the excitation duration, this would have silently starved the one safety mechanism this release depends on of the data it needs — the exact opposite of the intended behavior. Caught before any test run by re-reading the method's own control flow, not by a failing test; moved the recording call to before the early-return with an explicit comment explaining why the ordering matters.
+
+## A real regression found and fixed via testing
+
+Adding the `_excitation` field to `AdaptiveModbusController.__init__` broke `_make_ctrl()`, a test helper in `test_adaptive_modbus.py` that bypasses `__init__` entirely via `object.__new__()` and sets every field manually — a pattern already used, and already required updating, for every prior field added to this class across the project's history (five separate prior instances, each with its own comment noting the same gap). This one was missed initially and caused 52 spurious failures across files that don't touch `AdaptiveModbusController` at all (collection-order artifacts of the same kind documented since 2.0.7). Fixed with one line in the existing helper, matching its own established comment convention; confirmed back to the exact known baseline (5 failed/12 errors) afterward.
+
+## Testing
+
+35 new tests in `test_excitation_controller.py`, using real execution against the actual module rather than source-level pattern matching — `ExcitationController` and its helpers are genuinely self-contained (stdlib + `AdaptiveParams` only), matching the same real-execution convention already established for `physical_group_for()`/`_split_by_physical_group()` in `test_update_coordinator.py`.
+
+Coverage: full lifecycle (start state, override application, advancement within and across modes, reaching `COMPLETE`, `COMPLETE` behaving identically to no-override); the safety-critical go/no-go path most thoroughly (error-rate breach, timeout-rate breach, incomplete-window never judged early, halted state applies no override and does not auto-advance or auto-resume even under a long run of clean outcomes afterward, explicit resume restarting at level zero not the breaching level); persistence round-trips including malformed-data recovery and out-of-range clamping, and the deliberate choice not to trust transaction counts across a restart; telemetry snapshot correctness including the adversarial case of a transition override needing to show `None` for the applied value rather than a stale prior one. A separate `TestDefaultScheduleSafety` class checks the actual shipped schedule directly — every GAP level within the existing validated envelope, every POLL level within the agreed 30-120s subset, no TIMEOUT excitation mode present, GAP sequenced before POLL — so a future edit to the schedule that reintroduces a fixed danger fails a test automatically rather than depending on review catching it.
+
+## Final verification
+
+- Every file in the packaged `huawei_solar-2.0.15.zip` compiles cleanly; `strings.json`, `translations/en.json`, and `services.yaml` all validate.
+- Full suite, run from a **fresh, independent extraction** of that exact zip: **1,297 passed, 1 skipped**, matching the working tree and the established pre-existing baseline exactly — zero drift, zero new regressions.
+
+## What comes next
+
+Deploy with `enable_excitation()` called explicitly (not automatic) and run for the planned 2-4 days. The go/no-go monitor is expected to keep the schedule safe unmonitored, but per the "no rollercoaster" requirement, a halt should be reviewed by a person before calling `resume_after_halt()`, not treated as something to script around. Once the schedule reaches `COMPLETE` (or is deliberately stopped), the resulting capture is what turns `adaptive_controller_design.md`'s Section 8 excitation experiment from a documented gap into an actual causal test — that analysis, not this release, is where the real controller decision gets made.

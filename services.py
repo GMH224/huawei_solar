@@ -33,17 +33,21 @@ from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import device_registry as dr
 import homeassistant.helpers.config_validation as cv
 
+from .adaptive_modbus import AdaptiveModbusController
 from .battery_health_manager import BatteryHealthManager
 
 from .const import (
     CONF_ENABLE_PARAMETER_CONFIGURATION,
     DATA_DEVICE_DATAS,
     DOMAIN,
+    SERVICE_DISABLE_EXCITATION,
+    SERVICE_ENABLE_EXCITATION,
     SERVICE_FORCIBLE_CHARGE,
     SERVICE_FORCIBLE_CHARGE_SOC,
     SERVICE_FORCIBLE_DISCHARGE,
     SERVICE_FORCIBLE_DISCHARGE_SOC,
     SERVICE_RESET_MAXIMUM_FEED_GRID_POWER,
+    SERVICE_RESUME_EXCITATION_AFTER_HALT,
     SERVICE_SET_CAPACITY_CONTROL_PERIODS,
     SERVICE_SET_DI_ACTIVE_POWER_SCHEDULING,
     SERVICE_SET_FIXED_CHARGE_PERIODS,
@@ -65,11 +69,14 @@ from .types import (
 )
 
 ALL_SERVICES = [
+    SERVICE_DISABLE_EXCITATION,
+    SERVICE_ENABLE_EXCITATION,
     SERVICE_FORCIBLE_CHARGE,
     SERVICE_FORCIBLE_CHARGE_SOC,
     SERVICE_FORCIBLE_DISCHARGE,
     SERVICE_FORCIBLE_DISCHARGE_SOC,
     SERVICE_RESET_MAXIMUM_FEED_GRID_POWER,
+    SERVICE_RESUME_EXCITATION_AFTER_HALT,
     SERVICE_SET_CAPACITY_CONTROL_PERIODS,
     SERVICE_SET_DI_ACTIVE_POWER_SCHEDULING,
     SERVICE_SET_FIXED_CHARGE_PERIODS,
@@ -285,6 +292,81 @@ async def set_pack_install_date(service_call: ServiceCall) -> None:
     # drift out of sync by each reimplementing the same three steps
     # separately.
     bh_manager.set_pack_install_date(serial, install_ts)
+
+
+def _get_adaptive_controller_for_call(service_call: ServiceCall) -> AdaptiveModbusController:
+    """Resolve the AdaptiveModbusController for the inverter device_id in
+    the service call.
+
+    v2.0.15 (experimental identification release): GAP and POLL are
+    per-device adaptive quantities (see excitation_controller.py's own
+    ExcitationController docstring for why a shared instance across
+    devices would be wrong), so every excitation service call targets
+    one specific inverter device_id, exactly like every other
+    single-device service in this file (get_inverter_data,
+    get_battery_device_data).
+    """
+    dd = get_inverter_data(service_call)
+    ctrl = AdaptiveModbusController.get(dd.device.serial_number)
+    if ctrl is None:
+        raise ServiceValidationError(
+            translation_domain=DOMAIN,
+            translation_key="adaptive_controller_not_found",
+            translation_placeholders={"device_id": service_call.data[DATA_DEVICE_ID]},
+        )
+    return ctrl
+
+
+async def enable_excitation(service_call: ServiceCall) -> None:
+    """v2.0.15 (experimental identification release): start the bounded,
+    deterministic GAP/POLL excitation schedule for one inverter device.
+
+    See AdaptiveModbusController.enable_excitation()'s own docstring for
+    the full effects (learning is disabled for the duration; excitation
+    state persists across restarts once started). This is a deliberate,
+    explicit, human-initiated action -- there is no automatic trigger for
+    this anywhere in the integration, matching the "no rollercoaster
+    deployment" requirement this release was built under.
+    """
+    ctrl = _get_adaptive_controller_for_call(service_call)
+    ctrl.enable_excitation()
+
+
+async def disable_excitation(service_call: ServiceCall) -> None:
+    """v2.0.15: stop excitation for one inverter device and re-enable
+    normal adaptive learning. See AdaptiveModbusController.disable_
+    excitation()'s own docstring -- this discards schedule progress
+    rather than pausing it; calling enable_excitation() again starts a
+    fresh schedule from the beginning.
+    """
+    ctrl = _get_adaptive_controller_for_call(service_call)
+    ctrl.disable_excitation()
+
+
+async def resume_excitation_after_halt(service_call: ServiceCall) -> None:
+    """v2.0.15: explicit, human-initiated recovery from a go/no-go safety
+    halt for one inverter device.
+
+    Deliberately a SEPARATE service from enable_excitation(), not a
+    parameter on it -- resuming after a halt is a fundamentally different
+    action from starting fresh (it restarts the mode that breached safety
+    thresholds from its own first level, not from wherever it stopped;
+    see ExcitationController.resume_after_halt()'s own docstring), and a
+    reviewer deciding whether to resume should not be able to do so by
+    reflexively re-calling the same "start" service they used originally.
+    A no-op (not an error) if the controller is not currently halted --
+    see ExcitationController.resume_after_halt()'s own docstring for why
+    that is the correct behavior here, not something this handler needs
+    to special-case.
+    """
+    ctrl = _get_adaptive_controller_for_call(service_call)
+    if not ctrl.excitation_is_enabled():
+        raise ServiceValidationError(
+            translation_domain=DOMAIN,
+            translation_key="excitation_not_enabled",
+            translation_placeholders={"device_id": service_call.data[DATA_DEVICE_ID]},
+        )
+    ctrl.resume_excitation_after_halt()
 
 
 @callback
@@ -617,6 +699,15 @@ _ALL_SERVICE_NAMES: tuple[str, ...] = (
     SERVICE_SET_TOU_PERIODS,
     SERVICE_SET_CAPACITY_CONTROL_PERIODS,
     SERVICE_SET_FIXED_CHARGE_PERIODS,
+    # v2.0.15 (experimental identification release): added here
+    # deliberately, unlike SERVICE_SET_PACK_INSTALL_DATE just above,
+    # which is registered (see its own hass.services.async_register call
+    # further down) but was never added to this specific tuple -- a
+    # pre-existing gap from an earlier release, out of scope to fix here,
+    # but not one to repeat for these three new services.
+    SERVICE_ENABLE_EXCITATION,
+    SERVICE_DISABLE_EXCITATION,
+    SERVICE_RESUME_EXCITATION_AFTER_HALT,
 )
 
 
@@ -1325,6 +1416,34 @@ async def async_setup_services(
         DOMAIN,
         SERVICE_RESET_MAXIMUM_FEED_GRID_POWER,
         reset_maximum_feed_grid_power,
+        schema=INVERTER_DEVICE_SCHEMA,
+    )
+
+    # v2.0.15 (experimental identification release): registered
+    # unconditionally, same reasoning as SERVICE_RESET_MAXIMUM_FEED_GRID_
+    # POWER just above -- GAP/POLL excitation is a per-inverter adaptive
+    # Modbus concern, not gated on battery presence (has_battery) or any
+    # other device-kind condition. INVERTER_DEVICE_SCHEMA (DATA_DEVICE_ID
+    # only) is correct here: _get_adaptive_controller_for_call() ->
+    # get_inverter_data() already rejects a non-SUN2000Device target via
+    # its own existing wrong_device_type check, so no separate schema is
+    # needed to enforce that.
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_ENABLE_EXCITATION,
+        enable_excitation,
+        schema=INVERTER_DEVICE_SCHEMA,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_DISABLE_EXCITATION,
+        disable_excitation,
+        schema=INVERTER_DEVICE_SCHEMA,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_RESUME_EXCITATION_AFTER_HALT,
+        resume_excitation_after_halt,
         schema=INVERTER_DEVICE_SCHEMA,
     )
 

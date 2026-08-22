@@ -1155,6 +1155,9 @@
     }
   },
   "exceptions": {
+    "adaptive_controller_not_found": {
+      "message": "No adaptive Modbus controller found for device: {device_id}"
+    },
     "battery_health_not_enabled": {
       "message": "Battery health is not enabled for device: {device_id}"
     },
@@ -1163,6 +1166,9 @@
     },
     "entry_not_loaded": {
       "message": "Entry not loaded: {entry}"
+    },
+    "excitation_not_enabled": {
+      "message": "Excitation is not enabled for device: {device_id}. Call enable_excitation first."
     },
     "ha_device_not_found": {
       "message": "Could not retrieve Huawei Solar device associated with ID {device_id}"
@@ -1367,6 +1373,36 @@
         }
       },
       "name": "Set battery pack install date"
+    },
+    "enable_excitation": {
+      "description": "v2.0.15 experimental identification release: start the bounded, deterministic GAP/POLL excitation schedule for this inverter. Not a production optimization -- generates data for a future capture. Disables normal adaptive learning for the duration. See the integration's own release notes for the full design and safety bounds before using.",
+      "fields": {
+        "device_id": {
+          "description": "The inverter to run the excitation schedule on",
+          "name": "Inverter"
+        }
+      },
+      "name": "Enable Modbus excitation (experimental)"
+    },
+    "disable_excitation": {
+      "description": "Stop the excitation schedule for this inverter and re-enable normal adaptive learning. Discards schedule progress -- enabling again starts a fresh schedule from the beginning.",
+      "fields": {
+        "device_id": {
+          "description": "The inverter to stop the excitation schedule on",
+          "name": "Inverter"
+        }
+      },
+      "name": "Disable Modbus excitation"
+    },
+    "resume_excitation_after_halt": {
+      "description": "Resume the excitation schedule after it was automatically halted by the go/no-go safety monitor. Review the halt reason (see the device's own diagnostics) before resuming. Restarts the mode that halted from its own first level, not from where it stopped. Does nothing if excitation is enabled but not currently halted.",
+      "fields": {
+        "device_id": {
+          "description": "The inverter whose halted excitation schedule should resume",
+          "name": "Inverter"
+        }
+      },
+      "name": "Resume Modbus excitation after safety halt"
     },
     "stop_forcible_charge": {
       "description": "Cancel the running forcible charge command",

@@ -271,6 +271,18 @@ SERVICE_SET_FIXED_CHARGE_PERIODS = "set_fixed_charge_periods"
 # own docstring (services.py).
 SERVICE_SET_PACK_INSTALL_DATE = "set_pack_install_date"
 
+# v2.0.15 (experimental identification release): control services for the
+# opt-in GAP/POLL excitation schedule -- see excitation_controller.py's
+# own module docstring for the full design. Deliberately three separate
+# services rather than one with a mode parameter: enable/disable/resume
+# are conceptually distinct actions with different prerequisites (resume
+# only makes sense after a halt), and separate services let each get its
+# own clear description and validation in the HA services UI rather than
+# a single service whose behavior depends on an opaque mode string.
+SERVICE_ENABLE_EXCITATION = "enable_excitation"
+SERVICE_DISABLE_EXCITATION = "disable_excitation"
+SERVICE_RESUME_EXCITATION_AFTER_HALT = "resume_excitation_after_halt"
+
 SERVICES = (
     SERVICE_FORCIBLE_CHARGE,
     SERVICE_FORCIBLE_DISCHARGE,
@@ -291,6 +303,11 @@ SERVICES = (
     # unregistered on integration unload, a genuine (if minor) resource
     # leak this test exists specifically to prevent.
     SERVICE_SET_PACK_INSTALL_DATE,
+    # v2.0.15 (experimental identification release): see these constants'
+    # own comment above for why three separate services rather than one.
+    SERVICE_ENABLE_EXCITATION,
+    SERVICE_DISABLE_EXCITATION,
+    SERVICE_RESUME_EXCITATION_AFTER_HALT,
 )
 
 # ── Adaptive Modbus learning ──────────────────────────────────────────────────

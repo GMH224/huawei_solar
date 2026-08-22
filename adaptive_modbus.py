@@ -508,6 +508,14 @@ class AdaptiveModbusController:
         self._bus_wait_p95: float = 0.0
         self._bus_service_p95: float = 0.0
         self._bus_requests_waited: int = 0
+        # v2.0.15 (experimental identification release): opt-in only,
+        # None unless explicitly enabled via enable_excitation(). Existing
+        # deployments upgrading to 2.0.15 see NO behavior change unless
+        # this is turned on deliberately -- see enable_excitation()'s own
+        # docstring. Deferred import to avoid a circular import with
+        # excitation_controller.py, which itself imports AdaptiveParams
+        # from this module.
+        self._excitation: Any | None = None
         self._bus_total_wait_s: float = 0.0
         # v2.0.11 (Phase 5.2, this release): see note_bus_metrics()'s
         # own comment. None until the coordinator has pushed at least
@@ -682,6 +690,13 @@ class AdaptiveModbusController:
         • The current 15-minute time slot's historical failure rate and RTT.
         • Whether a state transition is currently active.
         • Blending with a conservative baseline when slot confidence is low.
+
+        v2.0.15: if excitation is enabled (see enable_excitation()), the
+        normally-derived params above are further overridden for GAP or
+        POLL per the active excitation schedule -- see
+        ExcitationController.apply() for the full precedence rules,
+        chiefly that an active transition always overrides excitation,
+        never the other way around.
         """
         now_mono = time.monotonic()
         if self._in_transition and now_mono > self._transition_expires:
@@ -689,7 +704,11 @@ class AdaptiveModbusController:
 
         slot_idx = self._current_slot_index()
         slot = self._slots[slot_idx]
-        return self._derive_params(slot, slot_idx, self._in_transition)
+        params = self._derive_params(slot, slot_idx, self._in_transition)
+        if self._excitation is not None:
+            self._excitation.maybe_advance()
+            params = self._excitation.apply(params, self._in_transition)
+        return params
 
     def learning_active(self) -> bool:
         """True when it is safe to learn from observations."""
@@ -718,6 +737,95 @@ class AdaptiveModbusController:
                 "using the current parameters.",
                 self.serial_number,
             )
+
+    def enable_excitation(self) -> None:
+        """v2.0.15 (experimental identification release): opt-in only.
+
+        Enabling this has two effects, both deliberate:
+          1. get_params() begins applying the GAP/POLL excitation schedule
+             from excitation_controller.py on top of its otherwise-normal
+             output, subject to the existing in_transition safety net
+             always winning (see ExcitationController.apply).
+          2. Learning is disabled for the duration (via
+             set_learning_enabled(False)) so the deliberately-perturbed
+             GAP/POLL values during excitation do not themselves get fed
+             back into the slot-level statistics that drive NORMAL
+             behavior -- this release exists to COLLECT data about the
+             plant's own response, not to let the existing learner treat
+             artificially excited values as if they were its own learned
+             conclusions.
+
+        Calling this on an already-enabled controller is a no-op.
+        Excitation state, once enabled, persists across restarts (see
+        _load()/_schedule_save() below) exactly like every other piece of
+        this controller's own state.
+        """
+        if self._excitation is not None:
+            return
+        from .excitation_controller import ExcitationController  # deferred: avoids circular import
+        self._excitation = ExcitationController()
+        self.set_learning_enabled(False)
+        _LOGGER.warning(
+            "AdaptiveModbus[%s]: EXCITATION ENABLED (v2.0.15 experimental "
+            "identification release). Learning is now disabled for the "
+            "duration. GAP and POLL will follow the deliberate excitation "
+            "schedule, not the normal adaptive controller, except during "
+            "an active transition. See excitation_controller.py for the "
+            "full schedule and safety bounds.",
+            self.serial_number,
+        )
+
+    def disable_excitation(self) -> None:
+        """Explicit, human-initiated stop -- does not happen automatically
+        on any timer. Re-enables learning. Excitation progress (which
+        level/mode had been reached) is discarded, not paused -- calling
+        enable_excitation() again starts a fresh schedule from the
+        beginning, since resuming a partially-run schedule after an
+        unknown-duration gap is not something this release's own go/no-go
+        design was built to reason about safely.
+        """
+        if self._excitation is None:
+            return
+        self._excitation = None
+        self.set_learning_enabled(True)
+        _LOGGER.warning(
+            "AdaptiveModbus[%s]: excitation disabled, learning re-enabled.",
+            self.serial_number,
+        )
+
+    def excitation_is_halted(self) -> bool:
+        """True if excitation is enabled AND currently halted by the
+        go/no-go safety monitor. Public accessor so callers (the
+        resume_excitation_after_halt service handler, in particular)
+        never need to reach into the private _excitation field directly.
+
+        Compares against the enum's own string value ("HALTED") rather
+        than importing ExcitationMode here -- this method is small and
+        narrow enough that a value comparison is clearer than adding a
+        second deferred import alongside enable_excitation()'s own, for
+        a single boolean check.
+        """
+        if self._excitation is None:
+            return False
+        return self._excitation._state.value == "HALTED"
+
+    def excitation_is_enabled(self) -> bool:
+        """True if enable_excitation() has been called and disable_
+        excitation() has not since. Public accessor -- see excitation_
+        is_halted()'s own docstring for why this exists rather than
+        checking `_excitation is None` at call sites."""
+        return self._excitation is not None
+
+    def resume_excitation_after_halt(self) -> None:
+        """Explicit, human-initiated recovery from a go/no-go safety
+        halt. A no-op if excitation was never enabled, or is enabled but
+        not currently halted -- see ExcitationController.resume_after_
+        halt()'s own docstring for the full reasoning on why a no-op
+        (not an error) is correct here.
+        """
+        if self._excitation is None:
+            return
+        self._excitation.resume_after_halt()
 
     def mark_recovery(self, reason: str) -> None:
         """Suppress learning for the settling period after a disturbance."""
@@ -857,6 +965,14 @@ class AdaptiveModbusController:
         call sites pass "transaction" explicitly, and those do NOT feed
         poll_n/poll_failures.
         """
+        if self._excitation is not None:
+            # Must run BEFORE the learning_active() early-return below:
+            # enable_excitation() disables learning for the duration, and
+            # the go/no-go safety monitor is exactly what needs to keep
+            # running while learning itself is off -- it is the ONE thing
+            # in this class that must not be gated by the same switch
+            # that turns off ordinary slot-statistics learning.
+            self._excitation.record_outcome(success, timeout)
         if not self.learning_active():
             self.suppressed_observations += 1
             return
@@ -1328,7 +1444,7 @@ class AdaptiveModbusController:
         # comment for the full reasoning on why this is dt_util.now().
         # date() rather than date.today().
         _today = dt_util.now().date()
-        return {
+        data = {
             "version": _STORAGE_VERSION,
             "data_schema": _DATA_SCHEMA_VERSION,
             "serial": self.serial_number,
@@ -1343,6 +1459,14 @@ class AdaptiveModbusController:
                 if s.n > 0.001   # skip empty slots to keep storage compact
             },
         }
+        # v2.0.15 (experimental identification release): only present at
+        # all if excitation was ever enabled this session -- omitted
+        # entirely (not a null/empty placeholder) for every deployment
+        # that never turns this on, keeping the stored payload identical
+        # to pre-2.0.15 for the overwhelming majority of installs.
+        if self._excitation is not None:
+            data["excitation"] = self._excitation.to_persisted_dict()
+        return data
 
     def _deserialize(self, raw: dict[str, Any]) -> None:
         self._reset_slots()
@@ -1361,6 +1485,23 @@ class AdaptiveModbusController:
         self._last_decay_date = date.fromisoformat(last_str) if last_str else None
         first_str = raw.get("first_data_date")
         self._first_data_date = date.fromisoformat(first_str) if first_str else None
+        # v2.0.15: only restores an ExcitationController if the stored
+        # payload actually contains one -- a pre-2.0.15 store, or a
+        # 2.0.15 store where excitation was never enabled, has no
+        # "excitation" key at all, and self._excitation correctly stays
+        # None (no behavior change) rather than being restored into some
+        # default-enabled state nothing ever asked for.
+        excitation_raw = raw.get("excitation")
+        if excitation_raw is not None:
+            from .excitation_controller import ExcitationController  # deferred: avoids circular import
+            self._excitation = ExcitationController.from_persisted_dict(excitation_raw)
+            _LOGGER.warning(
+                "AdaptiveModbus[%s]: restored ACTIVE excitation schedule "
+                "from storage (state=%s) -- excitation remains enabled "
+                "across this restart.",
+                self.serial_number,
+                excitation_raw.get("state"),
+            )
 
     def _reset_slots(self) -> None:
         self._slots = [TimeSlotStats(slot_index=i) for i in range(ADAPTIVE_SLOT_COUNT)]

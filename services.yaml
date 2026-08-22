@@ -205,3 +205,27 @@ set_fixed_charge_periods:
       selector:
         text:
           multiline: true
+
+enable_excitation:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: huawei_solar
+
+disable_excitation:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: huawei_solar
+
+resume_excitation_after_halt:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: huawei_solar
