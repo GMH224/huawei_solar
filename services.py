@@ -37,9 +37,9 @@ from .adaptive_modbus import AdaptiveModbusController
 from .battery_health_manager import BatteryHealthManager
 
 from .const import (
-    CONF_ENABLE_PARAMETER_CONFIGURATION,
     DATA_DEVICE_DATAS,
     DOMAIN,
+    elevated_permissions_enabled,
     SERVICE_DISABLE_EXCITATION,
     SERVICE_ENABLE_EXCITATION,
     SERVICE_FORCIBLE_CHARGE,
@@ -1360,7 +1360,7 @@ async def async_setup_services(
     entry: HuaweiSolarConfigEntry,
 ) -> None:
     """Huawei Solar Services Setup."""
-    if not entry.data.get(CONF_ENABLE_PARAMETER_CONFIGURATION, False):
+    if not elevated_permissions_enabled(entry):
         return
 
     # Deliberately NOT also guarded against re-registration on this same

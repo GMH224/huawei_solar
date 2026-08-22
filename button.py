@@ -11,7 +11,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .battery_health_manager import BatteryHealthManager
-from .const import CONF_ENABLE_PARAMETER_CONFIGURATION, DATA_DEVICE_DATAS
+from .const import DATA_DEVICE_DATAS, elevated_permissions_enabled
 # v2.0.7 FIX (ICS-12, ICS quality audit -- confirmed): this button's
 # stop-forcible-charge press and services.py's own stop_forcible_charge()
 # service are two independent entry points for the same physical
@@ -87,7 +87,7 @@ async def async_setup_entry(
     if health_buttons:
         async_add_entities(health_buttons)
 
-    if not entry.data.get(CONF_ENABLE_PARAMETER_CONFIGURATION):
+    if not elevated_permissions_enabled(entry):
         return
 
     entities_to_add: list[ButtonEntity] = []

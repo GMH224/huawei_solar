@@ -46,10 +46,10 @@ from .const import (
     CONF_SLOW_TIER_TTL_S,
     CONF_SYNC_POWER_DEDICATED_READS,
     DEFAULT_SLOW_TIER_TTL_S,
-    CONF_ENABLE_PARAMETER_CONFIGURATION,
     CONF_SLAVE_IDS,
     CONFIGURATION_UPDATE_INTERVAL,
     DATA_DEVICE_DATAS,
+    elevated_permissions_enabled,
     DATA_SYNC_POWER_COORDINATOR,
     DEVICE_CONNECT_TIMEOUT,
     DISCONNECT_TIMEOUT,
@@ -378,7 +378,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
             await _bounded_client_disconnect(client)
             raise
 
-        if entry.data.get(CONF_ENABLE_PARAMETER_CONFIGURATION):
+        if elevated_permissions_enabled(entry):
             if (
                 isinstance(primary_device, HuaweiSolarDeviceWithLogin)
                 and entry.data.get(CONF_USERNAME)
@@ -1448,7 +1448,7 @@ async def _setup_inverter_device_data(
                 exc_info=exc,
             )
 
-    if entry.data.get(CONF_ENABLE_PARAMETER_CONFIGURATION, False):
+    if elevated_permissions_enabled(entry):
         configuration_update_coordinator = HuaweiSolarUpdateCoordinator(
             hass,
             _LOGGER,
@@ -1589,7 +1589,7 @@ async def _setup_device_data(
         entry=entry,
     )
 
-    if entry.data.get(CONF_ENABLE_PARAMETER_CONFIGURATION, False):
+    if elevated_permissions_enabled(entry):
         configuration_update_coordinator = HuaweiSolarUpdateCoordinator(
             hass,
             _LOGGER,

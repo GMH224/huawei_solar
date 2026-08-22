@@ -1423,6 +1423,7 @@
         "data": {
           "slow_tier_ttl_s": "Slow-register refresh interval (s)",
           "bh_enabled": "Enable battery health monitoring",
+          "enable_parameter_configuration": "Advanced: elevate permissions (write access) -- unlike initial setup, this is not validated against the live device; enabling this without an account that actually has write access will cause writes to fail at the moment they're attempted, not here",
           "bh_rated_capacity_kwh": "Rated usable capacity (kWh)",
           "bh_warranty_throughput_kwh": "Warranty throughput (kWh)",
           "bh_weight_capacity": "Weight: SOH capacity",

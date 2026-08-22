@@ -23,10 +23,10 @@ from .adaptive_modbus import AdaptiveModbusController
 from .battery_health_manager import BatteryHealthManager
 from .bus_diagnostics import BusDiagnostics
 from .const import (
-    CONF_ENABLE_PARAMETER_CONFIGURATION,
     DATA_DEVICE_DATAS,
     DATA_SYNC_POWER_COORDINATOR,
     TELEMETRY_CAPTURE_INTERVAL,
+    elevated_permissions_enabled,
 )
 from .modbus_telemetry import ModbusTelemetry
 from .telemetry_capture import TelemetryCapture, build_telemetry_snapshot
@@ -184,7 +184,7 @@ async def async_setup_entry(
             "without it. All other switches are unaffected"
         )
 
-    if not entry.data.get(CONF_ENABLE_PARAMETER_CONFIGURATION, False):
+    if not elevated_permissions_enabled(entry):
         _LOGGER.info("Skipping switch setup, as parameter configuration is not enabled")
         return
 

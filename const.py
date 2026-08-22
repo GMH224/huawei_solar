@@ -1,6 +1,7 @@
 """Constants for the Huawei Solar integration."""
 
 from datetime import timedelta
+from typing import Any
 
 DOMAIN = "huawei_solar"
 DEFAULT_PORT = 502
@@ -8,6 +9,45 @@ DEFAULT_USERNAME = "installer"
 
 CONF_SLAVE_IDS = "slave_ids"
 CONF_ENABLE_PARAMETER_CONFIGURATION = "enable_parameter_configuration"
+
+
+def elevated_permissions_enabled(entry: Any) -> bool:
+    """Whether write/control access (services, number/select/switch/button
+    entities) is enabled for a config entry.
+
+    v2.0.15 FIX (external ICS review, this release): checks entry.options
+    FIRST, falling back to entry.data -- NOT entry.data alone, which is
+    where every call site checked prior to this release. This exists
+    specifically because CONF_ENABLE_PARAMETER_CONFIGURATION now has two
+    legitimate storage locations depending on how it was set:
+
+      - entry.data: written once, during initial setup (config_flow.py's
+        own async_step_setup_network), where the choice is validated
+        against the live device's own actual write-permission. Every
+        installation that existed before this release has its value
+        here, and nothing about this release changes that.
+      - entry.options: written by BatteryHealthOptionsFlowHandler,
+        alongside CONF_BH_ENABLED and CONF_SYNC_POWER_DEDICATED_READS --
+        the "Configure" screen, changeable at any time without touching
+        connection details or re-validating against the device (a
+        deliberate trade-off; see that flow's own schema comment).
+
+    A single, shared helper (used by every one of this integration's
+    own read sites, rather than each repeating its own two-level .get()
+    chain) exists specifically so that trade-off -- and the precedence
+    between the two locations -- only has to be gotten right once, not
+    independently re-derived at every call site with the attendant risk
+    of one of them drifting out of sync with the others.
+
+    `entry` is typed Any, not ConfigEntry, so this module can remain
+    free of any Home Assistant import -- see this file's own use by
+    test_const_services.py, which imports const.py directly and depends
+    on it having no HA or third-party dependency to do so.
+    """
+    options_value = entry.options.get(CONF_ENABLE_PARAMETER_CONFIGURATION)
+    if options_value is not None:
+        return bool(options_value)
+    return bool(entry.data.get(CONF_ENABLE_PARAMETER_CONFIGURATION, False))
 
 DATA_DEVICE_DATAS = "device_datas"
 DATA_SYNC_POWER_COORDINATOR = "sync_power_coordinator"
