@@ -425,6 +425,22 @@ class TestConstImportsAreDefined(unittest.TestCase):
                 )
             elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
                 names.add(node.target.id)
+            # v2.0.15 FIX (external ICS review, this release): const.py's
+            # own first module-level FUNCTION (elevated_permissions_
+            # enabled) exposed a real gap here -- this helper only ever
+            # recognized ast.Assign/ast.AnnAssign, since every prior name
+            # in const.py was a constant. A function defined at module
+            # level is exactly as valid and importable a name as a
+            # constant is; not recognizing it here would make this test
+            # fail against genuinely correct code, for a name that
+            # demonstrably imports and runs cleanly (see this file's own
+            # TestModulesImport, and test_const_services.py, which both
+            # already exercise const.py directly). Root-caused and fixed
+            # here rather than worked around by avoiding a function
+            # definition in const.py, which would have been treating this
+            # test's own coverage gap as a constraint on the code instead.
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                names.add(node.name)
         return names
 
     def test_every_const_import_resolves(self):
