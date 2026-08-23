@@ -57,6 +57,7 @@ from .const import (
     CONF_BH_WEIGHT_EFFICIENCY,
     CONF_BH_WINDOW_DAYS,
     CONF_ENABLE_PARAMETER_CONFIGURATION,
+    CONF_EXCITATION_ENABLED,
     CONF_SLAVE_IDS,
     DEFAULT_PORT,
     DEFAULT_USERNAME,
@@ -2064,6 +2065,48 @@ class BatteryHealthOptionsFlowHandler(config_entries.OptionsFlow):
                             CONF_ENABLE_PARAMETER_CONFIGURATION, False
                         ),
                     ),
+                ): bool,
+                # v2.0.15b FIX (external ICS review, this release):
+                # replaces enable_excitation/disable_excitation/resume_
+                # excitation_after_halt (all three services removed
+                # entirely) with this toggle plus a dedicated button
+                # entity (button.py, ResumeExcitationAfterHaltButton) --
+                # no Developer Tools service call is needed for any part
+                # of this feature anymore. Placed immediately after
+                # CONF_ENABLE_PARAMETER_CONFIGURATION deliberately:
+                # excitation is itself a write-capable, bus-behaviour-
+                # changing feature, and actually taking effect requires
+                # that flag to ALSO be true -- enforced where this value
+                # is actually read (_setup_inverter_device_data(),
+                # __init__.py), not here, since a static vol.Schema
+                # cannot make one field's own validity conditional on
+                # another field's value within the same form submission.
+                # Toggling this triggers a config-entry reload (this
+                # flow's own class docstring). What that reload actually
+                # does to excitation's own progress depends on WHY the
+                # reload happened, and this is worth being precise about
+                # rather than assuming either direction:
+                #   - A reload triggered by SOME OTHER option changing,
+                #     with this toggle staying True throughout, preserves
+                #     progress -- enable_excitation() is idempotent (a
+                #     no-op if already enabled), and AdaptiveModbusController's
+                #     own Store-based persistence has already restored
+                #     the in-progress schedule (async_load(), called
+                #     before this value is ever read) by the time this
+                #     wiring runs.
+                #   - Deliberately toggling THIS OFF still discards
+                #     progress -- disable_excitation()'s own documented
+                #     behaviour, unchanged by this fix. Turning it back
+                #     on afterward starts a genuinely fresh schedule,
+                #     not a resumed one. This is intentional, not a
+                #     limitation: resuming a schedule after an unknown-
+                #     duration deliberate stop is not something the
+                #     go/no-go design was built to reason about safely
+                #     (same reasoning disable_excitation()'s own
+                #     docstring already gives).
+                vol.Optional(
+                    CONF_EXCITATION_ENABLED,
+                    default=options.get(CONF_EXCITATION_ENABLED, False),
                 ): bool,
                 vol.Optional(
                     CONF_SLOW_TIER_TTL_S,

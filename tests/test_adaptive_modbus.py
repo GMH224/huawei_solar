@@ -52,6 +52,21 @@ _cmod.__package__ = "huawei_solar"
 _cspec.loader.exec_module(_cmod)
 sys.modules["huawei_solar.const"] = _cmod
 
+# v2.0.15b FIX (external ICS review, this release): adaptive_modbus.py
+# now imports ModbusGuard (from .modbus_guard import ModbusGuard) as
+# part of the telemetry-correctness fix -- see snapshot()'s own
+# docstring. This standalone loader must satisfy that import exactly
+# the same way it already does for const.py just above, or exec_module
+# below raises ModuleNotFoundError before a single test in this file
+# can even be collected.
+_gpath = pathlib.Path(__file__).parent.parent / "modbus_guard.py"
+_gspec = importlib.util.spec_from_file_location("huawei_solar.modbus_guard", str(_gpath))
+_gmod = importlib.util.module_from_spec(_gspec)
+_gmod.__package__ = "huawei_solar"
+_gspec.loader.exec_module(_gmod)
+sys.modules["huawei_solar.modbus_guard"] = _gmod
+ModbusGuard = _gmod.ModbusGuard
+
 # Load adaptive_modbus.py
 _SRC = pathlib.Path(__file__).parent.parent / "adaptive_modbus.py"
 _SPEC = importlib.util.spec_from_file_location("adaptive_modbus_test", str(_SRC))
@@ -151,6 +166,15 @@ def _make_ctrl() -> AdaptiveModbusController:
     # __init__'s own default -- same class of gap hit repeatedly this
     # session for every object.__new__()-based test fixture.
     ctrl._excitation = None
+    # v2.0.15b FIX (external ICS review, this release): same class of
+    # gap as _excitation immediately above -- _make_ctrl() bypasses
+    # __init__ entirely, so this needs setting explicitly too. snapshot()
+    # itself uses getattr(self, "_bus_endpoint", None) specifically so a
+    # missing attribute here would not raise -- but setting it
+    # explicitly keeps this fixture's own fields in sync with __init__'s
+    # real defaults, rather than relying on the getattr fallback to
+    # paper over a fixture that's drifted from the class it's faking.
+    ctrl._bus_endpoint = None
     return ctrl
 
 
@@ -1494,12 +1518,39 @@ class TestSnapshotPublicMethod(unittest.TestCase):
         ctrl = _make_ctrl()
         snap = ctrl.snapshot()
         for key in (
-            "poll_interval_s", "gap_ms", "timeout_s", "max_queue_depth",
+            # v2.0.15b FIX (external ICS review, this release): gap_ms
+            # and max_queue_depth renamed to *_requested/*_effective
+            # pairs -- see snapshot()'s own docstring for the full
+            # telemetry-correctness defect this closes. Checking the new
+            # names here, not the old ones, is the point of this update:
+            # a test that still passed against the old, misleading names
+            # would be silently certifying the exact defect being fixed.
+            "poll_interval_s", "gap_requested_ms", "gap_effective_ms",
+            "timeout_s", "max_queue_depth_requested", "max_queue_depth_effective",
             "confidence_pct", "slot_failure_rate_pct", "in_transition",
             "days_of_data", "shed_count", "admission_timeout_count",
             "bus_occupancy_pct",
         ):
             self.assertIn(key, snap, f"snapshot() is missing expected key '{key}'")
+
+    def test_old_misleading_gap_ms_key_is_genuinely_gone(self):
+        """Adversarial: the old key name must not silently persist
+        alongside the new ones -- a caller still reading "gap_ms" must
+        get a clear KeyError, not a stale, misleading number."""
+        ctrl = _make_ctrl()
+        snap = ctrl.snapshot()
+        self.assertNotIn("gap_ms", snap)
+        self.assertNotIn("max_queue_depth", snap)
+
+    def test_effective_values_none_without_a_bus_endpoint(self):
+        """_make_ctrl() sets _bus_endpoint = None (matching __init__'s
+        own default) -- confirms the fallback path is real and does not
+        raise, not just that it exists in source."""
+        ctrl = _make_ctrl()
+        snap = ctrl.snapshot()
+        self.assertIsNone(snap["gap_effective_ms"])
+        self.assertIsNone(snap["max_queue_depth_effective"])
+        self.assertIsNotNone(snap["gap_requested_ms"])
 
     def test_private_name_no_longer_exists(self):
         """The rename must be complete, not a case where both names

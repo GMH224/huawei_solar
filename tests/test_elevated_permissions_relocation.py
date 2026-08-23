@@ -33,7 +33,18 @@ def _function_body(name: str, is_async: bool = True) -> str:
     idx = source.find(f"{prefix}{name}(")
     assert idx > -1, f"{name} not found in config_flow.py"
     end = source.find(f"\n{prefix}", idx + len(prefix) + len(name))
-    return source[idx: end if end > -1 else idx + 8000]
+    # v2.0.15b FIX (external ICS review, this release): 8000 -> 20000.
+    # async_step_init has no next "async def " within the same class for
+    # this search to find (confirmed directly: BatteryHealthOptionsFlow
+    # Handler's own last method), so it always fell back to this
+    # hardcoded limit rather than a real function boundary. That limit
+    # was arbitrary, not principled, and this function's own real length
+    # (schema comments included) already exceeds it -- CONF_BH_WINDOW_
+    # DAYS sits at ~9091 characters from the function start. Rather than
+    # shorten a legitimate, valuable comment in config_flow.py itself to
+    # fit an arbitrary test-helper constant, the constant is fixed here,
+    # with real headroom, not just enough to pass today's specific check.
+    return source[idx: end if end > -1 else idx + 20000]
 
 
 class TestSetupNetworkOmitsCheckboxDuringReconfigure(unittest.TestCase):
@@ -95,15 +106,23 @@ class TestOptionsFlowHostsTheCheckbox(unittest.TestCase):
         self.body = _function_body("async_step_init")
 
     def test_appears_exactly_once(self):
-        # 3 occurrences expected: the vol.Optional(...) key, the
-        # options.get(...) default lookup, and the data.get(...) fallback
-        # inside that same default expression.
-        count = self.body.count("CONF_ENABLE_PARAMETER_CONFIGURATION")
+        # v2.0.15b FIX: the raw string "CONF_ENABLE_PARAMETER_
+        # CONFIGURATION" now legitimately appears a 4th time -- in
+        # CONF_EXCITATION_ENABLED's own neighboring comment, explaining
+        # why it's positioned right after this field. A plain substring
+        # count can no longer distinguish "the field is defined once"
+        # from "the field is defined once AND mentioned in a comment
+        # elsewhere" -- counting the actual field-key-definition pattern
+        # (vol.Optional(\n    NAME,) is what this test is actually
+        # trying to confirm, and does so precisely regardless of how
+        # many times the name is mentioned in surrounding prose.
+        count = self.body.count(
+            "vol.Optional(\n                    CONF_ENABLE_PARAMETER_CONFIGURATION,"
+        )
         self.assertEqual(
-            count, 3,
-            f"expected exactly 3 occurrences (field key + options default + "
-            f"data fallback), found {count} -- possible duplicate field "
-            f"definition reintroduced",
+            count, 1,
+            f"expected exactly 1 field-key definition, found {count} -- "
+            f"possible duplicate field definition reintroduced",
         )
 
     def test_positioned_after_sync_power_dedicated_reads_not_at_the_end(self):

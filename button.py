@@ -10,8 +10,13 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
+from .adaptive_modbus import AdaptiveModbusController
 from .battery_health_manager import BatteryHealthManager
-from .const import DATA_DEVICE_DATAS, elevated_permissions_enabled
+from .const import (
+    CONF_EXCITATION_ENABLED,
+    DATA_DEVICE_DATAS,
+    elevated_permissions_enabled,
+)
 # v2.0.7 FIX (ICS-12, ICS quality audit -- confirmed): this button's
 # stop-forcible-charge press and services.py's own stop_forcible_charge()
 # service are two independent entry points for the same physical
@@ -102,6 +107,25 @@ async def async_setup_entry(
                 ucs.device,
                 ucs.connected_energy_storage,
                 ucs.configuration_update_coordinator,
+            )
+        )
+
+    # v2.0.15b FIX (external ICS review, this release): a SEPARATE loop,
+    # deliberately not folded into the one just above -- excitation
+    # targets an inverter's own AdaptiveModbusController directly (GAP/
+    # POLL are per-device adaptive quantities, see excitation_
+    # controller.py's own module docstring), not anything battery-
+    # specific, so this must NOT be gated on ucs.connected_energy_
+    # storage the way StopForcibleChargeButtonEntity correctly is above.
+    # An inverter with no battery at all still has its own adaptive
+    # controller and can still have excitation enabled on it.
+    for ucs in device_datas:
+        if not isinstance(ucs, HuaweiSolarInverterData):
+            continue
+        entities_to_add.append(
+            ResumeExcitationAfterHaltButtonEntity(
+                ucs.device,
+                ucs.device_info,
             )
         )
 
@@ -295,3 +319,51 @@ class ReanchorCapacityReferenceButtonEntity(HuaweiSolarEntity, ButtonEntity):
     async def async_press(self) -> None:
         """Re-anchor the capacity reference to the measured value."""
         await self._manager.async_reanchor_capacity_reference()
+
+
+class ResumeExcitationAfterHaltButtonEntity(HuaweiSolarEntity, ButtonEntity):
+    """v2.0.15b FIX (external ICS review, this release): replaces the
+    resume_excitation_after_halt SERVICE (removed entirely) with a
+    standalone entity requiring no Developer Tools action at all.
+
+    Deliberately a separate button, not folded into a generic "resume"
+    action on some other entity -- resuming after a go/no-go safety
+    halt is a distinct, deliberate, human-reviewed recovery action (see
+    AdaptiveModbusController.resume_excitation_after_halt()'s own
+    docstring: it restarts the mode that breached safety thresholds
+    from its own first level, not from wherever it stopped), not
+    something that should be reachable by accident alongside an
+    unrelated control.
+
+    Pressing this when excitation was never enabled, or is enabled but
+    not currently halted, is a documented no-op (see
+    AdaptiveModbusController.resume_excitation_after_halt()'s own
+    docstring) -- this entity does not attempt to hide or disable
+    itself in those states, since doing so would require live
+    excitation-state polling this entity does not otherwise need, for
+    a press that is already safe to make and does nothing.
+    """
+
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_name = "Resume excitation after safety halt"
+    _attr_icon = "mdi:play-circle-outline"
+
+    def __init__(self, device: SUN2000Device, device_info: DeviceInfo) -> None:
+        """Initialize the button entity."""
+        self._device = device
+        self._attr_device_info = device_info
+        self._attr_unique_id = f"{device.serial_number}_resume_excitation_after_halt"
+
+    async def async_press(self) -> None:
+        """Resume a halted excitation schedule, if one exists and is
+        currently halted. A safe no-op otherwise -- see this class's
+        own docstring."""
+        controller = AdaptiveModbusController.get(self._device.serial_number)
+        if controller is None:
+            _LOGGER.warning(
+                "Resume excitation pressed for %s, but no adaptive "
+                "controller is registered for it -- nothing to resume.",
+                self._device.serial_number,
+            )
+            return
+        controller.resume_excitation_after_halt()

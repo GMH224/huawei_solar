@@ -311,18 +311,6 @@ SERVICE_SET_FIXED_CHARGE_PERIODS = "set_fixed_charge_periods"
 # own docstring (services.py).
 SERVICE_SET_PACK_INSTALL_DATE = "set_pack_install_date"
 
-# v2.0.15 (experimental identification release): control services for the
-# opt-in GAP/POLL excitation schedule -- see excitation_controller.py's
-# own module docstring for the full design. Deliberately three separate
-# services rather than one with a mode parameter: enable/disable/resume
-# are conceptually distinct actions with different prerequisites (resume
-# only makes sense after a halt), and separate services let each get its
-# own clear description and validation in the HA services UI rather than
-# a single service whose behavior depends on an opaque mode string.
-SERVICE_ENABLE_EXCITATION = "enable_excitation"
-SERVICE_DISABLE_EXCITATION = "disable_excitation"
-SERVICE_RESUME_EXCITATION_AFTER_HALT = "resume_excitation_after_halt"
-
 SERVICES = (
     SERVICE_FORCIBLE_CHARGE,
     SERVICE_FORCIBLE_DISCHARGE,
@@ -343,11 +331,15 @@ SERVICES = (
     # unregistered on integration unload, a genuine (if minor) resource
     # leak this test exists specifically to prevent.
     SERVICE_SET_PACK_INSTALL_DATE,
-    # v2.0.15 (experimental identification release): see these constants'
-    # own comment above for why three separate services rather than one.
-    SERVICE_ENABLE_EXCITATION,
-    SERVICE_DISABLE_EXCITATION,
-    SERVICE_RESUME_EXCITATION_AFTER_HALT,
+    # v2.0.15b FIX (external ICS review, this release): SERVICE_ENABLE_
+    # EXCITATION / SERVICE_DISABLE_EXCITATION / SERVICE_RESUME_
+    # EXCITATION_AFTER_HALT (introduced in 2.0.15) removed entirely, not
+    # just deprecated or left registered-but-unused. Excitation is now
+    # controlled exclusively through CONF_EXCITATION_ENABLED (the
+    # "Configure" options screen) and ResumeExcitationAfterHaltButton
+    # Entity (button.py) -- no Developer Tools service call is needed
+    # for any part of this feature, per the explicit requirement that
+    # config items work standalone.
 )
 
 # ── Adaptive Modbus learning ──────────────────────────────────────────────────
@@ -695,6 +687,21 @@ CONF_BH_ENABLED = "bh_enabled"
 # some installations genuinely want is still a legitimate use case this
 # default protects.
 CONF_SYNC_POWER_DEDICATED_READS = "sync_power_dedicated_reads"
+
+# v2.0.15b FIX (external ICS review, this release): replaces the
+# enable_excitation/disable_excitation services -- both removed
+# entirely, not left alongside this toggle -- per the explicit
+# requirement that config items work standalone, without requiring
+# Developer Tools or any service call at all. Defaults to False:
+# excitation is never active for any installation unless deliberately
+# turned on here, matching CONF_SYNC_POWER_DEDICATED_READS' own
+# established default-preserves-current-behaviour convention just
+# above, even though the two defaults point in opposite directions
+# (that one defaults ON to preserve existing behaviour; this one
+# defaults OFF because there is no existing behaviour to preserve --
+# excitation did not exist before this release, and its whole nature
+# as a bounded, temporary experiment argues against an opt-out default).
+CONF_EXCITATION_ENABLED = "excitation_enabled"
 
 CONF_BH_RATED_CAPACITY_KWH = "bh_rated_capacity_kwh"
 #: Finding D: true battery install/commissioning date (ISO yyyy-mm-dd).
