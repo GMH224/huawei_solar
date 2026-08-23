@@ -84,6 +84,7 @@ from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
+from .modbus_guard import ModbusGuard
 from .const import (
     ADAPTIVE_DECAY_FACTOR,
     ADAPTIVE_QUEUE_DEPTH_COLD_START,
@@ -425,10 +426,27 @@ class AdaptiveModbusController:
         hass: HomeAssistant,
         serial_number: str,
         device_info: DeviceInfo,
+        bus_endpoint: str | None = None,
     ) -> "AdaptiveModbusController":
+        """
+        v2.0.15b FIX (external ICS review, this release -- the telemetry-
+        correctness defect): bus_endpoint identifies which ModbusGuard
+        instance actually governs this device's real, effective GAP and
+        max_queue_depth (see snapshot()'s own docstring for the full
+        defect this closes). Always (re)assigned below, even when an
+        existing instance is returned -- a reconfigure that changes the
+        connection's own host/port changes this string, and a stale
+        value here would make snapshot() report the WRONG guard's own
+        effective values after that reconfigure, which is exactly the
+        class of defect this fix exists to close, not something to
+        risk reintroducing in a different form.
+        """
         if serial_number not in cls._registry:
             cls._registry[serial_number] = cls(hass, serial_number, device_info)
-        return cls._registry[serial_number]
+        ctrl = cls._registry[serial_number]
+        if bus_endpoint is not None:
+            ctrl._bus_endpoint = bus_endpoint
+        return ctrl
 
     @classmethod
     def get(cls, serial_number: str) -> "AdaptiveModbusController | None":
@@ -458,6 +476,13 @@ class AdaptiveModbusController:
         self.hass = hass
         self.serial_number = serial_number
         self.device_info = device_info
+        # v2.0.15b FIX: see get_or_create()'s own docstring. None here is
+        # a genuinely valid, handled state (test fixtures constructing
+        # this class directly, or a caller that hasn't wired the endpoint
+        # through yet) -- snapshot() falls back to requested-only values
+        # rather than raising when this is unset, not a silent None ->
+        # AttributeError waiting to happen on first real use.
+        self._bus_endpoint: str | None = None
 
         # 96 time slots covering the 24-hour day
         self._slots: list[TimeSlotStats] = [
@@ -1090,14 +1115,80 @@ class AdaptiveModbusController:
         A genuine test-coverage gap, not a mock silently swallowing a
         real failure. Closed by adding a test that actually registers a
         controller and exercises this exact path end to end.
+
+        v2.0.15b FIX (external ICS review, this release -- reported
+        directly against a real deployment, not found by internal
+        review first): gap_ms and max_queue_depth below used to report
+        params.request_gap / params.max_queue_depth -- this device's OWN
+        requested values from get_params() -- as if they were the real,
+        measured values governing the physical bus. They are not the
+        same thing whenever this device shares a bus/endpoint with
+        another device: ModbusGuard.update_gap() (modbus_guard.py) takes
+        the MAXIMUM requested gap across every device sharing the same
+        endpoint (the safer, more conservative value always wins, by
+        design -- Defect P), and update_max_queue_depth() takes the
+        MINIMUM depth the same way. A device requesting an aggressive
+        150ms gap while a sibling device on the same bus still requests
+        500ms produces a real, effective gap of 500ms on the wire --
+        while the old gap_ms field here would have reported 150ms, a
+        number that never actually governed anything.
+
+        Confirmed directly against a real field capture: a device's own
+        reported gap_ms was 150.0, while the real, measured inter-chunk
+        timing on the bus for that exact device was 505-545ms -- the
+        guard's own effective_gap_ms for that endpoint, not this
+        device's own request, is what a telemetry consumer measuring
+        "what's on the bus" needs.
+
+        Fixed by reporting BOTH values, explicitly and separately named
+        so neither can be mistaken for the other: gap_requested_ms /
+        max_queue_depth_requested (this device's own ask, still useful
+        diagnostic information for understanding WHY the effective
+        value is what it is) and gap_effective_ms / max_queue_depth_
+        effective (the real, shared value from ModbusGuard, governing
+        actual bus behaviour). No back-channel change to the guard's
+        own max()/min() combining logic itself -- that mechanism is a
+        legitimate, deliberate safety property (Defect P) and is not
+        being touched here; only what telemetry reports about its
+        result changes, not the mechanism itself.
+
+        The requested-only fallback (self._bus_endpoint is None) exists
+        because this is a genuinely reachable state, not a defensive
+        placeholder: every existing test fixture that constructs this
+        class via object.__new__() (bypassing __init__ and get_or_
+        create() both) has never set this field, and this method must
+        not raise for any of them.
         """
         params = self.get_params()
         slot = self._slots[params.slot_index]
+        gap_requested_ms = params.request_gap.total_seconds() * 1000
+        max_queue_depth_requested = params.max_queue_depth
+        bus_endpoint = getattr(self, "_bus_endpoint", None)
+        if bus_endpoint:
+            # Truthy check deliberately, not `is not None`: the real
+            # caller (_setup_inverter_device_data, __init__.py) defaults
+            # its own bus_endpoint parameter to "" rather than None, and
+            # an empty string is exactly as "not actually set" as None
+            # is here -- ModbusGuard.get_or_create("") would create a
+            # real registry entry for a meaningless key, silently
+            # masking this same class of defect in a new shape.
+            guard = ModbusGuard.get_or_create(bus_endpoint)
+            gap_effective_ms = guard.effective_gap_ms
+            max_queue_depth_effective = guard.queue_depth
+        else:
+            # No known endpoint (see docstring) -- the effective value
+            # cannot be looked up, so it is reported as None rather than
+            # silently falling back to the requested value under a name
+            # that promises it is the real one.
+            gap_effective_ms = None
+            max_queue_depth_effective = None
         return {
             "poll_interval_s": params.poll_interval.total_seconds(),
-            "gap_ms": params.request_gap.total_seconds() * 1000,
+            "gap_requested_ms": gap_requested_ms,
+            "gap_effective_ms": gap_effective_ms,
             "timeout_s": params.request_timeout.total_seconds(),
-            "max_queue_depth": params.max_queue_depth,
+            "max_queue_depth_requested": max_queue_depth_requested,
+            "max_queue_depth_effective": max_queue_depth_effective,
             "confidence_pct": round(params.confidence * 100, 1),
             # v2.0.9 (Phase 3.2, this release -- ICS-08/MOD-02, both
             # external ICS audits -- confirmed): exposed separately and
