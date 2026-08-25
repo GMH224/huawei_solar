@@ -784,11 +784,34 @@ class AdaptiveModbusController:
         Excitation state, once enabled, persists across restarts (see
         _load()/_schedule_save() below) exactly like every other piece of
         this controller's own state.
+
+        v2.0.15.3 FIX (real 3-day field run, this release): looks up the
+        SHARED ExcitationController for this device's own bus_endpoint
+        (ExcitationController.get_or_create()), not a private, per-device
+        instance -- see that class's own docstring for the full incident
+        this closes. A device with no known bus_endpoint (self._bus_
+        endpoint is None or "", e.g. a test fixture that never set it)
+        falls back to a private instance rather than crashing or silently
+        doing nothing -- this device's own excitation would simply not be
+        synchronized with any sibling on the same physical bus, matching
+        this method's own pre-2.0.15.3 behavior exactly, as the safest
+        possible degradation.
         """
         if self._excitation is not None:
             return
         from .excitation_controller import ExcitationController  # deferred: avoids circular import
-        self._excitation = ExcitationController()
+        if self._bus_endpoint:
+            self._excitation = ExcitationController.get_or_create(self._bus_endpoint)
+        else:
+            _LOGGER.warning(
+                "AdaptiveModbus[%s]: enable_excitation() called with no known "
+                "bus_endpoint -- falling back to a private, non-shared "
+                "excitation schedule for this device only. GAP excitation "
+                "will NOT be synchronized with any other device sharing "
+                "this physical bus.",
+                self.serial_number,
+            )
+            self._excitation = ExcitationController()
         self.set_learning_enabled(False)
         _LOGGER.warning(
             "AdaptiveModbus[%s]: EXCITATION ENABLED (v2.0.15 experimental "
@@ -1189,6 +1212,17 @@ class AdaptiveModbusController:
             "timeout_s": params.request_timeout.total_seconds(),
             "max_queue_depth_requested": max_queue_depth_requested,
             "max_queue_depth_effective": max_queue_depth_effective,
+            # v2.0.15.3 FIX (real 3-day field run, this release): closes
+            # a gap this project called out explicitly and repeatedly
+            # this session but never fixed until a real, unattended run
+            # was silently wasted by it -- ExcitationController.
+            # telemetry_snapshot() has existed since the original 2.0.15
+            # release but was never called from anywhere. Merged in
+            # directly (not nested under its own sub-key) so every
+            # excitation_* field lands in the same flat telemetry
+            # record as everything else here, without a capture reader
+            # needing to know a separate, nested shape exists.
+            **(self._excitation.telemetry_snapshot() if self._excitation is not None else {}),
             "confidence_pct": round(params.confidence * 100, 1),
             # v2.0.9 (Phase 3.2, this release -- ICS-08/MOD-02, both
             # external ICS audits -- confirmed): exposed separately and
@@ -1582,10 +1616,27 @@ class AdaptiveModbusController:
         # "excitation" key at all, and self._excitation correctly stays
         # None (no behavior change) rather than being restored into some
         # default-enabled state nothing ever asked for.
+        #
+        # v2.0.15.3 FIX (real 3-day field run, this release): uses
+        # get_or_restore(), not from_persisted_dict() directly -- see
+        # that method's own docstring. Each device on a shared bus calls
+        # this independently, from its own separately-stored persisted
+        # data; without registry-awareness here, the second device to
+        # restore would silently create and register its own, separate,
+        # disconnected ExcitationController for the same bus_endpoint,
+        # defeating the sharing fix at exactly the moment (a restart)
+        # it exists to protect. Same fallback as enable_excitation()'s
+        # own: no known bus_endpoint restores a private, non-shared
+        # instance rather than crashing or silently doing nothing.
         excitation_raw = raw.get("excitation")
         if excitation_raw is not None:
             from .excitation_controller import ExcitationController  # deferred: avoids circular import
-            self._excitation = ExcitationController.from_persisted_dict(excitation_raw)
+            if self._bus_endpoint:
+                self._excitation = ExcitationController.get_or_restore(
+                    self._bus_endpoint, excitation_raw
+                )
+            else:
+                self._excitation = ExcitationController.from_persisted_dict(excitation_raw)
             _LOGGER.warning(
                 "AdaptiveModbus[%s]: restored ACTIVE excitation schedule "
                 "from storage (state=%s) -- excitation remains enabled "
@@ -1658,9 +1709,22 @@ class AdaptiveModbusController:
 
 _ADAPTIVE_SENSORS: list[tuple[str, str, str | None, str]] = [
     ("poll_interval_s",        "Adaptive poll interval",       "s",   "mdi:timer-sync-outline"),
-    ("gap_ms",                 "Adaptive Modbus gap",          "ms",  "mdi:timer-pause-outline"),
+    # v2.0.15b FIX (external ICS review): gap_ms and max_queue_depth
+    # renamed to *_requested/*_effective pairs in snapshot() (see that
+    # method's own docstring for the full telemetry-correctness defect
+    # this closes) -- this list was never updated to match at the time,
+    # a real regression: the two old keys below no longer exist in
+    # snapshot()'s own output at all, so these two sensor entities
+    # showed "Unknown" in the live UI from that release onward, caught
+    # only when reported directly against a real deployment's own
+    # diagnostics page, not by any test (see test_adaptive_sensor_keys_
+    # match_snapshot.py, added specifically because no existing test
+    # checked this correspondence at all).
+    ("gap_requested_ms",       "Adaptive Modbus gap (requested)", "ms",  "mdi:timer-pause-outline"),
+    ("gap_effective_ms",       "Adaptive Modbus gap (effective)", "ms",  "mdi:timer-pause-outline"),
     ("timeout_s",              "Adaptive Modbus timeout",      "s",   "mdi:timer-alert-outline"),
-    ("max_queue_depth",        "Adaptive queue depth",         None,  "mdi:layers-triple-outline"),
+    ("max_queue_depth_requested", "Adaptive queue depth (requested)", None, "mdi:layers-triple-outline"),
+    ("max_queue_depth_effective", "Adaptive queue depth (effective)", None, "mdi:layers-triple-outline"),
     ("confidence_pct",         "Adaptive learning confidence", "%",   "mdi:school-outline"),
     ("slot_failure_rate_pct",  "Adaptive slot failure rate",   "%",   "mdi:percent"),
     ("in_transition",          "Inverter state transition",    None,  "mdi:swap-horizontal-bold"),
@@ -1689,6 +1753,21 @@ _ADAPTIVE_SENSORS: list[tuple[str, str, str | None, str]] = [
     ("bus_requests_waited",    "Bus requests delayed",         None,  "mdi:timer-alert-outline"),
     ("bus_total_wait_s",       "Bus total wait",               "s",   "mdi:timer-sand-full"),
     # (item 1) Is coalescing firing, and how much is it pulling forward?
+    # v2.0.15.3 FIX (real 3-day field run, this release): excitation
+    # state visible directly on this same diagnostics page, not just in
+    # a telemetry capture file -- ExcitationController.telemetry_
+    # snapshot() has existed since the original 2.0.15 release but was
+    # never wired into anything at all, including here. Reported
+    # directly by a user looking at exactly this page. Absent (shown as
+    # "Unknown", handled gracefully by .get() below) for any device
+    # that never had excitation enabled -- that is the correct,
+    # accurate "Unknown" for that case, unlike gap_requested_ms/gap_
+    # effective_ms above, which are unconditionally present for every
+    # device regardless of excitation state.
+    ("excitation_mode",                        "Excitation mode",              None, "mdi:sine-wave"),
+    ("excitation_halt_reason",                 "Excitation halt reason",       None, "mdi:alert-circle-outline"),
+    ("excitation_halted_for_s",                "Excitation halted for",        "s",  "mdi:timer-alert-outline"),
+    ("excitation_auto_resume_count_this_mode", "Excitation auto-resume count", None, "mdi:autorenew"),
 ]
 
 

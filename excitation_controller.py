@@ -226,14 +226,120 @@ class _GoNoGoMonitor:
 class ExcitationController:
     """Owns the 2.0.15 excitation schedule's own state and safety gating.
 
-    One instance per AdaptiveModbusController (i.e. per physical device),
-    since GAP and POLL are already per-device adaptive quantities and the
-    field evidence motivating this release (Controller_Redesign_Exact_
-    GAP_TIMEOUT_POLL_Data_Findings.md Section 6.2/6.3) found the two
-    devices in the reference installation behave differently -- a single,
-    shared schedule instance would conflate two genuinely different
-    excitation problems.
+    v2.0.15.3 FIX (real 3-day field run, this release): ONE INSTANCE PER
+    BUS ENDPOINT, not per device -- a genuine architectural correction,
+    not a stylistic one. The original per-device design (2.0.15/2.0.15b)
+    reasoned that GAP and POLL are per-device adaptive quantities and two
+    independent schedules would therefore be fine. That reasoning missed
+    a fact this project already knew and had even fixed telemetry for:
+    ModbusGuard.update_gap() combines every device's own requested GAP
+    on a shared bus via max() -- the SLOWEST device's own request always
+    wins on the real wire, regardless of what any other device requests.
+
+    Confirmed directly against a real 3-day capture: with two
+    independent, per-device schedules, one device's excitation halted
+    within ~15 minutes (a real go/no-go breach) and never resumed (no
+    auto-resume existed yet either -- see the cooldown/retry logic
+    below, added in the same release this docstring was rewritten for).
+    That device's own un-excited baseline request (500ms) then dominated
+    the shared bus's own max() for the ENTIRE remaining ~44 hours. The
+    OTHER device's own schedule ran genuinely, correctly, through all
+    three GAP levels -- and every one of those correct, well-executed
+    requests was silently discarded by the guard's own max(), because
+    nothing coordinated the two independent schedules to request the
+    same level at the same time. The real, physical bus gap was 500ms
+    for 100% of that 44-hour run. Two independent schedules cannot
+    reliably produce real GAP variation on a shared bus; only a
+    genuinely shared schedule can.
+
+    Sharing the whole controller (not just its GAP-mode state) is
+    deliberate, not merely convenient: POLL is NOT combined across
+    devices at the guard level (confirmed directly: no update_poll()/
+    update_timeout() method exists on ModbusGuard, unlike update_gap()/
+    update_max_queue_depth()), so a shared POLL schedule was not
+    strictly required to fix the defect above -- but it is not harmful
+    either. Each device's own get_params() still calls apply() and
+    receives the schedule's current level independently; sharing one
+    instance means both devices receive the SAME level at the SAME
+    time, which produces more consistent, better-populated POLL data
+    than one device exciting POLL alone, not less.
+
+    A genuine, related benefit of sharing rather than a side effect
+    reasoned about after the fact: the go/no-go monitor now aggregates
+    outcomes from every device sharing the bus, not just one -- a
+    problem that shows up as elevated errors/timeouts on one device but
+    not the other (plausible, given this project's own earlier finding
+    that the two devices share some common physical constraint but are
+    not identical) is now visible to the one schedule governing both,
+    rather than silently invisible to a schedule that only ever saw
+    half the picture.
     """
+
+    #: v2.0.15.3 FIX (real 3-day field run, this release): the missing
+    #: piece that let a single early halt silently waste an entire
+    #: unattended run. A halt now auto-resumes after a cooldown, up to a
+    #: bounded number of attempts for the CURRENT mode -- if it keeps
+    #: halting after that many genuine attempts, auto-resume stops and
+    #: the existing manual button (button.py) remains the only path
+    #: forward, exactly as it already was for every halt before this
+    #: release. This is not "never require a human" -- it is "don't let
+    #: one bad 15-minute window near the very start of a multi-day
+    #: unattended run cost the whole run before a human ever gets a
+    #: chance to look at it."
+    _HALT_COOLDOWN = timedelta(minutes=30)
+    _MAX_AUTO_RESUME_ATTEMPTS_PER_MODE = 3
+
+    #: Registry keyed by bus endpoint (matching ModbusGuard's own
+    #: get_or_create() pattern exactly) -- NOT by device serial number.
+    _registry: dict[str, "ExcitationController"] = {}
+
+    @classmethod
+    def get_or_create(
+        cls, bus_endpoint: str, schedule: tuple[ExcitationScheduleEntry, ...] = _DEFAULT_SCHEDULE
+    ) -> "ExcitationController":
+        if bus_endpoint not in cls._registry:
+            cls._registry[bus_endpoint] = cls(schedule)
+        return cls._registry[bus_endpoint]
+
+    @classmethod
+    def get_or_restore(
+        cls,
+        bus_endpoint: str,
+        persisted_data: dict[str, Any],
+        schedule: tuple[ExcitationScheduleEntry, ...] = _DEFAULT_SCHEDULE,
+    ) -> "ExcitationController":
+        """v2.0.15.3 FIX (real 3-day field run, this release): the
+        registry-aware counterpart to from_persisted_dict(), which by
+        itself always constructs a brand-new instance and was never
+        registry-aware at all -- correct on its own for the pre-2.0.15.3
+        per-device design, but a real, silent bug once ExcitationController
+        became shared per bus endpoint (see this class's own docstring):
+        each device's own AdaptiveModbusController._deserialize() calls
+        this restoration path independently, once per device, from its
+        own separately-stored persisted data. Without this method, the
+        SECOND device to restore would silently create and register its
+        own, separate ExcitationController for the same bus_endpoint --
+        overwriting the first device's own, likely more current, shared
+        instance in the registry with a second, disconnected one, right
+        at the exact moment (a restart) this whole fix exists to protect.
+
+        Deliberately "first restoration wins, every later one reuses it
+        unchanged" rather than trying to reconcile two devices' own
+        persisted snapshots of what was, before the restart, the SAME
+        shared object -- both should hold near-identical data (they were
+        sharing one instance right up until shutdown), so any difference
+        is a save-timing artifact, not a real conflict worth resolving
+        carefully for code this explicitly experimental and throwaway.
+        """
+        if bus_endpoint in cls._registry:
+            return cls._registry[bus_endpoint]
+        restored = cls.from_persisted_dict(persisted_data, schedule)
+        cls._registry[bus_endpoint] = restored
+        return restored
+
+    @classmethod
+    def clear_registry(cls) -> None:
+        cls._registry.clear()
 
     def __init__(self, schedule: tuple[ExcitationScheduleEntry, ...] = _DEFAULT_SCHEDULE):
         self._schedule = schedule
@@ -245,6 +351,16 @@ class ExcitationController:
         self._gonogo = _GoNoGoMonitor()
         self._halt_reason: str | None = None
         self._last_applied_value: float | None = None
+        # v2.0.15.3 FIX: auto-resume bookkeeping. _halt_mono is None
+        # whenever not currently halted (used both to detect "how long
+        # have we been halted" and, via is-None, whether the cooldown
+        # check in maybe_advance() applies at all). _auto_resume_count_
+        # this_mode resets to 0 on every genuine mode advance (see
+        # _advance_if_ready below) -- a mode that has never halted
+        # before always gets its own full attempt budget, not one
+        # inherited from whatever mode ran before it.
+        self._halt_mono: float | None = None
+        self._auto_resume_count_this_mode = 0
 
     # ── Outcome recording (call once per completed transaction) ────────────
 
@@ -260,30 +376,37 @@ class ExcitationController:
     def _halt(self, reason: str) -> None:
         _LOGGER.error(
             "ExcitationController: HALTING excitation schedule (%s). "
-            "Reverting to NORMAL. This does NOT auto-resume -- call "
-            "resume_after_halt() explicitly once the cause has been "
-            "reviewed.",
-            reason,
+            "Reverting to NORMAL. Will auto-resume after a %s cooldown, "
+            "up to %d attempt(s) for the current mode -- or call "
+            "resume_after_halt() explicitly to resume sooner once the "
+            "cause has been reviewed.",
+            reason, self._HALT_COOLDOWN, self._MAX_AUTO_RESUME_ATTEMPTS_PER_MODE,
         )
         self._state = ExcitationMode.HALTED
         self._halt_reason = reason
+        self._halt_mono = time.monotonic()
         self._gonogo.reset()
 
-    def resume_after_halt(self) -> None:
-        """Explicit, human-initiated recovery from a go/no-go halt.
+    def resume_after_halt(self, *, is_automatic: bool = False) -> None:
+        """Recovery from a go/no-go halt -- either human-initiated (the
+        button in button.py) or automatic (see maybe_advance()'s own
+        cooldown/retry-limit check below).
 
         Deliberately does NOT resume the level that triggered the halt --
         resumes at the START of that same mode's level sequence (level 0),
         since a level that just breached safety thresholds should not be
         immediately re-attempted with no change. Advancing past it silently
         would also hide the breach from anyone reviewing the schedule's own
-        history.
+        history. This is unchanged by the addition of auto-resume: an
+        automatic resume follows exactly the same rule a manual one always
+        has, not a lighter-touch version of it.
         """
         if self._state != ExcitationMode.HALTED:
             return
         _LOGGER.warning(
-            "ExcitationController: resuming after halt (was: %s), "
+            "ExcitationController: %s resume after halt (was: %s), "
             "restarting current mode from its first level.",
+            "AUTOMATIC" if is_automatic else "manual",
             self._halt_reason,
         )
         self._level_idx = 0
@@ -291,6 +414,7 @@ class ExcitationController:
         self._level_transaction_count = 0
         self._gonogo.reset()
         self._halt_reason = None
+        self._halt_mono = None
         self._state = self._schedule[self._entry_idx].mode
 
     # ── Schedule progression ────────────────────────────────────────────────
@@ -298,9 +422,14 @@ class ExcitationController:
     def maybe_advance(self) -> None:
         """Call once per poll cycle. Advances to the next level/mode if the
         current level has met BOTH its dwell-time and transaction-count
-        requirement. No-op if halted, complete, or requirements unmet.
+        requirement. While halted, checks the auto-resume cooldown/retry
+        logic instead (v2.0.15.3 FIX) -- no-op only once that budget is
+        exhausted, or if complete.
         """
-        if self._state in (ExcitationMode.COMPLETE, ExcitationMode.HALTED):
+        if self._state == ExcitationMode.COMPLETE:
+            return
+        if self._state == ExcitationMode.HALTED:
+            self._maybe_auto_resume()
             return
         if self._state == ExcitationMode.NORMAL:
             # NORMAL between/before modes is not itself timed -- the
@@ -321,6 +450,11 @@ class ExcitationController:
             self._entry_idx += 1
             self._level_idx = 0
             self._state = self._schedule[self._entry_idx].mode
+            # v2.0.15.3 FIX: a genuinely new mode gets its own full
+            # auto-resume attempt budget -- a mode that never halted
+            # before should never inherit a used-up budget from a
+            # different mode that struggled earlier in the schedule.
+            self._auto_resume_count_this_mode = 0
         else:
             _LOGGER.info("ExcitationController: schedule COMPLETE.")
             self._state = ExcitationMode.COMPLETE
@@ -337,6 +471,33 @@ class ExcitationController:
             self._state.value,
             self._current_level().label if self._current_level() else "n/a",
         )
+
+    def _maybe_auto_resume(self) -> None:
+        """v2.0.15.3 FIX (real 3-day field run, this release): the
+        specific gap that let one early, unattended halt silently waste
+        an entire 44-hour run -- see this class's own docstring for the
+        full incident.
+        """
+        assert self._halt_mono is not None, "HALTED state must always set _halt_mono"
+        elapsed = time.monotonic() - self._halt_mono
+        if elapsed < self._HALT_COOLDOWN.total_seconds():
+            return
+        if self._auto_resume_count_this_mode >= self._MAX_AUTO_RESUME_ATTEMPTS_PER_MODE:
+            # Budget exhausted for this mode -- stay halted. This is the
+            # deliberate hand-off point back to a human: repeated,
+            # genuine breaches after several real attempts are treated
+            # as a persistent problem, not transient bad luck, and the
+            # existing manual button (button.py) remains the only path
+            # forward from here, exactly as it always has been.
+            return
+        self._auto_resume_count_this_mode += 1
+        _LOGGER.warning(
+            "ExcitationController: auto-resume attempt %d/%d for this "
+            "mode after %s cooldown.",
+            self._auto_resume_count_this_mode, self._MAX_AUTO_RESUME_ATTEMPTS_PER_MODE,
+            self._HALT_COOLDOWN,
+        )
+        self.resume_after_halt(is_automatic=True)
 
     def _current_level(self) -> ExcitationLevel | None:
         if self._state not in (ExcitationMode.EXCITE_GAP, ExcitationMode.EXCITE_POLL):
@@ -384,6 +545,22 @@ class ExcitationController:
             "excitation_level_elapsed_s": round(time.monotonic() - self._level_start_mono, 1),
             "excitation_level_transaction_count": self._level_transaction_count,
             "excitation_halt_reason": self._halt_reason,
+            # v2.0.15.3 FIX (real 3-day field run, this release): the
+            # original release built this whole method but never wired
+            # it into anything -- see adaptive_modbus.py's own snapshot()
+            # for where that gap is finally closed. Included here from
+            # the start of THIS release's own visibility fix, not added
+            # after the fact: seconds since halt (None while not halted)
+            # and the current auto-resume attempt count let a telemetry
+            # reader distinguish "just halted, cooldown pending" from
+            # "auto-resumed once already, will try again" from "budget
+            # exhausted, now needs a human" without cross-referencing
+            # log timestamps by hand.
+            "excitation_halted_for_s": (
+                round(time.monotonic() - self._halt_mono, 1)
+                if self._halt_mono is not None else None
+            ),
+            "excitation_auto_resume_count_this_mode": self._auto_resume_count_this_mode,
         }
 
     # ── Persistence (mirrors AdaptiveModbusController's own Store pattern) ──
@@ -418,6 +595,18 @@ class ExcitationController:
                 # entry's own valid range rather than trusting stale data
                 entry = schedule[ctrl._entry_idx]
                 ctrl._level_idx = min(ctrl._level_idx, len(entry.levels) - 1)
+            if ctrl._state == ExcitationMode.HALTED:
+                # v2.0.15.3 FIX: _halt_mono is a monotonic timestamp, not
+                # persisted (same reasoning as level_start_mono above --
+                # meaningless across a restart). A restored HALTED state
+                # with _halt_mono left at None would make _maybe_auto_
+                # resume()'s own assertion fail the next time maybe_
+                # advance() runs. Treat the restart itself as the start
+                # of a fresh cooldown window -- safe in both directions:
+                # it never resumes sooner than a real 30-minute wait from
+                # NOW, and it never assumes a cooldown that started before
+                # the restart has already silently elapsed.
+                ctrl._halt_mono = time.monotonic()
         except (ValueError, KeyError, IndexError) as exc:
             _LOGGER.warning(
                 "ExcitationController: failed to restore persisted state (%s), "

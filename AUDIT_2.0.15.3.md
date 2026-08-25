@@ -1,0 +1,59 @@
+# huawei_solar 2.0.15.3 — Release Audit
+
+**Scope:** Corrective release fixing real, confirmed defects discovered in a real 3-day, ~44-hour field run of 2.0.15.2. This release remains explicitly experimental and throwaway — its sole purpose is producing telemetry/Modbus captures with genuine, usable GAP/POLL variability so the real controller/filter design work can happen later, on 2.0.14. Nothing here is intended to survive that transition except where explicitly noted.
+
+**Manifest version validated against HA's actual check this time**, not assumed: `"2.0.15b"` (2.0.15b's own version string) was confirmed to genuinely fail `homeassistant.loader`'s `AwesomeVersion(..., ensure_strategy=[CALVER, SEMVER, SIMPLEVER, BUILDVER, PEP440])` check — the exact mechanism that blocked 2.0.15b from loading in the field. `"2.0.15.3"` was confirmed to pass the identical check (`AwesomeVersionStrategy.SIMPLEVER`) before this release was ever handed over.
+
+**Final verification:** 1,355 passed, 1 skipped — confirmed identically from a fresh, independent extraction of `huawei_solar-2.0.15.3.zip`, matching the established pre-existing baseline (5 failed / 12 errored, documented since 2.0.7) with zero new regressions.
+
+---
+
+## What the 3-day field run of 2.0.15.2 actually found
+
+A real capture (~44h, both devices with excitation independently enabled) showed the real, effective GAP on the shared bus was 500ms for **100.0% of 5,220 telemetry snapshots** — the physical bus never varied at all, despite one device (dev8c0f) genuinely, correctly progressing through all three GAP levels (150/325/500ms) and the master device's own excitation being active too. Root-caused precisely: the master's excitation halted on a real go/no-go breach (10% error rate) roughly 15 minutes after being enabled, during the rough startup period immediately after a HACS reload — and, because no auto-resume existed yet, never recovered for the remaining ~43+ hours. `ModbusGuard.update_gap()`'s own `max()`-across-devices combining then meant the master's reverted, un-excited 500ms baseline request dominated the real bus for the entire run, silently discarding every one of dev8c0f's own correct, active excitation requests.
+
+## Fix 1 — ExcitationController is now shared per bus endpoint, not per device
+
+The original per-device design (2.0.15/2.0.15b) reasoned that GAP and POLL are per-device adaptive quantities and therefore two independent schedules would be fine. That reasoning missed a fact this project had already found and even fixed telemetry for: GAP is combined across every device sharing a bus via `max()` — the slowest device's own request always wins on the real wire. Two independent, per-device schedules can never reliably produce real GAP variation on a shared bus; only a genuinely shared schedule can, since only that guarantees both devices request the same level at the same time.
+
+`ExcitationController` now uses the same `get_or_create(bus_endpoint)` registry pattern `ModbusGuard` already established — confirmed directly via real execution that two `AdaptiveModbusController` instances on the same bus now share the same `ExcitationController` object, request the same GAP level simultaneously, and feed the same go/no-go monitor. `disable_excitation()` on one device correctly clears only its own local reference, verified not to disturb the shared instance a sibling device still uses.
+
+Sharing the whole controller (not just GAP-mode state) is deliberate: POLL is not combined across devices at the guard level at all (confirmed directly — no `update_poll()`/`update_timeout()` method exists on `ModbusGuard`, unlike `update_gap()`/`update_max_queue_depth()`), so this wasn't strictly required for POLL, but it isn't harmful either — both devices now receive the same POLL level at the same time, which produces more consistent data than one device exciting POLL alone.
+
+**A second real bug found and fixed during this work**: `from_persisted_dict()` was never registry-aware — it always constructed a brand-new instance. Since each device's own `_deserialize()` calls this restoration path independently, from its own separately-stored persisted data, the second device to restore after any restart would silently create and register its own, disconnected `ExcitationController` for the same bus endpoint — defeating the sharing fix at exactly the moment (a restart) it exists to protect. Fixed with a new `get_or_restore()` method (first restoration creates and registers, every later one reuses it unchanged); verified directly against the exact two-devices-restoring-independently scenario that caused the original defect.
+
+**A third real bug found and fixed**: a restored `HALTED` state never set `_halt_mono` (the monotonic halt timestamp, deliberately not persisted — meaningless across a restart, same reasoning as `_level_start_mono`). Without a fix, the very next `maybe_advance()` call after any restart during a halt would have failed `_maybe_auto_resume()`'s own assertion. Fixed by treating the restart itself as the start of a fresh cooldown window; verified directly.
+
+## Fix 2 — auto-resume after a cooldown, with a bounded per-mode retry limit
+
+The specific, direct cause of the wasted 44-hour run: a halt required a human to notice and press a button, and nobody did. `ExcitationController` now auto-resumes 30 minutes after a halt, up to 3 attempts for the current mode — restarting that mode from its own first level, identically to how manual resume already worked, not a lighter-touch version of it. If a mode keeps halting after 3 genuine attempts, auto-resume stops and the existing manual button remains the only path forward, treating repeated breaches as a persistent problem rather than transient bad luck. Verified through the complete lifecycle with real execution: halt → cooldown-not-elapsed (correctly no-op) → cooldown-elapsed (auto-resumes) → repeated to the limit → budget exhausted (stays halted) → manual button still works as the fallback.
+
+## Fix 3 — excitation state is now genuinely visible, in two places
+
+`ExcitationController.telemetry_snapshot()` has existed since the original 2.0.15 release but was never called from anywhere at all — confirmed directly this release, the same gap flagged (and left unfixed) in the 2.0.15 audit. Closed two ways:
+- Merged directly into `AdaptiveModbusController.snapshot()`'s own output (not nested under a sub-key), so `excitation_mode`, `excitation_halt_reason`, `excitation_halted_for_s`, and `excitation_auto_resume_count_this_mode` flow into every telemetry capture automatically.
+- Added as four new HA diagnostic sensor entities (`_ADAPTIVE_SENSORS`), genuinely visible on the same live diagnostics page a user would actually look at — not just in an exported capture file.
+
+## A fourth real bug, found only because a user sent a screenshot of their own diagnostics page
+
+The 2.0.15b telemetry-correctness fix renamed `gap_ms`/`max_queue_depth` to `gap_requested_ms`/`gap_effective_ms`/`max_queue_depth_requested`/`max_queue_depth_effective` in `snapshot()` — but `_ADAPTIVE_SENSORS`, a separate, hardcoded list defining the live HA sensor entities, was never updated to match. The result: "Adaptive Modbus gap" and "Adaptive queue depth" showed "Unknown" in the live UI for every 2.0.15b installation, silently, for as long as it shipped — no existing test checked this correspondence at all. Fixed by replacing the two stale entries with four correctly-named ones (both requested and effective get their own sensor, not just one), and by adding the four new excitation-visibility sensors from Fix 3 to the same list. A new permanent test (`test_adaptive_sensor_keys_match_snapshot.py`) now checks every `_ADAPTIVE_SENSORS` key genuinely resolves against a real `snapshot()` output, both with and without excitation enabled, specifically so this exact class of bug (a key renamed in one place, not propagated to this list) cannot silently ship again.
+
+## Testing
+
+23 new tests across two files, real execution throughout:
+- `test_shared_excitation_and_auto_resume.py` (18 tests): the shared registry (same-endpoint reuse, different-endpoint isolation, simultaneous level requests across two devices, disable-on-one-doesn't-affect-the-other, aggregated go/no-go, the no-bus_endpoint fallback), `get_or_restore()` (first-wins, second-reuses, restored-halted-state doesn't crash), the full auto-resume lifecycle, and the visibility fields in `snapshot()`.
+- `test_adaptive_sensor_keys_match_snapshot.py` (5 tests): every sensor key resolves with and without excitation enabled, the old removed keys are genuinely gone, both requested/effective replacements exist for gap and queue depth, no duplicate sensor keys.
+
+## Open, unresolved finding — not blocking this release
+
+The 3-day capture's own POLL data showed the 30s/60s/90s excitation levels tracking real, measured cycle timing closely (median 30.5s/64.7s/90.5s against those respective requests, checked across the full capture). The 120s level did not: real cycle timing was close to 120s for roughly the first half of that level's own dwell window, then shifted to a consistent, tight ~300s (a ~2.5× multiplier) for the remainder — confirmed this is not a schedule-completion artifact (GAP had already reverted to non-discrete values well before this shift, while POLL was still genuinely, actively requesting 120s throughout). Root cause not identified within this release's own scope. Given 30/60/90s already provide good, usable variability for the eventual filter/coordinator design work, and given this project's own explicitly throwaway, experimental framing for the 2.0.15.x line, this was not pursued further here — worth investigating if POLL data near the 120s level specifically turns out to matter for that later design work.
+
+## Final verification
+
+- Every file in the packaged `huawei_solar-2.0.15.3.zip` compiles cleanly; `strings.json`, `translations/en.json`, and `services.yaml` all validate.
+- Manifest version independently re-verified against HA's own exact check on the packaged artifact itself, not just the working tree.
+- Full suite, run from a **fresh, independent extraction** of that exact zip: **1,355 passed, 1 skipped**, matching the working tree and the established pre-existing baseline exactly — zero drift, zero new regressions.
+
+## What comes next
+
+Deploy 2.0.15.3 for the next excitation run. Both devices on the master's own bus should be enabled together (the shared-controller fix makes this the correct, and now only meaningful, way to run it). A halt should now recover on its own within 30 minutes without intervention — but the halt is genuinely visible this time, on the live diagnostics page, so it no longer has to be discovered after the fact. Per the standing agreement: this release and its predecessors exist to answer the controller/filter question; once genuinely varied GAP and POLL data exists, the real implementation is built on 2.0.14, carrying forward the specific, independent fixes from this whole 2.0.15.x line (the telemetry-correctness fix, the Configure-screen relocation, the shared-bus excitation architecture if excitation itself is ever judged worth keeping) deliberately, not by inheriting this experimental codebase wholesale.
