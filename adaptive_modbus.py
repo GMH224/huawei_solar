@@ -1197,7 +1197,15 @@ class AdaptiveModbusController:
             # masking this same class of defect in a new shape.
             guard = ModbusGuard.get_or_create(bus_endpoint)
             gap_effective_ms = guard.effective_gap_ms
-            max_queue_depth_effective = guard.queue_depth
+            # v2.0.15.3 FIX (real deployment check, this release): was
+            # guard.queue_depth -- live, current occupancy (fluctuates
+            # with real traffic), not the min()-combined CEILING this
+            # field's own name promises. See ModbusGuard.effective_max_
+            # queue_depth's own docstring for the full defect this
+            # closes; confirmed directly against a real capture (live
+            # occupancy observed fluctuating 0-1 against a requested
+            # ceiling of 3 -- unrelated, differently-scaled numbers).
+            max_queue_depth_effective = guard.effective_max_queue_depth
         else:
             # No known endpoint (see docstring) -- the effective value
             # cannot be looked up, so it is reported as None rather than

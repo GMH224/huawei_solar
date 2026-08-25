@@ -4,7 +4,11 @@
 
 **Manifest version validated against HA's actual check this time**, not assumed: `"2.0.15b"` (2.0.15b's own version string) was confirmed to genuinely fail `homeassistant.loader`'s `AwesomeVersion(..., ensure_strategy=[CALVER, SEMVER, SIMPLEVER, BUILDVER, PEP440])` check — the exact mechanism that blocked 2.0.15b from loading in the field. `"2.0.15.3"` was confirmed to pass the identical check (`AwesomeVersionStrategy.SIMPLEVER`) before this release was ever handed over.
 
-**Final verification:** 1,355 passed, 1 skipped — confirmed identically from a fresh, independent extraction of `huawei_solar-2.0.15.3.zip`, matching the established pre-existing baseline (5 failed / 12 errored, documented since 2.0.7) with zero new regressions.
+**Final verification:** 1,358 passed, 1 skipped — confirmed identically from a fresh, independent extraction of `huawei_solar-2.0.15.3.zip`, matching the established pre-existing baseline (5 failed / 12 errored, documented since 2.0.7) with zero new regressions.
+
+## Fix 5 — `max_queue_depth_effective` was reporting the wrong quantity entirely, found within 2 hours of real deployment
+
+Caught directly against a real ~10-minute capture sent for a quick post-deploy check: `max_queue_depth_effective` fluctuated 0/1 while the requested ceiling was 3 — two numbers with no relationship to each other. Root cause: `ModbusGuard` has two genuinely separate attributes — `queue_depth` (live, current queue occupancy, fluctuates with real traffic) and `_max_queue_depth` (the actual `min()`-combined ceiling across devices sharing the bus, previously with no public property exposing it at all). The 2.0.15b telemetry-correctness fix used `guard.queue_depth` for `max_queue_depth_effective`, treating it as if it were the combined version of `max_queue_depth_requested` the way `effective_gap_ms` genuinely is for `gap_requested_ms` — but unlike gap, these were never the same underlying quantity to begin with. Fixed by adding `ModbusGuard.effective_max_queue_depth` (mirroring `effective_gap_ms`'s own pattern) and switching `snapshot()` to use it; verified directly that the two values are now correctly distinct and that the reported ceiling matches `min()`-combining across multiple devices. Three new regression tests pin this specifically, including the exact live-occupancy-vs-ceiling scenario that exposed it.
 
 ---
 

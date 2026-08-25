@@ -841,6 +841,29 @@ class ModbusGuard:
         return self._queue_depth
 
     @property
+    def effective_max_queue_depth(self) -> int:
+        """v2.0.15.3 FIX (real deployment check, this release): the
+        actual min()-combined queue-depth CEILING across every device
+        sharing this bus -- NOT the same thing as queue_depth just
+        above, which is live, current occupancy (how many requests are
+        queued right now, fluctuating with real traffic), not a limit
+        at all.
+
+        Caught directly against a real capture: max_queue_depth_
+        effective in AdaptiveModbusController.snapshot() was wrongly
+        reading guard.queue_depth (live occupancy, observed fluctuating
+        0-1) instead of this value (the real, combined ceiling,
+        min()-combined the same way effective_gap_ms is max()-combined
+        just below) -- reporting an unrelated, differently-scaled
+        quantity under a name that promised it was the effective
+        version of max_queue_depth_requested. Exactly the class of
+        defect the *_requested/*_effective split was built to prevent
+        for gap, reintroduced here for queue depth by using the wrong
+        one of two existing, differently-named attributes.
+        """
+        return self._max_queue_depth
+
+    @property
     def is_busy(self) -> bool:
         return self._lock.locked()
 
