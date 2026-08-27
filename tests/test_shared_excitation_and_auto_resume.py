@@ -101,13 +101,23 @@ class TestSharedRegistry(_FastTestCase):
         )
 
     def test_disable_on_one_device_does_not_affect_the_other(self):
+        """v2.0.15.4 NOTE: rewritten to construct ExcitationController
+        directly, not via AdaptiveModbusController.enable_excitation() --
+        which class that method wires up is a per-release decision (this
+        release's own enable_excitation() now uses RandomExcitationController
+        instead, see random_excitation_controller.py). What this test
+        actually verifies -- the shared-registry class's own disable
+        behavior -- is unaffected by that and still applies to
+        ExcitationController directly, which still exists and is still
+        used elsewhere (its own tests, and available for a future
+        release to opt back into)."""
         hass = MagicMock()
         endpoint = "192.168.7.22:502"
         ctrl_a = AdaptiveModbusController.get_or_create(hass, "SN-A", {}, bus_endpoint=endpoint)
         ctrl_b = AdaptiveModbusController.get_or_create(hass, "SN-B", {}, bus_endpoint=endpoint)
-        ctrl_a.enable_excitation()
-        ctrl_b.enable_excitation()
-        shared = ctrl_b._excitation
+        shared = ExcitationController.get_or_create(endpoint)
+        ctrl_a._excitation = shared
+        ctrl_b._excitation = shared
 
         ctrl_a.disable_excitation()
 
@@ -116,12 +126,15 @@ class TestSharedRegistry(_FastTestCase):
         self.assertIs(ExcitationController.get_or_create(endpoint), shared)
 
     def test_gonogo_monitor_aggregates_outcomes_from_both_devices(self):
+        """v2.0.15.4 NOTE: see test_disable_on_one_device_does_not_
+        affect_the_other's own note just above -- same reasoning."""
         hass = MagicMock()
         endpoint = "192.168.7.22:502"
         ctrl_a = AdaptiveModbusController.get_or_create(hass, "SN-A", {}, bus_endpoint=endpoint)
         ctrl_b = AdaptiveModbusController.get_or_create(hass, "SN-B", {}, bus_endpoint=endpoint)
-        ctrl_a.enable_excitation()
-        ctrl_b.enable_excitation()
+        shared = ExcitationController.get_or_create(endpoint)
+        ctrl_a._excitation = shared
+        ctrl_b._excitation = shared
 
         for _ in range(10):
             ctrl_a.record_request(rtt_ms=10, success=True, timeout=False)
@@ -258,9 +271,16 @@ class TestSnapshotVisibility(_FastTestCase):
     -- confirmed directly in this release's own audit. Closed here."""
 
     def test_excitation_fields_present_when_enabled(self):
+        """v2.0.15.4 NOTE: constructs ExcitationController directly and
+        assigns it manually, rather than via enable_excitation() -- see
+        test_disable_on_one_device_does_not_affect_the_other's own note
+        in TestSharedRegistry above for why. What this test verifies
+        (ExcitationController's own telemetry fields correctly flowing
+        into snapshot()) is unaffected by which class this release's
+        own enable_excitation() happens to wire up."""
         hass = MagicMock()
         ctrl = AdaptiveModbusController.get_or_create(hass, "SN-VIS", {}, bus_endpoint="1.2.3.4:502")
-        ctrl.enable_excitation()
+        ctrl._excitation = ExcitationController.get_or_create("1.2.3.4:502")
         snap = ctrl.snapshot()
         self.assertEqual(snap["excitation_mode"], "EXCITE_GAP")
         self.assertIsNone(snap["excitation_halted_for_s"])
@@ -277,9 +297,11 @@ class TestSnapshotVisibility(_FastTestCase):
         self.assertNotIn("excitation_mode", snap)
 
     def test_halted_state_visible_with_reason_and_duration(self):
+        """v2.0.15.4 NOTE: see test_excitation_fields_present_when_
+        enabled's own note just above -- same reasoning."""
         hass = MagicMock()
         ctrl = AdaptiveModbusController.get_or_create(hass, "SN-HALT-VIS", {}, bus_endpoint="1.2.3.4:502")
-        ctrl.enable_excitation()
+        ctrl._excitation = ExcitationController.get_or_create("1.2.3.4:502")
         ctrl._excitation._state = ExcitationMode.HALTED
         ctrl._excitation._halt_mono = time.monotonic()
         ctrl._excitation._halt_reason = "test breach"

@@ -37,36 +37,67 @@ class TestAdaptiveSensorKeysMatchSnapshot(unittest.TestCase):
 
     def test_every_sensor_key_resolves_with_excitation_enabled(self):
         """The strongest check: with excitation enabled, snapshot()
-        includes every key this project currently knows about (the
-        base adaptive fields AND the excitation_* fields) -- every
-        single _ADAPTIVE_SENSORS entry must be found in that dict, or
-        the corresponding HA sensor entity will show "Unknown" exactly
-        as reported."""
+        includes every key relevant to whichever excitation class this
+        release's own enable_excitation() actually instantiates.
+
+        v2.0.15.4 NOTE: which class that is is now a per-release
+        decision (this release uses RandomExcitationController, not
+        ExcitationController -- see random_excitation_controller.py's
+        own module docstring). The two classes' own telemetry_
+        snapshot() keys are deliberately disjoint (excitation_* vs
+        random_excitation_*, confirmed directly when the second set was
+        added, specifically to avoid reproducing this exact class of
+        bug in a new shape) and BOTH sets coexist permanently in
+        _ADAPTIVE_SENSORS -- so only the keys relevant to whichever
+        class is actually active are required to be present here; the
+        other release's own keys are correctly, accurately absent, not
+        a gap this test should flag.
+        """
         ctrl = AdaptiveModbusController.get_or_create(
             self.hass, "SN-SENSOR-CHECK", {}, bus_endpoint="1.2.3.4:502"
         )
         ctrl.enable_excitation()
         snap = ctrl.snapshot()
 
-        missing = [key for key, name, unit, icon in _ADAPTIVE_SENSORS if key not in snap]
+        relevant = [key for key, *_ in _ADAPTIVE_SENSORS if not key.startswith("excitation_")]
+        missing = [key for key in relevant if key not in snap]
         self.assertEqual(
             missing, [],
             f"_ADAPTIVE_SENSORS references key(s) not present in snapshot(): "
             f"{missing} -- these will show 'Unknown' in the live HA UI, "
             f"exactly the bug this test exists to catch.",
         )
+        # And the legacy ExcitationController-specific keys must be
+        # genuinely, correctly absent -- not present-but-None.
+        legacy_keys = [key for key, *_ in _ADAPTIVE_SENSORS if key.startswith("excitation_")]
+        present_legacy = [key for key in legacy_keys if key in snap]
+        self.assertEqual(
+            present_legacy, [],
+            "legacy ExcitationController-specific keys unexpectedly present "
+            "while RandomExcitationController is active",
+        )
 
     def test_every_non_excitation_sensor_key_resolves_without_excitation(self):
         """The base-case check: a device that never enables excitation
-        must still see every one of its OWN (non-excitation_*) sensors
-        populated correctly -- confirms the fix didn't only work in the
-        excitation-enabled case."""
+        must still see every one of its OWN (non-excitation-specific)
+        sensors populated correctly -- confirms the fix didn't only
+        work in the excitation-enabled case.
+
+        v2.0.15.4 NOTE: excludes BOTH excitation_* (ExcitationController)
+        and random_excitation_* (this release's own RandomExcitationController)
+        prefixes -- both are excitation-specific and correctly absent
+        for a device that never enabled excitation at all, not "base"
+        fields this test should require.
+        """
         ctrl = AdaptiveModbusController.get_or_create(
             self.hass, "SN-SENSOR-CHECK-2", {}, bus_endpoint="1.2.3.5:502"
         )
         snap = ctrl.snapshot()
 
-        base_keys = [key for key, *_ in _ADAPTIVE_SENSORS if not key.startswith("excitation_")]
+        base_keys = [
+            key for key, *_ in _ADAPTIVE_SENSORS
+            if not (key.startswith("excitation_") or key.startswith("random_excitation_"))
+        ]
         missing = [key for key in base_keys if key not in snap]
         self.assertEqual(
             missing, [],
