@@ -764,73 +764,69 @@ class AdaptiveModbusController:
             )
 
     def enable_excitation(self) -> None:
-        """v2.0.15 (experimental identification release): opt-in only.
+        """v2.0.15.4 (broadband random excitation release): opt-in only.
 
         Enabling this has two effects, both deliberate:
-          1. get_params() begins applying the GAP/POLL excitation schedule
-             from excitation_controller.py on top of its otherwise-normal
-             output, subject to the existing in_transition safety net
-             always winning (see ExcitationController.apply).
-          2. Learning is disabled for the duration (via
-             set_learning_enabled(False)) so the deliberately-perturbed
-             GAP/POLL values during excitation do not themselves get fed
-             back into the slot-level statistics that drive NORMAL
-             behavior -- this release exists to COLLECT data about the
-             plant's own response, not to let the existing learner treat
-             artificially excited values as if they were its own learned
-             conclusions.
+          1. get_params() begins overriding GAP, TIMEOUT, and POLL with
+             a fresh, independent random draw every 10 minutes (see
+             random_excitation_controller.py's own module docstring for
+             the full design and reasoning), on top of its otherwise-
+             normal output, subject to the existing in_transition
+             safety net always winning -- unchanged and untouched by
+             this release.
+          2. Learning is disabled for the duration, for the same reason
+             as the sequential excitation release before it: a randomly
+             drawn value should not itself be fed back into the slot-
+             level statistics that drive NORMAL behavior.
 
         Calling this on an already-enabled controller is a no-op.
-        Excitation state, once enabled, persists across restarts (see
-        _load()/_schedule_save() below) exactly like every other piece of
-        this controller's own state.
 
-        v2.0.15.3 FIX (real 3-day field run, this release): looks up the
-        SHARED ExcitationController for this device's own bus_endpoint
-        (ExcitationController.get_or_create()), not a private, per-device
-        instance -- see that class's own docstring for the full incident
-        this closes. A device with no known bus_endpoint (self._bus_
-        endpoint is None or "", e.g. a test fixture that never set it)
-        falls back to a private instance rather than crashing or silently
-        doing nothing -- this device's own excitation would simply not be
-        synchronized with any sibling on the same physical bus, matching
-        this method's own pre-2.0.15.3 behavior exactly, as the safest
-        possible degradation.
+        v2.0.15.4: unlike the sequential ExcitationController this
+        replaces for this release, RandomExcitationController has
+        deliberately NO go/no-go safety monitor and NO persistence
+        across restarts -- see that class's own module docstring for
+        why both omissions are deliberate design choices, not gaps.
+        Shared per bus_endpoint (RandomExcitationController.get_or_
+        create()), for the same reason the sequential release needed
+        this: GAP is combined across every device on a bus via
+        ModbusGuard's own max(), so independent per-device draws would
+        silently produce an effective GAP governed by whichever device
+        happened to draw the larger value. The no-bus_endpoint fallback
+        (a private, non-shared instance) is retained for the same
+        reason it was in 2.0.15.3: the safest possible degradation for
+        a device with no known bus_endpoint, rather than crashing or
+        silently doing nothing.
         """
         if self._excitation is not None:
             return
-        from .excitation_controller import ExcitationController  # deferred: avoids circular import
+        from .random_excitation_controller import RandomExcitationController, REDRAW_INTERVAL  # deferred: avoids circular import
         if self._bus_endpoint:
-            self._excitation = ExcitationController.get_or_create(self._bus_endpoint)
+            self._excitation = RandomExcitationController.get_or_create(self._bus_endpoint)
         else:
             _LOGGER.warning(
                 "AdaptiveModbus[%s]: enable_excitation() called with no known "
                 "bus_endpoint -- falling back to a private, non-shared "
-                "excitation schedule for this device only. GAP excitation "
-                "will NOT be synchronized with any other device sharing "
-                "this physical bus.",
+                "random excitation instance for this device only. GAP "
+                "excitation will NOT be synchronized with any other "
+                "device sharing this physical bus.",
                 self.serial_number,
             )
-            self._excitation = ExcitationController()
+            self._excitation = RandomExcitationController()
         self.set_learning_enabled(False)
         _LOGGER.warning(
-            "AdaptiveModbus[%s]: EXCITATION ENABLED (v2.0.15 experimental "
-            "identification release). Learning is now disabled for the "
-            "duration. GAP and POLL will follow the deliberate excitation "
-            "schedule, not the normal adaptive controller, except during "
-            "an active transition. See excitation_controller.py for the "
-            "full schedule and safety bounds.",
+            "AdaptiveModbus[%s]: RANDOM EXCITATION ENABLED (v2.0.15.4 "
+            "broadband identification release). Learning is now "
+            "disabled for the duration. GAP, TIMEOUT, and POLL will be "
+            "redrawn independently at random every %s, except during "
+            "an active transition. See random_excitation_controller.py "
+            "for the full design and safety bounds.",
             self.serial_number,
+            REDRAW_INTERVAL,
         )
 
     def disable_excitation(self) -> None:
         """Explicit, human-initiated stop -- does not happen automatically
-        on any timer. Re-enables learning. Excitation progress (which
-        level/mode had been reached) is discarded, not paused -- calling
-        enable_excitation() again starts a fresh schedule from the
-        beginning, since resuming a partially-run schedule after an
-        unknown-duration gap is not something this release's own go/no-go
-        design was built to reason about safely.
+        on any timer. Re-enables learning.
         """
         if self._excitation is None:
             return
@@ -842,20 +838,18 @@ class AdaptiveModbusController:
         )
 
     def excitation_is_halted(self) -> bool:
-        """True if excitation is enabled AND currently halted by the
-        go/no-go safety monitor. Public accessor so callers (the
-        resume_excitation_after_halt service handler, in particular)
-        never need to reach into the private _excitation field directly.
-
-        Compares against the enum's own string value ("HALTED") rather
-        than importing ExcitationMode here -- this method is small and
-        narrow enough that a value comparison is clearer than adding a
-        second deferred import alongside enable_excitation()'s own, for
-        a single boolean check.
+        """v2.0.15.4: always False -- RandomExcitationController has no
+        go/no-go safety monitor and therefore no halt concept at all
+        (see that class's own module docstring for why this is a
+        deliberate design choice for this release, not a gap). Kept as
+        a real method, not removed, so callers written against the
+        sequential-excitation releases (the resume_excitation_after_
+        halt button in button.py, in particular) continue to work
+        unchanged against this release too, correctly reporting nothing
+        is ever halted rather than raising on a class that no longer
+        has a _state attribute at all.
         """
-        if self._excitation is None:
-            return False
-        return self._excitation._state.value == "HALTED"
+        return False
 
     def excitation_is_enabled(self) -> bool:
         """True if enable_excitation() has been called and disable_
@@ -865,15 +859,14 @@ class AdaptiveModbusController:
         return self._excitation is not None
 
     def resume_excitation_after_halt(self) -> None:
-        """Explicit, human-initiated recovery from a go/no-go safety
-        halt. A no-op if excitation was never enabled, or is enabled but
-        not currently halted -- see ExcitationController.resume_after_
-        halt()'s own docstring for the full reasoning on why a no-op
-        (not an error) is correct here.
+        """v2.0.15.4: always a safe no-op -- see excitation_is_halted()'s
+        own docstring. Kept as a real method so the existing button
+        entity (button.py) continues to work unchanged against this
+        release: pressing it when nothing can ever be halted correctly
+        does nothing, rather than the entity needing its own release-
+        specific special-casing.
         """
-        if self._excitation is None:
-            return
-        self._excitation.resume_after_halt()
+        return
 
     def mark_recovery(self, reason: str) -> None:
         """Suppress learning for the settling period after a disturbance."""
@@ -1597,7 +1590,18 @@ class AdaptiveModbusController:
         # entirely (not a null/empty placeholder) for every deployment
         # that never turns this on, keeping the stored payload identical
         # to pre-2.0.15 for the overwhelming majority of installs.
-        if self._excitation is not None:
+        #
+        # v2.0.15.4: RandomExcitationController deliberately has NO
+        # to_persisted_dict() at all (see that class's own module
+        # docstring -- there is no "progress" to preserve across a
+        # restart when every 10-minute window is independent). The
+        # hasattr() check here, rather than an isinstance() check
+        # against both classes, avoids importing either excitation
+        # class into this method just to tell them apart -- and stays
+        # correct automatically if a future release adds a third
+        # excitation class that also skips persistence for its own,
+        # different reasons.
+        if self._excitation is not None and hasattr(self._excitation, "to_persisted_dict"):
             data["excitation"] = self._excitation.to_persisted_dict()
         return data
 
@@ -1618,37 +1622,41 @@ class AdaptiveModbusController:
         self._last_decay_date = date.fromisoformat(last_str) if last_str else None
         first_str = raw.get("first_data_date")
         self._first_data_date = date.fromisoformat(first_str) if first_str else None
-        # v2.0.15: only restores an ExcitationController if the stored
+        # v2.0.15: only restores an excitation controller if the stored
         # payload actually contains one -- a pre-2.0.15 store, or a
         # 2.0.15 store where excitation was never enabled, has no
         # "excitation" key at all, and self._excitation correctly stays
         # None (no behavior change) rather than being restored into some
         # default-enabled state nothing ever asked for.
         #
-        # v2.0.15.3 FIX (real 3-day field run, this release): uses
-        # get_or_restore(), not from_persisted_dict() directly -- see
-        # that method's own docstring. Each device on a shared bus calls
-        # this independently, from its own separately-stored persisted
-        # data; without registry-awareness here, the second device to
-        # restore would silently create and register its own, separate,
-        # disconnected ExcitationController for the same bus_endpoint,
-        # defeating the sharing fix at exactly the moment (a restart)
-        # it exists to protect. Same fallback as enable_excitation()'s
-        # own: no known bus_endpoint restores a private, non-shared
-        # instance rather than crashing or silently doing nothing.
+        # v2.0.15.4: RandomExcitationController deliberately has NO
+        # persistence at all (see that class's own module docstring),
+        # so this release never writes an "excitation" key in the first
+        # place -- but a device UPGRADED from 2.0.15.3 in place, without
+        # clearing storage, may still have one left over from the
+        # sequential ExcitationController that release used. Restoring
+        # that as an ExcitationController here would silently give this
+        # release the WRONG excitation mechanism for the rest of the
+        # session (the old sequential schedule instead of the random
+        # redraws this release exists to run), with no warning at all --
+        # exactly the kind of silent, field-discovered surprise this
+        # project has already spent real effort tracking down more than
+        # once. Legacy data is explicitly recognized and discarded here
+        # instead: self._excitation stays None, matching this release's
+        # own "no persistence" design, and a person restarting after an
+        # in-place upgrade sees a clear, honest reason why any leftover
+        # sequential-excitation state was not carried forward.
         excitation_raw = raw.get("excitation")
         if excitation_raw is not None:
-            from .excitation_controller import ExcitationController  # deferred: avoids circular import
-            if self._bus_endpoint:
-                self._excitation = ExcitationController.get_or_restore(
-                    self._bus_endpoint, excitation_raw
-                )
-            else:
-                self._excitation = ExcitationController.from_persisted_dict(excitation_raw)
             _LOGGER.warning(
-                "AdaptiveModbus[%s]: restored ACTIVE excitation schedule "
-                "from storage (state=%s) -- excitation remains enabled "
-                "across this restart.",
+                "AdaptiveModbus[%s]: found a leftover 'excitation' key in "
+                "storage (state=%s) -- almost certainly left over from an "
+                "earlier release's own sequential ExcitationController "
+                "(2.0.15/2.0.15b/2.0.15.3). This release (2.0.15.4) uses "
+                "a different, non-persisted random excitation mechanism "
+                "and does not restore this legacy data. Call "
+                "enable_excitation() explicitly to start random "
+                "excitation fresh for this device.",
                 self.serial_number,
                 excitation_raw.get("state"),
             )
@@ -1776,6 +1784,23 @@ _ADAPTIVE_SENSORS: list[tuple[str, str, str | None, str]] = [
     ("excitation_halt_reason",                 "Excitation halt reason",       None, "mdi:alert-circle-outline"),
     ("excitation_halted_for_s",                "Excitation halted for",        "s",  "mdi:timer-alert-outline"),
     ("excitation_auto_resume_count_this_mode", "Excitation auto-resume count", None, "mdi:autorenew"),
+    # v2.0.15.4: RandomExcitationController's own telemetry_snapshot()
+    # uses different key names (random_excitation_*, not excitation_*)
+    # from ExcitationController's -- confirmed directly, before this list
+    # was updated, that these do NOT overlap with the four keys just
+    # above (a real regression already happened once this project, from
+    # exactly this kind of unchecked assumption -- see the gap_ms/max_
+    # queue_depth comment further up this same list). Both sets of keys
+    # coexist here permanently: whichever excitation class a given
+    # release's own enable_excitation() actually instantiates populates
+    # its own keys; the other release's own keys are simply and
+    # correctly absent (shown as "Unknown"), the same accurate-absence
+    # behavior already established for excitation_mode/etc. above when
+    # excitation was never enabled at all.
+    ("random_excitation_draw_gap_ms",         "Random excitation draw: gap",     "ms", "mdi:dice-multiple-outline"),
+    ("random_excitation_draw_timeout_s",      "Random excitation draw: timeout", "s",  "mdi:dice-multiple-outline"),
+    ("random_excitation_draw_poll_s",         "Random excitation draw: poll",    "s",  "mdi:dice-multiple-outline"),
+    ("random_excitation_draw_elapsed_s",      "Random excitation draw age",      "s",  "mdi:timer-sand"),
 ]
 
 
