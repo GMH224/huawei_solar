@@ -62,6 +62,10 @@ from huawei_solar import (
 )
 from huawei_solar.device.base import HuaweiSolarDevice
 from huawei_solar.files import OptimizerRealTimeData
+# v2.1.0.1 (external ICS audit ICS-008): tmodbus transport exceptions do
+# NOT subclass HuaweiSolarException. TModbusError is their common base --
+# see the exception handlers below for the full reasoning.
+from tmodbus.exceptions import TModbusError
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -1151,7 +1155,19 @@ class HuaweiSolarUpdateCoordinator(
                                 # previously invisible to telemetry
                                 # entirely. See ModbusTelemetry.
                                 # record_busy_retry()'s own docstring.
-                                self.telemetry.record_busy_retry()
+                                # v2.1.0.1 (external ICS audit ICS-003 --
+                                # confirmed): guarded. self.telemetry is
+                                # declared ModbusTelemetry | None and every
+                                # OTHER call site in this file already
+                                # guards it; this one did not, so a BUSY
+                                # response on a coordinator with telemetry
+                                # detached turned a recoverable, expected
+                                # physical condition (0x06) into an
+                                # AttributeError. Instrumentation must
+                                # never convert a recoverable Modbus
+                                # condition into a secondary exception.
+                                if self.telemetry:
+                                    self.telemetry.record_busy_retry()
                                 _LOGGER.debug(
                                     "%s: 0x06 SLAVE_DEVICE_BUSY on chunk %d/%d "
                                     "(retry %d/%d in %.0f ms)",
@@ -1418,6 +1434,73 @@ class HuaweiSolarUpdateCoordinator(
                 if self._verify_write_tasks.get(n) is t else None
             )
         )
+
+    def _stale_cache_fallback(
+        self, all_names: "list[RegisterName]", cause: str,
+    ) -> "dict[RegisterName, Result[Any]] | None":
+        """Serve whatever the cache is still willing to serve, or None.
+
+        v2.1.0.0 (V2_1_ARCHITECTURE_DESIGN.md §2.1). Extracted from the
+        TimeoutError branch of _async_update_data(), where this logic
+        lived alone since v2.0.0, and now called from EVERY failure
+        branch (timeout, ReadException, ConnectionInterruptedException,
+        HuaweiSolarException).
+
+        Why this was a real defect and not a deliberate scoping choice:
+        V2_ARCHITECTURE_DESIGN.md §8 already committed to `available`
+        following "one rule, uniformly, across every entity platform --
+        True for both GOOD and UNCERTAIN ... False only for BAD". A
+        fallback implemented in one of four failure branches is a
+        violation of that stated uniformity, not a later revision of it.
+        Field evidence (4-day capture, 2,951 unknown/unavailable
+        transitions across 14 entities) confirms the other three
+        branches genuinely fire in production: ServerDeviceBusyError
+        (a ReadException) and connection interruptions both appear in
+        the HA log at the exact timestamps of real sensor dropouts.
+
+        The subtler half of the same defect, traced directly through
+        Home Assistant's own DataUpdateCoordinator source rather than
+        assumed: raising from _async_update_data() does NOT clear
+        self.data (the assignment lives inside the try), so a single
+        failure never blanked an entity by itself. But HA notifies
+        listeners only on the FIRST transition into failure and returns
+        early on every subsequent consecutive failure. Because
+        data_age_seconds and the availability re-check are recomputed
+        only on a listener notification, a SUSTAINED outage froze
+        reported staleness at its first-failure value and the designed
+        300s/600s availability ceilings never fired at all. Returning a
+        dict here (rather than raising) keeps self.data changing, so
+        listeners keep firing, staleness keeps advancing, and the
+        ceilings work as designed -- the timeout branch only ever got
+        this right incidentally, as a side effect of returning
+        successfully.
+
+        Deliberately NOT called for ILLEGAL_DATA_ADDRESS -- see that
+        call site's own comment.
+
+        Returns None when the cache has nothing left to serve, so the
+        caller raises UpdateFailed exactly as before. That is the
+        intended, correct path to genuine unavailability: this helper
+        bounds how long a value is served, it does not make an entity
+        immortal. RegisterCache._live_quality() owns the actual ceiling
+        policy (REGISTER_STARVATION_CEILING_S, or the longer
+        ENERGY_AVAILABILITY_CEILING_S for energy counters), keyed by
+        register type -- this method deliberately applies no quality
+        gate of its own on top of it, for the same reason documented at
+        the original call site: a manual GOOD-only gate here would
+        undermine the cache's own, deliberately more generous, energy-
+        counter policy.
+        """
+        cached_fallback = {
+            n: v for n in all_names if (v := self.cache.get(n)) is not None
+        }
+        if not cached_fallback:
+            return None
+        _LOGGER.debug(
+            "%s: stale-cache fallback after %s — %d register(s) served",
+            self.name, cause, len(cached_fallback),
+        )
+        return cached_fallback
 
     async def _async_update_data(self) -> dict[RegisterName, Result[Any]]:
         # ── 0. First-poll stagger ─────────────────────────────────────────────
@@ -1811,15 +1894,14 @@ class HuaweiSolarUpdateCoordinator(
             # consumption site -- so this fallback is simply "serve
             # whatever the cache is willing to serve," the same as every
             # other register, uniformly.
-            cached_fallback = {
-                n: v for n in all_names if (v := self.cache.get(n)) is not None
-            }
-            if cached_fallback:
-                _LOGGER.debug(
-                    "%s: stale-cache fallback — %d register(s) served",
-                    self.name, len(cached_fallback),
-                )
-                return cached_fallback
+            #
+            # v2.1.0.0 (V2_1_ARCHITECTURE_DESIGN.md §2.1): extracted into
+            # _stale_cache_fallback() and now applied by EVERY failure
+            # branch below, not this one alone -- see that helper's own
+            # docstring for the full reasoning and field evidence.
+            fallback = self._stale_cache_fallback(all_names, "timeout")
+            if fallback is not None:
+                return fallback
 
             raise UpdateFailed(
                 f"Timeout communicating with {self.device.serial_number}: "
@@ -1836,6 +1918,20 @@ class HuaweiSolarUpdateCoordinator(
                     "(wait 30 s each) to find the culprit register.",
                     self.device.serial_number,
                 )
+                # v2.1.0.0 (§2.1): deliberately NO stale-cache fallback for
+                # ILLEGAL_DATA_ADDRESS specifically. Every other failure in
+                # this method means "we could not reach the value"; this one
+                # means "this register does not exist on this device" -- a
+                # configuration error, not a transport problem. Serving a
+                # cached value would mask exactly the condition the operator
+                # is being asked to diagnose above, and no amount of waiting
+                # will make the register appear.
+                raise UpdateFailed(
+                    f"Could not update {self.device.serial_number}: {err}"
+                ) from err
+            fallback = self._stale_cache_fallback(all_names, "read exception")
+            if fallback is not None:
+                return fallback
             raise UpdateFailed(
                 f"Could not update {self.device.serial_number}: {err}"
             ) from err
@@ -1846,13 +1942,38 @@ class HuaweiSolarUpdateCoordinator(
                 "%s: connection interrupted — another Modbus client may have connected.",
                 self.device.serial_number,
             )
+            fallback = self._stale_cache_fallback(all_names, "connection interrupted")
+            if fallback is not None:
+                return fallback
             raise UpdateFailed(
                 f"Connection to {self.device.serial_number} interrupted.",
                 retry_after=int(MODBUS_RETRY_BASE_WAIT.total_seconds()),
             ) from err
 
-        except HuaweiSolarException as err:
+        except (HuaweiSolarException, TModbusError) as err:
+            # v2.1.0.1 FIX (external ICS audit ICS-008 -- confirmed, but
+            # for a different reason than the audit gave). The audit
+            # listed ReadException/ServerDeviceBusy/DecodeError as
+            # unhandled; those all subclass HuaweiSolarException and were
+            # already caught. The REAL gap, found by enumerating the
+            # library's exception hierarchy directly: 24 tmodbus
+            # transport exceptions (ServerDeviceBusyError, CRCError,
+            # ModbusConnectionError, RequestRetryFailedError, ...) sit
+            # entirely OUTSIDE HuaweiSolarException and escaped every
+            # handler here. Corroborating evidence that these genuinely
+            # surface at this layer: config_flow.py already imports
+            # ModbusConnectionError from tmodbus directly.
+            #
+            # TModbusError is their common base (verified: it covers all
+            # 24, with none left outside), so catching it converts a
+            # transport failure into the same controlled UpdateFailed +
+            # stale-cache-fallback path every other communication failure
+            # already takes, rather than propagating as an unexpected
+            # exception.
             self._record_failure()
+            fallback = self._stale_cache_fallback(all_names, "device exception")
+            if fallback is not None:
+                return fallback
             raise UpdateFailed(
                 f"Could not update {self.device.serial_number}: {err}"
             ) from err
@@ -2131,7 +2252,13 @@ class HuaweiSolarOptimizerUpdateCoordinator(
                 retry_after=15 * 60,
             ) from err
 
-        except HuaweiSolarException as err:
+        except (HuaweiSolarException, TModbusError) as err:
+            # v2.1.0.1 FIX (external ICS audit ICS-008 -- confirmed): the
+            # optimizer coordinator has its own separate copy of this
+            # bookkeeping, so it needs the same fix applied separately --
+            # exactly as MOD-09 noted for the equivalent earlier fix. See
+            # the matching handler in HuaweiSolarUpdateCoordinator for
+            # the full reasoning on why TModbusError specifically.
             self._record_failure()
             raise UpdateFailed(
                 f"Could not update {self.device.serial_number} optimizers: {err}"

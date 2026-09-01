@@ -47,9 +47,49 @@ def _redact_serial_number(value: str | None) -> str | None:
     return f"**REDACTED-{pseudonym(str(value))}**"
 
 
-def _redact_coordinator_data(
-    data: dict[Any, Any] | None,
-) -> dict[str, Any] | None:
+def _redact_entity_entry(
+    entity_dict: dict[str, Any], serials: "set[str]",
+) -> dict[str, Any]:
+    """Redact serial-derived identifiers from one entity-registry entry.
+
+    v2.1.0.1 FIX (external ICS audit ICS-002 -- confirmed). The entity
+    registry was exported via entity_entry.extended_dict completely
+    unredacted, while this same module goes to real effort to pseudonymise
+    serials appearing in register VALUES (_redact_coordinator_data above).
+    That was an internal inconsistency in this file's own privacy model,
+    not a deliberate exemption.
+
+    Entity unique_ids in this integration are built directly from device
+    serials -- f"{device.serial_number}_{description.key}" and similar,
+    across sensor.py, number.py, select.py, switch.py, button.py, date.py
+    and battery_health_entities.py. Diagnostics are explicitly intended
+    to be exported and attached to support requests, so raw serials
+    escaped the redaction boundary through this path.
+
+    Substring replacement against the KNOWN serials for this entry,
+    rather than a pattern guess at what a serial looks like: the same
+    pseudonym scheme is then applied, so a maintainer comparing two
+    captures still sees a stable, matchable identifier. Applied
+    recursively because extended_dict nests (device identifiers, options,
+    capabilities) and a serial can appear at any depth.
+    """
+    def _scrub(value: Any) -> Any:
+        if isinstance(value, str):
+            out = value
+            for serial in serials:
+                if serial and serial in out:
+                    out = out.replace(serial, f"REDACTED-{pseudonym(serial)}")
+            return out
+        if isinstance(value, dict):
+            return {_scrub(k): _scrub(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return type(value)(_scrub(v) for v in value)
+        return value
+
+    return _scrub(entity_dict)
+
+
+
     """Redact any register whose name indicates it carries a serial number.
 
     v1.3.20 FIX (Defect X4): raw coordinator .data dicts were dumped
@@ -82,10 +122,23 @@ async def async_get_config_entry_diagnostics(
     """Return diagnostics for a config entry."""
     device_datas: list[HuaweiSolarDeviceData] = entry.runtime_data[DATA_DEVICE_DATAS]
 
+    # v2.1.0.1 (ICS-002): collect every serial this entry knows about, so
+    # entity-registry identifiers built from them can be pseudonymised
+    # below. Gathered from the device objects themselves rather than
+    # pattern-matching what a serial "looks like" -- a guess would both
+    # miss real serials and mangle unrelated strings.
+    _known_serials: set[str] = set()
+    for _dd in device_datas:
+        _sn = getattr(getattr(_dd, "device", None), "serial_number", None)
+        if _sn:
+            _known_serials.add(str(_sn))
+
     diagnostics_data = {
         "config_entry_data": async_redact_data(dict(entry.data), TO_REDACT),
         "entities": {
-            entity_entry.entity_id: entity_entry.extended_dict
+            entity_entry.entity_id: _redact_entity_entry(
+                dict(entity_entry.extended_dict), _known_serials
+            )
             for entity_entry in er.async_entries_for_config_entry(
                 er.async_get(hass), entry.entry_id
             )

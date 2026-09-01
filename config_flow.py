@@ -57,7 +57,6 @@ from .const import (
     CONF_BH_WEIGHT_EFFICIENCY,
     CONF_BH_WINDOW_DAYS,
     CONF_ENABLE_PARAMETER_CONFIGURATION,
-    CONF_EXCITATION_ENABLED,
     CONF_SLAVE_IDS,
     DEFAULT_PORT,
     DEFAULT_USERNAME,
@@ -1461,42 +1460,15 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_setup_network(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Handle connection parameters when using ModbusTCP.
-
-        v2.0.15 FIX (external ICS review, this release): the elevated-
-        permissions checkbox is now shown ONLY on initial setup, not
-        during reconfigure. Reconfigure exists specifically to change
-        connection details (host/port/slave IDs) for an already-working
-        deployment -- asking a user to also revisit a write-access
-        permissions flag on that same screen risked exactly what it was
-        flagged for: a change to write access being made incidentally,
-        by someone who opened this screen only intending to update an
-        IP address. During reconfigure, self._elevated_permissions was
-        already loaded from the existing entry by
-        _update_config_data_from_entry_data() and is preserved
-        unchanged here -- this step no longer reads or writes it at
-        all in that case. Changing it later, deliberately and outside
-        the connection-setup flow, is done through the options flow
-        instead (BatteryHealthOptionsFlowHandler) -- see that class's
-        own schema comment for the trade-off that path accepts (no
-        write-permission validation against the live device, since the
-        options flow does not reconnect) in exchange for never touching
-        connection details.
-        """
+        """Handle connection parameters when using ModbusTCP."""
         errors: dict[str, str] = {}
-        is_reconfigure = self._reconfigure_entry is not None
 
         if user_input is not None:
             self._host = user_input[CONF_HOST]
             assert self._host is not None
             self._port = user_input[CONF_PORT]
             assert self._port is not None
-            if not is_reconfigure:
-                self._elevated_permissions = user_input[CONF_ENABLE_PARAMETER_CONFIGURATION]
-            # else: leave self._elevated_permissions exactly as loaded from
-            # the existing entry -- this field is simply absent from the
-            # schema below during reconfigure, so there is nothing in
-            # user_input to read even if this branch were skipped.
+            self._elevated_permissions = user_input[CONF_ENABLE_PARAMETER_CONFIGURATION]
 
             slave_ids_input = user_input[CONF_SLAVE_IDS].strip().upper()
             if slave_ids_input == "AUTO":
@@ -1509,27 +1481,26 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             else:
                 return await self.async_step_manual_connect()
 
-        schema_dict: dict[Any, Any] = {
-            vol.Required(CONF_HOST, default=self._host): str,
-            vol.Required(
-                CONF_PORT, default=self._port or DEFAULT_PORT
-            ): cv.port,
-            vol.Required(
-                CONF_SLAVE_IDS,
-                default=",".join(map(str, self._slave_ids))
-                if self._slave_ids
-                else "AUTO",
-            ): str,
-        }
-        if not is_reconfigure:
-            schema_dict[vol.Required(
-                CONF_ENABLE_PARAMETER_CONFIGURATION,
-                default=self._elevated_permissions,
-            )] = bool
-
         return self.async_show_form(
             step_id="setup_network",
-            data_schema=vol.Schema(schema_dict),
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_HOST, default=self._host): str,
+                    vol.Required(
+                        CONF_PORT, default=self._port or DEFAULT_PORT
+                    ): cv.port,
+                    vol.Required(
+                        CONF_SLAVE_IDS,
+                        default=",".join(map(str, self._slave_ids))
+                        if self._slave_ids
+                        else "AUTO",
+                    ): str,
+                    vol.Required(
+                        CONF_ENABLE_PARAMETER_CONFIGURATION,
+                        default=self._elevated_permissions,
+                    ): bool,
+                }
+            ),
             errors=errors,
         )
 
@@ -2021,92 +1992,6 @@ class BatteryHealthOptionsFlowHandler(config_entries.OptionsFlow):
                 vol.Optional(
                     CONF_SYNC_POWER_DEDICATED_READS,
                     default=options.get(CONF_SYNC_POWER_DEDICATED_READS, True),
-                ): bool,
-                # v2.0.15 FIX (external ICS review, this release): moved
-                # here from the connection-setup flow (async_step_setup_
-                # network), where it was previously re-shown every time a
-                # user opened "Reconfigure" -- a flow meant specifically
-                # for changing host/port/slave IDs on an already-working
-                # deployment, not for touching write-access permissions.
-                # A user only intending to update an IP address had no
-                # way to do so without also being asked to re-decide this
-                # flag, on the same screen, with no visual distinction
-                # between the two. Placed here, immediately alongside
-                # CONF_BH_ENABLED and CONF_SYNC_POWER_DEDICATED_READS
-                # above -- these three are this integration's own
-                # prominent, entry-level toggles, and grouping them
-                # together (rather than after the battery-health numeric
-                # tuning fields below, where it sat before this fix) is
-                # deliberate, not incidental.
-                #
-                # Trade-off accepted deliberately: the connection-setup
-                # flow validates this choice against the live device (a
-                # request for elevated permissions on a device without
-                # actual write access there routes to a login/credential
-                # step during setup, before the entry is even created --
-                # see async_step_manual_connect()'s own check of
-                # info["has_write_permission"]). This options flow does
-                # NOT reconnect to the device at all, so no equivalent
-                # validation happens here -- enabling this for a device
-                # that genuinely lacks write access will surface as a
-                # write FAILURE at the moment something is actually
-                # written (a service call, a number/select/switch
-                # entity), not as an error on this settings screen.
-                # Defaults to whatever is already in entry.data (the
-                # value set during initial setup, where it WAS validated)
-                # so upgrading to this release changes nothing for any
-                # existing installation until this option is deliberately
-                # revisited.
-                vol.Optional(
-                    CONF_ENABLE_PARAMETER_CONFIGURATION,
-                    default=options.get(
-                        CONF_ENABLE_PARAMETER_CONFIGURATION,
-                        self.config_entry.data.get(
-                            CONF_ENABLE_PARAMETER_CONFIGURATION, False
-                        ),
-                    ),
-                ): bool,
-                # v2.0.15b FIX (external ICS review, this release):
-                # replaces enable_excitation/disable_excitation/resume_
-                # excitation_after_halt (all three services removed
-                # entirely) with this toggle plus a dedicated button
-                # entity (button.py, ResumeExcitationAfterHaltButton) --
-                # no Developer Tools service call is needed for any part
-                # of this feature anymore. Placed immediately after
-                # CONF_ENABLE_PARAMETER_CONFIGURATION deliberately:
-                # excitation is itself a write-capable, bus-behaviour-
-                # changing feature, and actually taking effect requires
-                # that flag to ALSO be true -- enforced where this value
-                # is actually read (_setup_inverter_device_data(),
-                # __init__.py), not here, since a static vol.Schema
-                # cannot make one field's own validity conditional on
-                # another field's value within the same form submission.
-                # Toggling this triggers a config-entry reload (this
-                # flow's own class docstring). What that reload actually
-                # does to excitation's own progress depends on WHY the
-                # reload happened, and this is worth being precise about
-                # rather than assuming either direction:
-                #   - A reload triggered by SOME OTHER option changing,
-                #     with this toggle staying True throughout, preserves
-                #     progress -- enable_excitation() is idempotent (a
-                #     no-op if already enabled), and AdaptiveModbusController's
-                #     own Store-based persistence has already restored
-                #     the in-progress schedule (async_load(), called
-                #     before this value is ever read) by the time this
-                #     wiring runs.
-                #   - Deliberately toggling THIS OFF still discards
-                #     progress -- disable_excitation()'s own documented
-                #     behaviour, unchanged by this fix. Turning it back
-                #     on afterward starts a genuinely fresh schedule,
-                #     not a resumed one. This is intentional, not a
-                #     limitation: resuming a schedule after an unknown-
-                #     duration deliberate stop is not something the
-                #     go/no-go design was built to reason about safely
-                #     (same reasoning disable_excitation()'s own
-                #     docstring already gives).
-                vol.Optional(
-                    CONF_EXCITATION_ENABLED,
-                    default=options.get(CONF_EXCITATION_ENABLED, False),
                 ): bool,
                 vol.Optional(
                     CONF_SLOW_TIER_TTL_S,

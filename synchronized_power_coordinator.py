@@ -797,6 +797,59 @@ class SynchronizedPowerCoordinator(DataUpdateCoordinator[SynchronizedPowerData])
                 _LOGGER.debug("SyncPower: failed to read %s: %s", label, exc)
                 if self._telemetry:
                     _record_failure(self._telemetry, exc)
+                # v2.1.0.0 (V2_1_ARCHITECTURE_DESIGN.md §2.2): last-resort
+                # UNCERTAIN-quality cache fallback, rather than returning
+                # None and blanking every derived value that depends on
+                # this register.
+                #
+                # The GOOD-only gate at the top of this method is correct
+                # for its own purpose: it decides whether to SKIP a
+                # physical read, and holding a high freshness bar there is
+                # right. This is a different question, asked only after
+                # the physical read has already failed: "is a known-stale
+                # value better than nothing at all?"
+                #
+                # Field evidence (4-day capture): 2,951 unknown/unavailable
+                # transitions, ~90% of them on these four *_synchronised
+                # entities. Breaking those down by which entities dropped
+                # out together, 940 of 1,069 events were PARTIAL (1-3 of
+                # the 4 entities) following dependency chains -- e.g.
+                # pv_power failing takes home_consumption with it, since
+                # consumption is derived from it. That is exactly this
+                # path returning None, not the temporal-alignment gate
+                # (which would drop all four at once, and accounts for
+                # only 129 events).
+                #
+                # This does NOT reintroduce "silently wrong": the value's
+                # real age flows into _mark_success() below exactly as a
+                # cache hit's does, so it widens sample_span_ms, which is
+                # what drives is_temporally_uncertain -- the existing,
+                # already-designed signal. A stale value therefore either
+                # stays within the alignment tolerance (genuinely fine to
+                # combine) or trips the uncertainty flag on its own merits.
+                # The quality model decides; this method just stops
+                # throwing information away.
+                #
+                # Bounded, not unlimited: cache.get()/quality_of() stop
+                # serving once RegisterCache's own ceilings expire the
+                # entry (REGISTER_STARVATION_CEILING_S, or the longer
+                # ENERGY_AVAILABILITY_CEILING_S), so a genuinely dead link
+                # still ends in None -> unavailable, as it must.
+                if cache is not None:
+                    quality, _reason, age = cache.quality_of(register)
+                    if quality == Quality.UNCERTAIN:
+                        stale_value = _cache_value_w(cache, register)
+                        if stale_value is not None:
+                            _mark_success(time.monotonic() - (age or 0.0))
+                            if self._telemetry:
+                                self._telemetry.record_cache_hit()
+                            self.fallback_cache_hits += 1
+                            _LOGGER.debug(
+                                "SyncPower: serving UNCERTAIN cached %s "
+                                "(age %.1fs) after physical read failed",
+                                label, age or 0.0,
+                            )
+                            return stale_value
                 return None
 
         # ── read 1: INV1 PV power ───────────────────────────────────────────

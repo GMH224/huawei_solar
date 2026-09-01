@@ -1,7 +1,6 @@
 """Constants for the Huawei Solar integration."""
 
 from datetime import timedelta
-from typing import Any
 
 DOMAIN = "huawei_solar"
 DEFAULT_PORT = 502
@@ -9,45 +8,6 @@ DEFAULT_USERNAME = "installer"
 
 CONF_SLAVE_IDS = "slave_ids"
 CONF_ENABLE_PARAMETER_CONFIGURATION = "enable_parameter_configuration"
-
-
-def elevated_permissions_enabled(entry: Any) -> bool:
-    """Whether write/control access (services, number/select/switch/button
-    entities) is enabled for a config entry.
-
-    v2.0.15 FIX (external ICS review, this release): checks entry.options
-    FIRST, falling back to entry.data -- NOT entry.data alone, which is
-    where every call site checked prior to this release. This exists
-    specifically because CONF_ENABLE_PARAMETER_CONFIGURATION now has two
-    legitimate storage locations depending on how it was set:
-
-      - entry.data: written once, during initial setup (config_flow.py's
-        own async_step_setup_network), where the choice is validated
-        against the live device's own actual write-permission. Every
-        installation that existed before this release has its value
-        here, and nothing about this release changes that.
-      - entry.options: written by BatteryHealthOptionsFlowHandler,
-        alongside CONF_BH_ENABLED and CONF_SYNC_POWER_DEDICATED_READS --
-        the "Configure" screen, changeable at any time without touching
-        connection details or re-validating against the device (a
-        deliberate trade-off; see that flow's own schema comment).
-
-    A single, shared helper (used by every one of this integration's
-    own read sites, rather than each repeating its own two-level .get()
-    chain) exists specifically so that trade-off -- and the precedence
-    between the two locations -- only has to be gotten right once, not
-    independently re-derived at every call site with the attendant risk
-    of one of them drifting out of sync with the others.
-
-    `entry` is typed Any, not ConfigEntry, so this module can remain
-    free of any Home Assistant import -- see this file's own use by
-    test_const_services.py, which imports const.py directly and depends
-    on it having no HA or third-party dependency to do so.
-    """
-    options_value = entry.options.get(CONF_ENABLE_PARAMETER_CONFIGURATION)
-    if options_value is not None:
-        return bool(options_value)
-    return bool(entry.data.get(CONF_ENABLE_PARAMETER_CONFIGURATION, False))
 
 DATA_DEVICE_DATAS = "device_datas"
 DATA_SYNC_POWER_COORDINATOR = "sync_power_coordinator"
@@ -331,15 +291,6 @@ SERVICES = (
     # unregistered on integration unload, a genuine (if minor) resource
     # leak this test exists specifically to prevent.
     SERVICE_SET_PACK_INSTALL_DATE,
-    # v2.0.15b FIX (external ICS review, this release): SERVICE_ENABLE_
-    # EXCITATION / SERVICE_DISABLE_EXCITATION / SERVICE_RESUME_
-    # EXCITATION_AFTER_HALT (introduced in 2.0.15) removed entirely, not
-    # just deprecated or left registered-but-unused. Excitation is now
-    # controlled exclusively through CONF_EXCITATION_ENABLED (the
-    # "Configure" options screen) and ResumeExcitationAfterHaltButton
-    # Entity (button.py) -- no Developer Tools service call is needed
-    # for any part of this feature, per the explicit requirement that
-    # config items work standalone.
 )
 
 # ── Adaptive Modbus learning ──────────────────────────────────────────────────
@@ -372,6 +323,102 @@ ADAPTIVE_SLOT_COUNT: int = 96          # 24 * 60 // ADAPTIVE_SLOT_MINUTES
 # Daily decay applied to all slot statistics on each new day.
 # 0.85^1 = 85 % retained, 0.85^14 ≈ 10 % — 14-day effective memory.
 ADAPTIVE_DECAY_FACTOR: float = 0.85
+
+# v2.1.0.0 (V2_1_ARCHITECTURE_DESIGN.md §4.2): one-off decay applied to
+# every slot when a device's own firmware version changes.
+#
+# The problem this addresses is already documented in adaptive_modbus.py's
+# own comments and was quantified there before this release: a ~1 h
+# firmware-update outage produces ~120 consecutive failures spread across
+# four 15-minute slots, lifting a mature slot's failure rate from ~3 % to
+# ~12 %, which maps to ~137 s polling instead of 20–30 s. Because
+# apply_decay() scales confidence and failure count by the SAME factor,
+# only fresh *successful* observations dilute the poisoned statistics --
+# and those now accrue 4–5x more slowly precisely because polling has
+# degraded. That comment's own conclusion: "a single maintenance window
+# therefore costs weeks of degraded polling". Huawei ships firmware
+# roughly quarterly, so this is recurring, not hypothetical.
+#
+# 0.25 (75 % of accumulated evidence discarded) is deliberately far more
+# aggressive than one day of ordinary decay, and is an ENGINEERING
+# CHOICE, not an evidence-derived value -- no capture in this project
+# spans a firmware update, so there is no measurement to fit it to. The
+# reasoning: post-update statistics describe a device whose Modbus
+# timing behaviour may genuinely have changed, so most prior evidence is
+# suspect. It is deliberately NOT 0.0 (a full wipe): the RTT sample
+# distribution shape is not decayed by apply_decay() at all, and
+# discarding every count would drop confidence to zero and force a
+# cold-start back-off -- trading one degraded-polling failure mode for a
+# different one. 0.25 leaves enough weight that a genuinely unchanged
+# device re-converges within roughly a day rather than from scratch,
+# while letting new observations dominate quickly if behaviour really
+# did change.
+ADAPTIVE_FIRMWARE_CHANGE_DECAY_FACTOR: float = 0.25
+
+# ── v2.1.0.0 load-regime conditioning (V2_1_ARCHITECTURE_DESIGN.md §3) ────────
+#
+# Evidence (4-day random-excitation capture, 2.0.15.4; MATLAB module 11
+# reports WELL_IDENTIFIED, so the three levers are separately estimable
+# for the first time in this project):
+#
+#   GAP's EFFECT on error rate is regime-dependent. Binned by effective
+#   gap, pooled across the whole capture for devdc46 (18,326 night /
+#   34,393 day bus events):
+#       gap bin      night err%    day err%
+#       150-200 ms      0.144        0.345
+#       250-300 ms      0.343        0.649
+#       350-400 ms      0.069        0.707
+#       450-500 ms      0.202        0.938
+#       500-550 ms      0.334        1.722
+#   At night, flat and low -- gap barely matters. During the day it
+#   rises monotonically, ~5x across the range. Because gap was drawn
+#   RANDOMLY and independently in that capture, reverse causation is
+#   excluded by construction.
+#
+#   TIMEOUT's effect is NOT regime-dependent: no monotonic relationship
+#   in either regime (night 0.09-0.34 %, day 0.53-1.02 %, no trend).
+#   Corroborated independently by module 17, which finds timeout has by
+#   far the lowest between/within device-variance ratio (0.20, against
+#   21.80 for gap). Timeout is simply the least sensitive lever on this
+#   hardware, both across devices and across regimes.
+#
+# Hence: GAP is regime-conditioned; TIMEOUT and POLL are not. That
+# asymmetry is the main reason this filter is simpler than a fully
+# regime-conditioned one, and it is evidence-derived, not a preference.
+
+# Smoothing horizon for the load-regime signal. Module 19's measured
+# error-rate autocorrelation decays from 0.42 at 1 h to ~0 by 4-5 h, so
+# a regime estimate should average over roughly that window. Deliberately
+# NOT seconds-scale: sub-hour reaction would chase noise the data shows
+# has no persistence. Expressed as an EWMA time constant in seconds.
+ADAPTIVE_LOAD_REGIME_TAU_S: float = 3600.0
+
+# Occupancy above which the bus counts as "high load" for gap
+# conditioning. Module 8 puts the observed occupancy knee at ~40-48 %
+# and recommends a ceiling below it; the day/night split that produced
+# the table above corresponds to roughly this boundary in practice.
+# A single threshold with hysteresis (below) rather than a continuous
+# function: module 20 found NO reliable out-of-sample predictive
+# structure (R^2 proxy 0.019-0.049, unchanged across 3x more holdout
+# data), so a finely-shaped response would be fitting noise.
+ADAPTIVE_LOAD_REGIME_HIGH_PCT: float = 40.0
+
+# Hysteresis band around the threshold, to stop a bus hovering near it
+# from flapping between regimes. Module 6 could not derive a gap
+# deadband from the excitation data (returns NaN -- gap moved in large
+# discrete jumps rather than drifting continuously, so chatter was not
+# measurable), so this is an explicit ENGINEERING CHOICE, not an
+# evidence-derived value. 5 percentage points either side.
+ADAPTIVE_LOAD_REGIME_HYSTERESIS_PCT: float = 5.0
+
+# Multiplier applied to the derived gap when in the HIGH-load regime.
+# The evidence above says a larger gap correlates with a HIGHER error
+# rate during the day -- so the correct direction is to tighten (reduce)
+# the gap under high load, not widen it. 0.8 is deliberately mild: the
+# same module 20 result that argues against a continuous function also
+# argues against a large correction, and MIN_INTER_REQUEST_GAP (150 ms,
+# a documented SUN2000 hardware constraint) clamps the floor regardless.
+ADAPTIVE_LOAD_REGIME_HIGH_GAP_FACTOR: float = 0.8
 
 # Number of weighted requests per slot for "full" confidence (1.0).
 # At 20–30 s polling: ~30 requests/slot/day → ~5 days for full confidence.
@@ -687,21 +734,6 @@ CONF_BH_ENABLED = "bh_enabled"
 # some installations genuinely want is still a legitimate use case this
 # default protects.
 CONF_SYNC_POWER_DEDICATED_READS = "sync_power_dedicated_reads"
-
-# v2.0.15b FIX (external ICS review, this release): replaces the
-# enable_excitation/disable_excitation services -- both removed
-# entirely, not left alongside this toggle -- per the explicit
-# requirement that config items work standalone, without requiring
-# Developer Tools or any service call at all. Defaults to False:
-# excitation is never active for any installation unless deliberately
-# turned on here, matching CONF_SYNC_POWER_DEDICATED_READS' own
-# established default-preserves-current-behaviour convention just
-# above, even though the two defaults point in opposite directions
-# (that one defaults ON to preserve existing behaviour; this one
-# defaults OFF because there is no existing behaviour to preserve --
-# excitation did not exist before this release, and its whole nature
-# as a bounded, temporary experiment argues against an opt-out default).
-CONF_EXCITATION_ENABLED = "excitation_enabled"
 
 CONF_BH_RATED_CAPACITY_KWH = "bh_rated_capacity_kwh"
 #: Finding D: true battery install/commissioning date (ISO yyyy-mm-dd).

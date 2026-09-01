@@ -3150,29 +3150,49 @@ class SynchronizedPowerSensorEntity(
         ordinary, seemingly-valid power-flow value with no indication
         anything was wrong.
 
-        The explicit contract chosen: unavailable, not silently wrong.
-        This matches how the rest of this project already treats
-        quality problems elsewhere (e.g. Quality.BAD means an entity
-        goes unavailable, not that a guessed value gets shown) --
-        picked over the alternative of exposing an extra "uncertain"
-        attribute alongside a still-displayed value, since a power-flow
-        number a user might act on (checking whether the battery is
-        genuinely charging or discharging right now) is exactly the
-        kind of value where showing a wrong-looking-right number is
-        worse than briefly showing unavailable.
+        v2.1.0.0 REVISION (V2_1_ARCHITECTURE_DESIGN.md §2.2): ICS-05
+        chose "unavailable, not silently wrong" and explicitly rejected
+        "an extra 'uncertain' attribute alongside a still-displayed
+        value". That reasoning was sound for its time and is preserved
+        below in the one case where it genuinely applies -- but it
+        predates this integration's own quality model reaching the
+        entity layer. `data_quality`/`data_quality_reason`/
+        `data_age_seconds` (types.py::_quality_attrs) now exist
+        precisely so a value can be shown AND declared unreliable, which
+        was not an available option when ICS-05 was decided. The
+        rejected alternative was "silently displayed with an extra
+        attribute"; what is implemented here is not silent -- the entity
+        carries an explicit UNCERTAIN quality code, a machine-readable
+        reason, and the measured misalignment, the same contract every
+        other sensor in this integration already follows.
+
+        The distinction that keeps ICS-05's actual safety property
+        intact: a value is still never INVENTED. `_get_value()`
+        returning None (a genuinely missing input) remains unavailable,
+        unchanged. Only the case "we have a real composite number whose
+        inputs were further apart in time than the alignment tolerance"
+        degrades rather than blanks -- and it degrades loudly.
         """
         data: SynchronizedPowerData | None = self.coordinator.data
         self._attr_native_value = self._get_value(data)
         uncertain = data is not None and data.is_temporally_uncertain
-        self._attr_available = self._attr_native_value is not None and not uncertain
-        self._attr_extra_state_attributes = (
-            {
-                "temporally_uncertain": True,
+
+        # A missing value is still unavailable -- unchanged from ICS-05.
+        # Temporal uncertainty alone no longer forces unavailability.
+        self._attr_available = self._attr_native_value is not None
+
+        if uncertain and data is not None:
+            self._attr_extra_state_attributes = {
+                "data_quality": "UNCERTAIN",
+                "data_quality_reason": "TEMPORAL_MISALIGNMENT",
                 "sample_span_ms": data.sample_span_ms,
+                # Kept under its original key as well: existing
+                # dashboards/automations built against ICS-05's own
+                # attribute should not break silently on upgrade.
+                "temporally_uncertain": True,
             }
-            if uncertain
-            else {}
-        )
+        else:
+            self._attr_extra_state_attributes = {}
         self.async_write_ha_state()
 
     def _get_value(self, data: SynchronizedPowerData | None) -> float | None:

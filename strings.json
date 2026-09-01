@@ -313,7 +313,7 @@
         "name": "Charger Phase A voltage"
       },
       "charger_phase_b_voltage": {
-        "name": "Charger Phase B voltagey"
+        "name": "Charger Phase B voltage"
       },
       "charger_phase_c_voltage": {
         "name": "Charger Phase C voltage"
@@ -1173,6 +1173,18 @@
     "invalid_pack_install_date": {
       "message": "Could not parse pack install date: {install_date}. Use an ISO format date, e.g. 2026-01-15"
     },
+    "target_battery_type_mismatch": {
+      "message": "Device {device} has a {actual} battery, but this service requires a {expected} battery. Battery models use different period register formats, so this call was rejected rather than writing an incompatible value."
+    },
+    "target_has_no_battery": {
+      "message": "Device {device} has no battery connected, so battery control services cannot be used for this target."
+    },
+    "target_no_capacity_control": {
+      "message": "Device {device} does not support capacity control, so this service cannot be used for this target."
+    },
+    "target_not_directly_controllable": {
+      "message": "Device {device} cannot be controlled directly. When an EMMA is present it manages the battery, so direct battery control services are not available for this target."
+    },
     "wrong_device_type": {
       "message": "Got wrong Huawei Solar device type for ID {device_id}: expected {expected_type}, got {actual_type}"
     }
@@ -1387,7 +1399,6 @@
         "data": {
           "slow_tier_ttl_s": "Slow-register refresh interval (s)",
           "bh_enabled": "Enable battery health monitoring",
-          "enable_parameter_configuration": "Advanced: elevate permissions (write access) -- unlike initial setup, this is not validated against the live device; enabling this without an account that actually has write access will cause writes to fail at the moment they're attempted, not here",
           "bh_rated_capacity_kwh": "Rated usable capacity (kWh)",
           "bh_warranty_throughput_kwh": "Warranty throughput (kWh)",
           "bh_weight_capacity": "Weight: SOH capacity",

@@ -259,9 +259,18 @@ def config_from_options(options: dict[str, Any] | None) -> BatteryHealthConfig:
     install = options.get(CONF_BH_INSTALL_DATE)
     if install:
         try:
-            cfg.battery_install_ts = datetime.fromisoformat(
-                str(install)
-            ).replace(tzinfo=timezone.utc).timestamp()
+            # v2.1.0.1 FIX (external ICS audit ICS-004 -- confirmed):
+            # see the identical fix in services.py::set_pack_install_date.
+            # .replace(tzinfo=utc) relabels an aware datetime instead of
+            # converting it, producing an offset-sized error in battery
+            # age. Naive input still treated as UTC; aware input now
+            # genuinely converted.
+            _dt = datetime.fromisoformat(str(install))
+            if _dt.tzinfo is None:
+                _dt = _dt.replace(tzinfo=timezone.utc)
+            else:
+                _dt = _dt.astimezone(timezone.utc)
+            cfg.battery_install_ts = _dt.timestamp()
         except (TypeError, ValueError):
             _LOGGER.warning(
                 "battery_health: could not parse battery install date %r; "

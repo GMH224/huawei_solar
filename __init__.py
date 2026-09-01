@@ -43,14 +43,13 @@ from homeassistant.helpers.device_registry import DeviceInfo
 
 from .const import (
     CONF_BH_ENABLED,
-    CONF_EXCITATION_ENABLED,
     CONF_SLOW_TIER_TTL_S,
     CONF_SYNC_POWER_DEDICATED_READS,
     DEFAULT_SLOW_TIER_TTL_S,
+    CONF_ENABLE_PARAMETER_CONFIGURATION,
     CONF_SLAVE_IDS,
     CONFIGURATION_UPDATE_INTERVAL,
     DATA_DEVICE_DATAS,
-    elevated_permissions_enabled,
     DATA_SYNC_POWER_COORDINATOR,
     DEVICE_CONNECT_TIMEOUT,
     DISCONNECT_TIMEOUT,
@@ -379,7 +378,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
             await _bounded_client_disconnect(client)
             raise
 
-        if elevated_permissions_enabled(entry):
+        if entry.data.get(CONF_ENABLE_PARAMETER_CONFIGURATION):
             if (
                 isinstance(primary_device, HuaweiSolarDeviceWithLogin)
                 and entry.data.get(CONF_USERNAME)
@@ -1252,35 +1251,20 @@ async def _setup_inverter_device_data(
     # statistics from HA storage.  All coordinators for this inverter share
     # one controller so every Modbus request contributes to the same model.
     adaptive = AdaptiveModbusController.get_or_create(
-        hass, device.serial_number, inverter_device_info, bus_endpoint=bus_endpoint
+        hass, device.serial_number, inverter_device_info
     )
     await adaptive.async_load()
-    # v2.0.15b FIX (external ICS review, this release): replaces the
-    # enable_excitation/disable_excitation services (both removed
-    # entirely) -- excitation is now driven purely by CONF_EXCITATION_
-    # ENABLED (set on the "Configure" options screen, alongside
-    # CONF_ENABLE_PARAMETER_CONFIGURATION and CONF_SYNC_POWER_DEDICATED_
-    # READS), with zero Developer Tools action required for either
-    # direction. Requires BOTH this option AND elevated_permissions_
-    # enabled(entry) to be true -- excitation is a write-capable,
-    # real-bus-behaviour-changing feature, gated the same way every
-    # other write-capable feature in this integration already is
-    # (button.py, number.py, select.py, switch.py, services.py all
-    # share this exact same gate).
-    #
-    # Both enable_excitation() and disable_excitation() are idempotent
-    # no-ops when already in the requested state (see their own
-    # docstrings) -- calling either on every single setup/reload,
-    # unconditionally, based on the CURRENT option value, is therefore
-    # safe and correct: a reload that happens for some unrelated reason,
-    # with this option unchanged, never disturbs an in-progress
-    # schedule (already restored above by async_load() before this
-    # runs); a reload caused by deliberately toggling this option does
-    # exactly what the option's own name says.
-    if elevated_permissions_enabled(entry) and entry.options.get(CONF_EXCITATION_ENABLED, False):
-        adaptive.enable_excitation()
-    else:
-        adaptive.disable_excitation()
+    # v2.1.0.0 (V2_1_ARCHITECTURE_DESIGN.md §4.2): checked immediately
+    # AFTER async_load(), so the comparison is against the version
+    # persisted from the previous session -- checking before the load
+    # would compare against a fresh None every time and never detect
+    # anything. Placed here rather than in a poll loop because
+    # software_version is read once at device setup; a firmware update
+    # necessarily involves the inverter restarting, which drops the
+    # connection and brings this setup path back around.
+    adaptive.note_firmware_version(
+        getattr(device, "software_version", None)
+    )
     update_coordinator.attach_adaptive(adaptive)
     # v1.3.19 FIX (Defect V/Finding 1): registered for the same reason as
     # telemetry above. Uses async_unload() (Defect V/Finding 10 -- flushes
@@ -1475,7 +1459,7 @@ async def _setup_inverter_device_data(
                 exc_info=exc,
             )
 
-    if elevated_permissions_enabled(entry):
+    if entry.data.get(CONF_ENABLE_PARAMETER_CONFIGURATION, False):
         configuration_update_coordinator = HuaweiSolarUpdateCoordinator(
             hass,
             _LOGGER,
@@ -1616,7 +1600,7 @@ async def _setup_device_data(
         entry=entry,
     )
 
-    if elevated_permissions_enabled(entry):
+    if entry.data.get(CONF_ENABLE_PARAMETER_CONFIGURATION, False):
         configuration_update_coordinator = HuaweiSolarUpdateCoordinator(
             hass,
             _LOGGER,

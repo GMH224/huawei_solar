@@ -36,9 +36,9 @@ import homeassistant.helpers.config_validation as cv
 from .battery_health_manager import BatteryHealthManager
 
 from .const import (
+    CONF_ENABLE_PARAMETER_CONFIGURATION,
     DATA_DEVICE_DATAS,
     DOMAIN,
-    elevated_permissions_enabled,
     SERVICE_FORCIBLE_CHARGE,
     SERVICE_FORCIBLE_CHARGE_SOC,
     SERVICE_FORCIBLE_DISCHARGE,
@@ -215,6 +215,138 @@ def get_battery_device_data(call: ServiceCall) -> HuaweiSolarInverterData:
     return _get_battery_device_data(call)
 
 
+# ── v2.1.0.1: target-capability validation (ICS-001/006/007/010) ──────────────
+#
+# External ICS audit of 2.1.0.0, findings ICS-001 (CRITICAL), ICS-006,
+# ICS-007 (both HIGH) and the handler half of ICS-010 -- all four are the
+# same structural defect applied to different services, so they get one
+# shared remediation rather than four parallel ones.
+#
+# The defect: service AVAILABILITY was decided from entry-wide aggregates
+# computed once at setup --
+#
+#     has_emma            = any(isinstance(uc.device, EMMADevice) ...)
+#     has_lg_battery      = any(... battery_type == LG_RESU ...)
+#     has_capacity_control= any(... supports_capacity_control ...)
+#
+# -- while the HANDLERS resolved a target via _get_battery_device_data()
+# and went straight to physical writes. That function matches device
+# identifiers and checks only that the inverter has SOME connected energy
+# storage; it never checks the resolved target's battery TYPE, its
+# capacity-control support, or whether it is EMMA-managed.
+#
+# In a heterogeneous installation (one entry with a direct-LUNA inverter
+# and an EMMA-managed inverter; or two entries with different battery
+# models) an `any()` that is True for one device registers the service
+# globally, and a call aimed at the OTHER device reaches the handler and
+# writes to it. These are not read-only services: they write
+# STORAGE_FORCIBLE_CHARGE_POWER,
+# STORAGE_FORCIBLE_CHARGE_DISCHARGE_SETTING_MODE and friends to physical
+# equipment.
+#
+# The fix follows the audit's own prescribed order -- resolve exact
+# target, THEN validate capability, THEN take the write lock, THEN write.
+# Validation deliberately happens BEFORE _get_device_write_lock() in
+# every handler below: rejecting an ineligible target must not first
+# serialise behind a lock held by a legitimate in-flight write to the
+# same device.
+#
+# Entry-level registration gating is deliberately LEFT IN PLACE. It is
+# still correct as a UI affordance (do not offer LG-only services on an
+# installation with no LG battery at all), and removing it would expose
+# services that were previously hidden. It is simply no longer relied on
+# as the safety boundary -- which was the audit's actual point.
+
+
+def _validate_battery_target(
+    dd: HuaweiSolarInverterData,
+    *,
+    require_battery_type: "rv.StorageProductModel | None" = None,
+    require_capacity_control: bool = False,
+) -> None:
+    """Validate that a resolved battery target may receive direct control.
+
+    v2.1.0.1 (external ICS audit ICS-001/006/007/010). Raises
+    ServiceValidationError if the target is ineligible; returns silently
+    otherwise.
+
+    Rejects, in order:
+
+    1. Non-SUN2000 targets (an EMMA device reached through a battery
+       service). EMMA owns battery management when present -- the
+       existing registration comment already said "no direct control of
+       the battery is possible", but nothing enforced it at the handler.
+    2. Targets with no battery at all (battery_type is NONE).
+    3. A battery-type mismatch, when the caller requires a specific model
+       (LG_RESU vs LUNA2000 use genuinely different period register
+       encodings -- writing one model's format to the other is not a
+       no-op, it is a malformed physical write).
+    4. Missing capacity-control support, when required.
+
+    Deliberately raises ServiceValidationError rather than ValueError:
+    this is a caller/target mismatch, which Home Assistant surfaces to
+    the user as a validation problem, not an integration crash.
+    """
+    device = dd.device
+
+    if not isinstance(device, SUN2000Device):
+        raise ServiceValidationError(
+            translation_domain=DOMAIN,
+            translation_key="target_not_directly_controllable",
+            translation_placeholders={"device": str(getattr(device, "serial_number", "?"))},
+        )
+
+    battery_type = getattr(device, "battery_type", None)
+    if battery_type is None or battery_type == rv.StorageProductModel.NONE:
+        raise ServiceValidationError(
+            translation_domain=DOMAIN,
+            translation_key="target_has_no_battery",
+            translation_placeholders={"device": str(device.serial_number)},
+        )
+
+    if require_battery_type is not None and battery_type != require_battery_type:
+        raise ServiceValidationError(
+            translation_domain=DOMAIN,
+            translation_key="target_battery_type_mismatch",
+            translation_placeholders={
+                "device": str(device.serial_number),
+                "expected": str(getattr(require_battery_type, "name", require_battery_type)),
+                "actual": str(getattr(battery_type, "name", battery_type)),
+            },
+        )
+
+    if require_capacity_control and not getattr(device, "supports_capacity_control", False):
+        raise ServiceValidationError(
+            translation_domain=DOMAIN,
+            translation_key="target_no_capacity_control",
+            translation_placeholders={"device": str(device.serial_number)},
+        )
+
+
+@callback
+def get_validated_battery_device_data(
+    call: ServiceCall,
+    *,
+    require_battery_type: "rv.StorageProductModel | None" = None,
+    require_capacity_control: bool = False,
+) -> HuaweiSolarInverterData:
+    """Resolve AND validate a battery service target in one step.
+
+    v2.1.0.1 (ICS-001/006/007/010). Every direct-battery-control service
+    handler uses this instead of get_battery_device_data(), so that
+    forgetting the validation step is not possible by omission -- the
+    audit's finding was precisely that resolution and validation had
+    drifted apart.
+    """
+    dd = _get_battery_device_data(call)
+    _validate_battery_target(
+        dd,
+        require_battery_type=require_battery_type,
+        require_capacity_control=require_capacity_control,
+    )
+    return dd
+
+
 BATTERY_DEVICE_SCHEMA = vol.Schema({DATA_DEVICE_ID: vol.All(cv.string, str)})
 
 # v2.0.12 (Battery Phase 5B, this release -- per-pack install dates):
@@ -258,11 +390,19 @@ async def set_pack_install_date(service_call: ServiceCall) -> None:
     install_date_str = service_call.data[DATA_INSTALL_DATE]
 
     try:
-        install_ts = (
-            datetime.fromisoformat(install_date_str)
-            .replace(tzinfo=timezone.utc)
-            .timestamp()
-        )
+        # v2.1.0.1 FIX (external ICS audit ICS-004 -- confirmed):
+        # .replace(tzinfo=utc) RELABELS an aware datetime rather than
+        # CONVERTING it. "2026-01-01T00:00:00-05:00" became
+        # 2026-01-01T00:00:00Z instead of 2026-01-01T05:00:00Z -- a
+        # 5-hour error, verified by direct execution. Naive input is
+        # still treated as UTC (unchanged, documented service contract);
+        # aware input is now genuinely converted.
+        _dt = datetime.fromisoformat(install_date_str)
+        if _dt.tzinfo is None:
+            _dt = _dt.replace(tzinfo=timezone.utc)
+        else:
+            _dt = _dt.astimezone(timezone.utc)
+        install_ts = _dt.timestamp()
     except (TypeError, ValueError) as err:
         raise ServiceValidationError(
             translation_domain=DOMAIN,
@@ -689,7 +829,7 @@ def _parse_lg_resu_periods(text: str) -> list[LG_RESU_TimeOfUsePeriod]:
 
 async def forcible_charge(service_call: ServiceCall) -> None:
     """Start a forcible charge on the battery."""
-    dd = get_battery_device_data(service_call)
+    dd = get_validated_battery_device_data(service_call)
     async with _get_device_write_lock(dd.device.serial_number):
         power = await _validate_power_value(
             service_call.data[DATA_POWER], dd, rn.STORAGE_MAXIMUM_CHARGE_POWER
@@ -722,7 +862,7 @@ async def forcible_charge(service_call: ServiceCall) -> None:
 
 async def forcible_discharge(service_call: ServiceCall) -> None:
     """Start a forcible charge on the battery."""
-    dd = get_battery_device_data(service_call)
+    dd = get_validated_battery_device_data(service_call)
     async with _get_device_write_lock(dd.device.serial_number):
         power = await _validate_power_value(
             service_call.data[DATA_POWER], dd, rn.STORAGE_MAXIMUM_DISCHARGE_POWER
@@ -751,7 +891,7 @@ async def forcible_discharge(service_call: ServiceCall) -> None:
 
 async def forcible_charge_soc(service_call: ServiceCall) -> None:
     """Start a forcible charge on the battery until the target SOC is hit."""
-    dd = get_battery_device_data(service_call)
+    dd = get_validated_battery_device_data(service_call)
     async with _get_device_write_lock(dd.device.serial_number):
         target_soc = service_call.data[DATA_TARGET_SOC]
         power = await _validate_power_value(
@@ -784,7 +924,7 @@ async def forcible_charge_soc(service_call: ServiceCall) -> None:
 
 async def forcible_discharge_soc(service_call: ServiceCall) -> None:
     """Start a forcible discharge on the battery until the target SOC is hit."""
-    dd = get_battery_device_data(service_call)
+    dd = get_validated_battery_device_data(service_call)
     async with _get_device_write_lock(dd.device.serial_number):
         target_soc = service_call.data[DATA_TARGET_SOC]
         power = await _validate_power_value(
@@ -810,7 +950,7 @@ async def forcible_discharge_soc(service_call: ServiceCall) -> None:
 
 async def stop_forcible_charge(service_call: ServiceCall) -> None:
     """Stop a forcible charge or discharge."""
-    dd = get_battery_device_data(service_call)
+    dd = get_validated_battery_device_data(service_call)
     async with _get_device_write_lock(dd.device.serial_number):
         # v2.0.0b (MOD-19/MOD-20, external ICS audit -- confirmed): five
         # writes, one logical "stop forcible charge" command -- see
@@ -1010,7 +1150,7 @@ async def set_battery_tou_periods(
 ) -> None:
     """Set the TOU periods of the battery."""
 
-    dd = get_battery_device_data(service_call)
+    dd = get_validated_battery_device_data(service_call)
 
     async with _get_device_write_lock(dd.device.serial_number):
         if dd.device.battery_type == rv.StorageProductModel.HUAWEI_LUNA2000:
@@ -1060,6 +1200,69 @@ async def set_emma_tou_periods(
 
         assert dd.configuration_update_coordinator
         await dd.configuration_update_coordinator.async_refresh()
+
+
+# v2.1.0.1 (external ICS audit ICS-010): single dispatching handler and
+# its schema, replacing the two conditionally-registered handlers above.
+#
+# The schema is the PERMISSIVE UNION of the two it replaces (it must
+# accept anything either target type could legitimately receive, since
+# the target is not known until the call arrives). The stricter,
+# per-target validation is not lost -- it is simply applied after
+# dispatch, where each underlying handler already re-checks the pattern
+# it actually supports against its own target. EMMA rejects a non-LUNA
+# period string exactly as before; the direct-battery path accepts both
+# LUNA2000 and LG_RESU forms exactly as before.
+TOU_PERIODS_DISPATCH_SCHEMA = vol.Schema(
+    {
+        vol.Required(DATA_DEVICE_ID): vol.All(cv.string, str),
+        vol.Required(DATA_PERIODS): vol.All(
+            cv.string,
+            vol.Match(
+                HUAWEI_LUNA2000_TOU_PATTERN + r"|" + LG_RESU_TOU_PATTERN
+            ),
+        ),
+    }
+)
+
+
+async def set_tou_periods_dispatch(service_call: ServiceCall) -> None:
+    """Route set_tou_periods to the implementation the TARGET requires.
+
+    v2.1.0.1 (external ICS audit ICS-010 -- confirmed). Previously the
+    same global service name was bound to one of two handlers at
+    registration time, based on whether the config entry happened to
+    contain an EMMA. With two entries of differing composition, the
+    last registration silently won for both -- so a call aimed at a
+    direct-battery inverter could execute the EMMA path, or vice versa.
+
+    Dispatch is by resolved target type, so registration order cannot
+    affect behaviour. An EMMA target goes to the EMMA implementation; a
+    SUN2000 target goes to the direct-battery implementation, which
+    performs the same capability validation as every other direct
+    battery service (ICS-001).
+    """
+    device_entry, entry = async_get_entry_id_for_service_call(service_call)
+    device_datas: list[HuaweiSolarDeviceData] = entry.runtime_data[DATA_DEVICE_DATAS]
+
+    is_emma_target = False
+    for dd in device_datas:
+        if not isinstance(dd.device, EMMADevice):
+            continue
+        for identifier in dd.device_info["identifiers"]:
+            if identifier in device_entry.identifiers:
+                is_emma_target = True
+                break
+        if is_emma_target:
+            break
+
+    if is_emma_target:
+        await set_emma_tou_periods(service_call)
+        return
+
+    # Not an EMMA target -- direct battery path, which validates the
+    # target's own capability before writing anything.
+    await set_battery_tou_periods(service_call)
 
 
 def _parse_capacity_control_periods(text: str) -> list[PeakSettingPeriod]:
@@ -1146,7 +1349,9 @@ def _validate_capacity_control_periods(periods: list[PeakSettingPeriod]) -> None
 async def set_capacity_control_periods(service_call: ServiceCall) -> None:
     """Set the Capacity Control Periods of the battery."""
 
-    dd = get_battery_device_data(service_call)
+    dd = get_validated_battery_device_data(
+        service_call, require_capacity_control=True
+    )
 
     async with _get_device_write_lock(dd.device.serial_number):
         if not re.fullmatch(
@@ -1241,7 +1446,9 @@ def _validate_fixed_charge_periods(periods: list[ChargeDischargePeriod]) -> None
 
 async def set_fixed_charge_periods(service_call: ServiceCall) -> None:
     """Set the fixed charging periods of the battery."""
-    dd = get_battery_device_data(service_call)
+    dd = get_validated_battery_device_data(
+        service_call, require_battery_type=rv.StorageProductModel.LG_RESU
+    )
 
     async with _get_device_write_lock(dd.device.serial_number):
         if not re.fullmatch(FIXED_CHARGE_PERIODS_PATTERN, service_call.data[DATA_PERIODS]):
@@ -1269,7 +1476,7 @@ async def async_setup_services(
     entry: HuaweiSolarConfigEntry,
 ) -> None:
     """Huawei Solar Services Setup."""
-    if not elevated_permissions_enabled(entry):
+    if not entry.data.get(CONF_ENABLE_PARAMETER_CONFIGURATION, False):
         return
 
     # Deliberately NOT also guarded against re-registration on this same
@@ -1361,22 +1568,27 @@ async def async_setup_services(
         )
 
     if has_battery:
-        # When an EMMA is present, it is responsible for managing the battery.
-        # No direct control of the battery is possible.
-        if has_emma:
-            hass.services.async_register(
-                DOMAIN,
-                SERVICE_SET_TOU_PERIODS,
-                set_emma_tou_periods,
-                schema=EMMA_TOU_PERIODS_SCHEMA,
-            )
-        else:
-            hass.services.async_register(
-                DOMAIN,
-                SERVICE_SET_TOU_PERIODS,
-                set_battery_tou_periods,
-                schema=BATTERY_TOU_PERIODS_SCHEMA,
-            )
+        # v2.1.0.1 FIX (external ICS audit ICS-010 -- confirmed): the
+        # registration half. Previously this bound ONE global service
+        # name (set_tou_periods) to one of TWO different handlers
+        # depending on whether the entry happened to contain an EMMA --
+        # so with two entries of different composition, whichever
+        # registered last silently won for BOTH. A user calling
+        # set_tou_periods against a direct-battery inverter could reach
+        # the EMMA handler, or vice versa.
+        #
+        # Now registered exactly once, unconditionally, with a single
+        # dispatching handler that resolves the TARGET device and picks
+        # the correct implementation per call -- the same "resolve, then
+        # validate, then act" order ICS-001 established for the other
+        # battery services. Registration order can no longer change
+        # behaviour because there is only one registration.
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_SET_TOU_PERIODS,
+            set_tou_periods_dispatch,
+            schema=TOU_PERIODS_DISPATCH_SCHEMA,
+        )
 
         # Direct forcible charge/discharge control writes STORAGE_FORCIBLE_*
         # registers straight to the inverter.  When an EMMA is present it is the

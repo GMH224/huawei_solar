@@ -84,9 +84,13 @@ from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
-from .modbus_guard import ModbusGuard
 from .const import (
     ADAPTIVE_DECAY_FACTOR,
+    ADAPTIVE_FIRMWARE_CHANGE_DECAY_FACTOR,
+    ADAPTIVE_LOAD_REGIME_HIGH_GAP_FACTOR,
+    ADAPTIVE_LOAD_REGIME_HIGH_PCT,
+    ADAPTIVE_LOAD_REGIME_HYSTERESIS_PCT,
+    ADAPTIVE_LOAD_REGIME_TAU_S,
     ADAPTIVE_QUEUE_DEPTH_COLD_START,
     LEARNING_SETTLING_PERIOD_S,
     ADAPTIVE_FAILURE_RATE_HIGH,
@@ -426,27 +430,10 @@ class AdaptiveModbusController:
         hass: HomeAssistant,
         serial_number: str,
         device_info: DeviceInfo,
-        bus_endpoint: str | None = None,
     ) -> "AdaptiveModbusController":
-        """
-        v2.0.15b FIX (external ICS review, this release -- the telemetry-
-        correctness defect): bus_endpoint identifies which ModbusGuard
-        instance actually governs this device's real, effective GAP and
-        max_queue_depth (see snapshot()'s own docstring for the full
-        defect this closes). Always (re)assigned below, even when an
-        existing instance is returned -- a reconfigure that changes the
-        connection's own host/port changes this string, and a stale
-        value here would make snapshot() report the WRONG guard's own
-        effective values after that reconfigure, which is exactly the
-        class of defect this fix exists to close, not something to
-        risk reintroducing in a different form.
-        """
         if serial_number not in cls._registry:
             cls._registry[serial_number] = cls(hass, serial_number, device_info)
-        ctrl = cls._registry[serial_number]
-        if bus_endpoint is not None:
-            ctrl._bus_endpoint = bus_endpoint
-        return ctrl
+        return cls._registry[serial_number]
 
     @classmethod
     def get(cls, serial_number: str) -> "AdaptiveModbusController | None":
@@ -476,13 +463,6 @@ class AdaptiveModbusController:
         self.hass = hass
         self.serial_number = serial_number
         self.device_info = device_info
-        # v2.0.15b FIX: see get_or_create()'s own docstring. None here is
-        # a genuinely valid, handled state (test fixtures constructing
-        # this class directly, or a caller that hasn't wired the endpoint
-        # through yet) -- snapshot() falls back to requested-only values
-        # rather than raising when this is unset, not a silent None ->
-        # AttributeError waiting to happen on first real use.
-        self._bus_endpoint: str | None = None
 
         # 96 time slots covering the 24-hour day
         self._slots: list[TimeSlotStats] = [
@@ -507,6 +487,10 @@ class AdaptiveModbusController:
             f"{DOMAIN}.adaptive.{serial_number}",
         )
         self._last_decay_date: date | None = None
+        # v2.1.0.0 (V2_1_ARCHITECTURE_DESIGN.md §4.2): last firmware
+        # version seen for this device, persisted across restarts. None
+        # until the first observation -- see note_firmware_version().
+        self._firmware_version: str | None = None
         # Learning gate (v1.2.2)
         self.learning_enabled = True
         self._suppressed_until: float | None = None
@@ -533,20 +517,27 @@ class AdaptiveModbusController:
         self._bus_wait_p95: float = 0.0
         self._bus_service_p95: float = 0.0
         self._bus_requests_waited: int = 0
-        # v2.0.15 (experimental identification release): opt-in only,
-        # None unless explicitly enabled via enable_excitation(). Existing
-        # deployments upgrading to 2.0.15 see NO behavior change unless
-        # this is turned on deliberately -- see enable_excitation()'s own
-        # docstring. Deferred import to avoid a circular import with
-        # excitation_controller.py, which itself imports AdaptiveParams
-        # from this module.
-        self._excitation: Any | None = None
         self._bus_total_wait_s: float = 0.0
         # v2.0.11 (Phase 5.2, this release): see note_bus_metrics()'s
         # own comment. None until the coordinator has pushed at least
         # one real value through -- matches ModbusGuard.bus_health_pct()'s
         # own "None until observed" semantics rather than a fake default.
         self._bus_health_pct: float | None = None
+        # v2.1.0.0 (V2_1_ARCHITECTURE_DESIGN.md §3.2/§3.3): smoothed
+        # bus-load regime signal. None until the first real occupancy
+        # observation -- see _update_load_regime() for why a fake 0.0
+        # starting point would be wrong (it would place a busy bus in
+        # the LOW regime for the first hour after every restart).
+        # Deliberately NOT persisted: the whole point is a 1-4 h EWMA of
+        # CURRENT conditions, and a value restored from an arbitrary
+        # time ago describes a bus state that may no longer exist.
+        self._load_ewma_pct: float | None = None
+        self._load_ewma_last_update: float | None = None
+        # Latched regime, so hysteresis has something to be sticky
+        # about. False (LOW) is the safe default: it applies no gap
+        # correction at all, i.e. exactly 2.0.14 behaviour, until real
+        # evidence of high load arrives.
+        self._load_regime_high: bool = False
         self._first_data_date: date | None = None
         self._dirty: bool = False
         # v2.0.3 FIX (ICS-02, external ICS audit -- confirmed): a
@@ -715,13 +706,6 @@ class AdaptiveModbusController:
         • The current 15-minute time slot's historical failure rate and RTT.
         • Whether a state transition is currently active.
         • Blending with a conservative baseline when slot confidence is low.
-
-        v2.0.15: if excitation is enabled (see enable_excitation()), the
-        normally-derived params above are further overridden for GAP or
-        POLL per the active excitation schedule -- see
-        ExcitationController.apply() for the full precedence rules,
-        chiefly that an active transition always overrides excitation,
-        never the other way around.
         """
         now_mono = time.monotonic()
         if self._in_transition and now_mono > self._transition_expires:
@@ -729,11 +713,7 @@ class AdaptiveModbusController:
 
         slot_idx = self._current_slot_index()
         slot = self._slots[slot_idx]
-        params = self._derive_params(slot, slot_idx, self._in_transition)
-        if self._excitation is not None:
-            self._excitation.maybe_advance()
-            params = self._excitation.apply(params, self._in_transition)
-        return params
+        return self._derive_params(slot, slot_idx, self._in_transition)
 
     def learning_active(self) -> bool:
         """True when it is safe to learn from observations."""
@@ -763,111 +743,6 @@ class AdaptiveModbusController:
                 self.serial_number,
             )
 
-    def enable_excitation(self) -> None:
-        """v2.0.15.4 (broadband random excitation release): opt-in only.
-
-        Enabling this has two effects, both deliberate:
-          1. get_params() begins overriding GAP, TIMEOUT, and POLL with
-             a fresh, independent random draw every 10 minutes (see
-             random_excitation_controller.py's own module docstring for
-             the full design and reasoning), on top of its otherwise-
-             normal output, subject to the existing in_transition
-             safety net always winning -- unchanged and untouched by
-             this release.
-          2. Learning is disabled for the duration, for the same reason
-             as the sequential excitation release before it: a randomly
-             drawn value should not itself be fed back into the slot-
-             level statistics that drive NORMAL behavior.
-
-        Calling this on an already-enabled controller is a no-op.
-
-        v2.0.15.4: unlike the sequential ExcitationController this
-        replaces for this release, RandomExcitationController has
-        deliberately NO go/no-go safety monitor and NO persistence
-        across restarts -- see that class's own module docstring for
-        why both omissions are deliberate design choices, not gaps.
-        Shared per bus_endpoint (RandomExcitationController.get_or_
-        create()), for the same reason the sequential release needed
-        this: GAP is combined across every device on a bus via
-        ModbusGuard's own max(), so independent per-device draws would
-        silently produce an effective GAP governed by whichever device
-        happened to draw the larger value. The no-bus_endpoint fallback
-        (a private, non-shared instance) is retained for the same
-        reason it was in 2.0.15.3: the safest possible degradation for
-        a device with no known bus_endpoint, rather than crashing or
-        silently doing nothing.
-        """
-        if self._excitation is not None:
-            return
-        from .random_excitation_controller import RandomExcitationController, REDRAW_INTERVAL  # deferred: avoids circular import
-        if self._bus_endpoint:
-            self._excitation = RandomExcitationController.get_or_create(self._bus_endpoint)
-        else:
-            _LOGGER.warning(
-                "AdaptiveModbus[%s]: enable_excitation() called with no known "
-                "bus_endpoint -- falling back to a private, non-shared "
-                "random excitation instance for this device only. GAP "
-                "excitation will NOT be synchronized with any other "
-                "device sharing this physical bus.",
-                self.serial_number,
-            )
-            self._excitation = RandomExcitationController()
-        self.set_learning_enabled(False)
-        _LOGGER.warning(
-            "AdaptiveModbus[%s]: RANDOM EXCITATION ENABLED (v2.0.15.4 "
-            "broadband identification release). Learning is now "
-            "disabled for the duration. GAP, TIMEOUT, and POLL will be "
-            "redrawn independently at random every %s, except during "
-            "an active transition. See random_excitation_controller.py "
-            "for the full design and safety bounds.",
-            self.serial_number,
-            REDRAW_INTERVAL,
-        )
-
-    def disable_excitation(self) -> None:
-        """Explicit, human-initiated stop -- does not happen automatically
-        on any timer. Re-enables learning.
-        """
-        if self._excitation is None:
-            return
-        self._excitation = None
-        self.set_learning_enabled(True)
-        _LOGGER.warning(
-            "AdaptiveModbus[%s]: excitation disabled, learning re-enabled.",
-            self.serial_number,
-        )
-
-    def excitation_is_halted(self) -> bool:
-        """v2.0.15.4: always False -- RandomExcitationController has no
-        go/no-go safety monitor and therefore no halt concept at all
-        (see that class's own module docstring for why this is a
-        deliberate design choice for this release, not a gap). Kept as
-        a real method, not removed, so callers written against the
-        sequential-excitation releases (the resume_excitation_after_
-        halt button in button.py, in particular) continue to work
-        unchanged against this release too, correctly reporting nothing
-        is ever halted rather than raising on a class that no longer
-        has a _state attribute at all.
-        """
-        return False
-
-    def excitation_is_enabled(self) -> bool:
-        """True if enable_excitation() has been called and disable_
-        excitation() has not since. Public accessor -- see excitation_
-        is_halted()'s own docstring for why this exists rather than
-        checking `_excitation is None` at call sites."""
-        return self._excitation is not None
-
-    def resume_excitation_after_halt(self) -> None:
-        """v2.0.15.4: always a safe no-op -- see excitation_is_halted()'s
-        own docstring. Kept as a real method so the existing button
-        entity (button.py) continues to work unchanged against this
-        release: pressing it when nothing can ever be halted correctly
-        does nothing, rather than the entity needing its own release-
-        specific special-casing.
-        """
-        return
-
     def mark_recovery(self, reason: str) -> None:
         """Suppress learning for the settling period after a disturbance."""
         self._suppressed_until = time.time() + LEARNING_SETTLING_PERIOD_S
@@ -878,6 +753,87 @@ class AdaptiveModbusController:
             "continues with current parameters",
             self.serial_number, LEARNING_SETTLING_PERIOD_S, reason,
         )
+
+    def note_firmware_version(self, version: str | None) -> bool:
+        """Record this device's firmware version; react if it changed.
+
+        v2.1.0.0 (V2_1_ARCHITECTURE_DESIGN.md §4.2). Returns True only
+        when a genuine change was detected and handled.
+
+        Why this exists: `mark_recovery()` has always been the right
+        response to "this device's timing behaviour may have just
+        changed", but it is only ever called from Home Assistant's own
+        start/stop hooks (__init__.py::_settle()) -- i.e. for HA-side
+        disturbances. Nothing detected the INVERTER changing underneath a
+        continuously-running HA, which is exactly the firmware-update
+        signature. Huawei ships firmware roughly quarterly, so the
+        exposure recurs several times a year.
+
+        Two distinct actions, for two distinct problems:
+
+        1. mark_recovery() suppresses learning for the settling period,
+           so observations taken while the device is still stabilising
+           after an update are not learned from at all.
+        2. A one-off aggressive decay
+           (ADAPTIVE_FIRMWARE_CHANGE_DECAY_FACTOR) discounts statistics
+           already accumulated under the OLD firmware. Suppression alone
+           would not help here -- the poisoned counts are already stored,
+           and this controller's own comments quantify the consequence:
+           "a single maintenance window therefore costs weeks of degraded
+           polling", because decay scales confidence and failures by the
+           same factor, so only fresh successes dilute it, and those
+           accrue more slowly precisely because polling has degraded.
+
+        First observation is deliberately NOT treated as a change: a
+        fresh install, and any pre-2.1.0.0 store (which has no persisted
+        firmware_version at all), must not have 75 % of its learned
+        statistics discarded merely for upgrading this integration.
+
+        A None version is also not a change. The version is read from a
+        register like any other value and can legitimately be absent for
+        a poll or two; treating "we could not read it" as "it changed"
+        would decay real statistics on a transient read failure -- and
+        the same transient failure could then repeat, compounding it.
+        """
+        if version is None:
+            return False
+        if self._firmware_version is None:
+            self._firmware_version = version
+            self._dirty = True
+            # v2.0.3 (ICS-02): every _dirty = True site must also bump
+            # _generation, or a mutation landing during an in-flight save
+            # is silently lost when the save clears _dirty on completion.
+            # This branch mutates persisted state (the recorded version)
+            # exactly like the change branch below does.
+            self._generation += 1
+            _LOGGER.debug(
+                "AdaptiveModbus[%s]: recording initial firmware version %s "
+                "(no change action taken)",
+                self.serial_number, version,
+            )
+            return False
+        if version == self._firmware_version:
+            return False
+
+        previous = self._firmware_version
+        self._firmware_version = version
+        self._dirty = True
+        _LOGGER.warning(
+            "AdaptiveModbus[%s]: firmware version changed (%s -> %s). "
+            "Discounting learned statistics by %.2f and suppressing "
+            "learning for %.0f s -- Modbus timing behaviour may have "
+            "changed. NOTE: this handles TIMING changes only; if this "
+            "update also changed the register map, sensor values may be "
+            "wrong in ways no timing adaptation can detect, and the "
+            "register map should be reviewed manually.",
+            self.serial_number, previous, version,
+            ADAPTIVE_FIRMWARE_CHANGE_DECAY_FACTOR, LEARNING_SETTLING_PERIOD_S,
+        )
+        for slot in self._slots:
+            slot.apply_decay(ADAPTIVE_FIRMWARE_CHANGE_DECAY_FACTOR)
+        self._generation += 1  # v2.0.3 (ICS-02): see this field's own comment in __init__
+        self.mark_recovery(f"firmware change {previous} -> {version}")
+        return True
 
     def suppress_indefinitely(self, reason: str) -> None:
         """Suppress learning until explicitly resumed (e.g. HA shutting down)."""
@@ -949,6 +905,73 @@ class AdaptiveModbusController:
         self._bus_total_wait_s = total_wait_s
         if bus_health_pct is not None:
             self._bus_health_pct = bus_health_pct
+        # v2.1.0.0 (V2_1_ARCHITECTURE_DESIGN.md §3.2): the ONE thing on
+        # this method that is no longer "storage only" -- occupancy now
+        # also feeds the smoothed load-regime signal that conditions the
+        # derived gap. Everything else here remains diagnostics-only, as
+        # the docstring above says.
+        self._update_load_regime(occupancy_pct)
+
+    def _update_load_regime(self, occupancy_pct: float) -> None:
+        """Update the smoothed load-regime signal and its latched state.
+
+        v2.1.0.0 (V2_1_ARCHITECTURE_DESIGN.md §3.2/§3.3).
+
+        Time-based EWMA rather than a fixed per-sample weight: this is
+        called once per poll, and the poll interval is itself one of the
+        adaptive parameters (20-180 s). A per-sample alpha would silently
+        change the effective smoothing horizon whenever the poll rate
+        changed -- and poll rate correlates with load, which is exactly
+        the signal being smoothed. Weighting by elapsed wall-clock time
+        keeps the horizon fixed at ADAPTIVE_LOAD_REGIME_TAU_S regardless.
+
+        Hysteresis is applied to the LATCHED regime, not the EWMA: a bus
+        hovering near the threshold would otherwise flip regimes
+        repeatedly, and each flip would step the gap. This mirrors the
+        chattery-signal problem found in the field with night_mode (which
+        flipped 6 times in 16 minutes under variable cloud) -- the reason
+        §3.2 rejected night_mode as the regime key in the first place.
+        """
+        now = time.monotonic()
+        # v2.1.0.0: getattr() on first read for the same __new__-bypasses-
+        # __init__ fixture reason documented at the _derive_params() use
+        # site. Reading them into locals first also keeps the arithmetic
+        # below readable.
+        ewma = getattr(self, "_load_ewma_pct", None)
+        last_update = getattr(self, "_load_ewma_last_update", None)
+        if ewma is None or last_update is None:
+            # First real observation seeds the EWMA directly. Seeding
+            # from 0.0 instead would place a genuinely busy bus in the
+            # LOW regime for roughly the first time constant after every
+            # restart -- a slow, silent wrong answer rather than an
+            # obvious one.
+            self._load_ewma_pct = occupancy_pct
+            self._load_ewma_last_update = now
+        else:
+            dt = max(0.0, now - last_update)
+            self._load_ewma_last_update = now
+            # Standard time-constant EWMA: alpha = 1 - exp(-dt/tau).
+            alpha = 1.0 - math.exp(-dt / ADAPTIVE_LOAD_REGIME_TAU_S)
+            self._load_ewma_pct = alpha * occupancy_pct + (1.0 - alpha) * ewma
+
+        smoothed = self._load_ewma_pct
+        high_on = ADAPTIVE_LOAD_REGIME_HIGH_PCT + ADAPTIVE_LOAD_REGIME_HYSTERESIS_PCT
+        high_off = ADAPTIVE_LOAD_REGIME_HIGH_PCT - ADAPTIVE_LOAD_REGIME_HYSTERESIS_PCT
+        if getattr(self, "_load_regime_high", False):
+            if smoothed < high_off:
+                self._load_regime_high = False
+                _LOGGER.debug(
+                    "AdaptiveModbus[%s]: load regime -> LOW (smoothed "
+                    "occupancy %.1f%% < %.1f%%)",
+                    self.serial_number, smoothed, high_off,
+                )
+        elif smoothed > high_on:
+            self._load_regime_high = True
+            _LOGGER.debug(
+                "AdaptiveModbus[%s]: load regime -> HIGH (smoothed "
+                "occupancy %.1f%% > %.1f%%)",
+                self.serial_number, smoothed, high_on,
+            )
 
     def note_shed(self) -> None:
         """Diagnostics only — a request shed by the shared bus guard."""
@@ -1006,14 +1029,6 @@ class AdaptiveModbusController:
         call sites pass "transaction" explicitly, and those do NOT feed
         poll_n/poll_failures.
         """
-        if self._excitation is not None:
-            # Must run BEFORE the learning_active() early-return below:
-            # enable_excitation() disables learning for the duration, and
-            # the go/no-go safety monitor is exactly what needs to keep
-            # running while learning itself is off -- it is the ONE thing
-            # in this class that must not be gated by the same switch
-            # that turns off ordinary slot-statistics learning.
-            self._excitation.record_outcome(success, timeout)
         if not self.learning_active():
             self.suppressed_observations += 1
             return
@@ -1131,99 +1146,14 @@ class AdaptiveModbusController:
         A genuine test-coverage gap, not a mock silently swallowing a
         real failure. Closed by adding a test that actually registers a
         controller and exercises this exact path end to end.
-
-        v2.0.15b FIX (external ICS review, this release -- reported
-        directly against a real deployment, not found by internal
-        review first): gap_ms and max_queue_depth below used to report
-        params.request_gap / params.max_queue_depth -- this device's OWN
-        requested values from get_params() -- as if they were the real,
-        measured values governing the physical bus. They are not the
-        same thing whenever this device shares a bus/endpoint with
-        another device: ModbusGuard.update_gap() (modbus_guard.py) takes
-        the MAXIMUM requested gap across every device sharing the same
-        endpoint (the safer, more conservative value always wins, by
-        design -- Defect P), and update_max_queue_depth() takes the
-        MINIMUM depth the same way. A device requesting an aggressive
-        150ms gap while a sibling device on the same bus still requests
-        500ms produces a real, effective gap of 500ms on the wire --
-        while the old gap_ms field here would have reported 150ms, a
-        number that never actually governed anything.
-
-        Confirmed directly against a real field capture: a device's own
-        reported gap_ms was 150.0, while the real, measured inter-chunk
-        timing on the bus for that exact device was 505-545ms -- the
-        guard's own effective_gap_ms for that endpoint, not this
-        device's own request, is what a telemetry consumer measuring
-        "what's on the bus" needs.
-
-        Fixed by reporting BOTH values, explicitly and separately named
-        so neither can be mistaken for the other: gap_requested_ms /
-        max_queue_depth_requested (this device's own ask, still useful
-        diagnostic information for understanding WHY the effective
-        value is what it is) and gap_effective_ms / max_queue_depth_
-        effective (the real, shared value from ModbusGuard, governing
-        actual bus behaviour). No back-channel change to the guard's
-        own max()/min() combining logic itself -- that mechanism is a
-        legitimate, deliberate safety property (Defect P) and is not
-        being touched here; only what telemetry reports about its
-        result changes, not the mechanism itself.
-
-        The requested-only fallback (self._bus_endpoint is None) exists
-        because this is a genuinely reachable state, not a defensive
-        placeholder: every existing test fixture that constructs this
-        class via object.__new__() (bypassing __init__ and get_or_
-        create() both) has never set this field, and this method must
-        not raise for any of them.
         """
         params = self.get_params()
         slot = self._slots[params.slot_index]
-        gap_requested_ms = params.request_gap.total_seconds() * 1000
-        max_queue_depth_requested = params.max_queue_depth
-        bus_endpoint = getattr(self, "_bus_endpoint", None)
-        if bus_endpoint:
-            # Truthy check deliberately, not `is not None`: the real
-            # caller (_setup_inverter_device_data, __init__.py) defaults
-            # its own bus_endpoint parameter to "" rather than None, and
-            # an empty string is exactly as "not actually set" as None
-            # is here -- ModbusGuard.get_or_create("") would create a
-            # real registry entry for a meaningless key, silently
-            # masking this same class of defect in a new shape.
-            guard = ModbusGuard.get_or_create(bus_endpoint)
-            gap_effective_ms = guard.effective_gap_ms
-            # v2.0.15.3 FIX (real deployment check, this release): was
-            # guard.queue_depth -- live, current occupancy (fluctuates
-            # with real traffic), not the min()-combined CEILING this
-            # field's own name promises. See ModbusGuard.effective_max_
-            # queue_depth's own docstring for the full defect this
-            # closes; confirmed directly against a real capture (live
-            # occupancy observed fluctuating 0-1 against a requested
-            # ceiling of 3 -- unrelated, differently-scaled numbers).
-            max_queue_depth_effective = guard.effective_max_queue_depth
-        else:
-            # No known endpoint (see docstring) -- the effective value
-            # cannot be looked up, so it is reported as None rather than
-            # silently falling back to the requested value under a name
-            # that promises it is the real one.
-            gap_effective_ms = None
-            max_queue_depth_effective = None
         return {
             "poll_interval_s": params.poll_interval.total_seconds(),
-            "gap_requested_ms": gap_requested_ms,
-            "gap_effective_ms": gap_effective_ms,
+            "gap_ms": params.request_gap.total_seconds() * 1000,
             "timeout_s": params.request_timeout.total_seconds(),
-            "max_queue_depth_requested": max_queue_depth_requested,
-            "max_queue_depth_effective": max_queue_depth_effective,
-            # v2.0.15.3 FIX (real 3-day field run, this release): closes
-            # a gap this project called out explicitly and repeatedly
-            # this session but never fixed until a real, unattended run
-            # was silently wasted by it -- ExcitationController.
-            # telemetry_snapshot() has existed since the original 2.0.15
-            # release but was never called from anywhere. Merged in
-            # directly (not nested under its own sub-key) so every
-            # excitation_* field lands in the same flat telemetry
-            # record as everything else here, without a capture reader
-            # needing to know a separate, nested shape exists.
-            **(self._excitation.telemetry_snapshot() if self._excitation is not None else {}),
+            "max_queue_depth": params.max_queue_depth,
             "confidence_pct": round(params.confidence * 100, 1),
             # v2.0.9 (Phase 3.2, this release -- ICS-08/MOD-02, both
             # external ICS audits -- confirmed): exposed separately and
@@ -1410,6 +1340,43 @@ class AdaptiveModbusController:
         )
         gap_ms_baseline = ADAPTIVE_GAP_MIN.total_seconds() * 1000
         gap_ms = confidence * gap_ms_derived + (1 - confidence) * gap_ms_baseline
+        # v2.1.0.0 (V2_1_ARCHITECTURE_DESIGN.md §3.2): load-regime
+        # conditioning, applied to GAP ONLY -- not timeout, not poll.
+        # See ADAPTIVE_LOAD_REGIME_* in const.py for the measured
+        # evidence behind both the asymmetry and the direction.
+        #
+        # ADDITIVE, per §7's implementation sequence: this multiplies
+        # the existing, unchanged time-of-day-slot derivation rather
+        # than replacing slot indexing with load indexing. The proven
+        # mechanism stays intact and the new signal can be evaluated
+        # against it in the field before any replacement is considered.
+        # In the LOW regime the factor is exactly 1.0, so behaviour is
+        # bit-identical to 2.0.14 -- a deployment that never reaches
+        # high load sees no change at all.
+        #
+        # Clamped to the same ADAPTIVE_GAP_MIN/MAX envelope the
+        # unconditioned value already respects, so regime conditioning
+        # can never push gap outside bounds this project has already
+        # validated. ModbusGuard clamps to MIN_INTER_REQUEST_GAP
+        # (150 ms, SUN2000 FSM hardware constraint) independently again.
+        #
+        # getattr() rather than a bare attribute read, for the same
+        # reason _serialize() uses it for _firmware_version -- this
+        # project's test fixtures routinely build controllers via
+        # object.__new__() and set only what a given test needs, a
+        # recurring breakage source the existing comments in this file
+        # already call out. Defaulting to False (LOW regime) is also the
+        # correct SEMANTIC default, not merely a safe one: it applies no
+        # gap correction at all, i.e. exactly 2.0.14 behaviour, which is
+        # what a controller with no observed load data should do.
+        if getattr(self, "_load_regime_high", False):
+            gap_ms = max(
+                ADAPTIVE_GAP_MIN.total_seconds() * 1000,
+                min(
+                    gap_ms * ADAPTIVE_LOAD_REGIME_HIGH_GAP_FACTOR,
+                    ADAPTIVE_GAP_MAX.total_seconds() * 1000,
+                ),
+            )
         request_gap = timedelta(milliseconds=gap_ms)
 
         # ── Timeout: 15 s → 60 s ──────────────────────────────────────────────
@@ -1570,7 +1537,7 @@ class AdaptiveModbusController:
         # comment for the full reasoning on why this is dt_util.now().
         # date() rather than date.today().
         _today = dt_util.now().date()
-        data = {
+        return {
             "version": _STORAGE_VERSION,
             "data_schema": _DATA_SCHEMA_VERSION,
             "serial": self.serial_number,
@@ -1579,31 +1546,25 @@ class AdaptiveModbusController:
             "suppressed_observations": self.suppressed_observations,
             "settling_events": self.settling_events,
             "first_data_date": (self._first_data_date or _today).isoformat(),
+            # v2.1.0.0 (V2_1_ARCHITECTURE_DESIGN.md §4.2): persisted so a
+            # firmware update that happens while Home Assistant is DOWN is
+            # still detected on the next startup. Detecting only in-session
+            # changes would miss the common case entirely -- an inverter
+            # firmware update and an HA restart often coincide.
+            #
+            # getattr() rather than a bare attribute read: this project's
+            # test fixtures routinely build controllers via
+            # object.__new__() and set only the attributes a given test
+            # needs, a pattern the existing comments in this file already
+            # call out repeatedly as a recurring source of breakage. A new
+            # persisted field must not make every such fixture raise.
+            "firmware_version": getattr(self, "_firmware_version", None),
             "slots": {
                 str(i): s.to_dict()
                 for i, s in enumerate(self._slots)
                 if s.n > 0.001   # skip empty slots to keep storage compact
             },
         }
-        # v2.0.15 (experimental identification release): only present at
-        # all if excitation was ever enabled this session -- omitted
-        # entirely (not a null/empty placeholder) for every deployment
-        # that never turns this on, keeping the stored payload identical
-        # to pre-2.0.15 for the overwhelming majority of installs.
-        #
-        # v2.0.15.4: RandomExcitationController deliberately has NO
-        # to_persisted_dict() at all (see that class's own module
-        # docstring -- there is no "progress" to preserve across a
-        # restart when every 10-minute window is independent). The
-        # hasattr() check here, rather than an isinstance() check
-        # against both classes, avoids importing either excitation
-        # class into this method just to tell them apart -- and stays
-        # correct automatically if a future release adds a third
-        # excitation class that also skips persistence for its own,
-        # different reasons.
-        if self._excitation is not None and hasattr(self._excitation, "to_persisted_dict"):
-            data["excitation"] = self._excitation.to_persisted_dict()
-        return data
 
     def _deserialize(self, raw: dict[str, Any]) -> None:
         self._reset_slots()
@@ -1622,44 +1583,13 @@ class AdaptiveModbusController:
         self._last_decay_date = date.fromisoformat(last_str) if last_str else None
         first_str = raw.get("first_data_date")
         self._first_data_date = date.fromisoformat(first_str) if first_str else None
-        # v2.0.15: only restores an excitation controller if the stored
-        # payload actually contains one -- a pre-2.0.15 store, or a
-        # 2.0.15 store where excitation was never enabled, has no
-        # "excitation" key at all, and self._excitation correctly stays
-        # None (no behavior change) rather than being restored into some
-        # default-enabled state nothing ever asked for.
-        #
-        # v2.0.15.4: RandomExcitationController deliberately has NO
-        # persistence at all (see that class's own module docstring),
-        # so this release never writes an "excitation" key in the first
-        # place -- but a device UPGRADED from 2.0.15.3 in place, without
-        # clearing storage, may still have one left over from the
-        # sequential ExcitationController that release used. Restoring
-        # that as an ExcitationController here would silently give this
-        # release the WRONG excitation mechanism for the rest of the
-        # session (the old sequential schedule instead of the random
-        # redraws this release exists to run), with no warning at all --
-        # exactly the kind of silent, field-discovered surprise this
-        # project has already spent real effort tracking down more than
-        # once. Legacy data is explicitly recognized and discarded here
-        # instead: self._excitation stays None, matching this release's
-        # own "no persistence" design, and a person restarting after an
-        # in-place upgrade sees a clear, honest reason why any leftover
-        # sequential-excitation state was not carried forward.
-        excitation_raw = raw.get("excitation")
-        if excitation_raw is not None:
-            _LOGGER.warning(
-                "AdaptiveModbus[%s]: found a leftover 'excitation' key in "
-                "storage (state=%s) -- almost certainly left over from an "
-                "earlier release's own sequential ExcitationController "
-                "(2.0.15/2.0.15b/2.0.15.3). This release (2.0.15.4) uses "
-                "a different, non-persisted random excitation mechanism "
-                "and does not restore this legacy data. Call "
-                "enable_excitation() explicitly to start random "
-                "excitation fresh for this device.",
-                self.serial_number,
-                excitation_raw.get("state"),
-            )
+        # v2.1.0.0 (§4.2): absent in every pre-2.1.0.0 store, which is
+        # handled deliberately -- None means "no previous version known",
+        # and note_firmware_version() treats that as "record it, do not
+        # decay". An upgrade to 2.1.0.0 must not look like a firmware
+        # change and wipe 75 % of every existing installation's learned
+        # statistics.
+        self._firmware_version = raw.get("firmware_version")
 
     def _reset_slots(self) -> None:
         self._slots = [TimeSlotStats(slot_index=i) for i in range(ADAPTIVE_SLOT_COUNT)]
@@ -1725,22 +1655,9 @@ class AdaptiveModbusController:
 
 _ADAPTIVE_SENSORS: list[tuple[str, str, str | None, str]] = [
     ("poll_interval_s",        "Adaptive poll interval",       "s",   "mdi:timer-sync-outline"),
-    # v2.0.15b FIX (external ICS review): gap_ms and max_queue_depth
-    # renamed to *_requested/*_effective pairs in snapshot() (see that
-    # method's own docstring for the full telemetry-correctness defect
-    # this closes) -- this list was never updated to match at the time,
-    # a real regression: the two old keys below no longer exist in
-    # snapshot()'s own output at all, so these two sensor entities
-    # showed "Unknown" in the live UI from that release onward, caught
-    # only when reported directly against a real deployment's own
-    # diagnostics page, not by any test (see test_adaptive_sensor_keys_
-    # match_snapshot.py, added specifically because no existing test
-    # checked this correspondence at all).
-    ("gap_requested_ms",       "Adaptive Modbus gap (requested)", "ms",  "mdi:timer-pause-outline"),
-    ("gap_effective_ms",       "Adaptive Modbus gap (effective)", "ms",  "mdi:timer-pause-outline"),
+    ("gap_ms",                 "Adaptive Modbus gap",          "ms",  "mdi:timer-pause-outline"),
     ("timeout_s",              "Adaptive Modbus timeout",      "s",   "mdi:timer-alert-outline"),
-    ("max_queue_depth_requested", "Adaptive queue depth (requested)", None, "mdi:layers-triple-outline"),
-    ("max_queue_depth_effective", "Adaptive queue depth (effective)", None, "mdi:layers-triple-outline"),
+    ("max_queue_depth",        "Adaptive queue depth",         None,  "mdi:layers-triple-outline"),
     ("confidence_pct",         "Adaptive learning confidence", "%",   "mdi:school-outline"),
     ("slot_failure_rate_pct",  "Adaptive slot failure rate",   "%",   "mdi:percent"),
     ("in_transition",          "Inverter state transition",    None,  "mdi:swap-horizontal-bold"),
@@ -1769,38 +1686,6 @@ _ADAPTIVE_SENSORS: list[tuple[str, str, str | None, str]] = [
     ("bus_requests_waited",    "Bus requests delayed",         None,  "mdi:timer-alert-outline"),
     ("bus_total_wait_s",       "Bus total wait",               "s",   "mdi:timer-sand-full"),
     # (item 1) Is coalescing firing, and how much is it pulling forward?
-    # v2.0.15.3 FIX (real 3-day field run, this release): excitation
-    # state visible directly on this same diagnostics page, not just in
-    # a telemetry capture file -- ExcitationController.telemetry_
-    # snapshot() has existed since the original 2.0.15 release but was
-    # never wired into anything at all, including here. Reported
-    # directly by a user looking at exactly this page. Absent (shown as
-    # "Unknown", handled gracefully by .get() below) for any device
-    # that never had excitation enabled -- that is the correct,
-    # accurate "Unknown" for that case, unlike gap_requested_ms/gap_
-    # effective_ms above, which are unconditionally present for every
-    # device regardless of excitation state.
-    ("excitation_mode",                        "Excitation mode",              None, "mdi:sine-wave"),
-    ("excitation_halt_reason",                 "Excitation halt reason",       None, "mdi:alert-circle-outline"),
-    ("excitation_halted_for_s",                "Excitation halted for",        "s",  "mdi:timer-alert-outline"),
-    ("excitation_auto_resume_count_this_mode", "Excitation auto-resume count", None, "mdi:autorenew"),
-    # v2.0.15.4: RandomExcitationController's own telemetry_snapshot()
-    # uses different key names (random_excitation_*, not excitation_*)
-    # from ExcitationController's -- confirmed directly, before this list
-    # was updated, that these do NOT overlap with the four keys just
-    # above (a real regression already happened once this project, from
-    # exactly this kind of unchecked assumption -- see the gap_ms/max_
-    # queue_depth comment further up this same list). Both sets of keys
-    # coexist here permanently: whichever excitation class a given
-    # release's own enable_excitation() actually instantiates populates
-    # its own keys; the other release's own keys are simply and
-    # correctly absent (shown as "Unknown"), the same accurate-absence
-    # behavior already established for excitation_mode/etc. above when
-    # excitation was never enabled at all.
-    ("random_excitation_draw_gap_ms",         "Random excitation draw: gap",     "ms", "mdi:dice-multiple-outline"),
-    ("random_excitation_draw_timeout_s",      "Random excitation draw: timeout", "s",  "mdi:dice-multiple-outline"),
-    ("random_excitation_draw_poll_s",         "Random excitation draw: poll",    "s",  "mdi:dice-multiple-outline"),
-    ("random_excitation_draw_elapsed_s",      "Random excitation draw age",      "s",  "mdi:timer-sand"),
 ]
 
 
