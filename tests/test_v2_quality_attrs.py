@@ -330,3 +330,79 @@ class TestGuardedWriteSequence(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# v2.1.0.0 — synchronized-power sensors degrade rather than blank
+# (V2_1_ARCHITECTURE_DESIGN.md §2.2)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestSynchronizedPowerDegradesRatherThanBlanks(unittest.TestCase):
+    """SynchronizedPowerSensorEntity._handle_coordinator_update().
+
+    ICS-05 (v2.0.3) made a temporally-misaligned composite reading
+    UNAVAILABLE, explicitly rejecting "an extra 'uncertain' attribute
+    alongside a still-displayed value". That reasoning was sound at the
+    time and is preserved where it genuinely applies -- but it predates
+    the quality model reaching the entity layer. data_quality /
+    data_quality_reason / data_age_seconds (types.py::_quality_attrs)
+    now exist precisely so a value can be shown AND declared unreliable.
+
+    Source-level rather than by instantiating the entity: sensor.py
+    imports the full Home Assistant entity stack, and this project's
+    established convention (see this file's own header, and
+    test_synchronized_power_coordinator.py) is to avoid loading a heavy
+    dependency chain to test one specific piece of logic. The behaviour
+    that MATTERS -- that a misaligned composite still produces a real
+    number, and that the uncertainty is computed -- is covered
+    behaviourally in test_synchronized_power_coordinator.py against the
+    real coordinator.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._src = (_ROOT / "sensor.py").read_text()
+        idx = cls._src.find("class SynchronizedPowerSensorEntity")
+        assert idx != -1, "SynchronizedPowerSensorEntity not found in sensor.py"
+        end = cls._src.find("\nclass _PvTotalSensor", idx)
+        cls._window = cls._src[idx: end if end != -1 else idx + 6000]
+
+    def test_availability_no_longer_gated_on_temporal_uncertainty(self):
+        """The core change: `not uncertain` must no longer appear in the
+        availability expression.
+
+        Before: available = value is not None AND not uncertain.
+        After:  available = value is not None.
+        """
+        self.assertIn("self._attr_available = self._attr_native_value is not None", self._window)
+        self.assertNotIn(
+            "self._attr_native_value is not None and not uncertain", self._window,
+            "temporal uncertainty must no longer force unavailability -- "
+            "it is declared via data_quality instead",
+        )
+
+    def test_missing_value_is_still_unavailable(self):
+        """ICS-05's actual safety property is preserved: a value is never
+        invented. Only the 'we have a real number but its inputs were
+        misaligned' case degrades; a genuinely missing input still
+        blanks."""
+        self.assertIn("self._attr_native_value is not None", self._window)
+
+    def test_uncertainty_is_declared_via_the_standard_quality_attributes(self):
+        """Degrading is only acceptable because it is loud. The entity
+        must carry the same machine-readable quality contract every
+        other sensor in this integration already uses."""
+        self.assertIn('"data_quality": "UNCERTAIN"', self._window)
+        self.assertIn('"data_quality_reason": "TEMPORAL_MISALIGNMENT"', self._window)
+        self.assertIn('"sample_span_ms"', self._window)
+
+    def test_legacy_attribute_key_is_retained(self):
+        """Adversarial: dashboards/automations built against ICS-05's own
+        `temporally_uncertain` attribute must not break silently on
+        upgrade."""
+        self.assertIn('"temporally_uncertain": True', self._window)
+
+    def test_attributes_are_empty_when_well_aligned(self):
+        """No quality attributes at all on a well-aligned reading --
+        an UNCERTAIN marker that is always present carries no signal."""
+        self.assertIn("self._attr_extra_state_attributes = {}", self._window)

@@ -543,8 +543,27 @@ class TestEnergyStaleCacheExclusion(unittest.TestCase):
         # the cache layer now; this fallback is just "serve whatever the
         # cache is willing to serve," uniformly, no register-type check at
         # this specific call site at all.
-        idx = _SOURCE.find("Stale-cache fallback")
-        window = _SOURCE[idx: idx + 1800]
+        #
+        # v2.1.0.0 (V2_1_ARCHITECTURE_DESIGN.md §2.1): the fallback body
+        # moved out of the TimeoutError branch into the shared
+        # _stale_cache_fallback() helper, so that all four failure
+        # branches use it rather than the timeout path alone. This test's
+        # INTENT is unchanged and still exactly as load-bearing -- "no
+        # manual GOOD-only gate, and the cache is what decides what is
+        # servable" -- but it now inspects the helper, which is where
+        # that policy actually lives after the refactor. Checked over the
+        # helper's own source window rather than the call site's, since
+        # the call site now legitimately contains neither the gate nor
+        # the cache.get() call.
+        idx = _SOURCE.find("def _stale_cache_fallback")
+        self.assertNotEqual(
+            idx, -1,
+            "_stale_cache_fallback() helper not found -- if the fallback "
+            "moved again, point this test at its new home rather than "
+            "deleting it: the GOOD-only-gate regression it guards against "
+            "is still real",
+        )
+        window = _SOURCE[idx: idx + 3600]
         self.assertNotIn(
             "quality_of(n)[0] != Quality.GOOD", window,
             "a manual GOOD-only gate has reappeared in this fallback -- "
@@ -552,6 +571,34 @@ class TestEnergyStaleCacheExclusion(unittest.TestCase):
             "energy_availability_ceiling_s, not layered on top of it here",
         )
         self.assertIn("cache.get(n)", window)
+
+    def test_stale_cache_fallback_is_used_by_every_failure_branch(self):
+        """v2.1.0.0 (V2_1_ARCHITECTURE_DESIGN.md §2.1).
+
+        The defect this guards against is precisely the one 2.1.0.0
+        fixed: the fallback existed but was wired into the TimeoutError
+        branch ALONE, so a ReadException (e.g. ServerDeviceBusyError, seen
+        repeatedly in real 4-day field captures), a connection
+        interruption, or a generic device exception all skipped it
+        entirely. Source-level rather than behavioural because the point
+        is structural coverage of every branch -- the behaviour of each
+        individual branch is tested separately below.
+        """
+        idx = _SOURCE.find("async def _async_update_data")
+        self.assertNotEqual(idx, -1)
+        body = _SOURCE[idx:]
+        # Bound the search to this method: stop at the next top-level class.
+        end = body.find("\nclass ")
+        if end != -1:
+            body = body[:end]
+        self.assertGreaterEqual(
+            body.count("self._stale_cache_fallback("), 4,
+            "expected the stale-cache fallback to be invoked by all four "
+            "failure branches (timeout, ReadException, "
+            "ConnectionInterruptedException, HuaweiSolarException); "
+            "a branch that skips it will blank sensors that the cache "
+            "could still legitimately serve",
+        )
 
     def test_energy_availability_ceiling_is_longer_not_shorter(self):
         # The whole point of the final design: energy counters get MORE
@@ -1823,3 +1870,129 @@ class TestPhysicalGroupWiredIntoChunkBuilding(unittest.TestCase):
         idx = _SOURCE.find("for protected_run in _split_by_physical_group(sorted_names):")
         window = _SOURCE[idx: idx + 400]
         self.assertIn("_chunk(group, self._service_aware_chunk_size(group))", window)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# v2.1.0.0 — stale-cache fallback uniformity (V2_1_ARCHITECTURE_DESIGN.md §2.1)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestStaleCacheFallbackHelper(unittest.TestCase):
+    """Behavioural tests for _stale_cache_fallback().
+
+    The source-level tests above prove the helper is WIRED into all four
+    failure branches. These prove it BEHAVES correctly -- the two are
+    genuinely different failure modes and the project has been bitten by
+    exactly that distinction before (a mechanism present but never
+    invoked).
+
+    The helper is a plain method depending only on self.cache and
+    self.name, so it can be exercised directly against a real
+    HuaweiSolarUpdateCoordinator instance created via __new__ (no event
+    loop, no HA, no device). That is deliberate: it tests the real
+    method rather than a reimplementation of it.
+    """
+
+    def _make_coord(self, cache_contents):
+        """Real coordinator object, only the two attributes the helper touches."""
+        from unittest.mock import MagicMock
+        import importlib.util, pathlib, sys
+
+        mod = sys.modules.get("custom_components.huawei_solar.update_coordinator")
+        if mod is None:  # pragma: no cover - import path varies by runner
+            import custom_components.huawei_solar.update_coordinator as mod
+
+        coord = mod.HuaweiSolarUpdateCoordinator.__new__(
+            mod.HuaweiSolarUpdateCoordinator
+        )
+        coord.name = "test_coord"
+        cache = MagicMock()
+        cache.get = MagicMock(side_effect=lambda n: cache_contents.get(n))
+        coord.cache = cache
+        return coord
+
+    def test_returns_none_when_cache_is_empty(self):
+        """No servable values -> None, so the caller raises UpdateFailed.
+
+        This is the path to GENUINE unavailability and must keep
+        working: the fix bounds how long a value is served, it does not
+        make entities immortal.
+        """
+        coord = self._make_coord({})
+        self.assertIsNone(coord._stale_cache_fallback(["a", "b"], "timeout"))
+
+    def test_returns_none_when_cache_returns_none_for_every_name(self):
+        """Adversarial: cache present but every entry expired/BAD."""
+        coord = self._make_coord({"a": None, "b": None})
+        self.assertIsNone(coord._stale_cache_fallback(["a", "b"], "timeout"))
+
+    def test_serves_what_the_cache_has(self):
+        coord = self._make_coord({"a": "VAL_A", "b": "VAL_B"})
+        out = coord._stale_cache_fallback(["a", "b"], "timeout")
+        self.assertEqual(out, {"a": "VAL_A", "b": "VAL_B"})
+
+    def test_partial_cache_serves_only_the_available_subset(self):
+        """A partially-populated cache must serve what it has rather than
+        failing all-or-nothing -- otherwise one expired register would
+        blank every entity on the device."""
+        coord = self._make_coord({"a": "VAL_A", "b": None})
+        out = coord._stale_cache_fallback(["a", "b"], "read exception")
+        self.assertEqual(out, {"a": "VAL_A"})
+
+    def test_applies_no_quality_gate_of_its_own(self):
+        """The cache decides what is servable, not this helper.
+
+        RegisterCache._live_quality() already applies a LONGER ceiling to
+        energy counters (ENERGY_AVAILABILITY_CEILING_S) than to ordinary
+        registers. A GOOD-only gate here would silently undermine that,
+        which is the exact regression the v2.0.0 design notes warn
+        about. Verified behaviourally: whatever cache.get() returns is
+        passed through untouched, including values a stricter gate would
+        have dropped.
+        """
+        sentinel = object()
+        coord = self._make_coord({"energy_x": sentinel})
+        out = coord._stale_cache_fallback(["energy_x"], "device exception")
+        self.assertIs(out["energy_x"], sentinel)
+
+    def test_only_requested_names_are_served(self):
+        """Adversarial: the helper must not leak unrelated cache entries
+        into a coordinator's own data dict."""
+        coord = self._make_coord({"a": "VAL_A", "unrelated": "VAL_U"})
+        out = coord._stale_cache_fallback(["a"], "timeout")
+        self.assertEqual(out, {"a": "VAL_A"})
+
+
+class TestIllegalDataAddressBypassesFallback(unittest.TestCase):
+    """ILLEGAL_DATA_ADDRESS must NOT get the stale-cache fallback.
+
+    Every other failure means "we could not reach the value". This one
+    means "this register does not exist on this device" -- a
+    configuration error the operator is explicitly asked to diagnose by
+    disabling sensors one at a time. Serving a cached value would mask
+    exactly that signal, and no amount of waiting makes the register
+    appear.
+    """
+
+    def test_illegal_data_address_raises_before_reaching_the_fallback(self):
+        # Anchor on the USE site inside the ReadException handler, not the
+        # constant's definition at module top (which is where a naive
+        # search for the bare name lands first).
+        handler = _SOURCE.find("except ReadException as err:")
+        self.assertNotEqual(handler, -1)
+        window = _SOURCE[handler: handler + 1600]
+        guard_pos = window.find("_EXC_ILLEGAL_DATA_ADDRESS")
+        self.assertNotEqual(
+            guard_pos, -1,
+            "expected the ILLEGAL_DATA_ADDRESS special case inside the "
+            "ReadException handler",
+        )
+        after_guard = window[guard_pos:]
+        raise_pos = after_guard.find("raise UpdateFailed")
+        fallback_pos = after_guard.find("_stale_cache_fallback")
+        self.assertNotEqual(raise_pos, -1, "expected an early raise for this case")
+        self.assertTrue(
+            fallback_pos == -1 or raise_pos < fallback_pos,
+            "ILLEGAL_DATA_ADDRESS must raise BEFORE any stale-cache "
+            "fallback is attempted -- serving cached data here would "
+            "mask a register-map configuration error",
+        )

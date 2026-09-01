@@ -1228,3 +1228,127 @@ class TestPhase210SyncPowerAttribution:
             "-- that attribution only applies to the physical-read path"
         )
 
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# v2.1.0.0 — degrade, don't blank (V2_1_ARCHITECTURE_DESIGN.md §2.2)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestUncertainCacheFallbackAfterFailedRead:
+    """_read_one()'s last-resort UNCERTAIN cache fallback.
+
+    Field evidence (4-day capture): 2,951 unknown/unavailable transitions,
+    ~90% on the four *_synchronised entities. Broken down by which
+    entities dropped out together, 940 of 1,069 events were PARTIAL (1-3
+    of 4) following dependency chains -- the signature of an individual
+    read returning None, not of the all-four temporal-alignment gate
+    (129 events).
+
+    The GOOD-only gate at the TOP of _read_one() is deliberately
+    unchanged: that decides whether to SKIP a physical read. These tests
+    cover the different question asked only after a read has already
+    failed -- "is a known-stale value better than nothing?"
+    """
+
+    @pytest.mark.asyncio
+    async def test_uncertain_cache_is_served_when_physical_read_fails(self):
+        cache = _FakeCache()
+        cache.set(rn.INPUT_POWER, quality=_Q.UNCERTAIN, age=12.0, value=2500)
+        coord = _make_coordinator_with_caches(
+            inv1_cache=cache, has_meter=False, has_battery=False,
+        )
+        coord._inv1.batch_update = AsyncMock(side_effect=ConnectionError("boom"))
+
+        result = await coord._async_update_data()
+
+        assert result.inv1_pv_power == 2500, (
+            "a physical-read failure with an UNCERTAIN cached value must "
+            "serve the stale value rather than blanking every derived "
+            "sensor that depends on it"
+        )
+
+    @pytest.mark.asyncio
+    async def test_stale_value_widens_the_measured_sample_span(self):
+        """The safety property: serving stale data is not silent.
+
+        The stale value's real age flows into _mark_success() exactly as
+        a GOOD cache hit's does, so it widens sample_span_ms -- which is
+        what drives is_temporally_uncertain. The quality model decides
+        whether the composite is trustworthy; _read_one() just stops
+        throwing the information away.
+        """
+        inv1_cache = _FakeCache()
+        inv1_cache.set(rn.INPUT_POWER, quality=_Q.UNCERTAIN, age=30.0, value=2500)
+        meter_cache = _FakeCache()
+        meter_cache.set(rn.POWER_METER_ACTIVE_POWER, quality=_Q.GOOD, age=0.1, value=500)
+        coord = _make_coordinator_with_caches(
+            inv1_cache=inv1_cache, meter_cache=meter_cache, has_battery=False,
+        )
+        coord._inv1.batch_update = AsyncMock(side_effect=ConnectionError("boom"))
+
+        result = await coord._async_update_data()
+
+        assert result.sample_span_ms is not None
+        assert result.sample_span_ms > 3000.0, (
+            "a 30s-old stale value combined with a fresh one must produce "
+            "a large measured span, not a silently well-aligned-looking one"
+        )
+        assert result.is_temporally_uncertain is True, (
+            "the widened span must trip the existing uncertainty flag -- "
+            "that is what keeps this from being 'silently wrong'"
+        )
+
+    @pytest.mark.asyncio
+    async def test_bad_quality_cache_is_not_served(self):
+        """Adversarial: the fallback is bounded, not unlimited.
+
+        Once RegisterCache's own ceilings expire an entry it stops being
+        UNCERTAIN, and a genuinely dead link must still end in
+        unavailable. Only UNCERTAIN is served here -- never BAD.
+
+        With a single inverter and no other inputs, refusing to serve the
+        BAD value means every read for this tick failed, so the
+        coordinator takes its documented "if ALL reads fail" path and
+        raises UpdateFailed. That raise IS the assertion: it can only
+        happen if the BAD-quality value was correctly withheld.
+        """
+        cache = _FakeCache()
+        cache.set(rn.INPUT_POWER, quality=_Q.BAD, age=9999.0, value=2500)
+        coord = _make_coordinator_with_caches(
+            inv1_cache=cache, has_meter=False, has_battery=False,
+        )
+        coord._inv1.batch_update = AsyncMock(side_effect=ConnectionError("boom"))
+
+        with pytest.raises(_FakeUpdateFailed):
+            await coord._async_update_data()
+
+    @pytest.mark.asyncio
+    async def test_no_cache_reference_still_fails_cleanly(self):
+        """Adversarial: no cache at all must not raise an unexpected
+        error type -- it must take the same, already-designed
+        all-reads-failed path, not e.g. AttributeError on a None cache."""
+        coord = _make_coordinator_with_caches(
+            inv1_cache=None, has_meter=False, has_battery=False,
+        )
+        coord._inv1.batch_update = AsyncMock(side_effect=ConnectionError("boom"))
+
+        with pytest.raises(_FakeUpdateFailed):
+            await coord._async_update_data()
+
+    @pytest.mark.asyncio
+    async def test_good_cache_still_short_circuits_before_any_read(self):
+        """Regression guard: the pre-existing GOOD-only fast path at the
+        top of _read_one() must be untouched by this change -- a GOOD
+        cached value should still avoid the physical read entirely."""
+        cache = _FakeCache()
+        cache.set(rn.INPUT_POWER, quality=_Q.GOOD, age=0.5, value=3000)
+        coord = _make_coordinator_with_caches(
+            inv1_cache=cache, has_meter=False, has_battery=False,
+        )
+        coord._inv1.batch_update = AsyncMock(side_effect=AssertionError(
+            "physical read must not be attempted when cache is GOOD"
+        ))
+
+        result = await coord._async_update_data()
+
+        assert result.inv1_pv_power == 3000

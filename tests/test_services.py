@@ -490,7 +490,15 @@ class TestPhase5BSetPackInstallDate:
         source = self._source()
         idx = source.find("async def set_pack_install_date(")
         assert idx > -1
-        body = source[idx: idx + 2700]
+        # v2.1.0.1: bounded by the NEXT top-level def rather than a fixed
+        # character count. The original 2700-char window broke when the
+        # ICS-004 timezone fix added explanatory comments to this same
+        # function -- a source-inspection test should not fail because
+        # correct code grew a comment. The assertion itself is unchanged.
+        nxt = source.find("\nasync def ", idx + 1)
+        nxt2 = source.find("\ndef ", idx + 1)
+        end = min(x for x in (nxt, nxt2, len(source)) if x > 0)
+        body = source[idx:end]
         assert "bh_manager.set_pack_install_date(serial, install_ts)" in body
 
     def test_no_longer_duplicates_the_dirty_and_save_calls_inline(self):
@@ -537,3 +545,207 @@ class TestPhase5BSetPackInstallDate:
     def test_battery_health_manager_imported_at_module_level(self):
         source = self._source()
         assert "from .battery_health_manager import BatteryHealthManager" in source
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# v2.1.0.1 — external ICS audit remediation (ICS-001/006/007/010/011)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestTargetCapabilityValidation:
+    """ICS-001 (CRITICAL), ICS-006 and ICS-007 (HIGH) — one shared defect.
+
+    Service AVAILABILITY was decided from entry-wide any() aggregates
+    computed once at setup, while the HANDLERS resolved a target and went
+    straight to physical writes without checking that specific target's
+    capability. In a heterogeneous installation (one entry with a
+    direct-LUNA inverter and an EMMA-managed inverter, or two entries with
+    different battery models) a service registered because SOME device
+    qualified could be called against a device that does not.
+
+    These are write services: STORAGE_FORCIBLE_CHARGE_POWER,
+    STORAGE_FORCIBLE_CHARGE_DISCHARGE_SETTING_MODE and friends go to
+    physical equipment.
+    """
+
+    def _validator(self):
+        source = _SERVICES_SRC.read_text()
+        assert "def _validate_battery_target(" in source
+        return source
+
+    def test_validator_exists_and_is_used_by_every_write_handler(self):
+        """Structural: the defect was that resolution and validation had
+        drifted apart, so every direct-control handler must go through
+        the combined resolver rather than the bare one."""
+        source = self._validator()
+        handlers = [
+            "forcible_charge", "forcible_discharge",
+            "forcible_charge_soc", "forcible_discharge_soc",
+            "stop_forcible_charge", "set_battery_tou_periods",
+            "set_capacity_control_periods", "set_fixed_charge_periods",
+        ]
+        for name in handlers:
+            idx = source.find(f"async def {name}(")
+            assert idx > -1, f"handler {name} not found"
+            nxt = source.find("\nasync def ", idx + 1)
+            body = source[idx: nxt if nxt > 0 else len(source)]
+            assert "get_validated_battery_device_data(" in body, (
+                f"{name} still resolves its target without capability "
+                f"validation -- this is the ICS-001 defect"
+            )
+
+    def test_validation_happens_before_the_write_lock(self):
+        """Rejecting an ineligible target must not first serialise behind
+        a lock held by a legitimate in-flight write to the same device."""
+        source = self._validator()
+        for name in ("forcible_charge", "set_capacity_control_periods"):
+            idx = source.find(f"async def {name}(")
+            nxt = source.find("\nasync def ", idx + 1)
+            body = source[idx: nxt if nxt > 0 else len(source)]
+            v = body.find("get_validated_battery_device_data(")
+            lock = body.find("_get_device_write_lock(")
+            assert v > -1 and lock > -1
+            assert v < lock, f"{name} takes the write lock before validating"
+
+    def test_lg_only_service_requires_lg_battery_type(self):
+        """ICS-006: LG_RESU and LUNA2000 use different period register
+        encodings -- writing one model's format to the other is a
+        malformed physical write, not a no-op."""
+        source = self._validator()
+        idx = source.find("async def set_fixed_charge_periods(")
+        nxt = source.find("\nasync def ", idx + 1)
+        body = source[idx: nxt if nxt > 0 else len(source)]
+        assert "require_battery_type=rv.StorageProductModel.LG_RESU" in body
+
+    def test_capacity_control_service_requires_capacity_control(self):
+        """ICS-007."""
+        source = self._validator()
+        idx = source.find("async def set_capacity_control_periods(")
+        nxt = source.find("\nasync def ", idx + 1)
+        body = source[idx: nxt if nxt > 0 else len(source)]
+        assert "require_capacity_control=True" in body
+
+    def test_validator_rejects_non_sun2000_targets(self):
+        """An EMMA reached through a battery service must be refused --
+        EMMA owns battery management when present. The registration
+        comment already said so; nothing enforced it at the handler."""
+        source = self._validator()
+        idx = source.find("def _validate_battery_target(")
+        body = source[idx: idx + 4000]
+        assert "isinstance(device, SUN2000Device)" in body
+        assert "target_not_directly_controllable" in body
+
+    def test_validator_rejects_targets_with_no_battery(self):
+        source = self._validator()
+        idx = source.find("def _validate_battery_target(")
+        body = source[idx: idx + 4000]
+        assert "StorageProductModel.NONE" in body
+        assert "target_has_no_battery" in body
+
+    def test_validator_raises_service_validation_error_not_valueerror(self):
+        """A caller/target mismatch is a validation problem HA should
+        surface to the user, not an integration crash."""
+        source = self._validator()
+        idx = source.find("def _validate_battery_target(")
+        body = source[idx: idx + 4000]
+        assert body.count("raise ServiceValidationError(") >= 4
+        assert "raise ValueError(" not in body
+
+    def test_all_new_translation_keys_exist(self):
+        """A ServiceValidationError with a missing translation key
+        surfaces as an unhelpful raw key to the user."""
+        import json
+        base = pathlib.Path(__file__).parent.parent
+        for name in ("strings.json", "translations/en.json"):
+            data = json.loads((base / name).read_text())
+            exc = data["exceptions"]
+            for key in (
+                "target_not_directly_controllable",
+                "target_has_no_battery",
+                "target_battery_type_mismatch",
+                "target_no_capacity_control",
+            ):
+                assert key in exc, f"{key} missing from {name}"
+
+
+class TestTouPeriodsSingleRegistration:
+    """ICS-010 — one global service name was bound to one of two handlers
+    depending on entry composition, so with two entries of differing
+    composition whichever registered last silently won for both."""
+
+    def test_tou_periods_registered_exactly_once(self):
+        # Counts actual async_register() calls, not every mention of the
+        # constant -- it also appears in the import block, in the
+        # unregister list, and in __all__-style collections, none of
+        # which are registrations.
+        source = _SERVICES_SRC.read_text()
+        registrations = 0
+        idx = 0
+        while True:
+            idx = source.find("hass.services.async_register(", idx)
+            if idx == -1:
+                break
+            block = source[idx: idx + 300]
+            if "SERVICE_SET_TOU_PERIODS," in block:
+                registrations += 1
+            idx += 1
+        assert registrations == 1, (
+            f"set_tou_periods must have exactly one registration, found "
+            f"{registrations} -- two conditional registrations is the "
+            f"ICS-010 defect"
+        )
+
+    def test_registration_is_not_conditional_on_has_emma(self):
+        source = _SERVICES_SRC.read_text()
+        idx = source.find("SERVICE_SET_TOU_PERIODS,")
+        window = source[max(0, idx - 700): idx]
+        assert "if has_emma:" not in window, (
+            "registration must not branch on entry-wide has_emma"
+        )
+
+    def test_dispatcher_exists_and_routes_by_resolved_target(self):
+        source = _SERVICES_SRC.read_text()
+        assert "async def set_tou_periods_dispatch(" in source
+        idx = source.find("async def set_tou_periods_dispatch(")
+        nxt = source.find("\ndef ", idx + 1)
+        body = source[idx: nxt if nxt > 0 else idx + 3000]
+        assert "EMMADevice" in body
+        assert "set_emma_tou_periods(service_call)" in body
+        assert "set_battery_tou_periods(service_call)" in body
+
+    def test_dispatch_schema_is_the_permissive_union(self):
+        """The target is unknown until the call arrives, so the schema
+        must accept anything either target type could legitimately
+        receive. Per-target strictness is re-applied after dispatch by
+        each underlying handler."""
+        source = _SERVICES_SRC.read_text()
+        idx = source.find("TOU_PERIODS_DISPATCH_SCHEMA = ")
+        body = source[idx: idx + 700]
+        assert "HUAWEI_LUNA2000_TOU_PATTERN" in body
+        assert "LG_RESU_TOU_PATTERN" in body
+
+
+class TestDuplicateDeviceIdentityGuard:
+    """ICS-011 — the audit rated this 'strongly indicated, runtime
+    regression required' because it did not examine config_flow.py.
+
+    The audit's own remediation option 1 ('reject duplicate physical
+    device identities across entries') is already implemented there via
+    Home Assistant's standard mechanism. This test pins it so it cannot
+    be silently removed, which is the real residual risk.
+    """
+
+    def test_config_flow_rejects_duplicate_serials(self):
+        source = (pathlib.Path(__file__).parent.parent / "config_flow.py").read_text()
+        assert "await self.async_set_unique_id(inverter_info[\"serial_number\"])" in source
+        assert "self._abort_if_unique_id_configured(" in source
+
+    def test_guard_is_on_the_entry_creation_path(self):
+        """It must gate async_create_entry, not sit in some unrelated
+        branch -- otherwise it does not actually prevent the duplicate."""
+        source = (pathlib.Path(__file__).parent.parent / "config_flow.py").read_text()
+        guard = source.find("self._abort_if_unique_id_configured(")
+        create = source.find("return self.async_create_entry(", guard)
+        assert guard > -1 and create > -1
+        assert create - guard < 400, (
+            "the duplicate guard must immediately precede entry creation"
+        )

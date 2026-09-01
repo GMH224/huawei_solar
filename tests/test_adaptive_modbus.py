@@ -52,21 +52,6 @@ _cmod.__package__ = "huawei_solar"
 _cspec.loader.exec_module(_cmod)
 sys.modules["huawei_solar.const"] = _cmod
 
-# v2.0.15b FIX (external ICS review, this release): adaptive_modbus.py
-# now imports ModbusGuard (from .modbus_guard import ModbusGuard) as
-# part of the telemetry-correctness fix -- see snapshot()'s own
-# docstring. This standalone loader must satisfy that import exactly
-# the same way it already does for const.py just above, or exec_module
-# below raises ModuleNotFoundError before a single test in this file
-# can even be collected.
-_gpath = pathlib.Path(__file__).parent.parent / "modbus_guard.py"
-_gspec = importlib.util.spec_from_file_location("huawei_solar.modbus_guard", str(_gpath))
-_gmod = importlib.util.module_from_spec(_gspec)
-_gmod.__package__ = "huawei_solar"
-_gspec.loader.exec_module(_gmod)
-sys.modules["huawei_solar.modbus_guard"] = _gmod
-ModbusGuard = _gmod.ModbusGuard
-
 # Load adaptive_modbus.py
 _SRC = pathlib.Path(__file__).parent.parent / "adaptive_modbus.py"
 _SPEC = importlib.util.spec_from_file_location("adaptive_modbus_test", str(_SRC))
@@ -87,6 +72,11 @@ ADAPTIVE_TIMEOUT_MAX   = _cmod.ADAPTIVE_TIMEOUT_MAX
 ADAPTIVE_GAP_MIN       = _cmod.ADAPTIVE_GAP_MIN
 ADAPTIVE_GAP_MAX       = _cmod.ADAPTIVE_GAP_MAX
 ADAPTIVE_DECAY_FACTOR  = _cmod.ADAPTIVE_DECAY_FACTOR
+# v2.1.0.0 (V2_1_ARCHITECTURE_DESIGN.md §4.2)
+ADAPTIVE_FIRMWARE_CHANGE_DECAY_FACTOR = _cmod.ADAPTIVE_FIRMWARE_CHANGE_DECAY_FACTOR
+# v2.1.0.0 (V2_1_ARCHITECTURE_DESIGN.md §3.2)
+ADAPTIVE_LOAD_REGIME_HIGH_PCT = _cmod.ADAPTIVE_LOAD_REGIME_HIGH_PCT
+ADAPTIVE_LOAD_REGIME_HIGH_GAP_FACTOR = _cmod.ADAPTIVE_LOAD_REGIME_HIGH_GAP_FACTOR
 ADAPTIVE_QUEUE_DEPTH_COLD_START = _cmod.ADAPTIVE_QUEUE_DEPTH_COLD_START
 ADAPTIVE_SLOT_COUNT    = _cmod.ADAPTIVE_SLOT_COUNT
 
@@ -110,6 +100,16 @@ def _make_ctrl() -> AdaptiveModbusController:
     ctrl._store.async_save = AsyncMock()
     ctrl._last_decay_date = None
     ctrl._first_data_date = None
+    # v2.1.0.0 (V2_1_ARCHITECTURE_DESIGN.md §4.2): same __new__-bypasses-
+    # __init__ gap called out for _generation below -- set explicitly,
+    # matching __init__'s own default of None ("no version seen yet").
+    ctrl._firmware_version = None
+    # v2.1.0.0 (V2_1_ARCHITECTURE_DESIGN.md §3.2): load-regime state,
+    # same __new__-bypasses-__init__ reason as above. Defaults match
+    # __init__: no observation yet, LOW regime (no gap correction).
+    ctrl._load_ewma_pct = None
+    ctrl._load_ewma_last_update = None
+    ctrl._load_regime_high = False
     ctrl._dirty = False
     # v2.0.3 (ICS-02, external ICS audit): _make_ctrl() bypasses __init__
     # entirely, so this needs setting explicitly, matching __init__'s own
@@ -161,20 +161,6 @@ def _make_ctrl() -> AdaptiveModbusController:
     ctrl._bus_health_pct = None
     ctrl._coalesce_events = 0
     ctrl._coalesced_registers = 0
-    # v2.0.15 (experimental identification release): _make_ctrl() bypasses
-    # __init__ entirely, so this needs setting explicitly, matching
-    # __init__'s own default -- same class of gap hit repeatedly this
-    # session for every object.__new__()-based test fixture.
-    ctrl._excitation = None
-    # v2.0.15b FIX (external ICS review, this release): same class of
-    # gap as _excitation immediately above -- _make_ctrl() bypasses
-    # __init__ entirely, so this needs setting explicitly too. snapshot()
-    # itself uses getattr(self, "_bus_endpoint", None) specifically so a
-    # missing attribute here would not raise -- but setting it
-    # explicitly keeps this fixture's own fields in sync with __init__'s
-    # real defaults, rather than relying on the getattr fallback to
-    # paper over a fixture that's drifted from the class it's faking.
-    ctrl._bus_endpoint = None
     return ctrl
 
 
@@ -1518,39 +1504,12 @@ class TestSnapshotPublicMethod(unittest.TestCase):
         ctrl = _make_ctrl()
         snap = ctrl.snapshot()
         for key in (
-            # v2.0.15b FIX (external ICS review, this release): gap_ms
-            # and max_queue_depth renamed to *_requested/*_effective
-            # pairs -- see snapshot()'s own docstring for the full
-            # telemetry-correctness defect this closes. Checking the new
-            # names here, not the old ones, is the point of this update:
-            # a test that still passed against the old, misleading names
-            # would be silently certifying the exact defect being fixed.
-            "poll_interval_s", "gap_requested_ms", "gap_effective_ms",
-            "timeout_s", "max_queue_depth_requested", "max_queue_depth_effective",
+            "poll_interval_s", "gap_ms", "timeout_s", "max_queue_depth",
             "confidence_pct", "slot_failure_rate_pct", "in_transition",
             "days_of_data", "shed_count", "admission_timeout_count",
             "bus_occupancy_pct",
         ):
             self.assertIn(key, snap, f"snapshot() is missing expected key '{key}'")
-
-    def test_old_misleading_gap_ms_key_is_genuinely_gone(self):
-        """Adversarial: the old key name must not silently persist
-        alongside the new ones -- a caller still reading "gap_ms" must
-        get a clear KeyError, not a stale, misleading number."""
-        ctrl = _make_ctrl()
-        snap = ctrl.snapshot()
-        self.assertNotIn("gap_ms", snap)
-        self.assertNotIn("max_queue_depth", snap)
-
-    def test_effective_values_none_without_a_bus_endpoint(self):
-        """_make_ctrl() sets _bus_endpoint = None (matching __init__'s
-        own default) -- confirms the fallback path is real and does not
-        raise, not just that it exists in source."""
-        ctrl = _make_ctrl()
-        snap = ctrl.snapshot()
-        self.assertIsNone(snap["gap_effective_ms"])
-        self.assertIsNone(snap["max_queue_depth_effective"])
-        self.assertIsNotNone(snap["gap_requested_ms"])
 
     def test_private_name_no_longer_exists(self):
         """The rename must be complete, not a case where both names
@@ -1654,3 +1613,334 @@ class TestMOD022UsesHomeAssistantTimezoneNotHostLocal(unittest.TestCase):
     def test_dt_util_imported_from_homeassistant_util(self):
         source = _SRC.read_text()
         self.assertIn("from homeassistant.util import dt as dt_util", source)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# v2.1.0.0 — firmware-change detection (V2_1_ARCHITECTURE_DESIGN.md §4.2)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestFirmwareChangeDetection(unittest.TestCase):
+    """note_firmware_version().
+
+    The exposure this closes was already documented and quantified in
+    this module's own comments before 2.1.0.0, but never acted on: a
+    ~1 h firmware outage lifts a mature slot from ~3 % to ~12 % failure
+    rate (~137 s polling instead of 20-30 s), and because apply_decay()
+    scales confidence and failures by the SAME factor, only fresh
+    successes dilute it -- which now accrue 4-5x more slowly precisely
+    because polling has degraded. Its own conclusion: "a single
+    maintenance window therefore costs weeks of degraded polling".
+
+    mark_recovery() was already the right response but was only ever
+    called from Home Assistant's own start/stop hooks, never for the
+    inverter changing underneath a running HA.
+    """
+
+    def _mature_ctrl(self):
+        """A controller with genuinely accumulated statistics."""
+        ctrl = _make_ctrl()
+        for slot in ctrl._slots[:4]:
+            slot.n = 100.0
+            slot.failures = 3.0
+            slot.timeouts = 1.0
+            slot.poll_n = 50.0
+            slot.poll_failures = 2.0
+        return ctrl
+
+    def test_first_observation_records_without_decaying(self):
+        """A fresh install -- and, critically, any pre-2.1.0.0 store,
+        which has no persisted firmware_version at all -- must not have
+        75 % of its learned statistics discarded merely for upgrading
+        this integration."""
+        ctrl = self._mature_ctrl()
+        changed = ctrl.note_firmware_version("V100R001C00SPC123")
+        self.assertFalse(changed)
+        self.assertEqual(ctrl._firmware_version, "V100R001C00SPC123")
+        self.assertEqual(ctrl._slots[0].n, 100.0, "statistics must be untouched")
+
+    def test_unchanged_version_is_a_noop(self):
+        ctrl = self._mature_ctrl()
+        ctrl.note_firmware_version("V100R001C00SPC123")
+        ctrl._dirty = False
+        changed = ctrl.note_firmware_version("V100R001C00SPC123")
+        self.assertFalse(changed)
+        self.assertEqual(ctrl._slots[0].n, 100.0)
+        self.assertFalse(ctrl._dirty, "an unchanged version must not dirty the store")
+
+    def test_changed_version_decays_all_slots(self):
+        ctrl = self._mature_ctrl()
+        ctrl.note_firmware_version("V100R001C00SPC123")
+        changed = ctrl.note_firmware_version("V100R001C00SPC124")
+        self.assertTrue(changed)
+        self.assertAlmostEqual(
+            ctrl._slots[0].n, 100.0 * ADAPTIVE_FIRMWARE_CHANGE_DECAY_FACTOR
+        )
+        self.assertAlmostEqual(
+            ctrl._slots[0].failures, 3.0 * ADAPTIVE_FIRMWARE_CHANGE_DECAY_FACTOR
+        )
+
+    def test_changed_version_suppresses_learning(self):
+        """The second half of the response: observations taken while the
+        device is still stabilising after an update must not be learned
+        from at all."""
+        ctrl = self._mature_ctrl()
+        ctrl.note_firmware_version("V1")
+        settling_before = ctrl.settling_events
+        ctrl.note_firmware_version("V2")
+        self.assertEqual(ctrl.settling_events, settling_before + 1)
+        self.assertIsNotNone(ctrl._suppressed_until)
+        self.assertIn("firmware change", ctrl._suppress_reason)
+
+    def test_none_version_is_never_treated_as_a_change(self):
+        """Adversarial, and the most important negative case: the version
+        is read from a register like any other value and can legitimately
+        be absent for a poll or two. Treating "could not read it" as
+        "it changed" would decay real statistics on a transient read
+        failure -- and the same transient failure could then repeat,
+        compounding the damage."""
+        ctrl = self._mature_ctrl()
+        ctrl.note_firmware_version("V1")
+        changed = ctrl.note_firmware_version(None)
+        self.assertFalse(changed)
+        self.assertEqual(ctrl._slots[0].n, 100.0, "statistics must be untouched")
+        self.assertEqual(ctrl._firmware_version, "V1", "must not forget the known version")
+
+    def test_none_on_a_fresh_controller_records_nothing(self):
+        ctrl = _make_ctrl()
+        self.assertFalse(ctrl.note_firmware_version(None))
+        self.assertIsNone(ctrl._firmware_version)
+
+    def test_decay_is_aggressive_but_not_a_wipe(self):
+        """The factor is an engineering choice, pinned here deliberately.
+
+        Not 0.0: a full wipe drops confidence to zero and forces a
+        cold-start back-off, trading one degraded-polling failure mode
+        for a different one. Not close to the daily 0.85 either: most
+        prior evidence really is suspect after a firmware change.
+        """
+        self.assertGreater(ADAPTIVE_FIRMWARE_CHANGE_DECAY_FACTOR, 0.0)
+        self.assertLess(ADAPTIVE_FIRMWARE_CHANGE_DECAY_FACTOR, ADAPTIVE_DECAY_FACTOR)
+
+    def test_version_round_trips_through_persistence(self):
+        """A firmware update that happens while HA is DOWN must still be
+        detected on the next startup -- so the version has to survive the
+        serialize/deserialize cycle, not just live in memory."""
+        ctrl = self._mature_ctrl()
+        ctrl.note_firmware_version("V1")
+        raw = ctrl._serialize()
+        self.assertEqual(raw["firmware_version"], "V1")
+
+        ctrl2 = _make_ctrl()
+        ctrl2._deserialize(raw)
+        self.assertEqual(ctrl2._firmware_version, "V1")
+        # And a different version after the restart is correctly detected.
+        self.assertTrue(ctrl2.note_firmware_version("V2"))
+
+    def test_pre_2100_store_without_the_field_does_not_look_like_a_change(self):
+        """Adversarial upgrade path: deserializing a store written by an
+        older version (no firmware_version key) must leave the controller
+        in the 'no version known yet' state, so the first observation
+        records rather than decays."""
+        ctrl = _make_ctrl()
+        ctrl._deserialize({"slots": {}})  # no firmware_version key at all
+        self.assertIsNone(ctrl._firmware_version)
+        self.assertFalse(ctrl.note_firmware_version("V1"))
+
+    def test_generation_bumps_on_both_mutation_paths(self):
+        """v2.0.3 (ICS-02): every _dirty = True site must also bump
+        _generation, or a mutation landing during an in-flight save is
+        silently lost. Both the first-observation and the changed
+        branches mutate persisted state."""
+        ctrl = _make_ctrl()
+        gen0 = ctrl._generation
+        ctrl.note_firmware_version("V1")
+        self.assertGreater(ctrl._generation, gen0, "first observation must bump")
+        gen1 = ctrl._generation
+        ctrl.note_firmware_version("V2")
+        self.assertGreater(ctrl._generation, gen1, "change must bump")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# v2.1.0.0 — load-regime gap conditioning (V2_1_ARCHITECTURE_DESIGN.md §3.2/§3.3)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestLoadRegimeConditioning(unittest.TestCase):
+    """Bus-load regime tracking and its effect on the derived gap.
+
+    Evidence (4-day random-excitation capture; MATLAB module 11 reports
+    WELL_IDENTIFIED, so the three levers are separately estimable):
+    GAP's effect on error rate is regime-dependent -- flat at night
+    (0.07-0.34 % across every gap bin), rising monotonically ~5x during
+    the day (0.345 % -> 1.722 %). TIMEOUT's effect is NOT (no monotonic
+    relationship in either regime), corroborated independently by module
+    17's device-variance ratios (gap 21.80, timeout 0.20).
+
+    Because gap was drawn RANDOMLY in that capture, reverse causation is
+    excluded by construction.
+    """
+
+    def _ctrl_with_mature_slot(self):
+        ctrl = _make_ctrl()
+        slot = ctrl._slots[0]
+        slot.n = 200.0
+        slot.failures = 4.0
+        slot.rtt_p95_ms = 500.0
+        return ctrl
+
+    # ── regime tracking ──────────────────────────────────────────────────────
+
+    def test_starts_in_low_regime(self):
+        """A controller with no observed load must apply no correction --
+        i.e. behave exactly as 2.0.14 did."""
+        ctrl = _make_ctrl()
+        self.assertFalse(ctrl._load_regime_high)
+
+    def test_first_observation_seeds_the_ewma_directly(self):
+        """Seeding from 0.0 would place a genuinely busy bus in the LOW
+        regime for roughly a full time constant after every restart -- a
+        slow, silent wrong answer."""
+        ctrl = _make_ctrl()
+        ctrl.note_bus_metrics(70.0, 0.0, 0.0)
+        self.assertAlmostEqual(ctrl._load_ewma_pct, 70.0)
+
+    def test_sustained_high_load_enters_high_regime(self):
+        ctrl = _make_ctrl()
+        ctrl.note_bus_metrics(80.0, 0.0, 0.0)   # seeds at 80 %
+        ctrl.note_bus_metrics(80.0, 0.0, 0.0)   # re-evaluates the latch
+        self.assertTrue(ctrl._load_regime_high)
+
+    def test_sustained_low_load_stays_in_low_regime(self):
+        ctrl = _make_ctrl()
+        ctrl.note_bus_metrics(5.0, 0.0, 0.0)
+        ctrl.note_bus_metrics(5.0, 0.0, 0.0)
+        self.assertFalse(ctrl._load_regime_high)
+
+    def test_hysteresis_prevents_flapping_at_the_threshold(self):
+        """Adversarial, and the reason a bare threshold was rejected: a
+        bus sitting exactly at the boundary must not oscillate. This
+        mirrors the chattery night_mode signal found in the field (6
+        transitions in 16 minutes under variable cloud) that led §3.2 to
+        reject night_mode as the regime key.
+        """
+        ctrl = _make_ctrl()
+        # Seed exactly at the nominal threshold -- inside the hysteresis
+        # band on both sides, so neither transition may fire.
+        ctrl.note_bus_metrics(ADAPTIVE_LOAD_REGIME_HIGH_PCT, 0.0, 0.0)
+        for _ in range(20):
+            ctrl.note_bus_metrics(ADAPTIVE_LOAD_REGIME_HIGH_PCT, 0.0, 0.0)
+        self.assertFalse(
+            ctrl._load_regime_high,
+            "a bus sitting at the nominal threshold must not enter HIGH -- "
+            "it has to cross the upper hysteresis edge",
+        )
+
+    def test_leaving_high_regime_requires_crossing_the_lower_edge(self):
+        ctrl = _make_ctrl()
+        ctrl._load_regime_high = True
+        ctrl._load_ewma_pct = 100.0
+        ctrl._load_ewma_last_update = time.monotonic()
+        # Drop to just inside the band (above the lower edge): must stay HIGH.
+        ctrl._load_ewma_pct = ADAPTIVE_LOAD_REGIME_HIGH_PCT
+        ctrl.note_bus_metrics(ADAPTIVE_LOAD_REGIME_HIGH_PCT, 0.0, 0.0)
+        self.assertTrue(ctrl._load_regime_high)
+
+    def test_ewma_smooths_rather_than_tracking_instantaneously(self):
+        """§3.3: the smoothing horizon is 1-4 h (module 19's measured
+        error-rate autocorrelation decays from 0.42 at 1 h to ~0 by
+        4-5 h). A single high sample arriving moments after a low seed
+        must barely move the estimate -- otherwise the filter chases
+        noise the data shows has no persistence.
+        """
+        ctrl = _make_ctrl()
+        ctrl.note_bus_metrics(0.0, 0.0, 0.0)     # seed low
+        ctrl.note_bus_metrics(100.0, 0.0, 0.0)   # one big spike, ~0 s later
+        self.assertLess(
+            ctrl._load_ewma_pct, 5.0,
+            "a single spike must not swing the smoothed regime signal",
+        )
+
+    # ── effect on derived parameters ─────────────────────────────────────────
+
+    def test_low_regime_gap_is_bit_identical_to_unconditioned(self):
+        """The additive-first guarantee (§7): in the LOW regime the
+        factor is exactly 1.0, so a deployment that never reaches high
+        load sees no behaviour change at all from 2.0.14."""
+        ctrl = self._ctrl_with_mature_slot()
+        ctrl._load_regime_high = False
+        low = ctrl._derive_params(ctrl._slots[0], 0, False)
+
+        ctrl2 = self._ctrl_with_mature_slot()
+        # Simulate the pre-2.1.0.0 code path by removing the attribute
+        # entirely -- getattr()'s default must produce the same answer.
+        del ctrl2._load_regime_high
+        unconditioned = ctrl2._derive_params(ctrl2._slots[0], 0, False)
+
+        self.assertEqual(low.request_gap, unconditioned.request_gap)
+
+    def test_high_regime_tightens_the_gap(self):
+        """Direction matters and is evidence-derived: a LARGER gap
+        correlated with a HIGHER error rate during the day, so the
+        correct response under load is to tighten, not widen."""
+        ctrl = self._ctrl_with_mature_slot()
+        ctrl._load_regime_high = False
+        low = ctrl._derive_params(ctrl._slots[0], 0, False)
+
+        ctrl._load_regime_high = True
+        high = ctrl._derive_params(ctrl._slots[0], 0, False)
+
+        self.assertLess(high.request_gap, low.request_gap)
+
+    def test_high_regime_gap_never_leaves_the_validated_envelope(self):
+        """Adversarial: regime conditioning must never push gap outside
+        bounds this project has already validated, however extreme the
+        slot statistics are."""
+        ctrl = _make_ctrl()
+        slot = ctrl._slots[0]
+        slot.n = 500.0
+        slot.failures = 250.0      # pathological failure rate
+        slot.rtt_p95_ms = 100000.0  # absurd RTT
+        ctrl._load_regime_high = True
+        params = ctrl._derive_params(slot, 0, False)
+        gap_ms = params.request_gap.total_seconds() * 1000
+        self.assertGreaterEqual(gap_ms, ADAPTIVE_GAP_MIN.total_seconds() * 1000)
+        self.assertLessEqual(gap_ms, ADAPTIVE_GAP_MAX.total_seconds() * 1000)
+
+    def test_timeout_is_not_regime_conditioned(self):
+        """The measured asymmetry, pinned: timeout showed no monotonic
+        relationship with error rate in EITHER regime, and module 17
+        independently found it the least device-variable lever (0.20 vs
+        gap's 21.80). Conditioning it would be adding mechanism against
+        an effect the evidence says is not there."""
+        ctrl = self._ctrl_with_mature_slot()
+        ctrl._load_regime_high = False
+        low = ctrl._derive_params(ctrl._slots[0], 0, False)
+        ctrl._load_regime_high = True
+        high = ctrl._derive_params(ctrl._slots[0], 0, False)
+        self.assertEqual(high.request_timeout, low.request_timeout)
+
+    def test_poll_interval_is_not_regime_conditioned(self):
+        ctrl = self._ctrl_with_mature_slot()
+        ctrl._load_regime_high = False
+        low = ctrl._derive_params(ctrl._slots[0], 0, False)
+        ctrl._load_regime_high = True
+        high = ctrl._derive_params(ctrl._slots[0], 0, False)
+        self.assertEqual(high.poll_interval, low.poll_interval)
+
+    def test_queue_depth_is_not_regime_conditioned(self):
+        ctrl = self._ctrl_with_mature_slot()
+        ctrl._load_regime_high = False
+        low = ctrl._derive_params(ctrl._slots[0], 0, False)
+        ctrl._load_regime_high = True
+        high = ctrl._derive_params(ctrl._slots[0], 0, False)
+        self.assertEqual(high.max_queue_depth, low.max_queue_depth)
+
+    def test_regime_state_is_not_persisted(self):
+        """Deliberate: the signal is a 1-4 h EWMA of CURRENT conditions.
+        A value restored from an arbitrary time ago describes a bus state
+        that may no longer exist, and would apply a real gap correction
+        on the strength of it."""
+        ctrl = _make_ctrl()
+        ctrl.note_bus_metrics(90.0, 0.0, 0.0)
+        raw = ctrl._serialize()
+        self.assertNotIn("load_ewma_pct", raw)
+        self.assertNotIn("load_regime_high", raw)
