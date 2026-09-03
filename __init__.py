@@ -736,19 +736,28 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     await async_setup_services(hass, entry)
 
-    # Reload on options change (battery health tunables — spec §10). Raw
-    # persisted segment/sample logs stay valid; only aggregation changes.
-    entry.async_on_unload(entry.add_update_listener(_async_options_updated))
+    # v2.2.0.0 FIX (HA 2026.12 breaking change): the config-entry update
+    # listener that used to live here (`_async_options_updated`,
+    # reloading on any options change) is removed. Its combination with
+    # the reloading methods already present elsewhere in this
+    # integration's config flow (reauth's and reconfigure's own
+    # `async_reload()`, and the new-entry path's
+    # `_abort_if_unique_id_configured(updates=...)`, which defaults to
+    # `reload_on_update=True`) is exactly what HA's official deprecation
+    # notice (developer blog, 2026-05-07) targets: "using a config entry
+    # listener together with any reloading methods in a config flow ...
+    # will result in an error from 2026.12".
+    #
+    # Removing the listener entirely -- not just its one most visible
+    # use in the options flow -- is what actually closes this: with no
+    # listener registered for the entry at all, none of those other
+    # three reloading-method call sites are "combined with a listener"
+    # any more either. The options-change reload itself is not lost; it
+    # now happens via BatteryHealthOptionsFlowHandler(OptionsFlowWithReload)
+    # in config_flow.py, whose own async_create_entry() performs the
+    # reload directly -- unchanged behaviour from the user's perspective.
 
     return True
-
-
-async def _async_options_updated(
-    hass: HomeAssistant, entry: HuaweiSolarConfigEntry
-) -> None:
-    """Handle an options update by reloading the config entry."""
-    await hass.config_entries.async_reload(entry.entry_id)
-
 
 def _async_register_learning_gates(
     hass: HomeAssistant,
@@ -1198,6 +1207,55 @@ async def _setup_inverter_device_data(
 ) -> HuaweiSolarInverterData:
     device_registry = dr.async_get(hass)
 
+    # v2.2.0.0 FIX (HA 2026.9 breaking change): `via_device` accepted a
+    # (DOMAIN, identifier) tuple and was deprecated in favour of
+    # `via_device_id`, which requires the PARENT's own device-registry
+    # entry ID (a UUID string), not its identifier tuple. HA 2027.8 will
+    # remove `via_device` outright; 2026.9 already escalated it from a
+    # warning to a hard RuntimeError for one specific call path (HA's
+    # own entity_platform.py resolving an entity's device_info, where no
+    # attributable integration frame exists) -- confirmed directly from
+    # a field log: "Error adding entity None for domain sensor with
+    # platform huawei_solar", which is why sensors were going
+    # unavailable rather than just logging a deprecation warning.
+    #
+    # connecting_inverter_device_id is a (DOMAIN, identifier) tuple, not
+    # an ID, so it must be resolved to the parent's real registry ID. It
+    # is always None at the (single) call site today -- this integration
+    # does not currently link a secondary inverter to a master via this
+    # mechanism -- but the parameter and its resolution are kept correct
+    # rather than dropped, since its own existence signals this is
+    # intended to be supported.
+    #
+    # Uses async_get_device_id_by_identifier(), NOT
+    # DeviceRegistry.async_get_device() -- the latter is ALSO deprecated
+    # in this same HA change (developer blog, "More device registry
+    # deprecations", 2026-08-24), which an earlier draft of this fix
+    # missed by fixing one deprecated call with another. The official
+    # helper returns the id directly (not a DeviceEntry) and raises
+    # ValueError rather than returning None when the via device does not
+    # (yet) exist -- caught here defensively, since this integration has
+    # never actually exercised a non-None connecting_inverter_device_id
+    # and the ordering guarantee ("only call it once the via device has
+    # been created") is therefore untested in this codebase.
+    connecting_inverter_device_id_resolved: str | None = None
+    if connecting_inverter_device_id is not None:
+        try:
+            connecting_inverter_device_id_resolved = (
+                dr.async_get_device_id_by_identifier(
+                    hass,
+                    connecting_inverter_device_id,
+                    config_entry_id=entry.entry_id,
+                )
+            )
+        except ValueError:
+            _LOGGER.warning(
+                "%s: could not resolve via-device identifier %s to a "
+                "registered device -- setting up without a via-device "
+                "relationship",
+                device.serial_number, connecting_inverter_device_id,
+            )
+
     inverter_device_info = DeviceInfo(
         identifiers={(DOMAIN, device.serial_number)},
         translation_key="inverter",
@@ -1205,11 +1263,19 @@ async def _setup_inverter_device_data(
         model=device.model_name,
         serial_number=device.serial_number,
         sw_version=device.software_version,
-        via_device=connecting_inverter_device_id,  # type: ignore[typeddict-item]
+        **(
+            {"via_device_id": connecting_inverter_device_id_resolved}
+            if connecting_inverter_device_id_resolved is not None
+            else {}
+        ),
     )
 
-    # Add inverter device to device registery
-    device_registry.async_get_or_create(
+    # Add inverter device to device registery. The return value is
+    # captured (v2.2.0.0) so its own real registry ID is available below
+    # for every sub-device's own via_device_id -- previously unused,
+    # since the sub-devices constructed their own via_device tuples
+    # independently instead.
+    inverter_device_entry = device_registry.async_get_or_create(
         config_entry_id=entry.entry_id,
         identifiers={(DOMAIN, device.serial_number)},
         manufacturer="Huawei",
@@ -1312,7 +1378,7 @@ async def _setup_inverter_device_data(
                 (DOMAIN, f"{device.serial_number}/power_meter"),
             },
             translation_key="power_meter",
-            via_device=(DOMAIN, device.serial_number),
+            via_device_id=inverter_device_entry.id,
         )
         power_meter_update_coordinator = HuaweiSolarUpdateCoordinator(
             hass,
@@ -1339,7 +1405,7 @@ async def _setup_inverter_device_data(
             translation_key="connected_energy_storage",
             model="Batteries",
             manufacturer=inverter_device_info.get("manufacturer"),
-            via_device=(DOMAIN, device.serial_number),
+            via_device_id=inverter_device_entry.id,
         )
 
         energy_storage_update_coordinator = HuaweiSolarUpdateCoordinator(
@@ -1366,7 +1432,7 @@ async def _setup_inverter_device_data(
             translation_key="battery_1",
             manufacturer=_battery_product_model_to_manufacturer(device.battery_1_type),
             model=_battery_product_model_to_model(device.battery_1_type),
-            via_device=(DOMAIN, device.serial_number),
+            via_device_id=inverter_device_entry.id,
         )
     else:
         battery_1_device_info = None
@@ -1379,7 +1445,7 @@ async def _setup_inverter_device_data(
             translation_key="battery_2",
             manufacturer=_battery_product_model_to_manufacturer(device.battery_2_type),
             model=_battery_product_model_to_model(device.battery_2_type),
-            via_device=(DOMAIN, device.serial_number),
+            via_device_id=inverter_device_entry.id,
         )
     else:
         battery_2_device_info = None
@@ -1424,7 +1490,7 @@ async def _setup_inverter_device_data(
                     manufacturer="Huawei",
                     model=optimizer.model,
                     sw_version=optimizer.software_version,
-                    via_device=(DOMAIN, device.serial_number),
+                    via_device_id=inverter_device_entry.id,
                 )
                 for optimizer_id, optimizer in optimizer_system_infos.items()
             }

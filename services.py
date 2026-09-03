@@ -107,33 +107,54 @@ T = TypeVar("T", bound=HuaweiSolarDevice)
 def async_get_entry_id_for_service_call(
     call: ServiceCall,
 ) -> tuple[dr.DeviceEntry, HuaweiSolarConfigEntry]:
-    """Get the entry ID related to a service call (by device ID)."""
+    """Get the entry ID related to a service call (by device ID).
+
+    v2.2.0.0 FIX (HA 2026.9 deprecation): previously iterated
+    `device_entry.config_entries` by hand to find the one owned by this
+    integration's domain. Since HA 2026.8 a device belongs to a single
+    config entry, `DeviceEntry.config_entries` is deprecated (removal
+    scheduled for HA 2027.8), and HA now provides
+    `async_get_device_and_config_entry_for_domain()` specifically to
+    replace this exact lookup pattern -- used below instead.
+
+    That helper does not distinguish "no such device at all" from "a
+    device exists but is not owned by this domain" -- both come back as
+    device=None. The explicit `device_registry.async_get(device_id)`
+    check is kept first so `invalid_device_id` (a bogus id) and
+    `config_entry_not_found` (a real device belonging to a different
+    integration) remain distinguishable, exactly as before. The helper
+    also does not check whether the config entry is loaded (documented
+    behaviour, not an oversight on HA's part) -- the existing
+    `entry_not_loaded` check is kept for the same reason.
+    """
     device_registry = dr.async_get(call.hass)
     device_id = call.data[ATTR_DEVICE_ID]
-    if (device_entry := device_registry.async_get(device_id)) is None:
+    if device_registry.async_get(device_id) is None:
         raise ServiceValidationError(
             translation_domain=DOMAIN,
             translation_key="invalid_device_id",
             translation_placeholders={"device_id": device_id},
         )
 
-    for entry_id in device_entry.config_entries:
-        if (entry := call.hass.config_entries.async_get_entry(entry_id)) is None:
-            continue
-        if entry.domain == DOMAIN:
-            if entry.state is not ConfigEntryState.LOADED:
-                raise ServiceValidationError(
-                    translation_domain=DOMAIN,
-                    translation_key="entry_not_loaded",
-                    translation_placeholders={"entry": entry.title},
-                )
-            return (device_entry, entry)
-
-    raise ServiceValidationError(
-        translation_domain=DOMAIN,
-        translation_key="config_entry_not_found",
-        translation_placeholders={"device_id": device_id},
+    device_entry, entry = dr.async_get_device_and_config_entry_for_domain(
+        call.hass, device_id, domain=DOMAIN,
     )
+
+    if device_entry is None or entry is None:
+        raise ServiceValidationError(
+            translation_domain=DOMAIN,
+            translation_key="config_entry_not_found",
+            translation_placeholders={"device_id": device_id},
+        )
+
+    if entry.state is not ConfigEntryState.LOADED:
+        raise ServiceValidationError(
+            translation_domain=DOMAIN,
+            translation_key="entry_not_loaded",
+            translation_placeholders={"entry": entry.title},
+        )
+
+    return (device_entry, entry)
 
 
 @callback

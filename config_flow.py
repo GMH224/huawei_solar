@@ -26,13 +26,13 @@ from huawei_solar.modbus_client import create_scan_rtu_client, create_scan_tcp_c
 from huawei_solar.device import detect_device_type
 from huawei_solar.device.base import HuaweiSolarDeviceWithLogin
 from huawei_solar.exceptions import DeviceDetectionError
-import serial.tools.list_ports
+import serialx
 from tmodbus.exceptions import ModbusConnectionError
 import voluptuous as vol
 
 from homeassistant import config_entries
 from homeassistant.components import usb
-from homeassistant.config_entries import ConfigFlowResult
+from homeassistant.config_entries import ConfigFlowResult, OptionsFlowWithReload
 from homeassistant.const import (
     CONF_HOST,
     CONF_PASSWORD,
@@ -1162,15 +1162,32 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     else:
                         return await self._create_or_update_entry(info)
 
-        ports = await self.hass.async_add_executor_job(serial.tools.list_ports.comports)
+        # v2.2.0.0 FIX (HA 2026.9 deprecation, developer blog 2026-04-27
+        # "Serious about serial: migrating from pyserial to serialx"):
+        # was `serial.tools.list_ports.comports` wrapped in
+        # `async_add_executor_job` (a sync call on the executor thread
+        # pool). serialx.async_list_serial_ports() is natively async, so
+        # the executor-job wrapping is removed entirely, not just the
+        # import -- a genuine improvement, not a mechanical rename.
+        #
+        # Field mapping from the old ListPortInfo to SerialPortInfo is
+        # not 1:1: there is no `description` field on SerialPortInfo.
+        # `product` is the semantic equivalent (the USB product string;
+        # `human_readable_device_name()`'s own docstring says "USBDevice
+        # attributes", and product is what that describes). vid/pid are
+        # `int | None` here, where human_readable_device_name() expects
+        # `str | None` -- converted explicitly rather than relying on
+        # str formatting inside that function to paper over the type
+        # mismatch.
+        ports = await serialx.async_list_serial_ports()
         list_of_ports = {
             port.device: usb.human_readable_device_name(
                 port.device,
                 port.serial_number,
                 port.manufacturer,
-                port.description,
-                port.vid,
-                port.pid,
+                port.product,
+                str(port.vid) if port.vid is not None else None,
+                str(port.pid) if port.pid is not None else None,
             )
             for port in ports
         }
@@ -1946,7 +1963,7 @@ class DeviceException(Exception):
         self.unit_id = unit_id
 
 
-class BatteryHealthOptionsFlowHandler(config_entries.OptionsFlow):
+class BatteryHealthOptionsFlowHandler(OptionsFlowWithReload):
     """Options flow exposing the Battery Health Index tunable constants,
     plus other entry-level runtime-tunable options that don't yet
     warrant their own dedicated flow (v2.0.9: SynchronizedPowerCoordinator's
@@ -1958,6 +1975,24 @@ class BatteryHealthOptionsFlowHandler(config_entries.OptionsFlow):
     Changing options triggers a config-entry reload; persisted raw
     segment/sample logs remain valid — only the aggregation formulas applied
     to them change (spec §10).
+
+    v2.2.0.0 FIX (HA 2026.12 breaking change): was `config_entries.
+    OptionsFlow`, with the reload performed by a SEPARATE config-entry
+    update listener (`_async_options_updated`, registered in
+    __init__.py::async_setup_entry()). Per HA's official deprecation
+    notice (developer blog, 2026-05-07): "using a config entry listener
+    together with any reloading methods in a config flow is deprecated
+    and will result in an error from 2026.12" -- because the combination
+    can double-reload or race.
+
+    Switching to OptionsFlowWithReload makes async_create_entry() itself
+    perform the reload, which is exactly what this integration's own
+    listener did -- so behaviour is unchanged from the user's
+    perspective, and the update listener in __init__.py is removed
+    entirely (see that file for why removing it, not just this class's
+    own use of it, is what actually closes the deprecation: it was ALSO
+    combined with reloading methods on the reauth, reconfigure and
+    new-entry paths of the main config flow, not only here).
     """
 
     async def async_step_init(
