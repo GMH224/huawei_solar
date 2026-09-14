@@ -1169,6 +1169,15 @@
     "invalid_pack_install_date": {
       "message": "Could not parse pack install date: {install_date}. Use an ISO format date, e.g. 2026-01-15"
     },
+    "pack_install_date_in_future": {
+      "message": "Pack install date {install_date} is in the future"
+    },
+    "invalid_number_value": {
+      "message": "Value {value} is not a finite number"
+    },
+    "number_value_out_of_range": {
+      "message": "Value {value} is outside the allowed range ({min} to {max})"
+    },
     "target_battery_type_mismatch": {
       "message": "Device {device} has a {actual} battery, but this service requires a {expected} battery. Battery models use different period register formats, so this call was rejected rather than writing an incompatible value."
     },
