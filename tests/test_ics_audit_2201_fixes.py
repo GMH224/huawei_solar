@@ -437,7 +437,7 @@ class TestHVC002DeclaredMinimumMatchesReleaseBaseline(unittest.TestCase):
 
     def test_manifest_version_bumped(self):
         manifest = json.loads((_ROOT / "manifest.json").read_text())
-        self.assertEqual(manifest["version"], "2.2.0.1")
+        self.assertEqual(manifest["version"], "2.2.0.2")
 
     def test_no_stray_2025_9_reference_in_shipped_production_files(self):
         """Whole-tree regression sweep, matching this project's own G12

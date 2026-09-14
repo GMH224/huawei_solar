@@ -418,7 +418,14 @@ class TestOptimizerDiscoveryBound(unittest.IsolatedAsyncioTestCase):
         source = _INIT_SRC.read_text()
         idx = source.find("device.get_optimizer_system_information_data()")
         assert idx != -1
-        window = source[idx: idx + 1500]
+        # v2.2.0.2 note: widened from 1500 -- HS-ICS-002's own fix added
+        # a new comment block between this call and its existing
+        # `except TimeoutError:` handler (registering the optimizer
+        # coordinator's first-refresh-task cleanup), pushing the
+        # handler further from this call site in character terms
+        # without changing that it's still the same dedicated handler
+        # wrapping the same code.
+        window = source[idx: idx + 2500]
         assert "except TimeoutError" in window, (
             "No dedicated except TimeoutError handler found near the "
             "bounded optimizer discovery call."
