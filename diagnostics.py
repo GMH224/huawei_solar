@@ -47,6 +47,55 @@ def _redact_serial_number(value: str | None) -> str | None:
     return f"**REDACTED-{pseudonym(str(value))}**"
 
 
+def _redact_coordinator_data(
+    data: "dict[str, Any] | None",
+) -> "dict[str, Any] | None":
+    """Redact any register whose name indicates it carries a serial number.
+
+    v1.3.20 FIX (Defect X4): raw coordinator .data dicts were dumped
+    completely unredacted. SUN2000/LUNA2000 installations can expose
+    several serial-number-bearing registers this way (the inverter's own,
+    plus per-storage-unit and per-battery-pack serials) even where the
+    top-level per-device summary below correctly omits it -- the register
+    data was the actual leak, not just the explicit field.
+
+    v2.2.0.1 FIX (external ICS audit HVC-001 -- confirmed): this function
+    is called from four sites below (the power-meter, battery, main, and
+    configuration coordinator dumps), but its own `def` line had been
+    lost -- the body above survived only as dead, unreachable text stuck
+    inside `_redact_entity_entry`'s own function (after that function's
+    `return`, at the same indentation, so it parsed without error but
+    never ran). Every one of those four call sites resolved
+    `_redact_coordinator_data` against module globals at runtime and got
+    `NameError`, so `async_get_config_entry_diagnostics()` failed
+    unconditionally on any config entry with an inverter -- Home
+    Assistant's own "Download diagnostics" button, a core support-request
+    workflow. Reproduced directly: a minimal compatibility shim supplying
+    only the imported HA/integration symbols confirmed
+    `NameError: name '_redact_coordinator_data' is not defined` before
+    this fix, and a clean return value after it (see
+    test_ics_audit_2201_fixes.py's own end-to-end diagnostics test, which
+    actually calls this entry point rather than string-matching the
+    source -- the gap that let this ship in the first place, per that
+    same audit).
+    """
+    if not data:
+        return data
+    redacted: dict[str, Any] = {}
+    for name, result in data.items():
+        if _SERIAL_REGISTER_SUBSTRING in str(name).lower():
+            try:
+                raw_value = result.value
+            except Exception:  # noqa: BLE001 — best-effort extraction only
+                raw_value = result
+            redacted[str(name)] = _redact_serial_number(
+                raw_value if raw_value is None else str(raw_value)
+            )
+        else:
+            redacted[str(name)] = result
+    return redacted
+
+
 def _redact_entity_entry(
     entity_dict: dict[str, Any], serials: "set[str]",
 ) -> dict[str, Any]:
@@ -87,33 +136,6 @@ def _redact_entity_entry(
         return value
 
     return _scrub(entity_dict)
-
-
-
-    """Redact any register whose name indicates it carries a serial number.
-
-    v1.3.20 FIX (Defect X4): raw coordinator .data dicts were dumped
-    completely unredacted. SUN2000/LUNA2000 installations can expose
-    several serial-number-bearing registers this way (the inverter's own,
-    plus per-storage-unit and per-battery-pack serials) even where the
-    top-level per-device summary below correctly omits it -- the register
-    data was the actual leak, not just the explicit field.
-    """
-    if not data:
-        return data
-    redacted: dict[str, Any] = {}
-    for name, result in data.items():
-        if _SERIAL_REGISTER_SUBSTRING in str(name).lower():
-            try:
-                raw_value = result.value
-            except Exception:  # noqa: BLE001 — best-effort extraction only
-                raw_value = result
-            redacted[str(name)] = _redact_serial_number(
-                raw_value if raw_value is None else str(raw_value)
-            )
-        else:
-            redacted[str(name)] = result
-    return redacted
 
 
 async def async_get_config_entry_diagnostics(

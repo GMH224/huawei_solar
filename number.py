@@ -3,6 +3,7 @@
 import asyncio
 from dataclasses import dataclass
 import logging
+import math
 from typing import TYPE_CHECKING
 
 from huawei_solar import (
@@ -20,11 +21,12 @@ from homeassistant.components.number import (
 from homeassistant.components.number.const import DEFAULT_MAX_VALUE, DEFAULT_MIN_VALUE
 from homeassistant.const import PERCENTAGE, EntityCategory, UnitOfPower
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import CONF_ENABLE_PARAMETER_CONFIGURATION, DATA_DEVICE_DATAS, STATIC_BOUND_READ_TIMEOUT
+from .const import CONF_ENABLE_PARAMETER_CONFIGURATION, DATA_DEVICE_DATAS, DOMAIN, STATIC_BOUND_READ_TIMEOUT
 from .types import (
     HuaweiSolarConfigEntry,
     HuaweiSolarDeviceData,
@@ -576,6 +578,35 @@ class HuaweiSolarNumberEntity(
 
     async def async_set_native_value(self, value: float) -> None:
         """Set a new value."""
+        # v2.2.0.1 FIX (external ICS audit ICS-003 -- confirmed):
+        # defense-in-depth range check at the write boundary itself,
+        # not just in native_min_value/native_max_value's own now-
+        # corrected truthiness (see those properties' own comments).
+        # Home Assistant's number platform already validates a service
+        # call against the entity's advertised min/max before reaching
+        # here, but this entity's min/max can itself change between
+        # that validation and this write (a dynamic bound is re-read
+        # from the device on every access), and this is the same
+        # "duplicate validation at the final command sink rather than
+        # relying exclusively on a UI/service schema" discipline this
+        # project already applies elsewhere (see SOC_SCHEMA's own
+        # finite-value write-boundary check, services.py).
+        value = float(value)
+        if not math.isfinite(value):
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="invalid_number_value",
+                translation_placeholders={"value": str(value)},
+            )
+        min_value, max_value = self.native_min_value, self.native_max_value
+        if not (min_value <= value <= max_value):
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="number_value_out_of_range",
+                translation_placeholders={
+                    "value": str(value), "min": str(min_value), "max": str(max_value),
+                },
+            )
         # v2.0.0b (MOD-05, external ICS audit -- confirmed): v2.0.0a's F05
         # fix routed this write through ModbusGuard but never bounded the
         # underlying device.set() call itself -- a stalled write held the
@@ -633,31 +664,60 @@ class HuaweiSolarNumberEntity(
     @property
     def native_max_value(self) -> float:
         """Maximum value, possibly determined dynamically using _dynamic_max_value."""
+        # v2.2.0.1 FIX (external ICS audit ICS-003 -- confirmed): every
+        # check below used to be plain Python truthiness (`if native_max_
+        # value:`, `if self._dynamic_max_value:`), which treats a
+        # legitimate value of 0 the same as "not configured". Several
+        # entity descriptions in this file declare native_min_value=0
+        # (harmless by coincidence, since HA's own DEFAULT_MIN_VALUE is
+        # also 0.0), but a device-derived dynamic or static MAXIMUM of
+        # exactly 0 -- "no permitted output right now", "control
+        # disabled", "zero available capacity" -- is a real, safety-
+        # relevant device state, and DEFAULT_MAX_VALUE is 100.0, not 0.
+        # Truthiness silently replaced a device telling this integration
+        # "the safe maximum right now is zero" with "100 is fine".
+        # Explicit `is not None` checks throughout, matching this
+        # project's own established convention for exactly this class of
+        # bug (see native_min_value's own history, and MOD-13 elsewhere
+        # in this file).
         native_max_value = (
-            self._static_max_value or self.entity_description.native_max_value
+            self._static_max_value
+            if self._static_max_value is not None
+            else self.entity_description.native_max_value
         )
 
-        if self._dynamic_max_value:
-            if native_max_value:
+        if self._dynamic_max_value is not None:
+            if native_max_value is not None:
                 return min(self._dynamic_max_value, native_max_value)
             return self._dynamic_max_value
 
-        if native_max_value:
+        if native_max_value is not None:
             return native_max_value
         return DEFAULT_MAX_VALUE
 
     @property
     def native_min_value(self) -> float:
         """Minimum value, possibly determined dynamically using _dynamic_min_value."""
+        # v2.2.0.1 FIX (external ICS audit ICS-003 -- confirmed): see
+        # native_max_value's own comment immediately above for the full
+        # reasoning -- the same truthiness defect existed here. Fixed
+        # for symmetry and correctness even though DEFAULT_MIN_VALUE
+        # being 0.0 happened to mask the most common case (a static
+        # native_min_value=0 falling through to an equally-zero
+        # default): a device-derived DYNAMIC minimum of exactly 0, with
+        # a non-zero static fallback, was not masked, and would have
+        # silently returned the wrong (non-zero) minimum.
         native_min_value = (
-            self._static_min_value or self.entity_description.native_min_value
+            self._static_min_value
+            if self._static_min_value is not None
+            else self.entity_description.native_min_value
         )
 
-        if self._dynamic_min_value:
-            if native_min_value:
+        if self._dynamic_min_value is not None:
+            if native_min_value is not None:
                 return max(self._dynamic_min_value, native_min_value)
             return self._dynamic_min_value
 
-        if native_min_value:
+        if native_min_value is not None:
             return native_min_value
         return DEFAULT_MIN_VALUE

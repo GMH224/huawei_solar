@@ -81,6 +81,7 @@ from typing import Callable
 
 from huawei_solar import HuaweiSolarException, RegisterName
 from huawei_solar.device.base import HuaweiSolarDevice
+from tmodbus.exceptions import TModbusError
 
 from .const import KEEPALIVE_INTERVAL, KEEPALIVE_REGISTER
 from .modbus_guard import ModbusAdmissionTimeout, ModbusGuard, ModbusQueueShed
@@ -382,7 +383,23 @@ class ModbusKeepAlive:
                 "unchanged", self.serial_number, exc,
             )
 
-        except (TimeoutError, HuaweiSolarException, OSError) as exc:
+        except (TimeoutError, HuaweiSolarException, TModbusError, OSError) as exc:
+            # v2.2.0.1 FIX (external ICS audit ICS-010 -- confirmed): this
+            # handler used to be (TimeoutError, HuaweiSolarException,
+            # OSError) -- TModbusError was never caught here, even
+            # though the main coordinator explicitly imports and treats
+            # it as a first-class transport-level fault (see
+            # update_coordinator.py's own comment: "NOT a subclass of
+            # HuaweiSolarException. TModbusError is their common base --
+            # verified: it covers all [transport errors]"). A transport-
+            # level fault surfacing during THIS probe fell all the way
+            # through to the outer _run() loop's generic `except
+            # Exception` instead, which logs at DEBUG and does nothing
+            # else -- no _failure_count increment, no _healthy
+            # transition, no _on_connection_lost() call. The health
+            # state machine this class exists to drive silently stopped
+            # tracking connection health for an entire class of real
+            # transport faults.
             self._failure_count += 1
             if self._healthy:
                 _LOGGER.warning(

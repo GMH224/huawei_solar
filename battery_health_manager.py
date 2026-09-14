@@ -800,6 +800,17 @@ class BatteryHealthManager:
             except Exception:  # noqa: BLE001 — one bad entity must not break the rest
                 _LOGGER.exception("battery_health[%s]: listener failed", self.serial_number)
 
+    #: v2.2.0.1 FIX (external ICS audit ICS-007 -- confirmed): a pack
+    #: install date more than this far in the future is rejected outright
+    #: rather than silently accepted -- see set_pack_install_date's own
+    #: docstring for the full reasoning. One day of slack (not zero)
+    #: because this is a date-only value (no time-of-day): someone in a
+    #: UTC+12 timezone picking "today" on their own wall clock is
+    #: already past midnight UTC, which would otherwise be flagged as
+    #: "tomorrow" and rejected for a perfectly legitimate, same-day
+    #: install.
+    FUTURE_INSTALL_DATE_TOLERANCE_S = 86400.0
+
     def set_pack_install_date(self, serial: str, install_ts: float) -> None:
         """v2.0.12 (Battery Phase 5B UI restructuring, this release):
         shared write path for a pack's own explicit install date --
@@ -809,8 +820,44 @@ class BatteryHealthManager:
         An explicit, deliberate, infrequent user action -- persisted
         promptly (see _maybe_save()'s own docstring for why this
         doesn't wait on the normal engine-tick debounce).
+
+        Raises
+        ------
+        ValueError
+            If `install_ts` is more than FUTURE_INSTALL_DATE_TOLERANCE_S
+            in the future. v2.2.0.1 FIX (external ICS audit ICS-007 --
+            confirmed): neither this method nor either of its two
+            callers previously rejected a future install date at all --
+            only TypeError/ValueError from the DATE STRING failing to
+            parse was ever caught (services.py), and date.py's picker
+            has no upper-bound constraint of its own. A future
+            age_origin flows straight into HealthReport's own age
+            computation (battery_health.py): age_years is clamped to a
+            floor of 0.0 there, but the adjacent, unclamped
+            battery_age_days attribute is not -- producing a visibly
+            negative "age in days" reported right alongside a
+            zero-clamped-to-"brand new" health forecast for the same
+            pack, an internally inconsistent result with no warning
+            anywhere that the input itself was the actual problem.
+            Each caller (services.py, date.py) is responsible for
+            translating this into whatever surfacing its own context
+            supports -- a raised ServiceValidationError for the
+            service call, a logged warning for the entity write -- both
+            already have an established local convention for exactly
+            that, immediately visible in each one's own other guard
+            clauses.
         """
-        self.engine.pack_capacity.pack_install_dates[serial] = install_ts
+        if install_ts > time.time() + self.FUTURE_INSTALL_DATE_TOLERANCE_S:
+            raise ValueError(
+                f"install date for pack {serial} is in the future "
+                f"(install_ts={install_ts})"
+            )
+        # v2.2.0.1 FIX (external ICS audit HVC-004 -- confirmed): was a
+        # direct, unbounded dict write here -- see pack_capacity.
+        # set_pack_install_date_override()'s own docstring (battery_
+        # health.py) for why that write path is now bounded, and why the
+        # bound is enforced there rather than here.
+        self.engine.pack_capacity.set_pack_install_date_override(serial, install_ts)
         self.engine.dirty = True
         self._maybe_save()
 

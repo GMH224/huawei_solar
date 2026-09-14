@@ -43,9 +43,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 
 from .const import (
     CONF_BH_ENABLED,
-    CONF_SLOW_TIER_TTL_S,
     CONF_SYNC_POWER_DEDICATED_READS,
-    DEFAULT_SLOW_TIER_TTL_S,
     CONF_ENABLE_PARAMETER_CONFIGURATION,
     CONF_SLAVE_IDS,
     CONFIGURATION_UPDATE_INTERVAL,
@@ -64,7 +62,6 @@ from .const import (
 from .adaptive_modbus import AdaptiveModbusController
 from .battery_health_manager import BatteryHealthManager
 from .modbus_guard import ModbusGuard
-from .register_cache import set_slow_tier_ttl
 from .modbus_keepalive import ModbusKeepAlive
 from .modbus_telemetry import ModbusTelemetry
 from .bus_diagnostics import BusDiagnostics
@@ -628,14 +625,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
         # must never be able to delay, cancel, or fail config-entry setup.
         # Nothing here is awaited on the setup critical path and every failure
         # mode is swallowed and logged.  See _async_setup_battery_health().
-        # v1.3.3: apply the configured SLOW-tier refresh interval before any
-        # polling starts, so the first cycle already uses it.
-        try:
-            set_slow_tier_ttl(
-                entry.options.get(CONF_SLOW_TIER_TTL_S, DEFAULT_SLOW_TIER_TTL_S)
-            )
-        except Exception:  # noqa: BLE001 — never break setup over a tunable
-            _LOGGER.exception("Could not apply SLOW-tier TTL option")
+        # v1.3.3: the configured SLOW-tier refresh interval used to be
+        # applied here via a process-global setter (set_slow_tier_ttl()).
+        #
+        # v2.2.0.1 FIX (external ICS audit ICS-004 -- confirmed): that
+        # setter mutated a single dict shared by every RegisterCache in
+        # the whole HA process, so a second huawei_solar entry (a second
+        # inverter) reloading with a different option value silently
+        # changed THIS entry's cache behaviour too. Removed entirely --
+        # each coordinator's RegisterCache now reads this entry's own
+        # options directly at construction time (see update_coordinator.
+        # py's own RegisterCache(...) call site), so there is nothing
+        # left to apply here.
 
         # v1.3.4's coalesce/night-defer options were REMOVED in v1.3.5
         # (see const.py) after causing a production outage. Nothing to apply
@@ -652,6 +653,27 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
                 "Failed to register learning gates; learning will proceed "
                 "without start-up suppression"
             )
+
+        # v2.2.0.1 FIX (external ICS audit HVC-003 -- confirmed): these two
+        # calls used to sit AFTER this try/except block, so a failure here
+        # (an entity-platform exception, a platform import/API
+        # incompatibility, or async_setup_services() itself raising) was
+        # never seen by any of the except clauses below -- cleanup_
+        # callbacks were never run and primary_device was never bounded-
+        # stopped, exactly the class of leak this same try/except exists
+        # to prevent for every earlier step of setup. Home Assistant does
+        # not guarantee async_unload_entry() runs after a failed
+        # async_setup_entry() (see _run_cleanup_callbacks's own docstring),
+        # so this was a genuine, unguarded gap for the Modbus guard,
+        # keep-alive tasks, telemetry registries, and battery-health
+        # managers already created earlier in this same attempt. Moving
+        # both calls inside the try body -- rather than adding a third,
+        # duplicate cleanup block -- means every except clause below
+        # already covers them for free, including the specific
+        # Connection*/TimeoutError/HuaweiSolarException handlers, in case
+        # a future platform ever raises one of those directly.
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+        await async_setup_services(hass, entry)
     except ConnectionInterruptedException as err:
         await _run_cleanup_callbacks(cleanup_callbacks)
         if primary_device is not None:
@@ -733,8 +755,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
             await _bounded_device_stop(primary_device)
         raise
 
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    await async_setup_services(hass, entry)
+    # v2.2.0.1 FIX (external ICS audit HVC-003 -- confirmed): the platform-
+    # forwarding and service-registration calls that used to live here,
+    # unprotected, were moved inside the try block above (right after the
+    # learning-gate registration) so every failure path through them runs
+    # the same cleanup as every earlier step of setup. See that call
+    # site's own comment for the full rationale; nothing replaces them
+    # here on purpose.
 
     # v2.2.0.0 FIX (HA 2026.12 breaking change): the config-entry update
     # listener that used to live here (`_async_options_updated`,
@@ -1006,176 +1033,194 @@ async def async_unload_entry(
     hass: HomeAssistant, entry: HuaweiSolarConfigEntry
 ) -> bool:
     """Unload a config entry."""
-    if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
-        device_datas: list[HuaweiSolarDeviceData] = entry.runtime_data[DATA_DEVICE_DATAS]
-        primary_device = device_datas[0].device
+    # v2.2.0.1 FIX (external ICS audit ICS-001 -- confirmed): every
+    # line of integration-owned cleanup below used to be nested INSIDE
+    # this condition, so a single platform failing to unload (any
+    # entity/platform raising during its own teardown) meant
+    # async_unload_platforms() returned False and NONE of the
+    # following ever ran: keepalive, the shared transport disconnect,
+    # telemetry/diagnostics/adaptive/battery-health registries, the
+    # ModbusGuard endpoint, or the static-bound cache. A partially
+    # unloaded entry is exactly the state where stale background
+    # activity is most dangerous -- surviving tasks and registry
+    # references can race a later reload's fresh setup. Home
+    # Assistant's own guidance is explicit that platform-unload
+    # failure and "no cleanup needed" are not the same thing.
+    # entry.runtime_data is still populated here regardless of
+    # unload_ok -- it is only ever cleared by this function's own
+    # code below, never by async_unload_platforms() itself -- so
+    # accessing DATA_DEVICE_DATAS unconditionally is safe.
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
-        # v2.0.3 FIX (ICS-10, external ICS audit -- confirmed): services
-        # used to be registered on every setup and never unregistered
-        # anywhere -- staying registered in Home Assistant's own service
-        # registry indefinitely, even with zero huawei_solar entries
-        # left loaded. Unregisters here (once this was confirmed to be
-        # the LAST entry still needing them -- see async_unload_
-        # services()'s own reference-counting) as the very first step,
-        # since it doesn't depend on any of the per-device teardown
-        # below and is safe to run regardless of whether the rest of it
-        # succeeds.
-        await async_unload_services(hass, entry)
+    device_datas: list[HuaweiSolarDeviceData] = entry.runtime_data[DATA_DEVICE_DATAS]
+    primary_device = device_datas[0].device
 
-        # v2.0.0a FIX (F21, external ICS audit -- confirmed): keepalive is
-        # the only ACTIVE TRAFFIC PRODUCER among everything torn down in
-        # this function -- telemetry/adaptive/battery-health only persist
-        # local state, they don't independently talk to the device. The
-        # keep-alive loop is cancellation-aware (not a confirmed deadlock),
-        # but there was still a real window where it could be mid-probe --
-        # having already acquired the guard, awaiting batch_update() --
-        # exactly when the transport got disconnected out from under it.
-        # Stopped for EVERY device on this entry FIRST, in its own pass,
-        # before the single shared-transport disconnect below (not
-        # interleaved with the rest of per-device teardown, which doesn't
-        # produce new traffic and is safe to run after).
-        for device_data in device_datas:
-            keepalive = ModbusKeepAlive.get(device_data.device.serial_number)
-            if keepalive:
-                keepalive.stop()
+    # v2.0.3 FIX (ICS-10, external ICS audit -- confirmed): services
+    # used to be registered on every setup and never unregistered
+    # anywhere -- staying registered in Home Assistant's own service
+    # registry indefinitely, even with zero huawei_solar entries
+    # left loaded. Unregisters here (once this was confirmed to be
+    # the LAST entry still needing them -- see async_unload_
+    # services()'s own reference-counting) as the very first step,
+    # since it doesn't depend on any of the per-device teardown
+    # below and is safe to run regardless of whether the rest of it
+    # succeeds.
+    await async_unload_services(hass, entry)
 
-        # v1.3.18 FIX (Defect U/Finding 3, independent ICS audit of
-        # v1.3.17): this used to be a bare `await
-        # primary_device.client.disconnect()`, with no timeout, sitting
-        # BEFORE every teardown loop below (telemetry, the adaptive
-        # controller, keep-alive, battery health, the shared guard). A
-        # wedged or half-dead transport could block here indefinitely,
-        # preventing ALL of that cleanup from ever running -- turning an
-        # unload-time transport problem into a stuck reload/config-change
-        # for the entire entry. Bounded with a short timeout, and any
-        # failure (timeout or otherwise) is logged and swallowed so
-        # teardown below always proceeds regardless of whether disconnect
-        # actually succeeded.
-        try:
-            await asyncio.wait_for(
-                primary_device.client.disconnect(),
-                timeout=DISCONNECT_TIMEOUT.total_seconds(),
-            )
-        except Exception:  # noqa: BLE001 — never let a stuck disconnect block teardown
-            _LOGGER.exception(
-                "Error disconnecting from the inverter during unload; "
-                "continuing with entry teardown regardless"
-            )
+    # v2.0.0a FIX (F21, external ICS audit -- confirmed): keepalive is
+    # the only ACTIVE TRAFFIC PRODUCER among everything torn down in
+    # this function -- telemetry/adaptive/battery-health only persist
+    # local state, they don't independently talk to the device. The
+    # keep-alive loop is cancellation-aware (not a confirmed deadlock),
+    # but there was still a real window where it could be mid-probe --
+    # having already acquired the guard, awaiting batch_update() --
+    # exactly when the transport got disconnected out from under it.
+    # Stopped for EVERY device on this entry FIRST, in its own pass,
+    # before the single shared-transport disconnect below (not
+    # interleaved with the rest of per-device teardown, which doesn't
+    # produce new traffic and is safe to run after).
+    for device_data in device_datas:
+        keepalive = ModbusKeepAlive.get(device_data.device.serial_number)
+        if keepalive:
+            keepalive.stop()
 
-        # Tear down ONLY this entry's singletons.  These registries are
-        # process-global and may hold instances belonging to other config
-        # entries that are still loaded (e.g. a second inverter added as a
-        # separate entry).  clear_registry() would wipe those too — breaking
-        # bus serialisation for the surviving entry and orphaning its
-        # keep-alive tasks.  Remove per-serial / per-endpoint instead.
-        seen_endpoints: set[str] = set()
-        for device_data in device_datas:
-            serial = device_data.device.serial_number
+    # v1.3.18 FIX (Defect U/Finding 3, independent ICS audit of
+    # v1.3.17): this used to be a bare `await
+    # primary_device.client.disconnect()`, with no timeout, sitting
+    # BEFORE every teardown loop below (telemetry, the adaptive
+    # controller, keep-alive, battery health, the shared guard). A
+    # wedged or half-dead transport could block here indefinitely,
+    # preventing ALL of that cleanup from ever running -- turning an
+    # unload-time transport problem into a stuck reload/config-change
+    # for the entire entry. Bounded with a short timeout, and any
+    # failure (timeout or otherwise) is logged and swallowed so
+    # teardown below always proceeds regardless of whether disconnect
+    # actually succeeded.
+    try:
+        await asyncio.wait_for(
+            primary_device.client.disconnect(),
+            timeout=DISCONNECT_TIMEOUT.total_seconds(),
+        )
+    except Exception:  # noqa: BLE001 — never let a stuck disconnect block teardown
+        _LOGGER.exception(
+            "Error disconnecting from the inverter during unload; "
+            "continuing with entry teardown regardless"
+        )
 
-            telemetry = ModbusTelemetry.get(serial)
-            if telemetry:
-                telemetry.stop()
-            ModbusTelemetry.remove(serial)
+    # Tear down ONLY this entry's singletons.  These registries are
+    # process-global and may hold instances belonging to other config
+    # entries that are still loaded (e.g. a second inverter added as a
+    # separate entry).  clear_registry() would wipe those too — breaking
+    # bus serialisation for the surviving entry and orphaning its
+    # keep-alive tasks.  Remove per-serial / per-endpoint instead.
+    seen_endpoints: set[str] = set()
+    for device_data in device_datas:
+        serial = device_data.device.serial_number
 
-            # v2.0.2 (TEL-004, external ICS/IQS audit -- confirmed): both
-            # BusDiagnostics and TelemetryCapture are per-ENDPOINT
-            # registries (not per-serial, like everything else in this
-            # loop) -- get_or_create() was the only production call
-            # either one ever had; remove() existed on both but was never
-            # called anywhere. Every endpoint ever captured stayed
-            # referenced forever, together with its hass object, buffers,
-            # and counters. Fixed for both together, not just
-            # TelemetryCapture specifically -- BusDiagnostics had the
-            # identical gap, found while checking whether this was a
-            # one-off or a systemic pattern; it was the latter.
-            # seen_endpoints avoids a redundant (harmless, but noisy)
-            # second remove() call for a second device sharing the same
-            # physical bus on this same entry.
-            #
-            # v2.0.9 FIX (Phase 4.8, this release -- old DEF-011,
-            # external ICS quality/defect/architecture audit --
-            # confirmed): remove() itself is now the bug -- it was
-            # unconditional, ignoring whether another entry sharing this
-            # same physical endpoint still holds a reference. Switched
-            # to release_endpoint(), the reference-counted pairing for
-            # switch.py's own acquire_endpoint() call at setup time (see
-            # its own comment) -- mirrors ModbusGuard's own established
-            # acquire/release pattern exactly, including the "no
-            # matching prior acquire is a safe no-op" behaviour, so this
-            # still degrades gracefully if switch.py's own setup ever
-            # failed to run for some reason.
-            guard = getattr(device_data.update_coordinator, "guard", None)
-            endpoint = getattr(guard, "endpoint", None)
-            if endpoint is not None and endpoint not in seen_endpoints:
-                seen_endpoints.add(endpoint)
-                BusDiagnostics.release_endpoint(endpoint)
-                TelemetryCapture.release_endpoint(endpoint)
+        telemetry = ModbusTelemetry.get(serial)
+        if telemetry:
+            telemetry.stop()
+        ModbusTelemetry.remove(serial)
 
-            # v2.0.0b (MOD-13, external ICS audit): clear this device's
-            # cached static number-entity bounds -- a reload can follow a
-            # firmware update or hardware swap, and a stale cached bound
-            # surviving that would be a correctness regression for the
-            # sake of an efficiency win that only needs to last one
-            # session anyway. See number.py's own _STATIC_BOUND_CACHE
-            # comment for the full reasoning.
-            clear_static_bound_cache(serial)
+        # v2.0.2 (TEL-004, external ICS/IQS audit -- confirmed): both
+        # BusDiagnostics and TelemetryCapture are per-ENDPOINT
+        # registries (not per-serial, like everything else in this
+        # loop) -- get_or_create() was the only production call
+        # either one ever had; remove() existed on both but was never
+        # called anywhere. Every endpoint ever captured stayed
+        # referenced forever, together with its hass object, buffers,
+        # and counters. Fixed for both together, not just
+        # TelemetryCapture specifically -- BusDiagnostics had the
+        # identical gap, found while checking whether this was a
+        # one-off or a systemic pattern; it was the latter.
+        # seen_endpoints avoids a redundant (harmless, but noisy)
+        # second remove() call for a second device sharing the same
+        # physical bus on this same entry.
+        #
+        # v2.0.9 FIX (Phase 4.8, this release -- old DEF-011,
+        # external ICS quality/defect/architecture audit --
+        # confirmed): remove() itself is now the bug -- it was
+        # unconditional, ignoring whether another entry sharing this
+        # same physical endpoint still holds a reference. Switched
+        # to release_endpoint(), the reference-counted pairing for
+        # switch.py's own acquire_endpoint() call at setup time (see
+        # its own comment) -- mirrors ModbusGuard's own established
+        # acquire/release pattern exactly, including the "no
+        # matching prior acquire is a safe no-op" behaviour, so this
+        # still degrades gracefully if switch.py's own setup ever
+        # failed to run for some reason.
+        guard = getattr(device_data.update_coordinator, "guard", None)
+        endpoint = getattr(guard, "endpoint", None)
+        if endpoint is not None and endpoint not in seen_endpoints:
+            seen_endpoints.add(endpoint)
+            BusDiagnostics.release_endpoint(endpoint)
+            TelemetryCapture.release_endpoint(endpoint)
 
-            # v1.3.19 FIX (Defect V/Finding 10, independent ICS audit): the
-            # old sync stop() only ever scheduled the dirty-state flush as
-            # a fire-and-forget background task, which could be cancelled
-            # or simply never run before teardown finished. async_unload()
-            # awaits the flush deterministically. Same fault-isolation
-            # pattern already used for battery_health just below: a failed
-            # flush must never prevent the rest of the entry from
-            # unloading cleanly.
-            controller = AdaptiveModbusController.get(serial)
-            if controller:
-                try:
-                    await controller.async_unload()
-                except Exception:  # noqa: BLE001
-                    _LOGGER.exception(
-                        "adaptive[%s]: unload failed; continuing with "
-                        "entry teardown", serial,
-                    )
-                    controller.stop()
-            AdaptiveModbusController.remove(serial)
+        # v2.0.0b (MOD-13, external ICS audit): clear this device's
+        # cached static number-entity bounds -- a reload can follow a
+        # firmware update or hardware swap, and a stale cached bound
+        # surviving that would be a correctness regression for the
+        # sake of an efficiency win that only needs to last one
+        # session anyway. See number.py's own _STATIC_BOUND_CACHE
+        # comment for the full reasoning.
+        clear_static_bound_cache(serial)
 
-            # v2.0.0a (F21): keepalive.stop() itself already moved to its
-            # own pass above, before the transport disconnect -- only the
-            # registry cleanup (removing this entry's reference) remains
-            # here, alongside the rest of per-device teardown.
-            ModbusKeepAlive.remove(serial)
+        # v1.3.19 FIX (Defect V/Finding 10, independent ICS audit): the
+        # old sync stop() only ever scheduled the dirty-state flush as
+        # a fire-and-forget background task, which could be cancelled
+        # or simply never run before teardown finished. async_unload()
+        # awaits the flush deterministically. Same fault-isolation
+        # pattern already used for battery_health just below: a failed
+        # flush must never prevent the rest of the entry from
+        # unloading cleanly.
+        controller = AdaptiveModbusController.get(serial)
+        if controller:
+            try:
+                await controller.async_unload()
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception(
+                    "adaptive[%s]: unload failed; continuing with "
+                    "entry teardown", serial,
+                )
+                controller.stop()
+        AdaptiveModbusController.remove(serial)
 
-            # Fault isolation (v1.1.7): a failed state flush must never
-            # prevent the rest of the entry from unloading cleanly — a stuck
-            # unload blocks reloads and config changes for the whole entry.
-            bh_manager = BatteryHealthManager.get(serial)
-            if bh_manager:
-                try:
-                    await bh_manager.async_unload()
-                except Exception:  # noqa: BLE001
-                    _LOGGER.exception(
-                        "battery_health[%s]: unload failed; continuing with "
-                        "entry teardown", serial,
-                    )
-                    bh_manager.stop()
-            BatteryHealthManager.remove(serial)
+        # v2.0.0a (F21): keepalive.stop() itself already moved to its
+        # own pass above, before the transport disconnect -- only the
+        # registry cleanup (removing this entry's reference) remains
+        # here, alongside the rest of per-device teardown.
+        ModbusKeepAlive.remove(serial)
 
-        # The ModbusGuard is keyed on the connection endpoint shared by all
-        # sub-devices of this entry; remove just that endpoint's guard.
-        # v2.0.0a (F04, external ICS audit): release_endpoint(), not the old
-        # unconditional remove() -- this only actually removes the guard
-        # from the registry once every entry/flow that acquired a reference
-        # to this endpoint (this one included) has released it. A second
-        # entry sharing this same physical endpoint keeps working
-        # uninterrupted; the guard is torn down only when the last such
-        # user is gone.
-        ModbusGuard.release_endpoint(ModbusGuard.endpoint_for(entry.data))
+        # Fault isolation (v1.1.7): a failed state flush must never
+        # prevent the rest of the entry from unloading cleanly — a stuck
+        # unload blocks reloads and config changes for the whole entry.
+        bh_manager = BatteryHealthManager.get(serial)
+        if bh_manager:
+            try:
+                await bh_manager.async_unload()
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception(
+                    "battery_health[%s]: unload failed; continuing with "
+                    "entry teardown", serial,
+                )
+                bh_manager.stop()
+        BatteryHealthManager.remove(serial)
 
-        # The SynchronizedPowerCoordinator has no background tasks of its own —
-        # HA cancels its scheduled refresh when the config entry is unloaded.
-        # We only need to drop the reference so it can be garbage-collected.
-        entry.runtime_data.pop(DATA_SYNC_POWER_COORDINATOR, None)
+    # The ModbusGuard is keyed on the connection endpoint shared by all
+    # sub-devices of this entry; remove just that endpoint's guard.
+    # v2.0.0a (F04, external ICS audit): release_endpoint(), not the old
+    # unconditional remove() -- this only actually removes the guard
+    # from the registry once every entry/flow that acquired a reference
+    # to this endpoint (this one included) has released it. A second
+    # entry sharing this same physical endpoint keeps working
+    # uninterrupted; the guard is torn down only when the last such
+    # user is gone.
+    ModbusGuard.release_endpoint(ModbusGuard.endpoint_for(entry.data))
+
+    # The SynchronizedPowerCoordinator has no background tasks of its own —
+    # HA cancels its scheduled refresh when the config entry is unloaded.
+    # We only need to drop the reference so it can be garbage-collected.
+    entry.runtime_data.pop(DATA_SYNC_POWER_COORDINATOR, None)
 
     return unload_ok
 
@@ -1311,7 +1356,39 @@ async def _setup_inverter_device_data(
     # tasks and persisted state. Registered here for symmetry with what
     # async_unload_entry already does for a successful unload.
     if register_cleanup is not None:
-        register_cleanup(telemetry.stop)
+        # v2.2.0.1 FIX (external ICS audit ICS-011 -- confirmed): used to
+        # register only telemetry.stop -- the normal (successful) unload
+        # path always pairs .stop() with ModbusTelemetry.remove(serial)
+        # (see async_unload_entry), but this setup-failure rollback path
+        # never called remove(). stop() only cancels the periodic-push
+        # timer (_unsub = None); it does not clear the registry entry,
+        # and get_or_create() never re-arms an existing (already-
+        # stopped) instance's timer. A retry after a failed setup got
+        # back the exact same, permanently-dead ModbusTelemetry object
+        # -- no telemetry sensors would ever update again for this
+        # serial until the next full HA restart. Registering a small
+        # closure that does both, matching the normal-unload pairing
+        # exactly, rather than a second cleanup callback (harder to
+        # keep in sync with this one over time).
+        def _stop_and_remove_telemetry(serial=device.serial_number, t=telemetry):
+            t.stop()
+            ModbusTelemetry.remove(serial)
+
+        register_cleanup(_stop_and_remove_telemetry)
+
+    # v2.2.0.1 FIX (external ICS audit ICS-012 -- confirmed): a static
+    # number-entity bound read during THIS setup attempt is cached
+    # (number.py's own _STATIC_BOUND_CACHE) but was never cleared if
+    # setup failed on a LATER step -- clear_static_bound_cache() was
+    # only ever called from the successful-unload path
+    # (async_unload_entry). A retry after a firmware update or hardware
+    # swap that failed setup partway through would silently reuse a
+    # stale cached bound instead of issuing a fresh Modbus read for it,
+    # for however long the process kept running.
+    if register_cleanup is not None:
+        register_cleanup(
+            lambda serial=device.serial_number: clear_static_bound_cache(serial)
+        )
 
     # Create the circadian adaptive learning controller and load persisted
     # statistics from HA storage.  All coordinators for this inverter share

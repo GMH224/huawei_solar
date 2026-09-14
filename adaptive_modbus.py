@@ -142,6 +142,29 @@ _SENSOR_PUSH_INTERVAL = timedelta(seconds=60)
 _SAVE_DEBOUNCE_SECONDS = 60.0
 
 
+def _finite_float(value: Any, default: float = 0.0) -> float:
+    """Coerce a persisted value to a finite float, falling back to
+    `default` for anything that isn't -- NaN, +/-Infinity, or a value
+    that doesn't even parse as a number at all.
+
+    v2.2.0.1 FIX (external ICS audit ICS-020 -- confirmed):
+    TimeSlotStats.from_dict() (below) used to do a bare `float(...)` on
+    every persisted field with no finiteness check at all. A corrupted
+    or hand-edited storage file containing "NaN"/"Infinity" (both valid
+    input to Python's own float() constructor) would be accepted
+    silently, then reach _derive_params()'s own
+    `timedelta(seconds=round(poll_s))` -- round(nan) raises ValueError,
+    round(inf) raises OverflowError, so a single bad persisted value
+    could raise out of the adaptive-parameter derivation entirely,
+    confirmed by direct execution against the real formula.
+    """
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if math.isfinite(parsed) else default
+
+
 # ── Data structures ────────────────────────────────────────────────────────────
 
 @dataclass
@@ -197,15 +220,19 @@ class TimeSlotStats:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any], slot_index: int = 0) -> "TimeSlotStats":
+        # v2.2.0.1 FIX (external ICS audit ICS-020 -- confirmed): every
+        # field below used to be a bare float(...) call -- see
+        # _finite_float's own docstring for the full reasoning and the
+        # exact downstream crash this caused.
         return cls(
             slot_index=slot_index,
-            n=float(d.get("n", 0)),
-            failures=float(d.get("f", 0)),
-            timeouts=float(d.get("t", 0)),
-            rtt_p95_ms=float(d.get("rtt_p95", 0)),
-            rtt_samples=[float(x) for x in d.get("rtt_s", [])],
-            poll_n=float(d.get("poll_n", 0)),
-            poll_failures=float(d.get("poll_f", 0)),
+            n=_finite_float(d.get("n", 0)),
+            failures=_finite_float(d.get("f", 0)),
+            timeouts=_finite_float(d.get("t", 0)),
+            rtt_p95_ms=_finite_float(d.get("rtt_p95", 0)),
+            rtt_samples=[_finite_float(x) for x in d.get("rtt_s", [])],
+            poll_n=_finite_float(d.get("poll_n", 0)),
+            poll_failures=_finite_float(d.get("poll_f", 0)),
         )
 
     def apply_decay(self, factor: float) -> None:
@@ -1328,6 +1355,20 @@ class AdaptiveModbusController:
         # here almost immediately, exactly the field-observed symptom
         # both audits independently flagged.
         poll_s = poll_confidence * poll_s_derived + (1 - poll_confidence) * poll_s_baseline
+        # v2.2.0.1 FIX (external ICS audit ICS-020 -- confirmed):
+        # defense-in-depth at the actual crash site itself, in addition
+        # to _finite_float's own fix at the persistence boundary (see
+        # that helper's docstring) -- matching this project's own
+        # established "duplicate validation at the final command sink"
+        # convention (e.g. SOC_SCHEMA's write-boundary check,
+        # verify_write's own retry-loop guards). poll_confidence/t are
+        # themselves clamped upstream in this same method, but
+        # poll_s_derived/poll_s_baseline both ultimately trace back to
+        # module-level ADAPTIVE_POLL_* constants and could, in
+        # principle, be reached by a future edit that reintroduces a
+        # non-finite value some other way than the one this audit found.
+        if not math.isfinite(poll_s):
+            poll_s = ADAPTIVE_POLL_COLD_START.total_seconds()
         poll_interval = timedelta(seconds=round(poll_s))
 
         # ── Gap: 150 ms → 500 ms (floor is a hardware constraint, not configurable) ──

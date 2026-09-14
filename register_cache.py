@@ -186,19 +186,12 @@ _TIER_BASE_TTL: dict[RegisterTier, float] = {
 #: the replacement mechanism and AUDIT_1.3.5.md for the full incident record.
 
 
-def set_slow_tier_ttl(seconds: float) -> None:
-    """Override the SLOW-tier base TTL (options flow).
+def _clamp_slow_tier_ttl(seconds: float) -> float:
+    """Clamp a requested SLOW-tier TTL to a sane band, so a mistyped
+    option cannot either hammer the bus or effectively disable
+    slow-changing data."""
+    return max(300.0, min(3600.0, float(seconds)))
 
-    Applies to entries created after the call; existing entries pick it up on
-    their next tier reset. Clamped to a sane band so a mistyped option cannot
-    either hammer the bus or effectively disable slow-changing data.
-    """
-    clamped = max(300.0, min(3600.0, float(seconds)))
-    _TIER_BASE_TTL[RegisterTier.SLOW] = clamped
-    _LOGGER.info(
-        "register_cache: SLOW-tier base TTL set to %.0f s "
-        "(expensive registers refresh this often)", clamped,
-    )
 
 # Adaptive cap TTLs (seconds) — TTL will not grow beyond this
 _TIER_CAP_TTL: dict[RegisterTier, float] = {
@@ -517,7 +510,10 @@ def _classify(name: RegisterName) -> RegisterTier:
 class _CacheEntry:
     __slots__ = ("value", "raw", "ts", "quality", "reason", "tier", "effective_ttl")
 
-    def __init__(self, value: Any, raw: Any, ts: float, tier: RegisterTier) -> None:
+    def __init__(
+        self, value: Any, raw: Any, ts: float, tier: RegisterTier,
+        effective_ttl: float,
+    ) -> None:
         self.value = value                          # full Result object
         self.raw = raw                              # comparable raw value for change detection
         self.ts = ts                                # single timestamp -- see Quality docstring above
@@ -530,7 +526,13 @@ class _CacheEntry:
         self.quality: "Quality" = Quality.GOOD
         self.reason: "Reason | None" = None
         self.tier = tier
-        self.effective_ttl: float = _TIER_BASE_TTL[tier]
+        # v2.2.0.1 FIX (external ICS audit ICS-004 -- confirmed): used to
+        # look up _TIER_BASE_TTL[tier] directly here -- see RegisterCache.
+        # __init__'s own comment for why that global no longer exists.
+        # The caller (RegisterCache.update(), the only construction site)
+        # now passes its OWN instance-scoped base TTL for this tier in
+        # explicitly.
+        self.effective_ttl: float = effective_ttl
 
 
 def _raw(result: "Result[Any]") -> Any:
@@ -585,12 +587,31 @@ class RegisterCache:
         telemetry: "ModbusTelemetry | None" = None,
         starvation_ceiling_s: float = 300.0,
         energy_availability_ceiling_s: float = 600.0,
+        slow_tier_ttl_s: float | None = None,
     ) -> None:
         self._store: dict[RegisterName, _CacheEntry] = {}
         self._telemetry = telemetry
         self._night_mode: bool = False
         self._starvation_ceiling_s = starvation_ceiling_s
         self._energy_availability_ceiling_s = energy_availability_ceiling_s
+        # v2.2.0.1 FIX (external ICS audit ICS-004 -- confirmed): base
+        # TTLs used to live in a single module-level dict
+        # (_TIER_BASE_TTL), mutated in place by the free function
+        # set_slow_tier_ttl() -- every RegisterCache instance in the
+        # whole HA process (i.e. every coordinator, across every
+        # config entry) shared that one dict. A second huawei_solar
+        # entry (a second inverter) reloading with a different SLOW-
+        # tier TTL option silently changed the FIRST entry's cache
+        # behaviour too, with no log, no event, and no way to detect it
+        # short of noticing an unexplained change in poll cadence.
+        # Each instance now owns its own copy, seeded from the shared
+        # read-only defaults (_TIER_BASE_TTL, never mutated after this
+        # fix) and optionally overridden for SLOW right away if the
+        # constructing coordinator already knows its entry's option
+        # value (see update_coordinator.py's own construction site).
+        self._tier_base_ttl: dict[RegisterTier, float] = dict(_TIER_BASE_TTL)
+        if slow_tier_ttl_s is not None:
+            self._tier_base_ttl[RegisterTier.SLOW] = _clamp_slow_tier_ttl(slow_tier_ttl_s)
 
     # ── night-mode control ────────────────────────────────────────────────────
 
@@ -613,11 +634,30 @@ class RegisterCache:
             if not active:
                 for entry in self._store.values():
                     if entry.tier in (RegisterTier.NORMAL, RegisterTier.FAST):
-                        entry.effective_ttl = _TIER_BASE_TTL[entry.tier]
+                        entry.effective_ttl = self._tier_base_ttl[entry.tier]
 
     @property
     def night_mode(self) -> bool:
         return self._night_mode
+
+    def set_slow_tier_ttl(self, seconds: float) -> None:
+        """Override this cache's own SLOW-tier base TTL (options flow).
+
+        v2.2.0.1 FIX (external ICS audit ICS-004 -- confirmed): instance
+        method, replacing the old module-level free function of the
+        same name that mutated a single dict shared by every
+        RegisterCache in the process -- see __init__'s own comment on
+        _tier_base_ttl for the full history. Applies to entries already
+        loaded on their next tier reset; existing STORED entries' own
+        effective_ttl is untouched until they naturally reset (matching
+        the old function's own documented behaviour exactly).
+        """
+        clamped = _clamp_slow_tier_ttl(seconds)
+        self._tier_base_ttl[RegisterTier.SLOW] = clamped
+        _LOGGER.info(
+            "register_cache: SLOW-tier base TTL set to %.0f s "
+            "(expensive registers refresh this often)", clamped,
+        )
 
     # ── effective TTL helper ──────────────────────────────────────────────────
 
@@ -751,14 +791,16 @@ class RegisterCache:
                     existing.value = result
                     existing.ts = now
                 else:
-                    existing.effective_ttl = _TIER_BASE_TTL[tier]
+                    existing.effective_ttl = self._tier_base_ttl[tier]
                     existing.raw = raw_new
                     existing.value = result
                     existing.ts = now
                 existing.quality = Quality.GOOD
                 existing.reason = None
             else:
-                self._store[name] = _CacheEntry(result, raw_new, now, tier)
+                self._store[name] = _CacheEntry(
+                    result, raw_new, now, tier, self._tier_base_ttl[tier],
+                )
 
     def record_attempt(
         self,

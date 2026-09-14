@@ -76,6 +76,8 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .adaptive_modbus import AdaptiveModbusController
 from .const import (
     BACKOFF_NORMAL_DIVISOR,
+    CONF_SLOW_TIER_TTL_S,
+    DEFAULT_SLOW_TIER_TTL_S,
     REGISTER_STARVATION_CEILING_S,
     ENERGY_AVAILABILITY_CEILING_S,
     ENERGY_PROMOTION_CEILING_S,
@@ -525,6 +527,16 @@ class HuaweiSolarUpdateCoordinator(
         self.cache = RegisterCache(
             starvation_ceiling_s=REGISTER_STARVATION_CEILING_S,
             energy_availability_ceiling_s=ENERGY_AVAILABILITY_CEILING_S,
+            # v2.2.0.1 FIX (external ICS audit ICS-004 -- confirmed): read
+            # straight from THIS entry's own options at construction time
+            # instead of relying on a process-global set by __init__.py's
+            # own setup step (see register_cache.py's own comment on
+            # _tier_base_ttl for why that global was removed). A second
+            # entry's option can no longer affect this one at all.
+            slow_tier_ttl_s=(
+                entry.options.get(CONF_SLOW_TIER_TTL_S, DEFAULT_SLOW_TIER_TTL_S)
+                if entry is not None else None
+            ),
         )
         self.telemetry: ModbusTelemetry | None = None
         self._adaptive: AdaptiveModbusController | None = None
@@ -647,7 +659,24 @@ class HuaweiSolarUpdateCoordinator(
                 if attempt <= WRITE_VERIFY_RETRIES:
                     await asyncio.sleep(WRITE_VERIFY_DELAY.total_seconds())
 
-            except (TimeoutError, HuaweiSolarException):
+            except (TimeoutError, HuaweiSolarException, TModbusError):
+                # v2.2.0.1 FIX (external ICS audit ICS-019 -- confirmed):
+                # was (TimeoutError, HuaweiSolarException) only --
+                # TModbusError is a separate hierarchy from
+                # HuaweiSolarException (see this file's own comment,
+                # near its import, for how that was verified), and both
+                # of the OTHER two register-write-related except clauses
+                # in this same file already catch it explicitly. An
+                # escaped TModbusError here used to propagate straight
+                # out of verify_write() -- skipping every remaining
+                # retry attempt AND the "write verification FAILED"
+                # warning below -- and, since this coroutine only ever
+                # runs via schedule_verify_write()'s background task
+                # (see that method's own comment on the done-callback
+                # fix, just below), would have surfaced only as
+                # asyncio's own generic "Task exception was never
+                # retrieved" — not this coordinator's own structured
+                # failure handling.
                 _LOGGER.debug(
                     "%s: write verification read failed (attempt %d)", self.name, attempt
                 )
@@ -1429,11 +1458,41 @@ class HuaweiSolarUpdateCoordinator(
 
         self._verify_write_tasks[name] = task
         task.add_done_callback(
-            lambda t, n=name: (
-                self._verify_write_tasks.pop(n, None)
-                if self._verify_write_tasks.get(n) is t else None
-            )
+            lambda t, n=name: self._on_verify_write_task_done(t, n)
         )
+
+    def _on_verify_write_task_done(self, task: asyncio.Task, name: RegisterName) -> None:
+        """Done-callback for schedule_verify_write()'s own task.
+
+        v2.2.0.1 FIX (external ICS audit ICS-019 -- confirmed): used to
+        be an inline lambda that only popped the task out of
+        self._verify_write_tasks -- it never called task.exception(),
+        so any exception verify_write() itself did NOT already catch
+        (i.e. any genuinely unanticipated bug, not the transport faults
+        ICS-019's own fix above now also catches) would surface only as
+        asyncio's own generic, unstructured "Task exception was never
+        retrieved" warning, logged from wherever the task object
+        happens to be garbage-collected -- not tied to this register,
+        this coordinator, or this write, and easy to miss entirely.
+        Retrieving the exception here (which is also what marks a
+        task's exception as "retrieved", suppressing that generic
+        warning) and logging it with the same register-name context
+        every other failure path in this file already provides.
+        Deliberately does not re-raise -- a done-callback running
+        inside the event loop is not a place a caller of
+        schedule_verify_write() (a fire-and-forget scheduling call)
+        could ever observe or handle a re-raised exception anyway.
+        """
+        if self._verify_write_tasks.get(name) is task:
+            self._verify_write_tasks.pop(name, None)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            _LOGGER.error(
+                "%s: write verification for %s failed with an unexpected "
+                "error: %s", self.name, name, exc, exc_info=exc,
+            )
 
     def _stale_cache_fallback(
         self, all_names: "list[RegisterName]", cause: str,
@@ -2167,15 +2226,37 @@ class HuaweiSolarOptimizerUpdateCoordinator(
             async with self.guard.request():
                 t0 = time.monotonic()
                 async with asyncio.timeout(effective_timeout.total_seconds()):
-                    if self.telemetry:
-                        self.telemetry.record_request(1)
-                        # v2.0.13 FIX (MOD-021, this release): see
-                        # _record_optimizer_failure's own identical
-                        # fix, same reasoning -- one physical attempt,
-                        # no chunking on this coordinator's own path.
-                        self.telemetry.record_physical_attempt()
+                    # v2.2.0.1 FIX (external ICS audit ICS-021 -- confirmed):
+                    # record_request()/record_physical_attempt() used to
+                    # be called HERE, before the actual device await --
+                    # i.e. before the outcome was known at all -- despite
+                    # record_request()'s own docstring describing it as
+                    # recording a SUCCESSFUL request. Every failure path
+                    # below (record_timeout()'s "device" kind, and every
+                    # branch that calls self._record_failure()) ALSO
+                    # increments the exact same counters
+                    # (total_attempts/total_physical_attempts) for its
+                    # own, correct classification of the same outcome --
+                    # so a single failed poll was counted TWICE: once
+                    # optimistically here, once again for its real
+                    # outcome. (queue_shed/admission-timeout outcomes
+                    # were never affected -- guard.request() itself
+                    # raises before this line is ever reached for those
+                    # two.) Moved to fire exactly once, after the
+                    # outcome is actually known -- see the success path
+                    # below, and each failure handler's own pre-existing
+                    # record_timeout()/_record_failure() call, now the
+                    # ONLY place either counter is touched for this
+                    # coordinator.
                     result = await self.device.get_latest_optimizer_history_data()
                 rtt_ms = (time.monotonic() - t0) * 1000
+                if self.telemetry:
+                    self.telemetry.record_request(1)
+                    # v2.0.13 FIX (MOD-021, this release): see
+                    # _record_optimizer_failure's own identical
+                    # fix, same reasoning -- one physical attempt,
+                    # no chunking on this coordinator's own path.
+                    self.telemetry.record_physical_attempt()
 
         except TimeoutError as err:
             # Defect D. NOTE: HuaweiSolarOptimizerUpdateCoordinator is a

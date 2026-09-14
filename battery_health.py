@@ -94,6 +94,72 @@ SECONDS_PER_DAY = 86_400.0
 # derived constant.
 MAX_RETIRED_PACK_HISTORY = 50
 
+#: v2.2.0.1 FIX (external ICS audit HVC-004 -- confirmed): pack_install_
+#: dates is written directly from user-supplied service-call input
+#: (set_pack_install_date, services.py) and previously had no cap of its
+#: own. _prune_retired_history_and_stale_serials() below already prunes
+#: this same dict, but only as a side effect of an actual physical pack
+#: replacement being archived -- a unit that never has a pack replaced
+#: never runs that prune, so it does not bound THIS write path by itself.
+#: set_pack_install_date's own docstring explains why a serial the engine
+#: has never seen is accepted without error (a deliberate, permissive
+#: design choice, preserved here); this constant only bounds the
+#: pathological case of that permissiveness -- an arbitrarily large
+#: number of distinct never-observed serials -- not the normal one.
+MAX_PACK_INSTALL_DATE_OVERRIDES = 64
+
+#: v2.2.0.1 FIX (external ICS audit ICS-014/ICS-022 -- confirmed): a
+#: generous ceiling applied, at restore() time only, to several
+#: persisted epoch-log/pool lists across this file (SegmentTracker.
+#: reference_epochs, EfficiencyTracker._baseline_pool/baseline_epochs,
+#: BalanceTracker.baseline_epochs/_pool_dv/_pool_dt) that have no
+#: OTHER bound of their own at restore time -- unlike segments/buckets
+#: elsewhere in this same file, which reuse an existing, real prune()
+#: method immediately after restore (see SegmentTracker.restore() and
+#: StressAccumulator.restore() for that pattern). These specific lists
+#: have no equivalent time-based prune() to reuse: they are ordinary
+#: small, infrequently-appended epoch logs in normal operation (each
+#: entry marks a rare event -- a re-anchor, a captured baseline), with
+#: no existing runtime cap at all for restore() to inherit. This
+#: constant is deliberately generous -- far beyond anything normal
+#: operation could ever produce -- so it only bounds the pathological
+#: case (a corrupted or hand-edited storage file), never normal use.
+#: Truncated to the MOST RECENT entries (these are append-ordered), not
+#: an arbitrary/oldest-first slice, so a genuinely oversized real
+#: history still keeps its most relevant (newest) records.
+MAX_RESTORED_EPOCH_LOG_LENGTH = 500
+
+#: v2.2.0.1 FIX (external ICS audit ICS-014/ICS-022 -- confirmed): a
+#: generous ceiling for restore()-time collections that ARE also
+#: bounded during normal operation by an existing, real, time-based
+#: prune() method (SegmentTracker.segments, StressAccumulator._buckets)
+#: -- unlike MAX_RESTORED_EPOCH_LOG_LENGTH's own targets just above,
+#: which have no other bound at all. This is deliberately a COUNT cap,
+#: not a call to that real prune() logic at restore time: prune()'s own
+#: cutoff is anchored to actual wall-clock time
+#: (`now - cfg.capacity_window_days * SECONDS_PER_DAY`), which is
+#: correct during normal operation (samples always carry real epoch
+#: timestamps) but would incorrectly discard an otherwise-legitimate,
+#: small persisted history recorded against a synthetic or relative
+#: time base -- e.g. this project's own test suite's convention of
+#: starting sample timestamps at 0.0. A plain count cap sidesteps that
+#: mismatch entirely while still bounding the pathological case (a
+#: corrupted or hand-edited storage file) exactly as intended: normal
+#: operation's own prune() calls, on the very next real tick, still
+#: apply the real time-based cutoff on top of this, unchanged.
+MAX_RESTORED_COLLECTION_LENGTH = 5000
+
+
+def _bounded_epoch_log(raw: Any, max_len: int = MAX_RESTORED_EPOCH_LOG_LENGTH) -> list:
+    """Coerce a persisted value to a list, capped to the most recent
+    `max_len` entries. See MAX_RESTORED_EPOCH_LOG_LENGTH's own comment
+    for why this exists and why it keeps the TAIL, not the head."""
+    if not isinstance(raw, list):
+        return []
+    if len(raw) <= max_len:
+        return list(raw)
+    return list(raw[-max_len:])
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Configuration
@@ -1376,8 +1442,21 @@ class SegmentTracker:
         }
 
     def restore(self, data: dict[str, Any]) -> None:
+        # v2.2.0.1 FIX (external ICS audit ICS-014 -- confirmed):
+        # segments used to be constructed directly from the full
+        # persisted list with no bound of any kind. Capped to the most
+        # recent MAX_RESTORED_COLLECTION_LENGTH raw entries BEFORE
+        # constructing any DischargeSegment objects at all -- see that
+        # constant's own comment for why a count cap is used here
+        # instead of reusing prune()'s real, time-based logic directly
+        # at restore time (this same tracker's own prune(), just below,
+        # still runs normally on the very next real tick, on top of
+        # this).
         self.segments = [
-            DischargeSegment.from_dict(d) for d in data.get("segments", [])
+            DischargeSegment.from_dict(d)
+            for d in _bounded_epoch_log(
+                data.get("segments", []), max_len=MAX_RESTORED_COLLECTION_LENGTH,
+            )
         ]
         self._throughput_since_full_kwh = float(data.get("throughput_since_full", 0.0))
         self._last_discharge_kwh = data.get("last_discharge")
@@ -1386,7 +1465,12 @@ class SegmentTracker:
         self.gap_bridged_count = int(data.get("gap_bridged", 0))
         self.reference_capacity_kwh = data.get("reference_capacity")
         self.reference_captured_ts = data.get("reference_captured_ts")
-        self.reference_epochs = list(data.get("reference_epochs", []))
+        # v2.2.0.1 FIX (external ICS audit ICS-014 -- confirmed): no
+        # existing prune() covers this field (it is a rare re-anchor
+        # event log, not time-windowed data) -- see
+        # MAX_RESTORED_EPOCH_LOG_LENGTH's own comment for the bound
+        # applied here instead.
+        self.reference_epochs = _bounded_epoch_log(data.get("reference_epochs", []))
         self.stale_endpoint_skips = int(data.get("stale_endpoint_skips", 0))
         self.condition_coverage = {
             str(k): int(v) for k, v in data.get("condition_coverage", {}).items()
@@ -1833,6 +1917,65 @@ class PackCapacityTracker:
             return self.pack_first_detected[serial], "first_detected"
         return None, "unknown"
 
+    def set_pack_install_date_override(self, serial: str, install_ts: float) -> None:
+        """Record an explicit, user-provided install-date override for one
+        pack serial (see pack_install_dates' own comment above for how
+        this combines with pack_first_detected).
+
+        v2.2.0.1 FIX (external ICS audit HVC-004 -- confirmed): the only
+        caller (BatteryHealthManager.set_pack_install_date(),
+        battery_health_manager.py) used to write
+        ``self.pack_install_dates[serial] = install_ts`` directly, with no
+        bound of its own. set_pack_install_date's own docstring explains
+        why a serial the engine has never seen is accepted without error
+        -- that permissiveness is preserved here unchanged -- but nothing
+        stopped a caller from repeating the service call with an
+        unbounded number of distinct, never-observed serials, growing
+        this persisted dict forever between physical pack replacements
+        (_prune_retired_history_and_stale_serials() only runs when one is
+        actually archived).
+
+        This is the single write path for pack_install_dates for exactly
+        that reason: enforcing the cap here, once, covers every current
+        and future caller automatically (currently just the one service;
+        a future per-pack date entity, matching pack_first_detected's own
+        write pattern, would inherit the bound without needing to
+        remember it separately).
+        """
+        self.pack_install_dates[serial] = install_ts
+        overflow = len(self.pack_install_dates) - MAX_PACK_INSTALL_DATE_OVERRIDES
+        if overflow <= 0:
+            return
+
+        # Over the cap: evict oldest entries first (dict preserves
+        # insertion order), but prefer evicting ones that are not
+        # currently relevant -- same definition of "relevant" as
+        # _prune_retired_history_and_stale_serials() below (a live slot's
+        # own serial, or one still referenced by a retained retired-pack
+        # history entry) -- over a currently-live pack's own explicit
+        # override.
+        relevant_serials = {s for s in self._last_serial if s is not None}
+        relevant_serials.update(
+            entry["serial_number"] for entry in self.retired_pack_history
+            if entry.get("serial_number") is not None
+        )
+        for s in list(self.pack_install_dates):
+            if overflow <= 0:
+                break
+            if s in relevant_serials:
+                continue
+            del self.pack_install_dates[s]
+            overflow -= 1
+        # Still over the cap (every remaining entry is currently
+        # relevant -- only possible with an implausibly large pack
+        # count): fall back to oldest-first regardless of relevance
+        # rather than silently exceeding the bound.
+        for s in list(self.pack_install_dates):
+            if overflow <= 0:
+                break
+            del self.pack_install_dates[s]
+            overflow -= 1
+
     def _prune_retired_history_and_stale_serials(self) -> None:
         """v2.0.13 FIX (BH-015, external ICS quality/defect/architecture
         audit -- confirmed): called once, right after a new replacement
@@ -2205,8 +2348,18 @@ class EfficiencyTracker:
         self.window_tiers = deque(data.get("window_tiers", []), maxlen=64)
         self.baseline = data.get("baseline")
         self.baseline_tier = data.get("baseline_tier")
-        self._baseline_pool = list(data.get("baseline_pool", []))
-        self.baseline_epochs = list(data.get("baseline_epochs", []))
+        # v2.2.0.1 FIX (external ICS audit ICS-014/ICS-022 -- confirmed):
+        # both used to be plain, unbounded lists built straight from the
+        # persisted data -- windows/window_tiers just above are already
+        # bounded (deque maxlen=64), but these two are not: _baseline_pool
+        # is normally self-bounded at runtime (cleared once
+        # cfg.eff_baseline_windows samples accumulate -- see
+        # new_epoch()/feed()) and baseline_epochs has no runtime bound at
+        # all (a rare re-anchor-event log). See
+        # MAX_RESTORED_EPOCH_LOG_LENGTH's own comment for why a generous
+        # fixed cap, not deque(maxlen=...), is used here instead.
+        self._baseline_pool = _bounded_epoch_log(data.get("baseline_pool", []))
+        self.baseline_epochs = _bounded_epoch_log(data.get("baseline_epochs", []))
         self.last_ceiling = data.get("last_ceiling")
 
 
@@ -2515,9 +2668,17 @@ class BalanceTracker:
         self.baseline_dv = data.get("baseline_dv")
         self.baseline_dt = data.get("baseline_dt")
         self.baseline_captured_ts = data.get("baseline_captured_ts")
-        self.baseline_epochs = list(data.get("baseline_epochs", []))
-        self._pool_dv = list(data.get("pool_dv", []))
-        self._pool_dt = list(data.get("pool_dt", []))
+        # v2.2.0.1 FIX (external ICS audit ICS-014/ICS-022 -- confirmed):
+        # same defect as EfficiencyTracker's own baseline_pool/
+        # baseline_epochs just above in this file -- see that restore()'s
+        # own comment. _pool_dv/_pool_dt are this tracker's own
+        # equivalent of _baseline_pool (self-bounded at runtime by count
+        # before being cleared, but not at restore()); baseline_epochs
+        # is, again, an unbounded rare-event log with no runtime cap of
+        # its own to inherit.
+        self.baseline_epochs = _bounded_epoch_log(data.get("baseline_epochs", []))
+        self._pool_dv = _bounded_epoch_log(data.get("pool_dv", []))
+        self._pool_dt = _bounded_epoch_log(data.get("pool_dt", []))
         self.last_ceiling = data.get("last_ceiling")
         self._median_cache = None
 
@@ -2616,9 +2777,25 @@ class StressAccumulator:
         return {"buckets": {str(k): v for k, v in self._buckets.items()}}
 
     def restore(self, data: dict[str, Any]) -> None:
+        # v2.2.0.1 FIX (external ICS audit ICS-014/ICS-022 -- confirmed):
+        # _buckets used to be fully constructed with no bound of any
+        # kind. Capped to the MAX_RESTORED_COLLECTION_LENGTH most
+        # recent buckets (highest keys -- these are hour-since-epoch
+        # buckets, so "most recent" is "largest key", not insertion
+        # order) BEFORE building the live dict -- see that constant's
+        # own comment for why a count cap is used here instead of
+        # reusing prune()'s real, time-based logic directly at restore
+        # time. This tracker's own prune(), just below, still runs
+        # normally on the very next real tick, on top of this.
+        raw_buckets = data.get("buckets", {})
+        if len(raw_buckets) > MAX_RESTORED_COLLECTION_LENGTH:
+            kept_keys = sorted(raw_buckets, key=lambda k: int(k))[
+                -MAX_RESTORED_COLLECTION_LENGTH:
+            ]
+            raw_buckets = {k: raw_buckets[k] for k in kept_keys}
         self._buckets = {
             int(k): [float(v[0]), float(v[1])]
-            for k, v in data.get("buckets", {}).items()
+            for k, v in raw_buckets.items()
         }
         self._total_sdt = sum(v[0] for v in self._buckets.values())
         self._total_dt = sum(v[1] for v in self._buckets.values())
@@ -3354,10 +3531,23 @@ class BatteryHealthEngine:
             )
             return
         self.first_seen_ts = data.get("first_seen_ts")
+        # v2.2.0.1 FIX (external ICS audit ICS-014/ICS-022 -- confirmed):
+        # this dict is keyed, in every real code path, by exactly the
+        # three literal names in the composite's own `live = {...}` dict
+        # (see the held-subscore logic below, in this same class) --
+        # "capacity"/"efficiency"/"balance" can never legitimately exceed
+        # 3 entries. A restore() with no key filter of its own accepted
+        # any number of arbitrary keys from a corrupted or hand-edited
+        # storage file, none of which any runtime code path would ever
+        # read or clean up again (only the three known names are ever
+        # looked up). Filtered to exactly the legitimate key set here --
+        # a precise fix, not just a size cap, since the valid domain is
+        # small and fully known.
         self._held = {
             k: (float(v[0]), float(v[1]))
             for k, v in (data.get("held_subscores") or {}).items()
-            if isinstance(v, (list, tuple)) and len(v) == 2
+            if k in ("capacity", "efficiency", "balance")
+            and isinstance(v, (list, tuple)) and len(v) == 2
         }
         self.learning_enabled = bool(data.get("learning_enabled", True))
         self.settling_events = int(data.get("settling_events", 0))

@@ -445,7 +445,22 @@ async def set_pack_install_date(service_call: ServiceCall) -> None:
     # and the new per-pack date entity (date.py) from being able to
     # drift out of sync by each reimplementing the same three steps
     # separately.
-    bh_manager.set_pack_install_date(serial, install_ts)
+    #
+    # v2.2.0.1 FIX (external ICS audit ICS-007 -- confirmed): a future
+    # install date used to reach the engine unrejected -- see that
+    # method's own docstring for the full reasoning and the resulting
+    # inconsistent-attributes symptom. ValueError is this method's own,
+    # HA-independent way of signalling that; translated to a
+    # ServiceValidationError here, matching every other rejected input
+    # in this same handler above.
+    try:
+        bh_manager.set_pack_install_date(serial, install_ts)
+    except ValueError as err:
+        raise ServiceValidationError(
+            translation_domain=DOMAIN,
+            translation_key="pack_install_date_in_future",
+            translation_placeholders={"install_date": install_date_str},
+        ) from err
 
 
 @callback
@@ -758,6 +773,64 @@ def _get_device_write_lock(serial_number: str) -> asyncio.Lock:
 # not also a guard against re-registration.
 _entries_with_services: set[str] = set()
 
+# v2.2.0.1 FIX (external ICS audit ICS-009 -- confirmed): _entries_with_
+# services above answers only "does ANY loaded entry need ANY of this
+# integration's services" -- a single flat flag shared by every
+# capability-gated service cluster below (has_battery, has_lg_battery,
+# has_capacity_control, EMMA-vs-direct-battery). Two entries with
+# DIFFERENT capabilities (e.g. one with a battery, one without) meant
+# unloading the battery entry while the other stayed loaded kept EVERY
+# service registered -- including the battery-only ones the remaining
+# entry has no use for -- and conversely, as long as ANY entry needing
+# ANY service remained, a capability-specific service whose OWN last
+# provider had already unloaded stayed visible/callable indefinitely.
+# _capability_entries tracks each capability cluster's own entry set
+# separately, so async_unload_services() below can unregister exactly
+# the services whose own last provider just unloaded -- without
+# changing _entries_with_services itself, or the coarser fast-path it
+# still correctly provides ("nothing at all is registered right now").
+_CAPABILITY_SERVICES: dict[str, tuple[str, ...]] = {
+    # Registered unconditionally whenever CONF_ENABLE_PARAMETER_
+    # CONFIGURATION is set, regardless of device kind or battery
+    # presence -- see async_setup_services's own DEF-004 comment for
+    # why these four are registered exactly once, dispatch-by-target.
+    "always": (
+        SERVICE_RESET_MAXIMUM_FEED_GRID_POWER,
+        SERVICE_SET_ZERO_POWER_GRID_CONNECTION,
+        SERVICE_SET_MAXIMUM_FEED_GRID_POWER,
+        SERVICE_SET_MAXIMUM_FEED_GRID_POWER_PERCENT,
+    ),
+    "not_has_emma": (
+        SERVICE_SET_DI_ACTIVE_POWER_SCHEDULING,
+    ),
+    "has_battery": (
+        SERVICE_SET_TOU_PERIODS,
+    ),
+    "has_battery_not_emma": (
+        SERVICE_FORCIBLE_CHARGE,
+        SERVICE_FORCIBLE_DISCHARGE,
+        SERVICE_FORCIBLE_CHARGE_SOC,
+        SERVICE_FORCIBLE_DISCHARGE_SOC,
+        SERVICE_STOP_FORCIBLE_CHARGE,
+        # v2.2.0.1 FIX (external ICS audit, found alongside ICS-009 --
+        # confirmed): SERVICE_SET_PACK_INSTALL_DATE was registered here
+        # (has_battery and not has_emma) but was NEVER included in the
+        # old flat _ALL_SERVICE_NAMES unregister-all list below --
+        # unlike every one of its five siblings in this exact same
+        # registration block. It stayed registered, callable, and
+        # visible in the service picker even after the LAST entry with
+        # a directly-controlled battery unloaded, indefinitely.
+        SERVICE_SET_PACK_INSTALL_DATE,
+    ),
+    "has_lg_battery": (
+        SERVICE_SET_FIXED_CHARGE_PERIODS,
+    ),
+    "has_capacity_control": (
+        SERVICE_SET_CAPACITY_CONTROL_PERIODS,
+    ),
+}
+_capability_entries: dict[str, set[str]] = {cap: set() for cap in _CAPABILITY_SERVICES}
+
 # Every service name this integration can register -- used by
 # async_unload_services() to unregister all of them once the last
 # relevant entry unloads. hass.services.async_remove() is safe to call
@@ -778,6 +851,11 @@ _ALL_SERVICE_NAMES: tuple[str, ...] = (
     SERVICE_SET_TOU_PERIODS,
     SERVICE_SET_CAPACITY_CONTROL_PERIODS,
     SERVICE_SET_FIXED_CHARGE_PERIODS,
+    # v2.2.0.1 FIX (external ICS audit, found alongside ICS-009 --
+    # confirmed): was missing from this list entirely -- see
+    # _CAPABILITY_SERVICES' own "has_battery_not_emma" comment above
+    # for the full history.
+    SERVICE_SET_PACK_INSTALL_DATE,
 )
 
 
@@ -798,6 +876,20 @@ async def async_unload_services(
     itself was uninstalled from a running instance.
     """
     _entries_with_services.discard(entry.entry_id)
+    # v2.2.0.1 FIX (external ICS audit ICS-009 -- confirmed): per-
+    # capability unregistration -- see _capability_entries' own comment
+    # above for the full reasoning. Runs regardless of whether
+    # _entries_with_services is now empty: a capability-specific
+    # service can lose its own last provider while OTHER entries
+    # needing OTHER services remain loaded.
+    for cap_entries in _capability_entries.values():
+        cap_entries.discard(entry.entry_id)
+    for cap, service_names in _CAPABILITY_SERVICES.items():
+        if _capability_entries[cap]:
+            continue  # another loaded entry still needs this cluster
+        for service_name in service_names:
+            hass.services.async_remove(DOMAIN, service_name)
+
     if _entries_with_services:
         return  # other entries still need these services registered
     for service_name in _ALL_SERVICE_NAMES:
@@ -1540,6 +1632,26 @@ async def async_setup_services(
         for uc in hsucs
     )
     has_emma = any(isinstance(uc.device, EMMADevice) for uc in hsucs)
+
+    # v2.2.0.1 FIX (external ICS audit ICS-009 -- confirmed): populate
+    # the per-capability tracking async_unload_services() now reads --
+    # see _capability_entries' own comment for the full reasoning. Does
+    # NOT change any of the registration calls below -- those keep
+    # their own existing conditions exactly as-is; this only records,
+    # separately, which capability clusters THIS entry contributes, so
+    # its later unload can unregister precisely the clusters it was the
+    # last provider of.
+    _capability_entries["always"].add(entry.entry_id)
+    if not has_emma:
+        _capability_entries["not_has_emma"].add(entry.entry_id)
+    if has_battery:
+        _capability_entries["has_battery"].add(entry.entry_id)
+    if has_battery and not has_emma:
+        _capability_entries["has_battery_not_emma"].add(entry.entry_id)
+    if has_lg_battery:
+        _capability_entries["has_lg_battery"].add(entry.entry_id)
+    if has_capacity_control:
+        _capability_entries["has_capacity_control"].add(entry.entry_id)
 
     # v2.0.9 FIX (DEF-004, same audit -- confirmed): registered exactly
     # once each, unconditionally -- not gated on has_emma, and not

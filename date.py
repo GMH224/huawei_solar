@@ -238,4 +238,19 @@ class HuaweiSolarPackInstallDateEntity(DateEntity):
         install_ts = datetime(
             value.year, value.month, value.day, tzinfo=timezone.utc
         ).timestamp()
-        self._manager.set_pack_install_date(serial, install_ts)
+        # v2.2.0.1 FIX (external ICS audit ICS-007 -- confirmed): a
+        # future install date used to reach the engine unrejected --
+        # see BatteryHealthManager.set_pack_install_date's own
+        # docstring for the full reasoning. Logged and refused, matching
+        # this same method's own two guard clauses immediately above
+        # (invalid pack index, no serial observed yet) rather than
+        # raising -- an entity write, unlike the service call in
+        # services.py, has no established convention in this file for
+        # surfacing a raised exception to the user.
+        try:
+            self._manager.set_pack_install_date(serial, install_ts)
+        except ValueError:
+            _LOGGER.warning(
+                "battery_health: refusing to set install date for %s -- "
+                "date is in the future", self._attr_unique_id,
+            )
