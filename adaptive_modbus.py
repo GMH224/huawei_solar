@@ -224,13 +224,30 @@ class TimeSlotStats:
         # field below used to be a bare float(...) call -- see
         # _finite_float's own docstring for the full reasoning and the
         # exact downstream crash this caused.
+        #
+        # v2.2.0.2 FIX (external ICS audit HS-ICS-007 -- confirmed):
+        # rtt_samples itself was still unbounded here even after the
+        # v2.2.0.1 fix above -- that fix addressed FINITENESS
+        # (rejecting NaN/Infinity) but not LENGTH. record()'s own
+        # runtime FIFO trim (this class, below) only pops one sample
+        # per new observation once the list exceeds max_samples, so a
+        # persisted "rtt_s" list far larger than ADAPTIVE_RTT_SAMPLE_
+        # SIZE would stay oversized for a long time after restore.
+        # Capped here to the same real runtime bound, keeping the most
+        # RECENT samples (list is append-ordered) -- exactly matching
+        # what the FIFO trim itself would already have converged to.
+        raw_rtt_samples = d.get("rtt_s", [])
+        if not isinstance(raw_rtt_samples, list):
+            raw_rtt_samples = []
+        if len(raw_rtt_samples) > ADAPTIVE_RTT_SAMPLE_SIZE:
+            raw_rtt_samples = raw_rtt_samples[-ADAPTIVE_RTT_SAMPLE_SIZE:]
         return cls(
             slot_index=slot_index,
             n=_finite_float(d.get("n", 0)),
             failures=_finite_float(d.get("f", 0)),
             timeouts=_finite_float(d.get("t", 0)),
             rtt_p95_ms=_finite_float(d.get("rtt_p95", 0)),
-            rtt_samples=[_finite_float(x) for x in d.get("rtt_s", [])],
+            rtt_samples=[_finite_float(x) for x in raw_rtt_samples],
             poll_n=_finite_float(d.get("poll_n", 0)),
             poll_failures=_finite_float(d.get("poll_f", 0)),
         )

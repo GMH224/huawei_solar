@@ -2179,6 +2179,16 @@ class HuaweiSolarOptimizerUpdateCoordinator(
         self._adaptive: AdaptiveModbusController | None = None
         self._consecutive_timeouts: int = 0
         self._consecutive_failures: int = 0
+        # v2.2.0.2 FIX (external ICS audit HS-ICS-002 -- confirmed):
+        # holds the detached first-refresh task's own handle once
+        # create_optimizer_update_coordinator() schedules it, so the
+        # caller that owns this setup attempt's cleanup_callbacks list
+        # can cancel it if a LATER setup step fails -- see that
+        # function's own comment for the full reasoning. None until
+        # that scheduling actually happens (and stays None if it fails
+        # to schedule at all -- the caller's own register_cleanup call
+        # already guards for that).
+        self._first_refresh_task: "asyncio.Task | None" = None
 
     def attach_telemetry(self, telemetry: ModbusTelemetry) -> None:
         self.telemetry = telemetry
@@ -2457,12 +2467,25 @@ async def create_optimizer_update_coordinator(
     try:
         create_task = getattr(entry, "async_create_background_task", None)
         if create_task is not None:
-            create_task(
+            first_refresh_task = create_task(
                 hass, _first_refresh(),
                 f"optimizer_coordinator_first_refresh_{device.serial_number}",
             )
         else:  # pragma: no cover — older HA cores, or no entry passed
-            hass.async_create_task(_first_refresh())
+            first_refresh_task = hass.async_create_task(_first_refresh())
+        # v2.2.0.2 FIX (external ICS audit HS-ICS-002 -- confirmed): this
+        # task's handle used to be discarded immediately, with no way
+        # for the caller (create_optimizer_update_coordinator's own
+        # caller in __init__.py, which owns this setup attempt's
+        # cleanup_callbacks list) to cancel it if a LATER setup step
+        # failed. Stored on the coordinator itself so that caller can
+        # register its cancellation -- see __init__.py's own call site,
+        # right after this function returns, for the other half of this
+        # fix. Kept as a plain attribute rather than changing this
+        # function's own signature to accept a register_cleanup
+        # callback directly, since the task is only meaningful together
+        # with the coordinator object the caller already receives.
+        coordinator._first_refresh_task = first_refresh_task
     except Exception:  # noqa: BLE001 — never break entry setup over scheduling
         _LOGGER.exception(
             "optimizer_coordinator[%s]: could not schedule first refresh",

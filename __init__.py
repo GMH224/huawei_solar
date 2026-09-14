@@ -591,12 +591,31 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
                 try:
                     create_task = getattr(entry, "async_create_background_task", None)
                     if create_task is not None:
-                        create_task(
+                        sync_first_refresh_task = create_task(
                             hass, _sync_first_refresh(),
                             "sync_power_coordinator_first_refresh",
                         )
                     else:  # pragma: no cover — older HA cores
-                        hass.async_create_task(_sync_first_refresh())
+                        sync_first_refresh_task = hass.async_create_task(
+                            _sync_first_refresh()
+                        )
+                    # v2.2.0.2 FIX (external ICS audit HS-ICS-002 --
+                    # confirmed): this task's handle used to be discarded
+                    # immediately -- not captured, not registered with
+                    # cleanup_callbacks. If a LATER step in this same
+                    # setup attempt failed, this already-scheduled task
+                    # was never cancelled: it would wake up after its own
+                    # sleep and call coord.async_request_refresh()
+                    # against a coordinator the failed setup attempt
+                    # intended to abandon, well after _run_cleanup_
+                    # callbacks() and _bounded_device_stop() had already
+                    # run. Registered here, immediately after creation --
+                    # matching this project's own established "register
+                    # cleanup right next to resource creation" discipline
+                    # used for every other resource in this same
+                    # function (telemetry, adaptive, keepalive) -- rather
+                    # than a separate, easy-to-forget bookkeeping list.
+                    cleanup_callbacks.append(sync_first_refresh_task.cancel)
                 except Exception:  # noqa: BLE001 — never break entry setup
                     _LOGGER.exception(
                         "SynchronizedPowerCoordinator: could not schedule "
@@ -642,7 +661,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
         # (see const.py) after causing a production outage. Nothing to apply
         # here any more.
 
-        _async_setup_battery_health(hass, entry, device_datas)
+        _async_setup_battery_health(hass, entry, device_datas, cleanup_callbacks.append)
         # v1.2.2: gate BOTH learners across HA start-up and shutdown.
         try:
             _async_register_learning_gates(
@@ -880,6 +899,7 @@ def _async_setup_battery_health(
     hass: HomeAssistant,
     entry: HuaweiSolarConfigEntry,
     device_datas: list[HuaweiSolarDeviceData],
+    register_cleanup: Callable[[Callable[[], object]], None] | None = None,
 ) -> None:
     """Create battery-health managers without touching the setup critical path.
 
@@ -949,7 +969,25 @@ def _async_setup_battery_health(
         try:
             create_task = getattr(entry, "async_create_background_task", None)
             if create_task is not None:
-                create_task(hass, _initialize(), f"battery_health_init_{serial}")
+                init_task = create_task(
+                    hass, _initialize(), f"battery_health_init_{serial}"
+                )
+                # v2.2.0.2 FIX (external ICS audit HS-ICS-002 --
+                # confirmed): this task's handle used to be discarded
+                # immediately here -- unlike the older-HA-cores fallback
+                # branch just below, which already ties its own task to
+                # entry.async_on_unload(). That call is a DIFFERENT
+                # lifecycle hook, though (normal unload of an already-
+                # LOADED entry), and does not fire for a setup attempt
+                # that fails before ever reaching LOADED at all -- which
+                # is exactly this function's own scenario, since it is
+                # only ever called from mid-setup. Registered with THIS
+                # setup attempt's own cleanup_callbacks instead, so a
+                # later step failing in the same attempt cancels this
+                # task too, matching every other per-entry resource in
+                # async_setup_entry.
+                if register_cleanup is not None:
+                    register_cleanup(init_task.cancel)
             else:  # pragma: no cover — older HA cores
                 # v2.0.9 FIX (Phase 4.10, this release -- found during a
                 # log review, not either external audit): this fallback
@@ -969,6 +1007,15 @@ def _async_setup_battery_health(
                 # newer API this fallback exists for.
                 task = hass.async_create_task(_initialize())
                 entry.async_on_unload(task.cancel)
+                # v2.2.0.2 FIX (external ICS audit HS-ICS-002 --
+                # confirmed): entry.async_on_unload's own cancellation,
+                # just above, only fires on normal unload of an
+                # already-LOADED entry -- not for a setup attempt that
+                # fails before ever reaching LOADED. Also registered
+                # with cleanup_callbacks for exactly that case, same
+                # reasoning as the branch above.
+                if register_cleanup is not None:
+                    register_cleanup(task.cancel)
         except Exception:  # noqa: BLE001
             _LOGGER.exception(
                 "battery_health[%s]: could not schedule initialisation", serial
@@ -1581,6 +1628,20 @@ async def _setup_inverter_device_data(
                 entry=entry,
                 start_delay=_staggered_start_delay("optimizer", device_index),
             )
+            # v2.2.0.2 FIX (external ICS audit HS-ICS-002 -- confirmed):
+            # see create_optimizer_update_coordinator's own comment
+            # (update_coordinator.py) on _first_refresh_task for the
+            # full reasoning -- this is the other half of that fix,
+            # registering the already-scheduled task's cancellation
+            # with THIS setup attempt's own cleanup_callbacks, right
+            # next to where every other per-device resource in this
+            # same function already does.
+            if register_cleanup is not None and (
+                optimizer_update_coordinator._first_refresh_task is not None
+            ):
+                register_cleanup(
+                    optimizer_update_coordinator._first_refresh_task.cancel
+                )
             optimizer_update_coordinator.attach_telemetry(telemetry)
             optimizer_update_coordinator.attach_adaptive(adaptive)
         except TimeoutError:

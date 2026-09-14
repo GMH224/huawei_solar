@@ -381,9 +381,28 @@ BATTERY_DEVICE_SCHEMA = vol.Schema({DATA_DEVICE_ID: vol.All(cv.string, str)})
 DATA_PACK_SERIAL_NUMBER = "pack_serial_number"
 DATA_INSTALL_DATE = "install_date"
 
+#: v2.2.0.2 FIX (external ICS audit HS-ICS-006 -- confirmed): generous
+#: but explicit upper bounds for the two free-form strings below --
+#: neither had any size budget at all. A real Huawei battery pack
+#: serial is a few dozen characters at most (see this exact file's own
+#: test fixtures -- e.g. "PACKSERIAL001", "HV2220098926"); 64 leaves
+#: generous headroom. A full ISO-8601 datetime with fractional seconds
+#: and a UTC offset is under 35 characters; 40 leaves headroom for
+#: that too. This is a config/service-call input (requires access to
+#: this HA instance's own automations/services UI, not a remote/
+#: unauthenticated surface) -- the realistic concern is giant values
+#: reaching parsing, exception text, and logs deeper than necessary,
+#: not a remote attack.
+MAX_PACK_SERIAL_LENGTH = 64
+MAX_INSTALL_DATE_LENGTH = 40
+
 SET_PACK_INSTALL_DATE_SCHEMA = BATTERY_DEVICE_SCHEMA.extend({
-    vol.Required(DATA_PACK_SERIAL_NUMBER): cv.string,
-    vol.Required(DATA_INSTALL_DATE): cv.string,
+    vol.Required(DATA_PACK_SERIAL_NUMBER): vol.All(
+        cv.string, vol.Length(max=MAX_PACK_SERIAL_LENGTH)
+    ),
+    vol.Required(DATA_INSTALL_DATE): vol.All(
+        cv.string, vol.Length(max=MAX_INSTALL_DATE_LENGTH)
+    ),
 })
 
 
@@ -497,7 +516,20 @@ SOC_SCHEMA = FORCIBLE_CHARGE_BASE_SCHEMA.extend(
 )
 
 MAXIMUM_FEED_GRID_POWER_SCHEMA = {
-    vol.Required(DATA_POWER): vol.All(vol.Coerce(int), vol.Range(min=-1000)),
+    # v2.2.0.2 FIX (external ICS audit HS-ICS-004 -- confirmed): was
+    # `vol.Range(min=-1000)` -- an asymmetric, undocumented negative
+    # floor with no stated reason anywhere in this file, for a
+    # "maximum feed grid power" setpoint. _validate_power_value()
+    # (below) only ever enforces an UPPER bound against the device's
+    # own reported maximum; nothing rejected a negative value here. A
+    # negative maximum-power setpoint has no documented meaning for
+    # this register, and this project has no evidence (from vendor
+    # documentation or otherwise) that Huawei's own P_MAX register
+    # accepts one. Floored at 0 rather than removing the bound
+    # entirely: if a legitimate negative use turns up later (e.g. a
+    # documented sentinel value), that is a deliberate, evidenced
+    # change to make -- not the absence of any floor at all.
+    vol.Required(DATA_POWER): vol.All(vol.Coerce(int), vol.Range(min=0)),
 }
 
 
@@ -512,6 +544,26 @@ MAXIMUM_FEED_GRID_POWER_PERCENTAGE_SCHEMA = {
 # malformed values like 29:99 that the old "[0-2]\d:\d\d" allowed.
 _TIME = r"(?:[01]\d|2[0-3]):[0-5]\d"
 
+# v2.2.0.2 FIX (external ICS audit HS-ICS-006 -- confirmed): the
+# {0,14}/{0,10} repetition counts below already bound how many RECORDS
+# a period string can contain, but not each record's own token
+# lengths -- every pattern below uses at least one `\d+`, so a single
+# absurdly long digit run (or, more generally, any oversized input)
+# still reached full regex evaluation, and an invalid value is echoed
+# verbatim into this file's own exception text. MAX_PERIODS_STRING_
+# LENGTH is a coarse, safe pre-check applied BEFORE the regex itself
+# runs (this project's own recommended remediation for exactly this
+# finding: "reject oversized input before regex parsing"), sized
+# generously above the longest string every pattern below could ever
+# legitimately produce (14 records x roughly 25 characters each is
+# under 400) without needing to touch any of these patterns' own,
+# already-validated internal structure -- narrowing the per-token
+# `\d+` itself is deliberately left for a separate, more careful pass,
+# to avoid risking a regression in live device-control validation
+# within this same release.
+MAX_PERIODS_STRING_LENGTH = 1000
+
+
 # Period quantifier stays {0,N}: an empty string is a valid "clear all periods"
 # request.  The parsers below skip blank lines so empty input clears safely
 # instead of raising.  The day field requires at least one day ([1-7]{1,7}).
@@ -522,6 +574,7 @@ BATTERY_TOU_PERIODS_SCHEMA = BATTERY_DEVICE_SCHEMA.extend(
     {
         vol.Required(DATA_PERIODS): vol.All(
             cv.string,
+            vol.Length(max=MAX_PERIODS_STRING_LENGTH),
             vol.Match(HUAWEI_LUNA2000_TOU_PATTERN + r"|" + LG_RESU_TOU_PATTERN),
         )
     }
@@ -531,6 +584,7 @@ EMMA_TOU_PERIODS_SCHEMA = EMMA_DEVICE_SCHEMA.extend(
     {
         vol.Required(DATA_PERIODS): vol.All(
             cv.string,
+            vol.Length(max=MAX_PERIODS_STRING_LENGTH),
             vol.Match(HUAWEI_LUNA2000_TOU_PATTERN),
         )
     }
@@ -544,6 +598,7 @@ CAPACITY_CONTROL_PERIODS_SCHEMA = BATTERY_DEVICE_SCHEMA.extend(
     {
         vol.Required(DATA_PERIODS): vol.All(
             cv.string,
+            vol.Length(max=MAX_PERIODS_STRING_LENGTH),
             vol.Match(CAPACITY_CONTROL_PERIODS_PATTERN),
         )
     }
@@ -555,6 +610,7 @@ FIXED_CHARGE_PERIODS_SCHEMA = BATTERY_DEVICE_SCHEMA.extend(
     {
         vol.Required(DATA_PERIODS): vol.All(
             cv.string,
+            vol.Length(max=MAX_PERIODS_STRING_LENGTH),
             vol.Match(FIXED_CHARGE_PERIODS_PATTERN),
         )
     }

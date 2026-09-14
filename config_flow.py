@@ -938,12 +938,48 @@ async def validate_network_setup_login(
         ModbusGuard.release_endpoint(endpoint)
 
 
+#: v2.2.0.2 FIX (external ICS audit HS-ICS-003 -- confirmed): parse_
+#: unit_ids() (below) used to have no length/count/range/uniqueness
+#: limit of any kind -- a config-flow input field accepting a
+#: comma-separated string of ints could be handed an arbitrarily large
+#: number of tokens, arbitrarily large integers, out-of-protocol-range
+#: values, or repeated duplicates, all silently accepted. This is a
+#: config-flow-only input (requires access to this HA instance's own
+#: setup wizard, not a remote/unauthenticated surface), so the
+#: realistic trigger is a copy-paste accident rather than an attacker
+#: -- but validating it properly is still cheap and standard hygiene.
+#: 0-247 is the standard Modbus RTU/TCP unit-id range (0 reserved for
+#: broadcast on RTU, but already treated as a legitimate scan target
+#: by this exact file's own auto-discovery unit_ids_to_scan list, just
+#: above/below -- kept consistent with that existing convention rather
+#: than excluding it here). 32 is a generous cap: RS-485's own
+#: electrical/addressing limits make a real daisy chain longer than
+#: this exceedingly unlikely.
+MIN_SLAVE_ID = 0
+MAX_SLAVE_ID = 247
+MAX_SLAVE_ID_COUNT = 32
+
+
 def parse_unit_ids(unit_ids: str) -> list[int]:
     """Parse unit ids string into list of ints."""
     try:
-        return list(map(int, unit_ids.split(",")))
+        parsed = list(map(int, unit_ids.split(",")))
     except ValueError as err:
         raise UnitIdsParseException from err
+    # v2.2.0.2 FIX (external ICS audit HS-ICS-003 -- confirmed): see
+    # this function's own constants, just above, for the full
+    # reasoning behind each of the three checks below.
+    if not parsed or len(parsed) > MAX_SLAVE_ID_COUNT:
+        raise UnitIdsParseException(
+            f"expected 1-{MAX_SLAVE_ID_COUNT} unit ids, got {len(parsed)}"
+        )
+    if len(set(parsed)) != len(parsed):
+        raise UnitIdsParseException("duplicate unit ids are not allowed")
+    if any(not (MIN_SLAVE_ID <= uid <= MAX_SLAVE_ID) for uid in parsed):
+        raise UnitIdsParseException(
+            f"unit ids must be between {MIN_SLAVE_ID} and {MAX_SLAVE_ID}"
+        )
+    return parsed
 
 
 class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -1492,8 +1528,17 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 return await self.async_step_auto_discovery()
 
             try:
-                self._slave_ids = list(map(int, user_input[CONF_SLAVE_IDS].split(",")))
-            except ValueError:
+                # v2.2.0.2 FIX (external ICS audit HS-ICS-003 --
+                # confirmed): this used to be its own inline
+                # `list(map(int, ...))`, duplicating parse_unit_ids()
+                # (this file, above) without any of its validation --
+                # every other slave-id entry point in this file already
+                # goes through the shared function. Now does too, so
+                # this step gets the same length/range/uniqueness
+                # checks for free, and any future change to those rules
+                # only has to be made in one place.
+                self._slave_ids = parse_unit_ids(user_input[CONF_SLAVE_IDS])
+            except UnitIdsParseException:
                 errors["base"] = "invalid_slave_ids"
             else:
                 return await self.async_step_manual_connect()

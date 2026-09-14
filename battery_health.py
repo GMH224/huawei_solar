@@ -745,6 +745,35 @@ class CeilingMonitor:
 # ═════════════════════════════════════════════════════════════════════════════
 # SOH_cap — discharge segment harvesting
 # ═════════════════════════════════════════════════════════════════════════════
+#: v2.2.0.2 FIX (external ICS audit HS-ICS-007 -- confirmed): the full
+#: set of literal bucket names _condition_bucket_key() (below) can
+#: produce -- kept as a parallel enumeration rather than restructuring
+#: that already-working function to consume these names dynamically
+#: (a bigger, riskier diff for a working, validated function, for
+#: little real benefit). A dedicated regression test asserts every
+#: string _condition_bucket_key() can actually produce is a member of
+#: _VALID_CONDITION_BUCKET_KEYS (below), so the two cannot silently
+#: drift apart without a test failure calling it out.
+_CONDITION_TEMP_BUCKETS = ("temp_unknown", "cold", "cool", "nominal", "warm", "hot")
+_CONDITION_RATE_BUCKETS = ("low_rate", "nominal_rate", "high_rate")
+
+#: v2.2.0.2 FIX (external ICS audit HS-ICS-007 -- confirmed): every
+#: legitimate key condition_coverage (SegmentTracker.restore(), below)
+#: can ever contain, in real operation -- exactly the same situation as
+#: BatteryHealthEngine._held (see that field's own v2.2.0.1 restore
+#: fix): a small, fully-known key space (6 temp buckets x 3 rate
+#: buckets = 18 combinations) that real code only ever reads via
+#: `.get(key, 0) + 1` for one of these 18 specific strings, never by
+#: iterating the dict to prune unrecognised ones. A corrupted or
+#: hand-edited storage file could previously inject an arbitrary
+#: number of garbage keys here with nothing to ever clean them up.
+_VALID_CONDITION_BUCKET_KEYS = frozenset(
+    f"{temp}:{rate}"
+    for temp in _CONDITION_TEMP_BUCKETS
+    for rate in _CONDITION_RATE_BUCKETS
+)
+
+
 def _condition_bucket_key(
     cfg: BatteryHealthConfig, avg_temp_c: float | None, avg_power_w: float,
 ) -> str:
@@ -1472,8 +1501,16 @@ class SegmentTracker:
         # applied here instead.
         self.reference_epochs = _bounded_epoch_log(data.get("reference_epochs", []))
         self.stale_endpoint_skips = int(data.get("stale_endpoint_skips", 0))
+        # v2.2.0.2 FIX (external ICS audit HS-ICS-007 -- confirmed): this
+        # dict used to be constructed with no key filter at all -- see
+        # _VALID_CONDITION_BUCKET_KEYS's own comment (module scope,
+        # above) for why its legitimate key space is small and fully
+        # known, and why a precise filter is used here rather than a
+        # size cap (the same choice already made for
+        # BatteryHealthEngine._held's own v2.2.0.1 restore fix).
         self.condition_coverage = {
             str(k): int(v) for k, v in data.get("condition_coverage", {}).items()
+            if str(k) in _VALID_CONDITION_BUCKET_KEYS
         }
         self.combined_norm_floor_hits = int(data.get("combined_norm_floor_hits", 0))
         self._gap_pending = False
