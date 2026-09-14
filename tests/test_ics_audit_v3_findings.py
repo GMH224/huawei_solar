@@ -73,9 +73,24 @@ def _find_func(tree, name, cls=ast.AsyncFunctionDef):
 class TestFinding1CleanupCoversAllThreeSingletons(unittest.TestCase):
     def test_telemetry_stop_is_registered(self):
         source = _INIT_SRC.read_text()
-        assert "register_cleanup(telemetry.stop)" in source, (
-            "telemetry.stop is not registered for cleanup -- this "
+        # v2.2.0.1 FIX (external ICS audit ICS-011 -- confirmed): the
+        # literal "register_cleanup(telemetry.stop)" this test used to
+        # check for was itself the ICS-011 defect -- it registered
+        # ONLY .stop(), never ModbusTelemetry.remove(serial), so a
+        # retry after a failed setup got back the same, permanently-
+        # dead telemetry singleton. Now registered via a small combined
+        # closure that calls both, in the same order the normal
+        # (successful) unload path already used. This test's own
+        # original intent -- confirm telemetry cleanup is registered at
+        # all -- still holds; it now also confirms the closure calls
+        # the actual .stop() method, not just that some callback exists.
+        assert "register_cleanup(_stop_and_remove_telemetry)" in source, (
+            "telemetry cleanup is not registered at all -- this "
             "reintroduces Finding 1 for telemetry."
+        )
+        assert "t.stop()" in source and "ModbusTelemetry.remove(serial)" in source, (
+            "the telemetry rollback closure no longer calls both stop() "
+            "and remove() -- this reintroduces ICS-011."
         )
 
     def test_adaptive_async_unload_is_registered(self):

@@ -382,16 +382,32 @@ class TestSlowTierTTL(unittest.TestCase):
         self.assertEqual(RC._TIER_BASE_TTL[Tier.NORMAL], 30.0)
 
     def test_ttl_override_is_clamped(self):
-        original = RC._TIER_BASE_TTL[Tier.SLOW]
-        try:
-            RC.set_slow_tier_ttl(10)
-            self.assertGreaterEqual(RC._TIER_BASE_TTL[Tier.SLOW], 300.0)
-            RC.set_slow_tier_ttl(999999)
-            self.assertLessEqual(RC._TIER_BASE_TTL[Tier.SLOW], 3600.0)
-            RC.set_slow_tier_ttl(1200)
-            self.assertEqual(RC._TIER_BASE_TTL[Tier.SLOW], 1200.0)
-        finally:
-            RC._TIER_BASE_TTL[Tier.SLOW] = original
+        # v2.2.0.1 FIX (external ICS audit ICS-004 -- confirmed): the
+        # module-level free function set_slow_tier_ttl(), which mutated
+        # the shared _TIER_BASE_TTL dict in place, was removed entirely
+        # -- that shared mutation was itself the defect (a second
+        # config entry's own TTL option silently changed every OTHER
+        # entry's cache behaviour too). Clamping is now verified against
+        # a RegisterCache INSTANCE's own set_slow_tier_ttl() method and
+        # its own _tier_base_ttl copy, matching how every real caller
+        # (update_coordinator.py's own RegisterCache(...) construction)
+        # actually uses this now. The module-level _TIER_BASE_TTL dict
+        # itself is asserted unchanged throughout, confirming instances
+        # no longer share it at all.
+        original_module_default = RC._TIER_BASE_TTL[Tier.SLOW]
+        cache = RC.RegisterCache()
+        cache.set_slow_tier_ttl(10)
+        self.assertGreaterEqual(cache._tier_base_ttl[Tier.SLOW], 300.0)
+        cache.set_slow_tier_ttl(999999)
+        self.assertLessEqual(cache._tier_base_ttl[Tier.SLOW], 3600.0)
+        cache.set_slow_tier_ttl(1200)
+        self.assertEqual(cache._tier_base_ttl[Tier.SLOW], 1200.0)
+        self.assertEqual(
+            RC._TIER_BASE_TTL[Tier.SLOW], original_module_default,
+            "the shared module-level default changed as a side effect "
+            "of one instance's set_slow_tier_ttl() call -- ICS-004 has "
+            "regressed.",
+        )
 
 
 class TestCoalescingAndNightDeferralAreGone(unittest.TestCase):

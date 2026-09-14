@@ -67,6 +67,24 @@ class _StubGuard:  # minimal stand-in; individual tests inject their own mock
         return cls()
 _guard_mod.ModbusGuard = _StubGuard
 
+# v2.2.0.1 FIX (external ICS audit ICS-010 -- confirmed): modbus_keepalive.py
+# now also imports tmodbus.exceptions.TModbusError (see that fix's own
+# comment in modbus_keepalive.py for why) -- stubbed here the same way
+# every other real dependency in this self-contained test file already
+# is, rather than requiring the actual tmodbus package to be installed.
+_tmodbus_pkg = types.ModuleType("tmodbus")
+_tmodbus_pkg.__path__ = []
+_tmodbus_exc = types.ModuleType("tmodbus.exceptions")
+
+
+class TModbusError(Exception):
+    pass
+
+
+_tmodbus_exc.TModbusError = TModbusError
+sys.modules.setdefault("tmodbus", _tmodbus_pkg)
+sys.modules.setdefault("tmodbus.exceptions", _tmodbus_exc)
+
 
 # v2.0.0a (F08, external ICS audit): modbus_keepalive.py now imports
 # ModbusAdmissionTimeout from .modbus_guard to distinguish a bus-congestion
@@ -421,7 +439,9 @@ class TestQueueShedVsDeviceTimeout(unittest.TestCase):
         just inferred from the behavioural tests above."""
         source = pathlib.Path(_MOD.__file__).read_text()
         shed_idx = source.find("except ModbusQueueShed as exc:")
-        generic_idx = source.find("except (TimeoutError, HuaweiSolarException, OSError) as exc:")
+        generic_idx = source.find(
+            "except (TimeoutError, HuaweiSolarException, TModbusError, OSError) as exc:"
+        )
         self.assertGreater(shed_idx, -1, "no dedicated ModbusQueueShed handler found")
         self.assertGreater(generic_idx, -1)
         self.assertLess(

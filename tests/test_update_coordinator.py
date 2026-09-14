@@ -399,10 +399,20 @@ class TestPhase47WriteVerificationCoalescing(unittest.TestCase):
     def test_done_callback_cleans_up_the_tracking_dict(self):
         """Adversarial: without cleanup, _verify_write_tasks would leak
         one entry per register ever written to, for the coordinator's
-        entire lifetime."""
-        body = self._method_body("schedule_verify_write")
-        self.assertIn("task.add_done_callback(", body)
-        self.assertIn("self._verify_write_tasks.pop(n, None)", body)
+        entire lifetime.
+
+        v2.2.0.1 FIX (external ICS audit ICS-019 -- confirmed): the
+        pop-and-cleanup logic used to be an inline lambda passed
+        directly to add_done_callback() here; moved to its own method,
+        _on_verify_write_task_done(), so it could also retrieve and log
+        any unexpected task exception (see that method's own docstring)
+        -- something a one-line lambda can't reasonably do. Checked
+        there now instead of in schedule_verify_write's own body."""
+        schedule_body = self._method_body("schedule_verify_write")
+        self.assertIn("task.add_done_callback(", schedule_body)
+        self.assertIn("_on_verify_write_task_done", schedule_body)
+        callback_body = self._method_body("_on_verify_write_task_done")
+        self.assertIn("self._verify_write_tasks.pop(name, None)", callback_body)
 
     def test_done_callback_checks_identity_before_popping(self):
         """Adversarial: the done-callback for an OLD (cancelled) task
@@ -410,15 +420,21 @@ class TestPhase47WriteVerificationCoalescing(unittest.TestCase):
         NEWER task has since replaced it, popping unconditionally would
         incorrectly clear the current task's own tracking entry too.
         Must check 'is this callback's own task still the one tracked'
-        before popping."""
-        body = self._method_body("schedule_verify_write")
-        idx = body.find("self._verify_write_tasks.pop(n, None)")
+        before popping.
+
+        v2.2.0.1 FIX (external ICS audit ICS-019 -- confirmed): see
+        test_done_callback_cleans_up_the_tracking_dict's own comment
+        immediately above for why this now checks
+        _on_verify_write_task_done's body instead of schedule_verify_
+        write's."""
+        callback_body = self._method_body("_on_verify_write_task_done")
+        idx = callback_body.find("self._verify_write_tasks.pop(name, None)")
         assert idx > -1
-        window = body[max(0, idx - 200): idx + 150]
+        window = callback_body[max(0, idx - 200): idx + 50]
         self.assertIn(
-            "self._verify_write_tasks.get(n) is t", window,
-            "the done-callback must check identity (is t still the "
-            "tracked task for n) before popping -- otherwise a stale "
+            "self._verify_write_tasks.get(name) is task", window,
+            "the done-callback must check identity (is task still the "
+            "tracked task for name) before popping -- otherwise a stale "
             "callback could clobber a newer task's own entry",
         )
 
