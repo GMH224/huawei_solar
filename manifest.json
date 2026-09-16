@@ -15,7 +15,7 @@
         "@GMH224"
     ],
     "iot_class": "local_polling",
-    "version": "2.2.0.2",
+    "version": "2.3.0.0",
     "loggers": [
         "huawei_solar",
         "tmodbus"

@@ -1382,11 +1382,20 @@ async def set_emma_tou_periods(
 # it actually supports against its own target. EMMA rejects a non-LUNA
 # period string exactly as before; the direct-battery path accepts both
 # LUNA2000 and LG_RESU forms exactly as before.
+#
+# v2.3.0.0 FIX (HS-230-001, found during this release's own review):
+# v2.2.0.2's HS-ICS-006 length cap was added to BATTERY_TOU_PERIODS_
+# SCHEMA and EMMA_TOU_PERIODS_SCHEMA, but neither has been REGISTERED
+# since v2.1.0.1 replaced them with this dispatcher -- so the schema
+# that actually guards `set_tou_periods` never received it, and an
+# oversized string still reached full regex evaluation. Same cap, same
+# position (before vol.Match), applied where it is actually enforced.
 TOU_PERIODS_DISPATCH_SCHEMA = vol.Schema(
     {
         vol.Required(DATA_DEVICE_ID): vol.All(cv.string, str),
         vol.Required(DATA_PERIODS): vol.All(
             cv.string,
+            vol.Length(max=MAX_PERIODS_STRING_LENGTH),
             vol.Match(
                 HUAWEI_LUNA2000_TOU_PATTERN + r"|" + LG_RESU_TOU_PATTERN
             ),

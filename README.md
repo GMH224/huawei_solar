@@ -11,6 +11,7 @@ This integration exposes the information and functions made available by Huawei 
 
 - [Screenshots](#screenshots)
 - [Battery Health Index](#battery-health-index)
+- [Battery time-of-use schedule](#battery-time-of-use-schedule)
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
 - [Inverter polling frequency](#inverter-polling-frequency)
@@ -54,6 +55,50 @@ measured-vs-model divergence early-warning sensor. No extra polling, no
 register writes. Tunables are exposed via the integration's *Configure*
 dialog. Full design rationale, formulas, and limitations:
 [BATTERY_HEALTH.md](BATTERY_HEALTH.md).
+
+## Battery time-of-use schedule
+
+Since **v2.3.0.0** the time-of-use (TOU) periods of a directly connected
+Huawei **LUNA2000** battery can be edited from the battery device page
+(*Configuration* section), not only through the `set_tou_periods` service.
+Parameter configuration ("Elevate permissions") must be enabled.
+
+There is one **TOU period N** entity per slot (1 to 14). Slots 1-4 are shown
+by default; slots 5-14 exist but are hidden (unhide them under
+*Settings → Devices & services → Entities*). The entities are available in
+**every** storage working mode, so you can prepare a schedule while the
+battery is still in *Maximum self consumption* and switch the working mode to
+*Time of use* afterwards. The periods only take effect in *Time of use* mode.
+
+Each slot holds one period:
+
+```
+HH:MM-HH:MM/DAYS/FLAG        e.g.  00:00-06:00/1234567/+
+```
+
+| Part | Meaning |
+|---|---|
+| `HH:MM-HH:MM` | Start and end, 00:00-23:59. Start must be before end (no crossing midnight; use `23:59` as the latest end). |
+| `DAYS` | 1 = Monday … 7 = Sunday, each at most once, any order. |
+| `FLAG` | `+` = charge, `-` = discharge. |
+| *(empty)* | Remove the period in this slot. |
+
+How edits behave:
+
+- Setting a slot that already has a period **replaces** it.
+- Setting a slot beyond the last configured period **appends** it (so it
+  appears in the next free slot, not necessarily the one you typed in).
+- Clearing a slot **removes** that period; later periods move up one slot.
+- Periods must not overlap on the same day. An invalid or overlapping entry
+  is rejected with a message naming the slots and day, and **nothing is
+  written** to the inverter.
+- Every edit re-reads the current schedule from the inverter first, so
+  changes made meanwhile in the FusionSolar app are not overwritten.
+
+Not covered by these entities (the `set_tou_periods` service still works
+for them): LG RESU batteries (price periods) and installations with an EMMA,
+which manages the battery itself. A period set elsewhere with an end time of
+24:00 is displayed as-is; to edit it, enter `23:59`.
 
 ## Prerequisites
 

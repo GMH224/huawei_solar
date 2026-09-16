@@ -1152,6 +1152,11 @@
       "storage_charge_from_grid_function": {
         "name": "Charge from grid"
       }
+    },
+    "text": {
+      "tou_period": {
+        "name": "TOU period {slot}"
+      }
     }
   },
   "exceptions": {
@@ -1196,6 +1201,39 @@
     },
     "wrong_device_type": {
       "message": "Got wrong Huawei Solar device type for ID {device_id}: expected {expected_type}, got {actual_type}"
+    },
+    "tou_period_invalid_format": {
+      "message": "Invalid time-of-use period \"{value}\". Use HH:MM-HH:MM/DAYS/+ or -, for example 00:00-06:00/1234567/+ (days: 1 = Monday ... 7 = Sunday; leave empty to clear the slot)."
+    },
+    "tou_period_too_long": {
+      "message": "Time-of-use period text is {length} characters long; the maximum is {max}."
+    },
+    "tou_period_duplicate_days": {
+      "message": "Time-of-use period \"{value}\" lists the same day more than once."
+    },
+    "tou_period_start_not_before_end": {
+      "message": "Time-of-use period start {start} must be before its end {end}. Periods cannot cross midnight; use 23:59 as the latest end time."
+    },
+    "tou_period_too_many": {
+      "message": "A schedule can hold at most {max} time-of-use periods (got {count})."
+    },
+    "tou_period_overlap": {
+      "message": "Time-of-use period in slot {slot_a} overlaps the period in slot {slot_b} on {day}. Nothing was written."
+    },
+    "tou_period_invalid_slot": {
+      "message": "Time-of-use slot {slot} is out of range (1 to {max})."
+    },
+    "tou_period_read_failed": {
+      "message": "Could not read the current time-of-use schedule from {device}. Nothing was written."
+    },
+    "tou_period_write_rejected": {
+      "message": "The inverter {device} did not accept the new time-of-use schedule."
+    },
+    "tou_period_timeout": {
+      "message": "Timed out after {seconds}s updating the time-of-use schedule on {device}; the inverter may be busy. Check the schedule and try again."
+    },
+    "tou_period_device_error": {
+      "message": "Updating the time-of-use schedule on {device} failed ({error})."
     }
   },
   "services": {

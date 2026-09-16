@@ -232,6 +232,10 @@ PLATFORMS: list[Platform] = [
     Platform.SELECT,
     Platform.SENSOR,
     Platform.SWITCH,
+    # v2.3.0.0: new platform -- per-slot editable LUNA2000 time-of-use
+    # period entities (text.py). Only creates entities when parameter
+    # configuration is enabled and a direct LUNA2000 battery is present.
+    Platform.TEXT,
 ]
 
 

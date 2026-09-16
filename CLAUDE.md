@@ -1,7 +1,9 @@
 # CLAUDE.md — Huawei Solar Integration
 
 > **Maintained by Claude (Anthropic) on behalf of the community.**
-> Current version: **1.3.21** — see `manifest.json`.
+> Current version: **2.3.0.0** — see `manifest.json`.
+> Releases 2.0.0 – 2.2.0.2 are documented in their own `AUDIT_<version>.md`
+> files rather than in §8 below; 2.3.0.0 is recorded in both.
 
 ---
 
@@ -35,6 +37,8 @@ library. Exposes:
 | `number` | Max charge/discharge power, end-of-charge SOC |
 | `select` | Storage working mode, TOU settings |
 | `switch` | Grid-tied switch, forcible charge |
+| `date` | Per-pack battery install date (v2.0.12) |
+| `text` | Per-slot LUNA2000 time-of-use periods (v2.3.0.0) |
 | `button` | Reset / trigger actions |
 
 ### Supported hardware
@@ -77,6 +81,9 @@ homeassistant/
         ├── select.py        # SelectEntity (enum registers)
         ├── switch.py        # SwitchEntity (boolean registers)
         ├── button.py        # ButtonEntity (one-shot actions)
+        ├── date.py          # DateEntity (per-pack install date, v2.0.12)
+        ├── text.py          # ← NEW (2.3.0.0): TextEntity, per-slot TOU periods
+        ├── tou_periods.py   # ← NEW (2.3.0.0): pure TOU grammar/validation (no HA imports)
         ├── services.py      # HA service definitions
         ├── config_flow.py   # UI-based config flow
         ├── diagnostics.py   # HA diagnostics dump
@@ -93,7 +100,8 @@ homeassistant/
             ├── test_synchronized_power_coordinator.py
             ├── test_battery_health.py
             ├── test_battery_health_entities.py          ← NEW (1.1.7)
-            └── test_battery_health_isolation.py         ← NEW (1.1.7)
+            ├── test_battery_health_isolation.py         ← NEW (1.1.7)
+            └── test_tou_period_text.py                  ← NEW (2.3.0.0)
 ```
 
 ---
@@ -281,6 +289,40 @@ Now resets **both** `STORAGE_FORCIBLE_CHARGE_POWER` and
 `STORAGE_FORCIBLE_DISCHARGE_POWER` to 0 on stop. Previously only the discharge
 register was cleared, leaving a stale charge-power value in the inverter.
 
+### Time-of-use period slots (v2.3.0.0, `text.py` + `tou_periods.py`)
+
+Fourteen `text` entities, **TOU period 1 … 14**, on the battery device
+(`EntityCategory.CONFIG`), one per slot of
+`STORAGE_HUAWEI_LUNA2000_TIME_OF_USE_CHARGING_AND_DISCHARGING_PERIODS`.
+Slots 1–4 visible by default, 5–14 hidden-by-default (still enabled).
+Unique id: `{inverter_serial}_{register}_slot_{n}`.
+
+- **Why 14 entities, not one:** HA caps entity state at 255 chars
+  (`MAX_LENGTH_STATE_STATE`); a full schedule needs ~307.
+- **Not gated on working mode** — schedule must be editable before
+  switching to TOU mode.
+- **Created only when:** parameter configuration enabled, SUN2000 inverter
+  with configuration coordinator, connected battery is LUNA2000, and **no
+  EMMA anywhere in the entry** (`tou_slot_entities_eligible()`).
+- **Grammar:** one line of `set_tou_periods` (`HH:MM-HH:MM/DAYS/±`), ASCII
+  digits only, 24:00 refused on input, duplicate days refused, empty =
+  clear. No HA `pattern` attribute (HA would also apply it to the
+  *displayed* device value, e.g. a FusionSolar-set 24:00).
+- **Slot semantics:** replace in place / append past end / clear shifts
+  later periods up / clearing an empty slot is a no-op.
+- **Write path (keep this order):** parse → `get_device_write_lock(serial)`
+  (shared with services.py) → one `_guarded_write_sequence()` hold
+  covering *fresh* `device.get()` + `apply_slot_edit()` + skip-if-unchanged
+  + `validate_periods()` + one `write()` → `invalidate_cache()` +
+  `schedule_verify_write()` → `async_request_refresh()` (after lock
+  release). Library `encode()` re-validates as a second gate.
+- **Errors:** `TouPeriodError` → `ServiceValidationError` (translated
+  `tou_period_*` keys); timeouts/guard shedding → `tou_period_timeout`;
+  `HuaweiSolarException` → `tou_period_device_error`; `set()` returning
+  False → `tou_period_write_rejected`.
+- `available` = coordinator healthy **and** register present
+  (`CoordinatorEntity.available` alone ignores `_attr_available`).
+
 ### Number entities
 
 | Entity | Unit | Range | Step |
@@ -314,6 +356,19 @@ fix that calls `_evict()` from `record_failure()` and `record_timeout()`.
 ---
 
 ## 8. Changelog
+
+### v2.3.0.0 (2026-09-16)
+**Editable LUNA2000 time-of-use periods + HS-230-001**
+
+- New `text` platform: per-slot **TOU period 1–14** entities on the battery
+  device, available in every working mode (§6). New pure module
+  `tou_periods.py`.
+- **HS-230-001 (fix):** `TOU_PERIODS_DISPATCH_SCHEMA` — the schema actually
+  registered for `set_tou_periods` since 2.1.0.1 — lacked the
+  `MAX_PERIODS_STRING_LENGTH` cap that 2.2.0.2 (HS-ICS-006) added only to the
+  two unregistered schemas.
+- New `tests/test_tou_period_text.py` (96 tests); version-pin test updated.
+- Full record: `AUDIT_2.3.0.0.md`.
 
 ### v1.1.4 (2026-06-20)
 **Code optimization + entity-layer test coverage**
@@ -3125,6 +3180,17 @@ All tests stub HA imports and the `huawei-solar` library.
 3. Add translation strings to `strings.json` and `translations/en.json`
    under `entity.sensor.<key>.name`.
 
+### Adding a new platform
+
+1. Add the `Platform.X` member to `PLATFORMS` in `__init__.py`.
+2. Gate entity creation on `CONF_ENABLE_PARAMETER_CONFIGURATION` for any
+   writable entity.
+3. Route every write through `types.py` (`_guarded_write()` /
+   `_guarded_write_sequence()`), and multi-step or read-modify-write
+   commands additionally through `get_device_write_lock()`.
+4. Keep pure logic in an HA-free module so it can be tested against the
+   real `huawei-solar` library (see `tou_periods.py`).
+
 ### Adding a new HA service
 
 1. `SERVICE_<NAME> = "name"` in `const.py`.
@@ -3182,3 +3248,4 @@ for f in list(base.glob('*.json')) + list(base.glob('translations/*.json')):
 | 5 | Med | `modbus_telemetry.py` | `record_failure/timeout` skip `_evict()` | Unbounded deques during outages |
 | 6 | Med | `const.py` | `SERVICE_SET_MAXIMUM_FEED_GRID_POWER_PERCENT` missing from `SERVICES` | Service leaks on unload |
 | 7 | Low | `update_coordinator.py` | `_day_interval` falls back to `UPDATE_TIMEOUT` | Night-mode and cache use request timeout as poll interval |
+| HS-230-001 | Med | `services.py` | Length cap added to unregistered TOU schemas only | Oversized `set_tou_periods` input still reached regex evaluation |
