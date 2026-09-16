@@ -39,7 +39,7 @@ class TestWritePermissionProbeOrdering(unittest.TestCase):
                 n for n in ast.walk(func)
                 if isinstance(n, ast.If) and isinstance(n.test, ast.BoolOp)
                 and any(
-                    isinstance(v, ast.Await) for v in n.test.values
+                    self._contains_await(v) for v in n.test.values
                 )
             ),
             None,
@@ -50,9 +50,18 @@ class TestWritePermissionProbeOrdering(unittest.TestCase):
         )
         return if_stmt.test
 
+    @staticmethod
+    def _contains_await(node: ast.AST) -> bool:
+        # v2.3.0.1 (HS-2301-003): the probe is now nested as
+        # `(not probe_write_permission or await ...)`, so the awaited call
+        # is no longer a direct value of the top-level `and`. The guarded
+        # invariant is unchanged: the value CONTAINING the await must
+        # still come after the free coordinator check.
+        return any(isinstance(n, ast.Await) for n in ast.walk(node))
+
     def _index_of_await(self, boolop: ast.BoolOp) -> int:
         for i, v in enumerate(boolop.values):
-            if isinstance(v, ast.Await):
+            if self._contains_await(v):
                 return i
         raise AssertionError("No Await found in the condition's values")
 

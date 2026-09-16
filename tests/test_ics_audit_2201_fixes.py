@@ -436,10 +436,10 @@ class TestHVC002DeclaredMinimumMatchesReleaseBaseline(unittest.TestCase):
         self.assertEqual(hacs["homeassistant"], "2026.9.0")
 
     def test_manifest_version_bumped(self):
-        # v2.3.0.0: updated from "2.2.0.2" -- this assertion pins the
+        # v2.3.0.1: updated from "2.3.0.0" (was "2.2.0.2") -- this assertion pins the
         # CURRENT release's version and must move with every bump.
         manifest = json.loads((_ROOT / "manifest.json").read_text())
-        self.assertEqual(manifest["version"], "2.3.0.0")
+        self.assertEqual(manifest["version"], "2.3.0.1")
 
     def test_no_stray_2025_9_reference_in_shipped_production_files(self):
         """Whole-tree regression sweep, matching this project's own G12
