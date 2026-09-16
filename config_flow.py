@@ -46,6 +46,8 @@ from .const import (
     CONF_BH_AMBIENT_ENTITY,
     CONF_SLOW_TIER_TTL_S,
     CONF_SYNC_POWER_DEDICATED_READS,
+    CONF_WRITE_PERMISSION_PROBE,
+    DEFAULT_WRITE_PERMISSION_PROBE,
     DEFAULT_SLOW_TIER_TTL_S,
     CONF_BH_ENABLED,
     CONF_BH_INSTALL_DATE,
@@ -2072,6 +2074,15 @@ class BatteryHealthOptionsFlowHandler(OptionsFlowWithReload):
                 vol.Optional(
                     CONF_SYNC_POWER_DEDICATED_READS,
                     default=options.get(CONF_SYNC_POWER_DEDICATED_READS, True),
+                ): bool,
+                # v2.3.0.1 (HS-2301-003): off by default. The probe writes
+                # the time-zone register back on every start/reload; see
+                # const.py's CONF_WRITE_PERMISSION_PROBE.
+                vol.Optional(
+                    CONF_WRITE_PERMISSION_PROBE,
+                    default=options.get(
+                        CONF_WRITE_PERMISSION_PROBE, DEFAULT_WRITE_PERMISSION_PROBE
+                    ),
                 ): bool,
                 vol.Optional(
                     CONF_SLOW_TIER_TTL_S,

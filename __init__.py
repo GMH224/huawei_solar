@@ -221,6 +221,68 @@ async def _run_cleanup_callbacks(callbacks: list[Callable[[], object]]) -> None:
                 "Error while cleaning up a resource after a failed setup attempt"
             )
 
+
+# v2.3.0.1 FIX (HS-2301-001, found from a field log -- confirmed):
+# strong references to rollback tasks started by _await_rollback_shielded.
+# asyncio only keeps WEAK references to running tasks, so an otherwise
+# unreferenced rollback task could be garbage-collected mid-way.
+_ROLLBACK_TASKS: set[asyncio.Task[None]] = set()
+
+
+async def _await_rollback_shielded(
+    rollback: Callable[[], Any], what: str
+) -> None:
+    """Run ``rollback()`` to completion even though the caller was cancelled.
+
+    v2.3.0.1 FIX (HS-2301-001). Used ONLY from ``except
+    asyncio.CancelledError`` handlers in async_setup_entry().
+
+    Why a separate task plus ``asyncio.shield``:
+
+    * ``asyncio.CancelledError`` derives from ``BaseException``, not
+      ``Exception``, so none of async_setup_entry's existing rollback
+      handlers ran when Home Assistant cancelled a setup attempt. The TCP
+      connection, keep-alive probe, first-refresh tasks, telemetry and
+      the ModbusGuard endpoint reference all stayed alive and kept using
+      the bus -- competing with the NEXT setup attempt on an already
+      slow gateway. That is the field symptom this fixes.
+    * The rollback runs in its own task, so its internal
+      ``asyncio.wait_for``/``asyncio.timeout`` bounds see a task with a
+      clean cancellation count and behave normally.
+    * ``shield`` means that if the caller is cancelled AGAIN while
+      waiting, the rollback still finishes in the background instead of
+      being abandoned half-way. Every step is already bounded (task
+      cancels, a local storage flush, the DISCONNECT_TIMEOUT-bounded
+      device stop, a lock-count release), so the background task cannot
+      run indefinitely.
+
+    The rollback performs NO Modbus reads or writes of its own; it only
+    stops activity and closes the connection.
+
+    Never raises: failures are logged, and the caller re-raises the
+    original CancelledError itself.
+    """
+
+    async def _runner() -> None:
+        try:
+            result = rollback()
+            if inspect.isawaitable(result):
+                await result
+        except Exception:  # noqa: BLE001 — rollback must never raise into the cancel path
+            _LOGGER.exception("Error while rolling back after %s", what)
+
+    task: asyncio.Task[None] = asyncio.ensure_future(_runner())
+    _ROLLBACK_TASKS.add(task)
+    task.add_done_callback(_ROLLBACK_TASKS.discard)
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        _LOGGER.warning(
+            "Cancelled again while rolling back after %s; the rollback "
+            "continues in the background",
+            what,
+        )
+
 PLATFORMS: list[Platform] = [
     Platform.BUTTON,
     # v2.0.12 (Battery Phase 5B UI restructuring, this release): new
@@ -377,6 +439,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
             # fix, so a non-timeout failure skipped client cleanup
             # entirely rather than merely handling it differently.
             await _bounded_client_disconnect(client)
+            raise
+        except asyncio.CancelledError:
+            # v2.3.0.1 FIX (HS-2301-001): cancellation is a BaseException,
+            # so the `except Exception` above never saw it and the raw
+            # connection stayed open. primary_device is still None here,
+            # so the outer cancellation handler cannot reach this client.
+            await _await_rollback_shielded(
+                lambda: _bounded_client_disconnect(client),
+                "a cancelled inverter identification",
+            )
             raise
 
         if entry.data.get(CONF_ENABLE_PARAMETER_CONFIGURATION):
@@ -776,6 +848,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
             # v2.0.0b (MOD-16): see the ConnectionInterruptedException
             # handler's own note above on this same fix.
             await _bounded_device_stop(primary_device)
+        raise
+
+    except asyncio.CancelledError:
+        # v2.3.0.1 FIX (HS-2301-001, field log -- confirmed): the same
+        # rollback as the `except Exception` handler above. Home Assistant
+        # cancelling a setup attempt (a second reload click, a restart, or
+        # its own setup timeout) previously skipped every handler above,
+        # because CancelledError is a BaseException. The partially started
+        # entry then kept polling and probing the gateway in the
+        # background. The cancellation is always re-raised unchanged.
+        device_to_stop = primary_device
+
+        async def _rollback() -> None:
+            await _run_cleanup_callbacks(cleanup_callbacks)
+            if device_to_stop is not None:
+                await _bounded_device_stop(device_to_stop)
+
+        await _await_rollback_shielded(_rollback, "a cancelled setup attempt")
         raise
 
     # v2.2.0.1 FIX (external ICS audit HVC-003 -- confirmed): the platform-

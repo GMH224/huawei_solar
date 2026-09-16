@@ -48,7 +48,13 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DATA_DEVICE_DATAS, DATA_SYNC_POWER_COORDINATOR, WRITE_PERMISSION_CHECK_TIMEOUT
+from .const import (
+    CONF_WRITE_PERMISSION_PROBE,
+    DATA_DEVICE_DATAS,
+    DATA_SYNC_POWER_COORDINATOR,
+    DEFAULT_WRITE_PERMISSION_PROBE,
+    WRITE_PERMISSION_CHECK_TIMEOUT,
+)
 from .adaptive_modbus import AdaptiveModbusController, create_adaptive_entities
 from .battery_health_entities import (
     create_battery_health_entities,
@@ -1212,7 +1218,11 @@ async def _has_write_permission_bounded(
         return False
 
 
-async def create_sun2000_entities(ucs: HuaweiSolarInverterData) -> list[SensorEntity]:
+async def create_sun2000_entities(
+    ucs: HuaweiSolarInverterData,
+    *,
+    probe_write_permission: bool = DEFAULT_WRITE_PERMISSION_PROBE,
+) -> list[SensorEntity]:
     """Create SUN2000 sensor entities."""
     entities_to_add: list[SensorEntity] = []
 
@@ -1280,12 +1290,22 @@ async def create_sun2000_entities(ucs: HuaweiSolarInverterData) -> list[SensorEn
     # multi-inverter installation pays this once per ineligible device on
     # every boot/reload. Cheap, free checks now run first; the bounded
     # probe only runs once the entity is already known to be eligible.
+    #
+    # v2.3.0.1 (HS-2301-003): the probe itself is a write (the library
+    # writes the time-zone register back with its own value), so it now
+    # only runs when the user enabled it in the options. With the probe
+    # off (the default), eligibility alone decides -- see const.py's
+    # CONF_WRITE_PERMISSION_PROBE for why that is safe. Either way the
+    # cheap checks still run first, so an ineligible device never probes.
     if (
         not isinstance(ucs.device.primary_device, (EMMADevice, SmartLoggerDevice))
         and ucs.configuration_update_coordinator
-        and await _has_write_permission_bounded(
-            ucs.device, ucs.device.serial_number,
-            guard=ucs.configuration_update_coordinator.guard,
+        and (
+            not probe_write_permission
+            or await _has_write_permission_bounded(
+                ucs.device, ucs.device.serial_number,
+                guard=ucs.configuration_update_coordinator.guard,
+            )
         )
     ):
         entities_to_add.append(
@@ -2331,7 +2351,15 @@ async def async_setup_entry(
     entities_to_add = []
     for ucs in device_datas:
         if isinstance(ucs, HuaweiSolarInverterData):
-            entities_to_add.extend(await create_sun2000_entities(ucs))
+            entities_to_add.extend(
+                await create_sun2000_entities(
+                    ucs,
+                    probe_write_permission=entry.options.get(
+                        CONF_WRITE_PERMISSION_PROBE,
+                        DEFAULT_WRITE_PERMISSION_PROBE,
+                    ),
+                )
+            )
         elif isinstance(ucs.device, EMMADevice):
             entities_to_add.extend(create_emma_entities(ucs))
         elif isinstance(ucs.device, SChargerDevice):

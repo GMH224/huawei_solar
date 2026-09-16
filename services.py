@@ -889,10 +889,12 @@ _capability_entries: dict[str, set[str]] = {cap: set() for cap in _CAPABILITY_SE
 
 # Every service name this integration can register -- used by
 # async_unload_services() to unregister all of them once the last
-# relevant entry unloads. hass.services.async_remove() is safe to call
-# for a service that was never registered by this process (a no-op, not
-# an exception), so this list is intentionally unconditional rather than
-# tracking exactly which subset a given setup actually registered.
+# relevant entry unloads. The list is intentionally unconditional rather
+# than tracking exactly which subset a given setup actually registered.
+# v2.3.0.1 (HS-2301-002): removal goes through
+# _remove_service_if_registered(), because hass.services.async_remove()
+# on an unregistered service is not silent -- Home Assistant logs an
+# "Unable to remove unknown service" warning for each one.
 _ALL_SERVICE_NAMES: tuple[str, ...] = (
     SERVICE_FORCIBLE_CHARGE,
     SERVICE_FORCIBLE_DISCHARGE,
@@ -944,11 +946,28 @@ async def async_unload_services(
         if _capability_entries[cap]:
             continue  # another loaded entry still needs this cluster
         for service_name in service_names:
-            hass.services.async_remove(DOMAIN, service_name)
+            _remove_service_if_registered(hass, service_name)
 
     if _entries_with_services:
         return  # other entries still need these services registered
     for service_name in _ALL_SERVICE_NAMES:
+        _remove_service_if_registered(hass, service_name)
+
+
+def _remove_service_if_registered(hass: HomeAssistant, service_name: str) -> None:
+    """Remove one of this integration's services only if it is registered.
+
+    v2.3.0.1 FIX (HS-2301-002, field log -- confirmed, cosmetic):
+    async_unload_services() asks Home Assistant to remove services that
+    were never registered for this installation (capability-gated ones,
+    e.g. LG-only or capacity-control services) and, via the final
+    unregister-all pass, services the per-capability pass had already
+    removed. Home Assistant logs "Unable to remove unknown service" for
+    each such call -- 15 warnings on every reload in the field log.
+    Checking first removes the noise. Which services end up removed is
+    unchanged.
+    """
+    if hass.services.has_service(DOMAIN, service_name):
         hass.services.async_remove(DOMAIN, service_name)
 
 

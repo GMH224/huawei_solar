@@ -1,9 +1,9 @@
 # CLAUDE.md — Huawei Solar Integration
 
 > **Maintained by Claude (Anthropic) on behalf of the community.**
-> Current version: **2.3.0.0** — see `manifest.json`.
+> Current version: **2.3.0.1** — see `manifest.json`.
 > Releases 2.0.0 – 2.2.0.2 are documented in their own `AUDIT_<version>.md`
-> files rather than in §8 below; 2.3.0.0 is recorded in both.
+> files rather than in §8 below; 2.3.0.0 onwards are recorded in both.
 
 ---
 
@@ -356,6 +356,30 @@ fix that calls `_evict()` from `record_failure()` and `record_timeout()`.
 ---
 
 ## 8. Changelog
+
+### v2.3.0.1 (2026-09-16)
+**Fix release from a field log (failed reload) + write-probe option**
+
+- **HS-2301-001 (fix):** a setup attempt CANCELLED by Home Assistant (second
+  reload click, restart, setup timeout) skipped every rollback handler,
+  because `CancelledError` is a `BaseException`. Connection, keep-alive,
+  first-refresh tasks, telemetry and the ModbusGuard reference stayed alive
+  and kept using the gateway. `async_setup_entry` now has `except
+  asyncio.CancelledError` handlers (identification step and outer try) that
+  run the same rollback via `_await_rollback_shielded()` (own task,
+  `asyncio.shield`, strong reference) and re-raise.
+- **HS-2301-002 (fix, cosmetic):** service unload only removes registered
+  services (`_remove_service_if_registered`).
+- **HS-2301-003 (option):** `write_permission_probe`, default **off**. The
+  library's `has_write_permission()` writes the time-zone register back;
+  it now runs at startup only if enabled. Off: the Active Power Control
+  Mode sensor is created whenever parameter configuration is enabled.
+- No new Modbus writes; one recurring write (and its read) removed by
+  default. No new reads by default; only if a user had enabled the
+  (disabled-by-default) Active Power Control Mode sensor do its registers
+  47415–47418 return to the slow configuration poll (AUDIT §3).
+  New `tests/test_ics_2301_fixes.py` (26 tests).
+- Full record: `AUDIT_2.3.0.1.md`.
 
 ### v2.3.0.0 (2026-09-16)
 **Editable LUNA2000 time-of-use periods + HS-230-001**
@@ -3249,3 +3273,4 @@ for f in list(base.glob('*.json')) + list(base.glob('translations/*.json')):
 | 6 | Med | `const.py` | `SERVICE_SET_MAXIMUM_FEED_GRID_POWER_PERCENT` missing from `SERVICES` | Service leaks on unload |
 | 7 | Low | `update_coordinator.py` | `_day_interval` falls back to `UPDATE_TIMEOUT` | Night-mode and cache use request timeout as poll interval |
 | HS-230-001 | Med | `services.py` | Length cap added to unregistered TOU schemas only | Oversized `set_tou_periods` input still reached regex evaluation |
+| HS-2301-001 | High | `__init__.py` | Cancelled setup skipped rollback (`CancelledError` ≠ `Exception`) | Orphaned connection/tasks kept loading the gateway; reloads failed |

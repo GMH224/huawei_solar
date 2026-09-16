@@ -12,6 +12,7 @@ This integration exposes the information and functions made available by Huawei 
 - [Screenshots](#screenshots)
 - [Battery Health Index](#battery-health-index)
 - [Battery time-of-use schedule](#battery-time-of-use-schedule)
+- [Write-permission test at startup](#write-permission-test-at-startup)
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
 - [Inverter polling frequency](#inverter-polling-frequency)
@@ -99,6 +100,26 @@ Not covered by these entities (the `set_tou_periods` service still works
 for them): LG RESU batteries (price periods) and installations with an EMMA,
 which manages the battery itself. A period set elsewhere with an end time of
 24:00 is displayed as-is; to edit it, enter `23:59`.
+
+## Write-permission test at startup
+
+By default (since **v2.3.0.1**) the integration no longer tests its write
+permission each time Home Assistant starts or the integration reloads.
+That test, built into the underlying `huawei-solar` library, reads the
+inverter's time-zone setting and **writes the same value back**: one write
+to the inverter's configuration storage per inverter, on every start and
+reload. Its only use at runtime is deciding whether to create the
+read-only *Active Power Control Mode* sensor.
+
+With the test off, that sensor is created whenever parameter configuration
+("Elevate permissions") is enabled. Write access was already checked when
+you set up the integration; if it is later withdrawn, the sensor simply
+shows as unavailable.
+
+To turn the test back on: *Settings → Devices & services → Huawei Solar →
+Configure →* **Test write permission at every start**. Saving the options
+reloads the integration. The one-time check during initial setup,
+reconfigure and re-authentication is unchanged.
 
 ## Prerequisites
 

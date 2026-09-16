@@ -735,6 +735,24 @@ CONF_BH_ENABLED = "bh_enabled"
 # default protects.
 CONF_SYNC_POWER_DEDICATED_READS = "sync_power_dedicated_reads"
 
+#: v2.3.0.1 (HS-2301-003, user request): whether the sensor platform runs
+#: the vendor library's write-permission probe on every setup/reload.
+#: huawei-solar's HuaweiSolarDevice.has_write_permission() READS the
+#: time-zone register and WRITES the same value back -- a real write to
+#: the inverter's configuration storage, once per inverter, on every Home
+#: Assistant start and every integration reload, used only to decide
+#: whether to create the read-only "Active Power Control Mode" sensor.
+#: Defaults to False (probe OFF). With the probe off, that sensor is
+#: created whenever parameter configuration is enabled: for network
+#: setups the config flow only completes an elevated-permission setup
+#: after write access was verified (directly, or after the installer
+#: login); serial setups have always assumed it. If access is later
+#: revoked, the sensor simply becomes unavailable. The
+#: config flow's own one-time check during setup/reconfigure/reauth is
+#: user-initiated and unchanged.
+CONF_WRITE_PERMISSION_PROBE = "write_permission_probe"
+DEFAULT_WRITE_PERMISSION_PROBE = False
+
 CONF_BH_RATED_CAPACITY_KWH = "bh_rated_capacity_kwh"
 #: Finding D: true battery install/commissioning date (ISO yyyy-mm-dd).
 #: Without it the calendar-aging forecast treats an already-aged battery as
