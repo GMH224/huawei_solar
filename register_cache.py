@@ -508,7 +508,10 @@ def _classify(name: RegisterName) -> RegisterTier:
 # ── Cache entry ───────────────────────────────────────────────────────────────
 
 class _CacheEntry:
-    __slots__ = ("value", "raw", "ts", "quality", "reason", "tier", "effective_ttl")
+    __slots__ = (
+        "value", "raw", "ts", "quality", "reason", "tier", "effective_ttl",
+        "missed", "uncertain_since",
+    )
 
     def __init__(
         self, value: Any, raw: Any, ts: float, tier: RegisterTier,
@@ -533,6 +536,17 @@ class _CacheEntry:
         # now passes its OWN instance-scoped base TTL for this tier in
         # explicitly.
         self.effective_ttl: float = effective_ttl
+        # v2.3.0.2 (HS-2302-001): consecutive refresh attempts that did not
+        # deliver a value (record_attempt() with a non-GOOD outcome), reset
+        # by update(). invalidate_all() deliberately does NOT count -- it is
+        # not an attempt, and it is exactly the event after which a value is
+        # still most likely to be true.
+        self.missed: int = 0
+        # v2.3.0.2 (HS-2302-001): monotonic time at which the entry left
+        # GOOD (None while GOOD). Drives the hard limit in _live_quality();
+        # measured from here, not from `ts`, so a SLOW value that is
+        # legitimately old-but-GOOD is not expired the instant it degrades.
+        self.uncertain_since: float | None = None
 
 
 def _raw(result: "Result[Any]") -> Any:
@@ -588,12 +602,23 @@ class RegisterCache:
         starvation_ceiling_s: float = 300.0,
         energy_availability_ceiling_s: float = 600.0,
         slow_tier_ttl_s: float | None = None,
+        min_missed_refreshes: int = 2,
+        uncertain_hard_limit_factor: float = 3.0,
     ) -> None:
         self._store: dict[RegisterName, _CacheEntry] = {}
         self._telemetry = telemetry
         self._night_mode: bool = False
         self._starvation_ceiling_s = starvation_ceiling_s
         self._energy_availability_ceiling_s = energy_availability_ceiling_s
+        # v2.3.0.2 (HS-2302-001): see _live_quality(). Defaults match
+        # const.MIN_MISSED_REFRESHES_BEFORE_EXPIRY / UNCERTAIN_HARD_LIMIT_FACTOR
+        # (injected, not imported -- same dependency-light reasoning as the
+        # two ceilings above; a test pins the defaults to const). Clamped so a
+        # bad value can only make expiry STRICTER-than-intended in the sense
+        # of "never less than one miss" and "hard limit never below the
+        # ceiling itself" -- it can never disable expiry.
+        self._min_missed_refreshes = max(1, int(min_missed_refreshes))
+        self._uncertain_hard_limit_factor = max(1.0, float(uncertain_hard_limit_factor))
         # v2.2.0.1 FIX (external ICS audit ICS-004 -- confirmed): base
         # TTLs used to live in a single module-level dict
         # (_TIER_BASE_TTL), mutated in place by the free function
@@ -675,8 +700,8 @@ class RegisterCache:
     ) -> tuple["Quality", "Reason | None"]:
         """Quality/reason as of `now`, applying the lazy EXPIRED transition.
 
-        EXPIRED is a pure function of elapsed time (an UNCERTAIN entry aged
-        past its applicable ceiling becomes BAD) -- computed here, on read,
+        EXPIRED is a pure function of the entry's state (see the v2.3.0.2
+        rule at the end of this docstring) -- computed here, on read,
         rather than by any writer, so no background sweep task is needed;
         it reuses the same constant already shipped and field-validated
         for Defect Y (v1.3.21).
@@ -696,6 +721,26 @@ class RegisterCache:
         late-but-genuine reading still lands on the correct total. Checked
         by name (is_energy_counter), not tier -- energy counters span more
         than one tier.
+
+        v2.3.0.2 (HS-2302-001) -- age alone no longer expires a value. An
+        UNCERTAIN, non-STATIC entry becomes BAD/EXPIRED when EITHER
+
+          (a) its age exceeds the ceiling AND at least
+              `min_missed_refreshes` (default 2) consecutive refresh
+              attempts for it have failed / been shed / been deferred; or
+          (b) it has been UNCERTAIN for longer than
+              `uncertain_hard_limit_factor` x the ceiling (default 3x:
+              900 s generic, 1800 s energy) -- defence in depth for any
+              path that degrades a value without recording a miss.
+
+        Why (field capture 2026-09-26/27, 5 of 5 `unknown` episodes): at
+        night the poll interval (300 s) equals the generic ceiling, so a
+        value is already AT the ceiling when its next refresh is due. The
+        old age-only rule blanked the entity after one shed or busy poll,
+        although the value was one poll old and the next poll succeeded.
+        Staleness remains bounded: "ceiling, or two missed polls,
+        whichever is later", hard-capped by (b). While served, the entity's
+        data_quality attribute still says `uncertain` with reason and age.
         """
         if entry.quality != Quality.UNCERTAIN or entry.tier == RegisterTier.STATIC:
             return entry.quality, entry.reason
@@ -704,7 +749,10 @@ class RegisterCache:
             if is_energy_counter(name)
             else self._starvation_ceiling_s
         )
-        if now - entry.ts > ceiling:
+        if now - entry.ts > ceiling and entry.missed >= self._min_missed_refreshes:
+            return Quality.BAD, Reason.EXPIRED
+        since = entry.uncertain_since
+        if since is not None and now - since > ceiling * self._uncertain_hard_limit_factor:
             return Quality.BAD, Reason.EXPIRED
         return entry.quality, entry.reason
 
@@ -797,6 +845,10 @@ class RegisterCache:
                     existing.ts = now
                 existing.quality = Quality.GOOD
                 existing.reason = None
+                # v2.3.0.2 (HS-2302-001): a delivered value ends the miss
+                # streak and the uncertainty period.
+                existing.missed = 0
+                existing.uncertain_since = None
             else:
                 self._store[name] = _CacheEntry(
                     result, raw_new, now, tier, self._tier_base_ttl[tier],
@@ -828,14 +880,41 @@ class RegisterCache:
         longer be fully trusted. A register with no existing entry and a
         non-GOOD outcome has nothing to degrade; get()/quality_of() already
         report NEVER_READ correctly for an absent entry.
+
+        v2.3.0.2 (HS-2302-001): every non-GOOD outcome also counts as one
+        missed refresh for _live_quality()'s expiry rule, and starts the
+        uncertainty clock if it is not already running. Callers record each
+        register at most once per poll (per-chunk outcome, deadline
+        reconciliation of the remainder, or back-off deferral -- disjoint
+        sets), so the count is "consecutive polls that did not deliver this
+        register". A GOOD outcome here (not used by production code; success
+        goes through update()) clears both.
+
+        v2.3.0.2 (HS-2302-004): an entry that is BAD/WRITE_PENDING stays
+        BAD/WRITE_PENDING. We KNOW its value is the pre-write one
+        (V2_ARCHITECTURE_DESIGN.md §6); a failed re-read does not make it
+        any less wrong. Before this, the first failed re-read after a write
+        turned it into UNCERTAIN and the pre-write value was served again --
+        exactly what §6 decided against. Only update() clears it.
         """
         if now is None:
             now = time.monotonic()
         for name in names:
             entry = self._store.get(name)
             if entry is not None:
+                if entry.reason == Reason.WRITE_PENDING:
+                    if quality != Quality.GOOD:
+                        entry.missed += 1
+                    continue
                 entry.quality = quality
                 entry.reason = reason
+                if quality == Quality.GOOD:
+                    entry.missed = 0
+                    entry.uncertain_since = None
+                else:
+                    entry.missed += 1
+                    if entry.uncertain_since is None:
+                        entry.uncertain_since = now
 
     def quality_of(self, name: RegisterName) -> tuple["Quality", "Reason | None", float | None]:
         """(quality, reason, age_seconds) for a register -- the quality-model
@@ -912,11 +991,25 @@ class RegisterCache:
         attempts. Skipping them saves one batch read of ~10-15 registers on
         every reconnect / outage recovery, reducing the initial post-outage
         burst.
+
+        v2.3.0.2 (HS-2302-001/002): not an attempt, so the missed-refresh
+        count is left unchanged; the uncertainty clock (hard limit) starts
+        if not already running. Since v2.3.0.2 the only production caller
+        is on_connection_lost() (keep-alive probe failure); the coordinator
+        success path no longer calls this.
+
+        v2.3.0.2 (HS-2302-004): a BAD/WRITE_PENDING entry is left as it is
+        (known pre-write value -- see record_attempt()).
         """
+        now = time.monotonic()
         for entry in self._store.values():
+            if entry.reason == Reason.WRITE_PENDING:
+                continue
             if entry.tier != RegisterTier.STATIC:
                 entry.quality = Quality.UNCERTAIN
                 entry.reason = Reason.LINK_DOWN
+                if entry.uncertain_since is None:
+                    entry.uncertain_since = now
 
     def invalidate_all_including_static(self) -> None:
         """Mark every cached register untrustworthy, including STATIC tier.

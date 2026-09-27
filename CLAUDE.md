@@ -1,7 +1,7 @@
 # CLAUDE.md — Huawei Solar Integration
 
 > **Maintained by Claude (Anthropic) on behalf of the community.**
-> Current version: **2.3.0.1** — see `manifest.json`.
+> Current version: **2.3.0.2** — see `manifest.json`.
 > Releases 2.0.0 – 2.2.0.2 are documented in their own `AUDIT_<version>.md`
 > files rather than in §8 below; 2.3.0.0 onwards are recorded in both.
 
@@ -132,6 +132,14 @@ block that double-decremented it has been removed.
 | FAST | 0 s (always) | 60 s night | grid power, PV input, battery power |
 
 **Adaptive TTL:** unchanged value → TTL × 2 (capped at tier max); changed value → reset to base.
+
+**When a cached value is withheld (v2.3.0.2).** A failed / shed / deferred
+refresh makes a value UNCERTAIN; it is still served (entity attribute
+`data_quality: uncertain`). It becomes BAD/EXPIRED (entity `unknown`) only
+when its age exceeds the ceiling (300 s, energy counters 600 s) **and** at
+least 2 consecutive refreshes were missed, or after 3 × ceiling of
+continuous uncertainty. STATIC never expires; a register written by us is
+BAD until re-read. Only keep-alive link loss invalidates the whole cache.
 
 ### 3.3 Exponential back-off
 
@@ -356,6 +364,34 @@ fix that calls `_evict()` from `record_failure()` and `record_timeout()`.
 ---
 
 ## 8. Changelog
+
+### v2.3.0.2 (2026-09-27)
+**Stage 1 fix for sensors going `unknown` (field capture, 5 of 5 episodes traced)**
+
+- **HS-2302-001:** `RegisterCache._live_quality()` no longer expires an
+  UNCERTAIN value on age alone. Expiry needs age > ceiling **and** ≥ 2
+  consecutive missed refreshes (`MIN_MISSED_REFRESHES_BEFORE_EXPIRY`), or
+  continuous uncertainty > 3 × ceiling (`UNCERTAIN_HARD_LIMIT_FACTOR`,
+  900 s / 1800 s). `_CacheEntry` gains `missed` and `uncertain_since`;
+  `record_attempt()` counts, `update()` resets, `invalidate_all()` does
+  not count. At night (poll 300 s = ceiling) a single shed used to blank a
+  sensor for a full poll interval.
+- **HS-2302-002:** coordinator success path no longer calls
+  `cache.invalidate_all()` after a poll that followed a timeout / busy /
+  shed / admission timeout. It forced a full re-read (capture: up to 14 %
+  of bus service time) and blanked old SLOW values. Keep-alive link loss
+  (`on_connection_lost`) still invalidates.
+- **HS-2302-003:** label for `sync_power_dedicated_reads`; `{skipped_notice}`
+  restored in 14 translations.
+- **HS-2302-004:** BAD/WRITE_PENDING survives failed re-reads and link loss
+  (design §6); the pre-write value no longer reappears.
+- Bus: no new reads/writes; fewer reads after recovery. Pacing, queue
+  depth, transition mode, busy retry, back-off unchanged. Replay of the 5
+  captured episodes: 1,668 s → 452 s `unknown` (3 removed, 1 halved,
+  12:32 daytime unchanged → stage 2 only if the next capture needs it).
+  New `tests/test_ics_2302_fixes.py` (44 tests); 2 tests in
+  `test_v2_energy_aware_ceiling.py` updated to two misses (reason in audit).
+- Full record: `AUDIT_2.3.0.2.md`.
 
 ### v2.3.0.1 (2026-09-16)
 **Fix release from a field log (failed reload) + write-probe option**
@@ -3274,3 +3310,6 @@ for f in list(base.glob('*.json')) + list(base.glob('translations/*.json')):
 | 7 | Low | `update_coordinator.py` | `_day_interval` falls back to `UPDATE_TIMEOUT` | Night-mode and cache use request timeout as poll interval |
 | HS-230-001 | Med | `services.py` | Length cap added to unregistered TOU schemas only | Oversized `set_tou_periods` input still reached regex evaluation |
 | HS-2301-001 | High | `__init__.py` | Cancelled setup skipped rollback (`CancelledError` ≠ `Exception`) | Orphaned connection/tasks kept loading the gateway; reloads failed |
+| HS-2302-001 | Med | `register_cache.py` | Expiry on age alone; night poll interval = ceiling | One shed/busy poll blanked sensors ~300 s |
+| HS-2302-002 | Med | `update_coordinator.py` | `invalidate_all()` after every recovery | Full re-read burst; old values blanked right after "communication restored" |
+| HS-2302-004 | Med | `register_cache.py` | Failed re-read overwrote WRITE_PENDING with UNCERTAIN | Pre-write value shown again after a write |

@@ -144,7 +144,13 @@ class TestEnergyAwareCeiling(unittest.TestCase):
     def test_energy_counter_does_expire_past_its_own_longer_ceiling(self):
         c = RegisterCache(starvation_ceiling_s=300.0, energy_availability_ceiling_s=600.0)
         c.update({_ENERGY_NAME: _r(1.0)})
+        # v2.3.0.2 (HS-2302-001): expiry now needs age past the ceiling AND
+        # two consecutive missed refreshes; one miss alone keeps serving
+        # (asserted explicitly in test_ics_2302_fixes.py). Two misses are
+        # recorded so this test keeps testing what it is about: WHICH
+        # ceiling applies to an energy counter.
         c.record_attempt([_ENERGY_NAME], Quality.UNCERTAIN, Reason.LINK_DOWN)
+        c.record_attempt([_ENERGY_NAME], Quality.UNCERTAIN, Reason.TIMEOUT)
         c._store[_ENERGY_NAME].ts -= 700.0  # past even the longer ceiling
         quality, reason, _ = c.quality_of(_ENERGY_NAME)
         self.assertEqual(quality, Quality.BAD)
@@ -154,7 +160,9 @@ class TestEnergyAwareCeiling(unittest.TestCase):
     def test_non_energy_register_uses_the_generic_shorter_ceiling(self):
         c = RegisterCache(starvation_ceiling_s=300.0, energy_availability_ceiling_s=600.0)
         c.update({_NON_ENERGY_NAME: _r(1.0)})
+        # v2.3.0.2 (HS-2302-001): two misses, see the test above.
         c.record_attempt([_NON_ENERGY_NAME], Quality.UNCERTAIN, Reason.LINK_DOWN)
+        c.record_attempt([_NON_ENERGY_NAME], Quality.UNCERTAIN, Reason.TIMEOUT)
         c._store[_NON_ENERGY_NAME].ts -= 350.0  # past generic, well short of energy
         quality, reason, _ = c.quality_of(_NON_ENERGY_NAME)
         self.assertEqual(

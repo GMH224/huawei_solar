@@ -279,6 +279,14 @@ By providing logs directly when creating the issue, you will likely get help muc
 
 ---
 
+<a name="unknown-values"></a>
+
+**Q**: Some sensors briefly show `unknown`. Why, and what changed in v2.3.0.2?
+
+**A**: When the dongle is busy, a refresh can be missed. Since v2.3.0.2 a sensor then keeps its last value (its `data_quality` attribute shows `uncertain`, with the reason and the age of the value) instead of switching to `unknown`. It only becomes `unknown` when the value is older than 5 minutes (10 minutes for energy counters) **and** at least two refreshes in a row were missed, or after 15 minutes (30 minutes for energy counters) without a successful refresh. At night the inverters are polled every 5 minutes, so a single missed refresh no longer blanks a sensor; a longer disturbance still does. A value that was just written by the integration stays unavailable until the inverter confirms it. This adds no polling; it also removes an unnecessary full re-read of all values after short disturbances. If you add sensors in a template, guard against `unknown` with `has_value()` rather than `float(0)`, which would create false drops in totals.
+
+---
+
 <a name="enable-elevated-permissions"></a>
 
 **Q**: I didn't check 'Advanced: Elevate permissions' during the initial setup of this integration and changed my mind. How do I change this?

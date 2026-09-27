@@ -697,6 +697,37 @@ ENERGY_PROMOTION_CEILING_S: float = 90.0
 # fires at all.
 ENERGY_AVAILABILITY_CEILING_S: float = 600.0
 
+# v2.3.0.2 (HS-2302-001) — the two ceilings above no longer withhold a value
+# on AGE ALONE. A cached value that is UNCERTAIN and older than its ceiling
+# is withheld (BAD/EXPIRED -> entity `unknown`) only once at least this many
+# consecutive refresh attempts for that register have been missed (timeout,
+# busy, shed, admission timeout, back-off deferral, poll deadline). A
+# successful read resets the count.
+#
+# Why: field capture 2026-09-26/27 (5 of 5 `unknown` episodes). At night
+# (poll interval 300 s) a value is already ~300 s old when its next refresh
+# is due, i.e. AT the 300 s ceiling. A single shed or dongle-busy poll then
+# blanked the sensor for a full poll interval (observed 301-308 s), even
+# though the value was one poll old and the very next poll succeeded
+# (63 of 64 dongle failures in the capture recovered within 2 polls).
+#
+# Why 2 and not more: a missed refresh must still count, otherwise a
+# register that keeps losing to contention could be served indefinitely.
+# 2 bounds staleness at "ceiling, or two missed polls, whichever is later"
+# (day: ~60-90 s; night: ~600 s) and tolerates exactly the isolated miss
+# the data shows is benign. Interpretation only: this changes nothing on
+# the bus.
+MIN_MISSED_REFRESHES_BEFORE_EXPIRY: int = 2
+
+# v2.3.0.2 (HS-2302-001) — defence in depth for the rule above. If a
+# register stays UNCERTAIN for longer than this factor x its ceiling
+# (900 s generic, 1800 s energy counters) it is withheld regardless of the
+# miss count, so a failure path that never records a miss can still not
+# make a value immortal. Measured from the moment the value BECAME
+# uncertain (not from its read time), so a SLOW register that is
+# legitimately old but GOOD is not expired the instant it degrades.
+UNCERTAIN_HARD_LIMIT_FACTOR: float = 3.0
+
 # Caps how many starved registers get promoted into a single back-off cycle.
 # Deliberately small: several SLOW/STATIC registers read together in the same
 # original batch tend to share similar timestamps, so they can cross the

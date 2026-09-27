@@ -80,6 +80,8 @@ from .const import (
     DEFAULT_SLOW_TIER_TTL_S,
     REGISTER_STARVATION_CEILING_S,
     ENERGY_AVAILABILITY_CEILING_S,
+    MIN_MISSED_REFRESHES_BEFORE_EXPIRY,
+    UNCERTAIN_HARD_LIMIT_FACTOR,
     ENERGY_PROMOTION_CEILING_S,
     REGISTER_STARVATION_PROMOTIONS_PER_CYCLE,
     BATCH_CHUNK_SIZE,
@@ -527,6 +529,10 @@ class HuaweiSolarUpdateCoordinator(
         self.cache = RegisterCache(
             starvation_ceiling_s=REGISTER_STARVATION_CEILING_S,
             energy_availability_ceiling_s=ENERGY_AVAILABILITY_CEILING_S,
+            # v2.3.0.2 (HS-2302-001): expiry needs age AND missed refreshes
+            # -- see const.py and RegisterCache._live_quality().
+            min_missed_refreshes=MIN_MISSED_REFRESHES_BEFORE_EXPIRY,
+            uncertain_hard_limit_factor=UNCERTAIN_HARD_LIMIT_FACTOR,
             # v2.2.0.1 FIX (external ICS audit ICS-004 -- confirmed): read
             # straight from THIS entry's own options at construction time
             # instead of relying on a process-global set by __init__.py's
@@ -2043,7 +2049,24 @@ class HuaweiSolarUpdateCoordinator(
                 "%s: communication restored (after %d timeout(s) / %d failure(s))",
                 self.name, self._consecutive_timeouts, self._consecutive_failures,
             )
-            self.cache.invalidate_all()
+            # v2.3.0.2 (HS-2302-002): `self.cache.invalidate_all()` removed
+            # here. It ran after EVERY successful poll that followed any
+            # timeout, busy, shed or admission timeout (_record_shed() and
+            # _record_admission_timeout() advance _consecutive_timeouts too),
+            # and marked the whole cache UNCERTAIN/LINK_DOWN although nothing
+            # about the link was known to be wrong:
+            #   * the registers that actually failed were already recorded
+            #     individually (record_attempt), so they are re-read anyway;
+            #   * every other register had just been read successfully or
+            #     was GOOD within its own TTL;
+            #   * the next poll therefore re-read EVERYTHING (field capture:
+            #     ~3x the registers and 4-8x the service time of a normal
+            #     poll, on a bus that had just shown stress), and an old but
+            #     valid SLOW value went BAD at once under the age-only expiry
+            #     rule -> entity `unknown` right after "communication
+            #     restored".
+            # Genuine link loss is still handled: ModbusKeepAlive calls
+            # on_connection_lost(), which keeps its invalidate_all().
 
         self._consecutive_timeouts = 0
         self._consecutive_failures = 0
