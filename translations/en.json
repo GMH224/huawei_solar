@@ -1424,6 +1424,7 @@
         "data": {
           "slow_tier_ttl_s": "Slow-register refresh interval (s)",
           "bh_enabled": "Enable battery health monitoring",
+          "sync_power_dedicated_reads": "Dedicated power-flow reads (off = build the power-flow sensors from cached values only)",
           "bh_rated_capacity_kwh": "Rated usable capacity (kWh)",
           "bh_warranty_throughput_kwh": "Warranty throughput (kWh)",
           "bh_weight_capacity": "Weight: SOH capacity",
