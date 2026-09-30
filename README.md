@@ -13,6 +13,7 @@ This integration exposes the information and functions made available by Huawei 
 - [Battery Health Index](#battery-health-index)
 - [Battery time-of-use schedule](#battery-time-of-use-schedule)
 - [Write-permission test at startup](#write-permission-test-at-startup)
+- [Modbus reliability options (v2.3.1.0)](#modbus-reliability-options-v2310)
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
 - [Inverter polling frequency](#inverter-polling-frequency)
@@ -120,6 +121,31 @@ To turn the test back on: *Settings → Devices & services → Huawei Solar →
 Configure →* **Test write permission at every start**. Saving the options
 reloads the integration. The one-time check during initial setup,
 reconfigure and re-authentication is unchanged.
+
+## Modbus reliability options (v2.3.1.0)
+
+The options dialog (*Settings → Devices & services → Huawei Solar →
+Configure*) has five switches, all **on** by default. They exist so that a
+problem can be isolated without installing a different version:
+
+- **Isolate slow register regions** — some inverter registers are served
+  slowly (1–3 s). With this on, fast readings (power, battery pack values)
+  are never read together with them, and unused addresses between battery
+  pack registers are never read at all.
+- **Read slow settings less often** — settings are re-read at most every
+  30 minutes and the battery SOH-calibration status at most hourly. A value
+  you change is still read back immediately.
+- **Single retry layer** — each request is sent once and may take up to
+  20 seconds; it is only repeated if the connection itself was lost. A write
+  is never sent twice.
+- **Protect power readings** — power readings are never dropped when the bus
+  is busy, and a short-lived "busy" reply no longer slows down all reading
+  for 10 minutes.
+- **Wake all devices on the bus when one wakes up at dawn** — with two
+  inverters, the second one no longer stays on 5-minute night polling after
+  the first has already woken up.
+
+Saving the options reloads the integration.
 
 ## Prerequisites
 
@@ -283,7 +309,7 @@ By providing logs directly when creating the issue, you will likely get help muc
 
 **Q**: Some sensors briefly show `unknown`. Why, and what changed in v2.3.0.2?
 
-**A**: When the dongle is busy, a refresh can be missed. Since v2.3.0.2 a sensor then keeps its last value (its `data_quality` attribute shows `uncertain`, with the reason and the age of the value) instead of switching to `unknown`. It only becomes `unknown` when the value is older than 5 minutes (10 minutes for energy counters) **and** at least two refreshes in a row were missed, or after 15 minutes (30 minutes for energy counters) without a successful refresh. At night the inverters are polled every 5 minutes, so a single missed refresh no longer blanks a sensor; a longer disturbance still does. A value that was just written by the integration stays unavailable until the inverter confirms it. This adds no polling; it also removes an unnecessary full re-read of all values after short disturbances. If you add sensors in a template, guard against `unknown` with `has_value()` rather than `float(0)`, which would create false drops in totals.
+**A**: When the dongle is busy, a refresh can be missed. Since v2.3.0.2 a sensor then keeps its last value (its `data_quality` attribute shows `uncertain`, with the reason and the age of the value) instead of switching to `unknown`. It only becomes `unknown` when the value is older than 5 minutes (10 minutes for energy counters) **and** at least two refreshes in a row were missed, or after 15 minutes (30 minutes for energy counters) without a successful refresh. At night the inverters are polled every 5 minutes, so a single missed refresh no longer blanks a sensor; a longer disturbance still does. A value that was just written by the integration stays unavailable until the inverter confirms it. This adds no polling; it also removes an unnecessary full re-read of all values after short disturbances. Since v2.3.1.0 the most common cause of such disturbances — slow reads caused by reading fast and slow registers together — is avoided (see *Modbus reliability options*). If you add sensors in a template, guard against `unknown` with `has_value()` rather than `float(0)`, which would create false drops in totals.
 
 ---
 

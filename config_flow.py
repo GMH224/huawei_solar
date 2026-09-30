@@ -33,6 +33,7 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.components import usb
 from homeassistant.config_entries import ConfigFlowResult, OptionsFlowWithReload
+from homeassistant.core import callback
 from homeassistant.const import (
     CONF_HOST,
     CONF_PASSWORD,
@@ -48,6 +49,16 @@ from .const import (
     CONF_SYNC_POWER_DEDICATED_READS,
     CONF_WRITE_PERMISSION_PROBE,
     DEFAULT_WRITE_PERMISSION_PROBE,
+    CONF_DAWN_PEER_WAKE,
+    CONF_PROTECT_POWER_READS,
+    CONF_SINGLE_RETRY_LAYER,
+    CONF_SLOW_PATH_ISOLATION,
+    CONF_SLOW_REGISTER_CADENCE,
+    DEFAULT_DAWN_PEER_WAKE,
+    DEFAULT_PROTECT_POWER_READS,
+    DEFAULT_SINGLE_RETRY_LAYER,
+    DEFAULT_SLOW_PATH_ISOLATION,
+    DEFAULT_SLOW_REGISTER_CADENCE,
     DEFAULT_SLOW_TIER_TTL_S,
     CONF_BH_ENABLED,
     CONF_BH_INSTALL_DATE,
@@ -1046,6 +1057,10 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """
         super().__init__()
         self._discovered_sub_unit_ids: list[int] = []
+        # v2.3.1.0 (HS-2310-005, external audit F-04): reconfigure
+        # transaction state -- see async_step_reconfigure()/async_remove().
+        self._reconfigure_unloaded_entry_id: str | None = None
+        self._reconfigure_committed: bool = False
 
     def _reset_discovery_state(self) -> None:
         """Clear all state used by the discovery progress steps."""
@@ -1102,8 +1117,49 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self.context["entry_id"]
         )
         self._update_config_data_from_entry_data(self._reconfigure_entry.data)  # type: ignore[arg-type]
-        await self.hass.config_entries.async_unload(self.context["entry_id"])
+        # The running entry is unloaded on purpose: the device accepts only
+        # one Modbus connection, and validation below opens its own.
+        #
+        # v2.3.1.0 (HS-2310-005, external audit F-04): the unload result is
+        # no longer ignored, and an unload done HERE is remembered, so that
+        # if the flow ends WITHOUT a committed reconfiguration (Cancel,
+        # closing the dialog, a validation error the user abandons, any
+        # abort) async_remove() reloads the entry. Before, cancelling a
+        # reconfigure left the whole plant offline until a manual reload.
+        unloaded = await self.hass.config_entries.async_unload(self.context["entry_id"])
+        if unloaded:
+            self._reconfigure_unloaded_entry_id = self.context["entry_id"]
+        else:
+            _LOGGER.warning(
+                "Reconfigure: the running entry could not be unloaded; "
+                "validation will share the device with it"
+            )
         return await self.async_step_setup_connection_type()
+
+    @callback
+    def async_remove(self) -> None:
+        """Called by Home Assistant when this flow ends, for ANY reason.
+
+        v2.3.1.0 (HS-2310-005, external audit F-04): restores the entry this
+        flow unloaded unless the reconfiguration was committed (the commit
+        path reloads it itself). Scheduled as a task: this callback is
+        synchronous. Never raises -- a failure is logged.
+        """
+        entry_id = self._reconfigure_unloaded_entry_id
+        self._reconfigure_unloaded_entry_id = None
+        if entry_id is None or self._reconfigure_committed or self.hass is None:
+            return
+        try:
+            _LOGGER.info(
+                "Reconfigure ended without changes -- reloading the "
+                "integration that was unloaded for it"
+            )
+            self.hass.async_create_task(
+                self.hass.config_entries.async_reload(entry_id),
+                name="huawei_solar_reconfigure_restore",
+            )
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Reconfigure: restoring the unloaded entry failed")
 
     async def async_step_reauth(
         self, config: dict[str, Any] | None = None
@@ -1983,6 +2039,9 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         assert inverter_info
         self.context["title_placeholders"] = {"name": inverter_info["model_name"]}
         if self._reconfigure_entry:
+            # v2.3.1.0 (HS-2310-005): committed -- async_remove() must not
+            # schedule a second reload of the entry reloaded right here.
+            self._reconfigure_committed = True
             self.hass.config_entries.async_update_entry(
                 self._reconfigure_entry, data=data
             )
@@ -2083,6 +2142,29 @@ class BatteryHealthOptionsFlowHandler(OptionsFlowWithReload):
                     default=options.get(
                         CONF_WRITE_PERMISSION_PROBE, DEFAULT_WRITE_PERMISSION_PROBE
                     ),
+                ): bool,
+                # v2.3.1.0: bus-side switches, all default ON (see const.py
+                # and AUDIT_2.3.1.0.md). Each exists so a field regression
+                # can be isolated without a new build.
+                vol.Optional(
+                    CONF_SLOW_PATH_ISOLATION,
+                    default=options.get(CONF_SLOW_PATH_ISOLATION, DEFAULT_SLOW_PATH_ISOLATION),
+                ): bool,
+                vol.Optional(
+                    CONF_SLOW_REGISTER_CADENCE,
+                    default=options.get(CONF_SLOW_REGISTER_CADENCE, DEFAULT_SLOW_REGISTER_CADENCE),
+                ): bool,
+                vol.Optional(
+                    CONF_SINGLE_RETRY_LAYER,
+                    default=options.get(CONF_SINGLE_RETRY_LAYER, DEFAULT_SINGLE_RETRY_LAYER),
+                ): bool,
+                vol.Optional(
+                    CONF_PROTECT_POWER_READS,
+                    default=options.get(CONF_PROTECT_POWER_READS, DEFAULT_PROTECT_POWER_READS),
+                ): bool,
+                vol.Optional(
+                    CONF_DAWN_PEER_WAKE,
+                    default=options.get(CONF_DAWN_PEER_WAKE, DEFAULT_DAWN_PEER_WAKE),
                 ): bool,
                 vol.Optional(
                     CONF_SLOW_TIER_TTL_S,

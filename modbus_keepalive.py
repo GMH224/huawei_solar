@@ -89,7 +89,11 @@ from .modbus_guard import ModbusAdmissionTimeout, ModbusGuard, ModbusQueueShed
 _LOGGER = logging.getLogger(__name__)
 
 # Timeout for a single keep-alive read (must be shorter than KEEPALIVE_INTERVAL)
-_KEEPALIVE_TIMEOUT = timedelta(seconds=20)
+# v2.3.1.0 (HS-2310-002): 20 s -> 25 s. With the single retry layer one
+# transport attempt may take up to MODBUS_RESPONSE_TIMEOUT (20 s); an equal
+# outer bound would race it and could abandon a probe the dongle is still
+# answering. 25 s = 20 s + RESPONSE_TIMEOUT_MARGIN (a test pins this).
+_KEEPALIVE_TIMEOUT = timedelta(seconds=25)
 
 
 def _create_task(coro: object) -> asyncio.Task:
@@ -233,6 +237,34 @@ class ModbusKeepAlive:
         if self._task and not self._task.done():
             self._task.cancel()
             self._task = None
+
+    async def async_stop(self, timeout_s: float) -> bool:
+        """Cancel the background task AND wait (bounded) until it has exited.
+
+        v2.3.1.0 (HS-2310-005, external audit F-05): stop() only requests
+        cancellation. On unload the caller disconnects the transport next,
+        so it must know the probe is no longer in flight. Returns True when
+        the task has finished (or there was none), False if it did not exit
+        within `timeout_s` (logged; the caller carries on regardless --
+        teardown must never hang on this). Never raises.
+        """
+        task = self._task
+        self._task = None
+        if task is None or task.done():
+            return True
+        task.cancel()
+        try:
+            done, _pending = await asyncio.wait({task}, timeout=max(0.0, float(timeout_s)))
+        except Exception:  # noqa: BLE001 -- teardown must not fail here
+            _LOGGER.debug("ModbusKeepAlive[%s]: error while awaiting stop", self.serial_number)
+            return False
+        if task in done:
+            return True
+        _LOGGER.warning(
+            "ModbusKeepAlive[%s]: task did not stop within %.1f s; continuing teardown",
+            self.serial_number, timeout_s,
+        )
+        return False
 
     # ── background task ───────────────────────────────────────────────────────
 

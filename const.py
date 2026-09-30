@@ -622,7 +622,14 @@ WRITE_VERIFY_RETRIES: int = 2
 # directly: a write is a single-register set, a structurally simpler and
 # faster operation than a full batch read, so it doesn't need the same
 # generous adaptive ceiling a multi-register read does.
-WRITE_TIMEOUT = timedelta(seconds=15)
+#
+# v2.3.1.0 (HS-2310-002): 15 s -> 25 s. With the single retry layer
+# (MODBUS_RESPONSE_TIMEOUT below) one write attempt may legitimately take
+# up to 20 s before the transport itself gives up. A 15 s outer bound would
+# cancel that attempt while the dongle may still apply it -- an abandoned
+# write. 25 s = transport timeout + margin, so the transport, not this
+# wrapper, decides.
+WRITE_TIMEOUT = timedelta(seconds=25)
 
 # v2.0.0b (MOD-06/MOD-19, external ICS audit -- confirmed): the
 # whole-sequence deadline for a multi-register logical write command
@@ -783,6 +790,79 @@ CONF_SYNC_POWER_DEDICATED_READS = "sync_power_dedicated_reads"
 #: user-initiated and unchanged.
 CONF_WRITE_PERMISSION_PROBE = "write_permission_probe"
 DEFAULT_WRITE_PERMISSION_PROBE = False
+
+# ── v2.3.1.0: bus-side fixes (stage 2) ─────────────────────────────────────────
+# Evidence: two field captures (2.3.0.1, 18.5 h; 2.3.0.2, 49.8 h), the HA log
+# of the second, and the diagnostics dump. See AUDIT_2.3.1.0.md.
+# Each change can be switched off separately in the options (defaults ON),
+# so a field regression can be isolated without a new build.
+
+#: HS-2310-001a -- never let one physical read span a known slow address
+#: region together with registers outside it (see update_coordinator.
+#: _SLOW_ADDRESS_RANGES). Measured: reads spanning the unmapped addresses
+#: between a pack's state_of_capacity and charge_discharge_power: 4,769,
+#: all but 1 slow (p50 ~2.1 s); the same registers read without the gap:
+#: all 3.7-8.5 ms. INV main block 32064-32087 alone: 2,819 reads, all fast
+#: (p50 4.9 ms); merged with the status block 32088-32105: 1,336 reads,
+#: all slow (p50 2.4 s).
+CONF_SLOW_PATH_ISOLATION = "slow_path_isolation"
+DEFAULT_SLOW_PATH_ISOLATION = True
+
+#: HS-2310-001b -- slower cadence for registers that are genuinely slow on
+#: every read and change rarely: SOH-calibration status (pack + unit,
+#: ~2.4 s per read) at most hourly, and every register of the configuration
+#: coordinator (settings; ~13 % of all bus time) at most every 30 min. A
+#: write still invalidates the written register, which is re-read on the
+#: next poll regardless of this floor.
+CONF_SLOW_REGISTER_CADENCE = "slow_register_cadence"
+DEFAULT_SLOW_REGISTER_CADENCE = True
+SOH_CALIBRATION_MIN_TTL = timedelta(hours=1)
+CONFIGURATION_MIN_REGISTER_TTL = timedelta(minutes=30)
+
+#: HS-2310-002 -- one retry layer, one timeout. The vendor library re-sends a
+#: request after 10 s without an answer (and on busy / device-failure
+#: replies), inside the integration's own request and on top of its own busy
+#: retry. The HA log shows 352 late answers in 50 h: the dongle answered
+#: after we had already given up (median 17.6 s after sending). Re-sending
+#: makes the dongle do the same work twice exactly when it is overloaded,
+#: and re-sends a WRITE whose answer was merely late. With this option the
+#: library only retries after a lost connection (a genuinely lost request),
+#: and one attempt may take up to MODBUS_RESPONSE_TIMEOUT.
+CONF_SINGLE_RETRY_LAYER = "single_retry_layer"
+DEFAULT_SINGLE_RETRY_LAYER = True
+MODBUS_RESPONSE_TIMEOUT = timedelta(seconds=20)
+#: Outer bounds that wrap one transport attempt are kept at least this much
+#: longer than MODBUS_RESPONSE_TIMEOUT, so the transport -- not a wrapper --
+#: ends a slow attempt (a wrapper cancelling first would abandon a request
+#: the dongle is still working on).
+RESPONSE_TIMEOUT_MARGIN = timedelta(seconds=3)
+
+#: HS-2310-003 -- protect the power-flow readings. Chunks that contain one of
+#: the power-flow registers (inverter input/active power, meter active power,
+#: battery charge/discharge power) are admitted on the guard's priority lane:
+#: never shed, still serialised and paced. A busy reply starts the bus-wide
+#: transition throttle only if it persists through the integration's own
+#: busy retries, and then for BUSY_TRANSITION_DURATION instead of 10 min.
+#: Measured: 87 % of 526 sheds happened in transition mode, active 23 % of
+#: the time; one busy reply resolved by a 600 ms retry started 10 min of
+#: queue depth 1.
+CONF_PROTECT_POWER_READS = "protect_power_reads"
+DEFAULT_PROTECT_POWER_READS = True
+BUSY_TRANSITION_DURATION = timedelta(minutes=5)
+
+#: HS-2310-004 -- dawn: when one device on the bus leaves night mode on its
+#: own evidence, the other coordinators on the same bus leave night mode too,
+#: and do not re-enter it on PV power alone for PEER_WAKE_HOLD. Measured:
+#: INV2 woke at 07:39/07:46, INV1 only at 08:00/08:07, while 80 % of the
+#: remaining `unknown` time fell between 07:22 and 08:05 with INV1 still on
+#: 5-minute night polling (two misses = 10 min).
+CONF_DAWN_PEER_WAKE = "dawn_peer_wake"
+DEFAULT_DAWN_PEER_WAKE = True
+PEER_WAKE_HOLD = timedelta(minutes=60)
+
+#: HS-2310-005 (F-05) -- bound for awaiting the keep-alive task's exit on
+#: unload, before the transport is disconnected.
+KEEPALIVE_STOP_TIMEOUT = timedelta(seconds=5)
 
 CONF_BH_RATED_CAPACITY_KWH = "bh_rated_capacity_kwh"
 #: Finding D: true battery install/commissioning date (ISO yyyy-mm-dd).

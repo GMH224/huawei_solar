@@ -2,6 +2,7 @@
 
 import asyncio
 from collections.abc import Callable
+import functools
 import inspect
 import logging
 from datetime import timedelta
@@ -46,6 +47,7 @@ from .const import (
     CONF_SYNC_POWER_DEDICATED_READS,
     CONF_ENABLE_PARAMETER_CONFIGURATION,
     CONF_SLAVE_IDS,
+    CONFIGURATION_MIN_REGISTER_TTL,
     CONFIGURATION_UPDATE_INTERVAL,
     DATA_DEVICE_DATAS,
     DATA_SYNC_POWER_COORDINATOR,
@@ -54,6 +56,8 @@ from .const import (
     DOMAIN,
     ENERGY_STORAGE_UPDATE_INTERVAL,
     INVERTER_UPDATE_INTERVAL,
+    KEEPALIVE_STOP_TIMEOUT,
+    MODBUS_RESPONSE_TIMEOUT,
     OPTIMIZER_DISCOVERY_TIMEOUT,
     OPTIMIZER_UPDATE_INTERVAL,
     POWER_METER_UPDATE_INTERVAL,
@@ -61,6 +65,7 @@ from .const import (
 )
 from .adaptive_modbus import AdaptiveModbusController
 from .battery_health_manager import BatteryHealthManager
+from .bus_policy import BusPolicy, apply_single_retry_layer
 from .modbus_guard import ModbusGuard
 from .modbus_keepalive import ModbusKeepAlive
 from .modbus_telemetry import ModbusTelemetry
@@ -386,6 +391,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiSolarConfigEntry) 
                 port=entry.data[CONF_PORT],
                 unit_id=entry.data[CONF_SLAVE_IDS][0],
             )
+
+        # v2.3.1.0 (HS-2310-002): one retry layer, one timeout -- applied to
+        # the runtime client BEFORE it connects (the per-attempt timeout is
+        # taken over by the transport at connect time). Fail-safe: if the
+        # client does not look as expected, the library defaults stay.
+        # Config-flow validation clients are not touched (one-shot, user-
+        # initiated, and short-lived).
+        if BusPolicy.from_options(entry.options).single_retry_layer:
+            apply_single_retry_layer(client, MODBUS_RESPONSE_TIMEOUT.total_seconds())
 
         # v1.3.14 FIX (Defect M): bound this call ourselves so we give up,
         # cleanly, before Home Assistant's own external setup timeout can
@@ -1220,10 +1234,16 @@ async def async_unload_entry(
     # before the single shared-transport disconnect below (not
     # interleaved with the rest of per-device teardown, which doesn't
     # produce new traffic and is safe to run after).
+    #
+    # v2.3.1.0 (HS-2310-005, external audit F-05): cancellation is a
+    # request, not proof the task stopped -- the keep-alive task is now
+    # AWAITED (bounded by KEEPALIVE_STOP_TIMEOUT each) before the transport
+    # is disconnected, so no probe can still be in flight on it. A task
+    # that does not exit in time is logged and teardown continues.
     for device_data in device_datas:
         keepalive = ModbusKeepAlive.get(device_data.device.serial_number)
         if keepalive:
-            keepalive.stop()
+            await keepalive.async_stop(KEEPALIVE_STOP_TIMEOUT.total_seconds())
 
     # v1.3.18 FIX (Defect U/Finding 3, independent ICS audit of
     # v1.3.17): this used to be a bare `await
@@ -1587,7 +1607,11 @@ async def _setup_inverter_device_data(
     # async_setup_entry() (see _run_cleanup_callbacks for the full
     # reasoning).
     if register_cleanup is not None:
-        register_cleanup(keepalive.stop)
+        # v2.3.1.0 (HS-2310-005, external audit F-05): the rollback now
+        # AWAITS the task's exit (bounded), same primitive as unload.
+        register_cleanup(
+            functools.partial(keepalive.async_stop, KEEPALIVE_STOP_TIMEOUT.total_seconds())
+        )
 
     # Add power meter device if a power meter is detected
     if device.power_meter_type is not None:
@@ -1767,6 +1791,9 @@ async def _setup_inverter_device_data(
             start_delay=_staggered_start_delay("configuration", device_index),
             bus_endpoint=bus_endpoint,
             entry=entry,
+            # v2.3.1.0 (HS-2310-001b): settings are re-read at most every
+            # 30 min (applied only while slow_register_cadence is on).
+            min_register_ttl=CONFIGURATION_MIN_REGISTER_TTL,
         )
         configuration_update_coordinator.attach_telemetry(telemetry)
         configuration_update_coordinator.attach_adaptive(adaptive)
@@ -1906,6 +1933,8 @@ async def _setup_device_data(
             name=f"{device.serial_number}_config_data_update_coordinator",
             update_interval=CONFIGURATION_UPDATE_INTERVAL,
             entry=entry,
+            # v2.3.1.0 (HS-2310-001b): see the SUN2000 construction site.
+            min_register_ttl=CONFIGURATION_MIN_REGISTER_TTL,
         )
     else:
         configuration_update_coordinator = None

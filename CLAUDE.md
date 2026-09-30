@@ -1,7 +1,7 @@
 # CLAUDE.md — Huawei Solar Integration
 
 > **Maintained by Claude (Anthropic) on behalf of the community.**
-> Current version: **2.3.0.2** — see `manifest.json`.
+> Current version: **2.3.1.0** — see `manifest.json`.
 > Releases 2.0.0 – 2.2.0.2 are documented in their own `AUDIT_<version>.md`
 > files rather than in §8 below; 2.3.0.0 onwards are recorded in both.
 
@@ -69,6 +69,7 @@ homeassistant/
         ├── modbus_telemetry.py                # Rolling-window traffic stats + HA sensors
         ├── register_cache.py                  # Tier-aware + adaptive TTL register cache
         ├── night_mode.py                      # PV-power-based night/day mode detector
+        ├── bus_policy.py                      # ← NEW (2.3.1.0): bus-side switches + single retry layer (no HA imports)
         ├── update_coordinator.py              # Optimised DataUpdateCoordinator
         ├── synchronized_power_coordinator.py  # Coherent multi-inverter power snapshot
         │
@@ -141,6 +142,18 @@ least 2 consecutive refreshes were missed, or after 3 × ceiling of
 continuous uncertainty. STATIC never expires; a register written by us is
 BAD until re-read. Only keep-alive link loss invalidates the whole cache.
 
+**Cadence floors (v2.3.1.0, option `slow_register_cadence`).** SOH-calibration
+status is re-read at most hourly, configuration-coordinator registers at most
+every 30 min. Floors apply only to GOOD entries (never delay a written or
+uncertain register).
+
+**Slow address regions (v2.3.1.0, option `slow_path_isolation`).**
+`update_coordinator._SLOW_ADDRESS_RANGES`: 32000–32015, 32088–32105,
+37920–37926 and the unmapped gap between each battery pack's SOC and
+charge/discharge power. `_address_group()` never merges across them. Measured:
+a pack read across the gap ~2.1 s, without it ~5 ms; the power block alone
+never failed, merged with the status block it failed 68 times.
+
 ### 3.3 Exponential back-off
 
 ```
@@ -163,6 +176,23 @@ a poll cadence.
 - All cache TTLs × 10
 
 Wakes up instantly when power rises above 100 W.
+
+**Peer wake (v2.3.1.0, option `dawn_peer_wake`).** A coordinator that wakes on
+its own evidence wakes every other coordinator on the same bus, which then
+ignores night-entry evidence for 60 min (`PEER_WAKE_HOLD`). Night entry is
+never propagated; a peer-caused wake never cascades.
+
+### 3.5 Retry policy and power priority (v2.3.1.0)
+
+- **One retry layer** (option `single_retry_layer`): the vendor transport
+  sends each request once (retry only after a lost connection), 20 s per
+  attempt (`MODBUS_RESPONSE_TIMEOUT`); outer bounds ≥ 23 s. The integration's
+  own busy retry is the only retry on busy.
+- **Power priority** (option `protect_power_reads`): chunks containing
+  `input_power` / `active_power` / `power_meter_active_power` /
+  `storage_charge_discharge_power` use the guard's priority lane (never shed;
+  lane depth 4). A busy reply starts the transition throttle only if it
+  persisted through the busy retries, for 5 min.
 
 ---
 
@@ -364,6 +394,33 @@ fix that calls `_evict()` from `record_failure()` and `record_timeout()`.
 ---
 
 ## 8. Changelog
+
+### v2.3.1.0 (2026-09-30)
+**Stage 2: bus-side fixes from the 49.7 h 2.3.0.2 capture + HA log**
+
+Each of items 1–4 is an option (default ON) so a field regression can be
+isolated without a new build.
+
+- **HS-2310-001a (isolation):** reads never span a known slow address region
+  (pack gaps, 32000–32015, 32088–32105, 37920–37926). Pack-gap reads were
+  56 % of all bus time and 117 of 226 errors; every one of the 68 failed
+  power reads was a power block merged with the status block. Replaces the
+  agreed "slow down pack SOC/status" plan: the pack readings themselves are
+  cheap, so freshness is kept.
+- **HS-2310-001b (cadence):** SOH-calibration status ≤ 1/h, configuration
+  registers ≤ every 30 min (GOOD entries only).
+- **HS-2310-002 (single retry layer):** no hidden library re-sends (352 late
+  answers in 50 h); 20 s per attempt; a write is never re-sent;
+  `WRITE_TIMEOUT` 25 s, keep-alive probe 25 s, chunk bound ≥ 23 s.
+- **HS-2310-003 (power priority):** power-flow chunks on the priority lane
+  (depth 2 → 4); busy transition only when persistent, 5 min.
+- **HS-2310-004 (dawn peer wake):** one device waking wakes the bus
+  (60 min hold).
+- **HS-2310-005:** external audit F-04 (reconfigure cancel reloads the
+  entry), F-05 (awaited keep-alive stop), F-06 (raw `TModbusError` per chunk).
+- Estimated bus time −65 % (capture-based estimate). New `bus_policy.py`,
+  new `tests/test_ics_2310_fixes.py` (88 tests); 5 existing test files
+  updated (reasons in the audit). Full record: `AUDIT_2.3.1.0.md`.
 
 ### v2.3.0.2 (2026-09-27)
 **Stage 1 fix for sensors going `unknown` (field capture, 5 of 5 episodes traced)**
@@ -3313,3 +3370,7 @@ for f in list(base.glob('*.json')) + list(base.glob('translations/*.json')):
 | HS-2302-001 | Med | `register_cache.py` | Expiry on age alone; night poll interval = ceiling | One shed/busy poll blanked sensors ~300 s |
 | HS-2302-002 | Med | `update_coordinator.py` | `invalidate_all()` after every recovery | Full re-read burst; old values blanked right after "communication restored" |
 | HS-2302-004 | Med | `register_cache.py` | Failed re-read overwrote WRITE_PENDING with UNCERTAIN | Pre-write value shown again after a write |
+| HS-2310-001 | High | `update_coordinator.py` | Reads merged across slow address regions (pack gaps, status block) | ~2 s reads, 56 % of bus time, most errors; failed power reads |
+| HS-2310-002 | Med | `__init__.py`, `bus_policy.py` | Library re-sent timed-out/busy requests inside our request | Duplicate work on an overloaded dongle; late answers; writes re-sent |
+| HS-2310-003 | Med | `update_coordinator.py`, `adaptive_modbus.py` | Power reads shed; one resolved busy throttled the bus 10 min | `unknown` power sensors during daytime shed runs |
+| HS-2310-005 | Med | `config_flow.py` | Reconfigure unloaded the entry; cancel never reloaded it | Plant offline after an abandoned reconfigure |

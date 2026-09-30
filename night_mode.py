@@ -28,6 +28,7 @@ successful ``_async_update_data`` with the fresh result dict.
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable
 from datetime import timedelta
 from enum import Enum, auto
@@ -90,6 +91,8 @@ class NightModeDetector:
         self.poll_interval_night = poll_interval_night
         self._mode: InverterMode = InverterMode.DAY
         self._below_threshold_count: int = 0
+        # v2.3.1.0 (HS-2310-004): see force_day().
+        self._night_entry_suppressed_until: float = 0.0
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -109,6 +112,27 @@ class NightModeDetector:
             else self.poll_interval_day
         )
 
+    # ── v2.3.1.0 (HS-2310-004): peer wake ─────────────────────────────────────
+
+    def force_day(self, reason: str, hold_s: float) -> None:
+        """Leave NIGHT mode because another device on the same bus woke up,
+        and ignore night-entry evidence for `hold_s` seconds.
+
+        Without the hold, a device whose own PV is still below the night
+        threshold (or whose status still reads "standby") would drop straight
+        back to NIGHT on its next poll, defeating the purpose. After the hold
+        the normal per-device rules apply again unchanged. A no-op when
+        already in DAY mode (the hold is not extended then).
+        """
+        if self._mode != InverterMode.NIGHT:
+            return
+        self._night_entry_suppressed_until = time.monotonic() + max(0.0, float(hold_s))
+        self._below_threshold_count = 0
+        self._transition(InverterMode.DAY, reason=reason)
+
+    def night_entry_suppressed(self) -> bool:
+        return time.monotonic() < getattr(self, "_night_entry_suppressed_until", 0.0)
+
     def evaluate(self, result: dict[RegisterName, Any]) -> None:
         """Inspect a fresh poll result and update the mode if needed.
 
@@ -116,6 +140,12 @@ class NightModeDetector:
         result dict from the coordinator.
         """
         if not result:
+            return
+
+        # v2.3.1.0 (HS-2310-004): during a peer-wake hold, night-entry
+        # evidence (status or PV) is ignored; DAY stays DAY.
+        if self._mode == InverterMode.DAY and self.night_entry_suppressed():
+            self._below_threshold_count = 0
             return
 
         # ── Check device status first (instant transition) ────────────────

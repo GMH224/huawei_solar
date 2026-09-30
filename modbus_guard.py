@@ -127,7 +127,14 @@ BUS_HEALTH_EWMA_DECAY = 0.98
 # none, catching a genuinely pathological pile-up (e.g. a bug elsewhere
 # repeatedly spawning priority requests) rather than tuning for expected
 # normal operation.
-MAX_PRIORITY_QUEUE_DEPTH = 2
+#
+# v2.3.1.0 (HS-2310-003): 2 -> 4. Power-flow chunks now also use the priority
+# lane (protect_power_reads). Producers on a two-inverter bus: 2 keep-alives,
+# 2 main inverter coordinators, 1 meter, 1 battery (power-flow chunk only) --
+# they rarely wait at the same moment, but 2 would shed a power read exactly
+# in the congested moments the lane exists for. Still a hard ceiling, still
+# under the unchanged 20 %/10 s airtime budget and QUEUE_WAIT_TIMEOUT.
+MAX_PRIORITY_QUEUE_DEPTH = 4
 
 # v2.0.0b (AR-4, external ICS audit): the priority lane's own airtime
 # budget -- see _priority_window_start/_priority_busy_s's own comment in

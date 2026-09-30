@@ -604,6 +604,8 @@ class RegisterCache:
         slow_tier_ttl_s: float | None = None,
         min_missed_refreshes: int = 2,
         uncertain_hard_limit_factor: float = 3.0,
+        min_ttl_s: float = 0.0,
+        ttl_floors_s: "dict[str, float] | None" = None,
     ) -> None:
         self._store: dict[RegisterName, _CacheEntry] = {}
         self._telemetry = telemetry
@@ -619,6 +621,19 @@ class RegisterCache:
         # ceiling itself" -- it can never disable expiry.
         self._min_missed_refreshes = max(1, int(min_missed_refreshes))
         self._uncertain_hard_limit_factor = max(1.0, float(uncertain_hard_limit_factor))
+        # v2.3.1.0 (HS-2310-001b): refresh-cadence floors. `min_ttl_s` applies
+        # to every non-STATIC entry of THIS cache (used for the configuration
+        # coordinator: settings, ~13 % of bus time, rarely change);
+        # `ttl_floors_s` applies per exact register name (SOH-calibration
+        # status: ~2.4 s per read on every read). Floors only ever LENGTHEN
+        # the time until a GOOD value is re-read; they never affect an
+        # entry that is not GOOD (UNCERTAIN/BAD, incl. WRITE_PENDING after
+        # our own write), which filter_stale() re-reads on the next poll
+        # regardless. Negative values are clamped to 0 (no floor).
+        self._min_ttl_s = max(0.0, float(min_ttl_s))
+        self._ttl_floors_s: dict[str, float] = {
+            str(k): max(0.0, float(v)) for k, v in (ttl_floors_s or {}).items()
+        }
         # v2.2.0.1 FIX (external ICS audit ICS-004 -- confirmed): base
         # TTLs used to live in a single module-level dict
         # (_TIER_BASE_TTL), mutated in place by the free function
@@ -686,11 +701,18 @@ class RegisterCache:
 
     # ── effective TTL helper ──────────────────────────────────────────────────
 
-    def _effective_ttl(self, entry: _CacheEntry) -> float:
-        """Return the actual TTL to use for a cache entry, respecting night mode."""
+    def _effective_ttl(self, entry: _CacheEntry, name: "RegisterName | None" = None) -> float:
+        """Return the actual TTL to use for a cache entry, respecting night mode
+        and (v2.3.1.0, HS-2310-001b) the configured cadence floors."""
         ttl = entry.effective_ttl
         if self._night_mode and entry.tier != RegisterTier.STATIC:
             ttl = min(ttl * NIGHT_TTL_MULTIPLIER, _TIER_CAP_TTL[entry.tier])
+        if entry.tier != RegisterTier.STATIC:
+            floor = self._min_ttl_s
+            if name is not None and self._ttl_floors_s:
+                floor = max(floor, self._ttl_floors_s.get(str(name), 0.0))
+            if floor > ttl:
+                ttl = floor
         return ttl
 
     # ── public API ────────────────────────────────────────────────────────────
@@ -785,7 +807,7 @@ class RegisterCache:
                 stale.append(name)
                 continue
 
-            ttl = self._effective_ttl(entry)
+            ttl = self._effective_ttl(entry, name)
 
             # For NORMAL tier, never use a TTL shorter than default_ttl so that
             # the coordinator's own interval is always respected as a minimum.
@@ -1049,7 +1071,7 @@ class RegisterCache:
     def effective_ttl_of(self, name: RegisterName) -> float:
         """Return the current effective TTL of a cached register in seconds."""
         entry = self._store.get(name)
-        return self._effective_ttl(entry) if entry else 0.0
+        return self._effective_ttl(entry, name) if entry else 0.0
 
     def overdue_by(self, name: RegisterName) -> float | None:
         """How many seconds PAST its own due-time this register currently is.
@@ -1082,7 +1104,7 @@ class RegisterCache:
         if entry is None:
             return None
         age = time.monotonic() - entry.ts
-        return age - self._effective_ttl(entry)
+        return age - self._effective_ttl(entry, name)
 
     def worst_overdue(self, n: int = 5) -> list[tuple[RegisterName, float | None]]:
         """v2.0.11 (Phase 5.4, this release -- freshness-debt

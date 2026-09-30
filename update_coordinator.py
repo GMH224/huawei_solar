@@ -49,6 +49,7 @@ import logging
 import math
 import random
 import time
+import weakref
 from typing import Any
 
 from huawei_solar import (
@@ -74,6 +75,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .adaptive_modbus import AdaptiveModbusController
+from .bus_policy import BusPolicy
 from .const import (
     BACKOFF_NORMAL_DIVISOR,
     CONF_SLOW_TIER_TTL_S,
@@ -92,6 +94,11 @@ from .const import (
     BATCH_POLL_DEADLINE,
     BUSY_MAX_RETRIES,
     BUSY_RETRY_PAUSE,
+    BUSY_TRANSITION_DURATION,
+    MODBUS_RESPONSE_TIMEOUT,
+    PEER_WAKE_HOLD,
+    RESPONSE_TIMEOUT_MARGIN,
+    SOH_CALIBRATION_MIN_TTL,
     MAX_CONSECUTIVE_TIMEOUTS,
     MODBUS_RETRY_BASE_WAIT,
     MODBUS_RETRY_MAX_WAIT,
@@ -273,6 +280,148 @@ def _chunk_tier(chunk: list[RegisterName]) -> str:
 _ADDRESS_GROUP_MAX_GAP = 16
 _ADDRESS_GROUP_MAX_SPAN = 64
 
+
+# ── v2.3.1.0 (HS-2310-001a): known slow address regions ──────────────────────
+#
+# Measured, not assumed (both field captures, 39,400 bus records; see
+# AUDIT_2.3.1.0.md §2). Certain address regions are served by the inverter
+# through a slow internal path (~1-3 s per read, every read), while
+# neighbouring registers answer in ~5 ms. The vendor library -- and our own
+# _address_group() -- merges registers whose gap is < 16, so a cheap read
+# silently becomes a slow one whenever it is merged across such a region:
+#
+#   * pack gaps: the UNMAPPED addresses between each battery pack's
+#     state_of_capacity and charge_discharge_power (38230-38232 for pack 1).
+#     4,769 reads spanning them: all but one slow (p50 ~2.1 s). The same
+#     registers read without the gap: 24 reads, all 3.7-8.5 ms. Nothing we
+#     need lives there; reading it is pure cost (~50 % of all bus time).
+#   * 32000-32015 (state/alarm block): slow on every read, alone or merged.
+#   * 32088-32105 (device status / fault code / start-stop time block): the
+#     main power block 32064-32087 read alone: 2,819 reads, all fast
+#     (p50 4.9 ms); merged with this block: 1,336 reads, all slow (p50
+#     2.4 s) -- the power reading then pays the slow toll and is exposed to
+#     its timeouts.
+#   * 37920-37926 (SOH-calibration status): slow on every read.
+#
+# A region is isolated, never avoided: registers INSIDE a region are still
+# read (as their own exchange); registers outside it are never merged with
+# it, and a group is never allowed to span a region it does not need.
+# The configuration block (47xxx) is deliberately NOT listed: its slow and
+# fast addresses are interleaved, and the configuration coordinator's
+# cadence (HS-2310-001b) is the better lever there.
+def _build_slow_address_ranges() -> tuple[tuple[int, int], ...]:
+    ranges: list[tuple[int, int]] = [
+        (32000, 32015),
+        (32088, 32105),
+        (37920, 37926),
+    ]
+    try:
+        from huawei_solar.registers import REGISTERS
+        for unit in (1, 2):
+            for pack in (1, 2, 3):
+                soc = REGISTERS.get(f"storage_unit_{unit}_battery_pack_{pack}_state_of_capacity")
+                cdp = REGISTERS.get(f"storage_unit_{unit}_battery_pack_{pack}_charge_discharge_power")
+                if soc is None or cdp is None:
+                    continue
+                lo = soc.register + soc.length
+                hi = cdp.register - 1
+                if lo <= hi:
+                    ranges.append((lo, hi))
+    except Exception:  # noqa: BLE001 -- fixed ranges above still apply
+        pass
+    return tuple(sorted(ranges))
+
+
+_SLOW_ADDRESS_RANGES: tuple[tuple[int, int], ...] = _build_slow_address_ranges()
+
+
+def _slow_zone(address: int, ranges: tuple[tuple[int, int], ...]) -> int | None:
+    """Index of the slow region containing `address`, or None."""
+    for idx, (lo, hi) in enumerate(ranges):
+        if lo <= address <= hi:
+            return idx
+    return None
+
+
+def _gap_touches_slow_region(
+    gap_start: int, gap_end: int, ranges: tuple[tuple[int, int], ...]
+) -> bool:
+    """True if any address in [gap_start, gap_end] lies in a slow region."""
+    if gap_start > gap_end:
+        return False
+    return any(lo <= gap_end and hi >= gap_start for lo, hi in ranges)
+
+
+def _chunk_touches_slow_region(
+    chunk: list[RegisterName], ranges: tuple[tuple[int, int], ...]
+) -> bool:
+    """True if the address span one read of `chunk` covers touches a slow
+    region (used so a slow read can never claim the priority lane)."""
+    if not chunk:
+        return False
+    spans = [_modbus_span(n) for n in chunk]
+    lo = min(a for a, _ in spans)
+    hi = max(b for _, b in spans)
+    return _gap_touches_slow_region(lo, hi, ranges)
+
+
+# ── v2.3.1.0 (HS-2310-001b): per-register cadence floors ─────────────────────
+def _soh_calibration_ttl_floors() -> dict[str, float]:
+    """SOH-calibration status registers (unit + every pack slot of both
+    storage units): ~2.4 s per read on EVERY read (never seen fast in either
+    capture) and they change only during a multi-hour BMS calibration."""
+    floor = SOH_CALIBRATION_MIN_TTL.total_seconds()
+    names = {"storage_unit_soh_calibration_status": floor}
+    for unit in (1, 2):
+        for pack in (1, 2, 3):
+            names[f"storage_unit_{unit}_battery_pack_{pack}_soh_calibration_status"] = floor
+    return names
+
+
+# ── v2.3.1.0 (HS-2310-003): power-flow registers ──────────────────────────────
+#: A chunk containing one of these is admitted on the guard's priority lane
+#: (never shed) when protect_power_reads is on -- exactly the readings the
+#: power-flow card, the synchronised sensors and the user's own sum
+#: templates depend on. Battery PACK power is deliberately NOT included:
+#: throttling pack traffic during a transition is the point.
+_POWER_FLOW_REGISTERS: frozenset[str] = frozenset({
+    "input_power",
+    "active_power",
+    "power_meter_active_power",
+    "storage_charge_discharge_power",
+})
+
+
+def _is_power_flow_chunk(chunk: list[RegisterName]) -> bool:
+    """Priority-lane eligibility: contains a power-flow register and its read
+    does not touch a known slow region (a slow read never gets priority,
+    even with slow-path isolation switched off)."""
+    if not any(str(n) in _POWER_FLOW_REGISTERS for n in chunk):
+        return False
+    return not _chunk_touches_slow_region(chunk, _SLOW_ADDRESS_RANGES)
+
+
+# ── v2.3.1.0 (HS-2310-004): coordinators sharing one bus ──────────────────────
+#: bus key -> coordinators on that bus (weak: an unloaded coordinator
+#: disappears without explicit bookkeeping; _on_entry_unload also removes it).
+_BUS_MEMBERS: "dict[str, weakref.WeakSet[HuaweiSolarUpdateCoordinator]]" = {}
+
+
+def _register_bus_member(bus_key: str, coordinator: "HuaweiSolarUpdateCoordinator") -> None:
+    _BUS_MEMBERS.setdefault(bus_key, weakref.WeakSet()).add(coordinator)
+
+
+def _unregister_bus_member(bus_key: str, coordinator: "HuaweiSolarUpdateCoordinator") -> None:
+    members = _BUS_MEMBERS.get(bus_key)
+    if members is not None:
+        members.discard(coordinator)
+        if not members:
+            _BUS_MEMBERS.pop(bus_key, None)
+
+
+def _bus_peers(bus_key: str, coordinator: "HuaweiSolarUpdateCoordinator") -> list["HuaweiSolarUpdateCoordinator"]:
+    return [c for c in list(_BUS_MEMBERS.get(bus_key, ())) if c is not coordinator]
+
 # v2.0.14 (Battery Pack Physical Grouping study, this release): protected
 # physical groups for battery-pack registers, per the architecture study
 # document's own recommendation -- built and confirmed BEFORE any new
@@ -394,7 +543,10 @@ def _split_by_physical_group(
     return runs
 
 
-def _address_group(names: list[RegisterName]) -> list[list[RegisterName]]:
+def _address_group(
+    names: list[RegisterName],
+    slow_ranges: tuple[tuple[int, int], ...] = (),
+) -> list[list[RegisterName]]:
     """Partition ADDRESS-SORTED registers into contiguous groups.
 
     DEFECT E (v1.3.5) — retires the tier-based cost model entirely.
@@ -433,6 +585,11 @@ def _address_group(names: list[RegisterName]) -> list[list[RegisterName]]:
     desync seen in the field log immediately preceding a suspected freeze.
 
     Names must already be address-sorted (see _sort_by_modbus_address).
+
+    v2.3.1.0 (HS-2310-001a): with `slow_ranges` given, two registers are
+    additionally only merged if they lie in the same slow region (or both
+    outside any) AND the addresses between them touch no slow region. With
+    the default empty tuple the behaviour is exactly the pre-2.3.1.0 rule.
     """
     if not names:
         return []
@@ -440,18 +597,29 @@ def _address_group(names: list[RegisterName]) -> list[list[RegisterName]]:
     current: list[RegisterName] = [names[0]]
     _, current_end = _modbus_span(names[0])
     group_start, _ = _modbus_span(names[0])
+    current_zone = _slow_zone(group_start, slow_ranges) if slow_ranges else None
 
     for name in names[1:]:
         start, end = _modbus_span(name)
         gap = start - current_end - 1
         span = end - group_start
-        if gap < _ADDRESS_GROUP_MAX_GAP and span <= _ADDRESS_GROUP_MAX_SPAN:
+        mergeable = gap < _ADDRESS_GROUP_MAX_GAP and span <= _ADDRESS_GROUP_MAX_SPAN
+        zone = None
+        if mergeable and slow_ranges:
+            zone = _slow_zone(start, slow_ranges)
+            if zone != current_zone or (
+                zone is None
+                and _gap_touches_slow_region(current_end + 1, start - 1, slow_ranges)
+            ):
+                mergeable = False
+        if mergeable:
             current.append(name)
             current_end = max(current_end, end)
         else:
             groups.append(current)
             current = [name]
             group_start, current_end = start, end
+            current_zone = _slow_zone(start, slow_ranges) if slow_ranges else None
     groups.append(current)
     return groups
 
@@ -493,6 +661,7 @@ class HuaweiSolarUpdateCoordinator(
         start_delay: timedelta = timedelta(0),
         bus_endpoint: str = "",
         entry: ConfigEntry | None = None,
+        min_register_ttl: timedelta | None = None,
     ) -> None:
         super().__init__(
             hass, logger,
@@ -525,6 +694,18 @@ class HuaweiSolarUpdateCoordinator(
         # Bus-level guard (shared by all coordinators on the same RS485 bus)
         endpoint = bus_endpoint or device.serial_number
         self.guard = ModbusGuard.get_or_create(endpoint)
+        # v2.3.1.0: this entry's bus-side switches (all default ON; each
+        # can be turned off in the options). Read once here, like the
+        # SLOW-tier TTL option below -- an options change reloads the entry.
+        self._bus_policy: BusPolicy = BusPolicy.from_options(
+            entry.options if entry is not None else None
+        )
+        self._bus_key: str = endpoint
+        # HS-2310-004: monotonic deadline until which PV-based night entry is
+        # suppressed after a peer on the same bus woke this coordinator.
+        self._peer_wake_hold_until: float = 0.0
+        self._waking_from_peer: bool = False
+        _register_bus_member(endpoint, self)
 
         self.cache = RegisterCache(
             starvation_ceiling_s=REGISTER_STARVATION_CEILING_S,
@@ -542,6 +723,18 @@ class HuaweiSolarUpdateCoordinator(
             slow_tier_ttl_s=(
                 entry.options.get(CONF_SLOW_TIER_TTL_S, DEFAULT_SLOW_TIER_TTL_S)
                 if entry is not None else None
+            ),
+            # v2.3.1.0 (HS-2310-001b): cadence floors, only when the option
+            # is on. `min_register_ttl` is passed by the configuration
+            # coordinator's construction site only.
+            min_ttl_s=(
+                min_register_ttl.total_seconds()
+                if (min_register_ttl is not None and self._bus_policy.slow_register_cadence)
+                else 0.0
+            ),
+            ttl_floors_s=(
+                _soh_calibration_ttl_floors()
+                if self._bus_policy.slow_register_cadence else None
             ),
         )
         self.telemetry: ModbusTelemetry | None = None
@@ -714,6 +907,34 @@ class HuaweiSolarUpdateCoordinator(
             "%s: switching to %s mode — poll interval → %s",
             self.name, new_mode.name, new_interval,
         )
+        # v2.3.1.0 (HS-2310-004): a wake on this coordinator's OWN evidence
+        # wakes the other coordinators on the same bus that are still in
+        # night mode. A wake that was itself caused by a peer does not
+        # propagate further (no cascades, no loops). Night entry is never
+        # propagated -- each coordinator still decides that for itself.
+        if not is_night and not self._waking_from_peer and self._bus_policy.dawn_peer_wake:
+            self._wake_bus_peers()
+
+    def _wake_bus_peers(self) -> None:
+        """HS-2310-004: see _on_mode_change()."""
+        for peer in _bus_peers(self._bus_key, self):
+            try:
+                peer._peer_wake(self.name)
+            except Exception:  # noqa: BLE001 -- one peer must never break another
+                _LOGGER.exception("%s: waking bus peer failed", self.name)
+
+    def _peer_wake(self, source: str) -> None:
+        """Leave night mode because `source` on the same bus woke up."""
+        if not self._night_detector.is_night or self._shutdown:
+            return
+        self._waking_from_peer = True
+        try:
+            self._night_detector.force_day(
+                reason=f"peer on the same bus woke up ({source})",
+                hold_s=PEER_WAKE_HOLD.total_seconds(),
+            )
+        finally:
+            self._waking_from_peer = False
 
     def _adaptive_poll_interval(self) -> timedelta:
         if self._adaptive:
@@ -992,9 +1213,23 @@ class HuaweiSolarUpdateCoordinator(
         # pack register outside the three known categories, this is a
         # complete no-op: _split_by_physical_group() returns exactly the
         # same single run _address_group() would have received directly.
+        # v2.3.1.0 (HS-2310-001a): slow-region isolation -- see
+        # _SLOW_ADDRESS_RANGES. Off: the exact pre-2.3.1.0 grouping.
+        slow_ranges = _SLOW_ADDRESS_RANGES if self._bus_policy.slow_path_isolation else ()
         for protected_run in _split_by_physical_group(sorted_names):
-            for group in _address_group(protected_run):
+            for group in _address_group(protected_run, slow_ranges):
                 chunks.extend(_chunk(group, self._service_aware_chunk_size(group)))
+        # v2.3.1.0 (HS-2310-002): with the single retry layer, one transport
+        # attempt may take up to MODBUS_RESPONSE_TIMEOUT. The per-chunk bound
+        # must be longer, so the TRANSPORT ends a slow attempt rather than
+        # this wrapper abandoning a request the dongle is still processing
+        # (the late-answer pattern in the field log).
+        chunk_timeout_s = effective_timeout.total_seconds()
+        if self._bus_policy.single_retry_layer:
+            chunk_timeout_s = max(
+                chunk_timeout_s,
+                (MODBUS_RESPONSE_TIMEOUT + RESPONSE_TIMEOUT_MARGIN).total_seconds(),
+            )
         merged: dict[RegisterName, Result[Any]] = {}
         # v2.0.9 (Phase 2.1/2.4, this release -- ICS-16/Architecture R3/R4,
         # both external ICS audits -- confirmed): one ID shared by every
@@ -1081,7 +1316,17 @@ class HuaweiSolarUpdateCoordinator(
                         self.telemetry.record_physical_attempt()
                     while True:
                         try:
-                            async with self.guard.request(label=self.name) as _req:
+                            # v2.3.1.0 (HS-2310-003): power-flow chunks use the
+                            # guard's priority lane -- never shed, still
+                            # serialised and paced; bounded by the lane's own
+                            # depth and airtime budget (modbus_guard.py).
+                            use_priority = (
+                                self._bus_policy.protect_power_reads
+                                and _is_power_flow_chunk(chunk)
+                            )
+                            async with self.guard.request(
+                                priority=use_priority, label=self.name,
+                            ) as _req:
                                 # Attribute this exchange to what it actually reads, so
                                 # a stall can be correlated with register count/tier.
                                 _req.registers = len(chunk)
@@ -1120,7 +1365,7 @@ class HuaweiSolarUpdateCoordinator(
                                     if self._adaptive else None
                                 )
                                 t0 = time.monotonic()
-                                async with asyncio.timeout(effective_timeout.total_seconds()):
+                                async with asyncio.timeout(chunk_timeout_s):
                                     chunk_result = await self.device.batch_update(chunk)
                             merged.update(chunk_result)
                             # v2.0.0: record this chunk's success into the cache
@@ -1174,8 +1419,13 @@ class HuaweiSolarUpdateCoordinator(
                                 )
                             break  # chunk succeeded
 
+                        # v2.3.1.0 (HS-2310-005, external audit F-06): raw
+                        # TModbusError added, so a transport error the
+                        # coordinator's outer handler already recognises is
+                        # also classified per chunk instead of aborting the
+                        # remaining chunks of the batch.
                         except (TimeoutError, ReadException, ConnectionInterruptedException,
-                                HuaweiSolarException) as exc:
+                                HuaweiSolarException, TModbusError) as exc:
                             if (
                                 isinstance(exc, ReadException)
                                 and getattr(exc, "modbus_exception_code", None) == _EXC_SLAVE_DEVICE_BUSY
@@ -1210,13 +1460,34 @@ class HuaweiSolarUpdateCoordinator(
                                     busy_retries, BUSY_MAX_RETRIES,
                                     BUSY_RETRY_PAUSE.total_seconds() * 1000,
                                 )
-                                if busy_retries == 1 and self._adaptive:
-                                    # First BUSY is a reliable transition signal
+                                if (
+                                    busy_retries == 1
+                                    and self._adaptive
+                                    and not self._bus_policy.protect_power_reads
+                                ):
+                                    # Pre-2.3.1.0 behaviour (option off): the
+                                    # FIRST busy starts the 10-min transition.
                                     self._adaptive.notify_transition("0x06 SLAVE_DEVICE_BUSY")
                                 await asyncio.sleep(BUSY_RETRY_PAUSE.total_seconds())
                                 continue  # retry this chunk
 
                             # Non-BUSY failure, or retries exhausted for this chunk.
+                            # v2.3.1.0 (HS-2310-003): with protect_power_reads on,
+                            # the transition throttle starts only when a busy
+                            # reply PERSISTED through our own retries, and for
+                            # BUSY_TRANSITION_DURATION (5 min) instead of 10.
+                            # A busy that a 600 ms retry resolved is not a
+                            # reason to throttle the whole bus.
+                            if (
+                                self._bus_policy.protect_power_reads
+                                and self._adaptive
+                                and isinstance(exc, ReadException)
+                                and getattr(exc, "modbus_exception_code", None) == _EXC_SLAVE_DEVICE_BUSY
+                            ):
+                                self._adaptive.notify_transition(
+                                    "0x06 SLAVE_DEVICE_BUSY (persistent)",
+                                    duration=BUSY_TRANSITION_DURATION,
+                                )
                             # v2.0.0: record it into the cache right here, where
                             # `chunk`'s specific register names are genuinely in
                             # scope, then move on to the NEXT chunk instead of
@@ -1341,6 +1612,8 @@ class HuaweiSolarUpdateCoordinator(
         """
         self._shutdown = True
         self.guard.remove_source(self.device.serial_number)
+        # v2.3.1.0 (HS-2310-004): leave the bus-peer set.
+        _unregister_bus_member(self._bus_key, self)
 
     def _schedule_deferred_first_poll(self) -> None:
         """Run the actual first poll, after the stagger delay, as a

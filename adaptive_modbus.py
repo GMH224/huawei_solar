@@ -1087,7 +1087,7 @@ class AdaptiveModbusController:
             self._slots[slot_idx].record_poll(success)
         self._schedule_save()
 
-    def notify_transition(self, reason: str = "") -> None:
+    def notify_transition(self, reason: str = "", duration: timedelta | None = None) -> None:
         """Signal that the inverter has changed operating state.
 
         Called by the coordinator when any of the following is detected:
@@ -1100,9 +1100,17 @@ class AdaptiveModbusController:
         history, because the CPU load spike during a state change is immediate
         and can't be predicted from historical averages alone.
         """
-        duration = timedelta(minutes=ADAPTIVE_TRANSITION_DURATION_MINUTES)
+        # v2.3.1.0 (HS-2310-003): callers may pass a shorter duration (the
+        # persistent-busy trigger uses BUSY_TRANSITION_DURATION, 5 min). A
+        # new notification never SHORTENS a transition already in force: the
+        # expiry is the later of the running one and the new one.
+        if duration is None or duration.total_seconds() <= 0:
+            duration = timedelta(minutes=ADAPTIVE_TRANSITION_DURATION_MINUTES)
+        new_expiry = time.monotonic() + duration.total_seconds()
+        if self._in_transition and self._transition_expires > new_expiry:
+            new_expiry = self._transition_expires
         self._in_transition = True
-        self._transition_expires = time.monotonic() + duration.total_seconds()
+        self._transition_expires = new_expiry
         # v2.0.9 (Phase 2.2, this release -- ICS-13/ICS-14, both external
         # ICS audits): the reason string was previously only ever used in
         # this DEBUG log line -- never retained as state, so telemetry
@@ -1113,10 +1121,10 @@ class AdaptiveModbusController:
         self._last_transition_reason = reason or "unknown"
         self._last_transition_ts = time.monotonic()
         _LOGGER.debug(
-            "AdaptiveModbus[%s]: transition detected (%s) — elevated params for %d min",
+            "AdaptiveModbus[%s]: transition detected (%s) — elevated params for %.0f s",
             self.serial_number,
             reason or "unknown",
-            ADAPTIVE_TRANSITION_DURATION_MINUTES,
+            duration.total_seconds(),
         )
         self._push_to_listeners(None)
 
