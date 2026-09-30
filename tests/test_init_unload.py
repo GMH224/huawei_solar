@@ -143,7 +143,10 @@ class TestF21UnloadOrdering:
 
     def test_keepalive_stop_precedes_transport_disconnect(self):
         body = self._unload_body()
-        keepalive_stop_idx = body.find("keepalive.stop()")
+        # v2.3.1.0 (HS-2310-005): the stop is now AWAITED
+        # (keepalive.async_stop(...)) -- same ordering requirement, stronger
+        # guarantee. Search string updated accordingly.
+        keepalive_stop_idx = body.find("await keepalive.async_stop(")
         # NOT a plain find("primary_device.client.disconnect()") -- that
         # string also appears inside this function's own explanatory
         # comment (describing what the code used to look like), which
@@ -151,7 +154,7 @@ class TestF21UnloadOrdering:
         # trivially pass regardless of the actual code. The trailing
         # comma+newline is unique to the real call site.
         disconnect_idx = body.find("primary_device.client.disconnect(),\n")
-        assert keepalive_stop_idx > -1, "keepalive.stop() not found in async_unload_entry"
+        assert keepalive_stop_idx > -1, "await keepalive.async_stop() not found in async_unload_entry"
         assert disconnect_idx > -1, "transport disconnect() call site not found in async_unload_entry"
         assert keepalive_stop_idx < disconnect_idx, (
             "keepalive.stop() must run BEFORE the transport disconnect -- "
@@ -169,7 +172,8 @@ class TestF21UnloadOrdering:
         # The keepalive-stopping pass must itself contain a loop over
         # device_datas, not just a single device's keepalive.
         assert "for device_data in device_datas:" in pre_disconnect
-        assert "keepalive.stop()" in pre_disconnect
+        # v2.3.1.0 (HS-2310-005): awaited stop, see above.
+        assert "await keepalive.async_stop(" in pre_disconnect
 
     def test_keepalive_registry_cleanup_still_happens_after(self):
         """ModbusKeepAlive.remove() (per-entry registry bookkeeping, not a

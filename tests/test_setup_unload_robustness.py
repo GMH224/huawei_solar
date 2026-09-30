@@ -193,7 +193,11 @@ class TestFinding2CleanupOnPartialSetupFailure(unittest.TestCase):
         )
         assert func is not None
         source_segment = ast.get_source_segment(_INIT_SRC.read_text(), func) or ""
-        assert "register_cleanup(keepalive.stop)" in source_segment, (
+        # v2.3.1.0 (HS-2310-005): the registered callback is now the AWAITED
+        # stop (functools.partial(keepalive.async_stop, ...)) instead of the
+        # fire-and-forget keepalive.stop -- same hazard covered, stronger
+        # guarantee. Pinned structurally here; behaviour in test_ics_2310_fixes.
+        assert "register_cleanup(" in source_segment and "keepalive.async_stop" in source_segment, (
             "_setup_inverter_device_data no longer registers keepalive.stop "
             "for cleanup -- this reintroduces Finding 2's specific hazard "
             "(an orphaned keep-alive task surviving a later setup failure)."

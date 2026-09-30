@@ -1607,7 +1607,10 @@ class TestPhase53ServiceTimeAwareChunking(unittest.TestCase):
         # _address_group() is now called once per protected physical-
         # group run, not once for the whole sorted_names list directly --
         # updated to find the actual current call site.
-        idx = _SOURCE.find("for group in _address_group(protected_run):")
+        # v2.3.1.0 (HS-2310-001a): the call now also passes the slow-region
+        # tuple -- `_address_group(protected_run, slow_ranges)`; the search
+        # string is updated, the assertion itself is unchanged.
+        idx = _SOURCE.find("for group in _address_group(protected_run, slow_ranges):")
         assert idx > -1
         window = _SOURCE[idx: idx + 200]
         self.assertIn(
@@ -1880,7 +1883,9 @@ class TestPhysicalGroupWiredIntoChunkBuilding(unittest.TestCase):
         idx = _SOURCE.find("for protected_run in _split_by_physical_group(sorted_names):")
         self.assertGreater(idx, -1)
         window = _SOURCE[idx: idx + 300]
-        self.assertIn("for group in _address_group(protected_run):", window)
+        # v2.3.1.0 (HS-2310-001a): now called with the slow-region tuple
+        # (empty when the option is off = pre-2.3.1.0 grouping).
+        self.assertIn("for group in _address_group(protected_run, slow_ranges):", window)
 
     def test_service_aware_chunking_still_applied_after_the_split(self):
         idx = _SOURCE.find("for protected_run in _split_by_physical_group(sorted_names):")

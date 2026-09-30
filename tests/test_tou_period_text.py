@@ -1088,8 +1088,8 @@ class TestStaticContracts(unittest.TestCase):
 
     def test_manifest_version(self):
         manifest = json.loads((_ROOT / "manifest.json").read_text())
-        # v2.3.0.2: moved from "2.3.0.1" -- pins the CURRENT release.
-        self.assertEqual(manifest["version"], "2.3.0.2")
+        # v2.3.1.0: moved from "2.3.0.2" (was "2.3.0.1") -- pins the CURRENT release.
+        self.assertEqual(manifest["version"], "2.3.1.0")
 
     def test_translation_files_contain_all_keys_and_placeholders(self):
         used = _used_translation_keys()

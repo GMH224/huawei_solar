@@ -1434,7 +1434,12 @@
           "bh_min_segment_delta_soc": "Min segment ΔSOC (%)",
           "bh_install_date": "Battery install date (YYYY-MM-DD)",
           "bh_ambient_entity": "Ambient temperature sensor entity (optional)",
-          "write_permission_probe": "Test write permission at every start (writes the time-zone register back)"
+          "write_permission_probe": "Test write permission at every start (writes the time-zone register back)",
+          "slow_path_isolation": "Isolate slow register regions (keep power readings fast)",
+          "slow_register_cadence": "Read slow settings less often (settings every 30 min, SOH calibration hourly)",
+          "single_retry_layer": "Single retry layer (no hidden re-sends, 20 s per attempt)",
+          "protect_power_reads": "Protect power readings (never shed; shorter busy throttle)",
+          "dawn_peer_wake": "Wake all devices on the bus when one wakes up at dawn"
         }
       }
     }
