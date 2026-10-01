@@ -50,13 +50,20 @@ To enable these advanced features, you need to select 'Elevate permissions' duri
 ## Battery Health Index
 
 Since **v1.1.5** this fork computes a local, read-only **Battery Health Index**
-for LUNA2000-S1 systems: capacity retention from harvested discharge segments
-(with Huawei SOH-calibration "golden" anchors), round-trip efficiency drift,
+for LUNA2000-S1 systems: capacity retention per pack from harvested discharge
+segments (Huawei SOH-calibration periods excluded), round-trip efficiency drift,
 pack balance, equivalent full cycles, warranty throughput tracking, and a
 measured-vs-model divergence early-warning sensor. No extra polling, no
 register writes. Tunables are exposed via the integration's *Configure*
 dialog. Full design rationale, formulas, and limitations:
 [BATTERY_HEALTH.md](BATTERY_HEALTH.md).
+
+**v2.3.2.0** corrected the calculations: cell temperatures instead of the BMS
+board temperature, no warm-side or discharge-rate correction, a forecast that
+can only fall, steadier efficiency and balance scores, and a thermal-rise
+baseline that is actually set. On upgrade the baselines are re-learned once,
+automatically; balance and thermal rise take about 3 weeks. If you ever saved
+the battery-health options, set *Min segment ΔSOC* to 15 (new default).
 
 ## Battery time-of-use schedule
 

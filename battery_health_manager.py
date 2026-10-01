@@ -601,7 +601,9 @@ class BatteryHealthManager:
         if not self._last_update_success:
             # Coordinator just came back: settle before trusting the data for
             # anything irreversible (v1.2.1).
-            self.engine.mark_recovery("coordinator recovered")
+            # v2.3.2.0 (BH-2320-08): soft -- an ordinary read failure is a
+            # data gap; the open discharge segment is bridged, not discarded.
+            self.engine.mark_recovery("coordinator recovered", hard=False)
         self._last_update_success = True
 
         data = coordinator.data or {}

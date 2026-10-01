@@ -1099,7 +1099,8 @@ class TestOptionsAndStrings(unittest.TestCase):
 
     def test_version(self):
         manifest = json.loads((_ROOT / "manifest.json").read_text())
-        self.assertEqual(manifest["version"], "2.3.1.0")
+        # v2.3.2.0: moved from "2.3.1.0" -- pins the CURRENT release.
+        self.assertEqual(manifest["version"], "2.3.2.0")
 
 
 if __name__ == "__main__":

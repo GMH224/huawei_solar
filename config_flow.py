@@ -2205,7 +2205,7 @@ class BatteryHealthOptionsFlowHandler(OptionsFlowWithReload):
                 ): vol.All(vol.Coerce(int), vol.Range(min=14, max=365)),
                 vol.Optional(
                     CONF_BH_MIN_SEGMENT_DELTA_SOC,
-                    default=options.get(CONF_BH_MIN_SEGMENT_DELTA_SOC, 10.0),
+                    default=options.get(CONF_BH_MIN_SEGMENT_DELTA_SOC, 15.0),  # v2.3.2.0: was 10
                 ): vol.All(vol.Coerce(float), vol.Range(min=2.0, max=50.0)),
             }
         )

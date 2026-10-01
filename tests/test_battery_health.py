@@ -56,6 +56,14 @@ def _cfg(**overrides) -> "bh.BatteryHealthConfig":
     # symptom (estimated_capacity_kwh roughly doubled) before this fix.
     cfg.capacity_temp_sigma_c = 1e9
     cfg.capacity_rate_ref_w = 1e9
+    # v2.3.2.0 (BH-2320-05): the tests in this file feed balance samples
+    # tick by tick and test the SCORING rules, not the sampling cadence;
+    # they keep the pre-2.3.2.0 per-tick sampling (spacing <= 0 restores
+    # it, see BalanceTracker.feed). The new one-sample-per-rest-period
+    # cadence is tested in tests/test_ics_2320_fixes.py with the real
+    # defaults. Same reasoning as the normalisation neutralisers above.
+    cfg.balance_min_sample_spacing_s = 0.0
+    cfg.balance_rest_settle_s = 0.0
     for k, v in overrides.items():
         setattr(cfg, k, v)
     return cfg
@@ -567,8 +575,11 @@ class TestEfficiency(unittest.TestCase):  # T8
             chg += 40.0; dis += 40.0 * 0.94
             self._anchor(eng, i * DAY, chg, dis)
         soh, attrs = eng.efficiency.soh_efficiency()
-        # 2 %-points loss × 8 pts = 84
-        self.assertAlmostEqual(soh, 100.0 - 2.0 * 8.0, delta=0.5)
+        # 2 %-points loss × 8 pts = 84 before v2.3.2.0; since 2.3.2.0 the
+        # first eff_deadband_pct of loss is treated as seasonal noise
+        # (BH-2320-04): (2.0 - 0.25) × 8 = 14 -> 86.
+        self.assertAlmostEqual(
+            soh, 100.0 - (2.0 - cfg.eff_deadband_pct) * 8.0, delta=0.5)
         self.assertAlmostEqual(attrs["efficiency_current"], 0.94, places=3)
 
     def test_implausible_eta_discarded(self):
@@ -1298,8 +1309,15 @@ class TestCapacityReference(unittest.TestCase):  # T21 / Finding H
         reference value itself must reflect only those -- not be pulled
         toward a differently-valued calibration-tainted segment mixed
         into the same segment list."""
+        # v2.3.2.0: calibration_settle_s defaults to 3900 s now (BH-2320-10).
+        # This scenario jumps a whole day between ticks, so the calibration
+        # END is only noticed on the first clean segment's first tick and a
+        # 65-min settle would (correctly) exclude that 20-min segment too,
+        # leaving 9 instead of 10. The test is about WHICH segments define
+        # the reference, so it keeps the original 300 s settle.
         cfg = _cfg(freshness_tau_kwh=1e12, capacity_reference_min_segments=10,
-                   capacity_reference_min_span_days=5.0)
+                   capacity_reference_min_span_days=5.0,
+                   calibration_settle_s=300.0)
         eng = bh.BatteryHealthEngine(cfg)
         t = 0.0
         # 5 calibration-tainted segments at a very different (higher)
@@ -3395,15 +3413,16 @@ class TestTier3CapacityNormalization(unittest.TestCase):  # v2.0.6, battery heal
         normalized = seg.normalized_capacity_kwh(cfg)
         self.assertGreater(normalized, 20.0)
 
-    def test_high_power_segment_normalized_capacity_exceeds_raw(self):
-        """A genuine high-rate discharge understates true capacity the
-        same way -- normalization must correct upward here too."""
+    def test_high_power_segment_is_not_rate_corrected(self):
+        """v2.3.2.0 (BH-2320-02) -- REPLACES the v2.0.6 test
+        test_high_power_segment_normalized_capacity_exceeds_raw, which
+        asserted the rate correction this release removes (it doubled the
+        capacity at 5 kW, while the real effect for LiFePO4 at <= 0.25 C is
+        ~1 %). A high-rate segment is now taken as measured."""
         cfg = bh.BatteryHealthConfig()
-        # 8 kWh over 0.5h = 16 kW average power, well above the 5 kW reference.
         seg = self._seg(implied=20.0, avg_temp_c=cfg.capacity_temp_ref_c,
-                        energy_kwh=8.0, duration_h=0.5)
-        normalized = seg.normalized_capacity_kwh(cfg)
-        self.assertGreater(normalized, 20.0)
+                        energy_kwh=8.0, duration_h=0.5)   # 16 kW average
+        self.assertAlmostEqual(seg.normalized_capacity_kwh(cfg), 20.0, places=6)
 
     def test_clamp_floor_is_respected_for_extreme_temperature(self):
         cfg = bh.BatteryHealthConfig()
@@ -3421,9 +3440,7 @@ class TestTier3CapacityNormalization(unittest.TestCase):  # v2.0.6, battery heal
         the combined correction must now be capped at the same 2x a
         single adverse factor alone would produce."""
         cfg = bh.BatteryHealthConfig()
-        # Extreme cold (well past the temperature floor) AND extreme
-        # rate (well past the rate floor): 8 kWh over 0.1h = 80 kW
-        # average power, and -40C.
+        # Extreme cold AND extreme rate: 8 kWh over 0.1h = 80 kW, -40C.
         seg = self._seg(implied=20.0, avg_temp_c=-40.0, energy_kwh=8.0, duration_h=0.1)
         normalized = seg.normalized_capacity_kwh(cfg)
         single_factor_bound = 20.0 / cfg.capacity_norm_factor_floor  # 2x, not 4x
@@ -3433,9 +3450,11 @@ class TestTier3CapacityNormalization(unittest.TestCase):  # v2.0.6, battery heal
             "(the pre-fix bug allowed up to 80.0, a 4x correction from "
             "two floors compounding multiplicatively)",
         )
-        # Confirm this is a REAL, binding constraint for this input --
-        # not a vacuously true assertion because neither floor was hit.
-        self.assertAlmostEqual(normalized, single_factor_bound, places=2)
+        # v2.3.2.0 (BH-2320-02): the binding limit is now the cold cap
+        # (capacity_cold_max_pct, 10 %), far inside the 2x bound; the rate
+        # adds nothing. Was: exactly the 2x floor.
+        self.assertAlmostEqual(
+            normalized, 20.0 / (1.0 - cfg.capacity_cold_max_pct / 100.0), places=6)
 
     def test_avg_temp_c_accumulates_only_valid_readings(self):
         """A segment with some missing temperature ticks must average
@@ -3555,8 +3574,13 @@ class TestSectionEConditionCoverageAndFloorHits(unittest.TestCase):  # v2.0.7
     def test_adversarial_combined_floor_hit_is_counted(self):
         """BH-07's combined floor (both cold AND high-rate simultaneously)
         must be counted as a real occurrence when it genuinely binds."""
-        cfg = _cfg(freshness_tau_kwh=1e12, capacity_rate_ref_w=5000.0,
-                   capacity_temp_sigma_c=15.0)
+        # v2.3.2.0 (BH-2320-02): with the cold-only correction the floor can
+        # only bind if the cold cap is configured at >= 50 %; set so here to
+        # keep testing that the COUNTER works. Default config never binds
+        # (see test_negative_case_mild_conditions_never_hit_the_floor and
+        # test_ics_2320_fixes.py).
+        cfg = _cfg(freshness_tau_kwh=1e12, capacity_cold_max_pct=60.0,
+                   capacity_cold_pct_per_c=5.0)
         eng = bh.BatteryHealthEngine(cfg)
         # Extreme cold AND extreme rate: well past both individual floors,
         # forcing the combined-product clamp to actually bind. 6.0 kWh

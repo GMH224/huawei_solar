@@ -275,6 +275,11 @@ class HuaweiSolarBatteryHealthSensorEntity(SensorEntity):
                     "lab-grade prediction."
                 ),
                 "stress_ratio": report.stress_ratio,
+                # v2.3.2.0 (BH-2320-03)
+                "effective_age_days": report.attributes.get("effective_age_days"),
+                "effective_age_prior_frozen": report.attributes.get(
+                    "effective_age_prior_frozen"),
+                "temperature_source": report.attributes.get("temperature_source"),
             }
         elif self._attr_key == "confidence":
             self._attr_extra_state_attributes = {
@@ -298,7 +303,7 @@ class HuaweiSolarBatteryHealthSensorEntity(SensorEntity):
                     "capacity_reference_kwh", "capacity_reference_is_measured",
                     "capacity_reference_captured", "capacity_reference_epochs",
                     "segment_soc_midpoint_mean", "segment_charge_ceiling_mean",
-                    "segment_count",
+                    "segment_count", "segments_used",  # v2.3.2.0
                     # v2.0.12 FIX (Battery Phase 5B UI restructuring, this
                     # release): the genuinely PER-PACK values that used
                     # to live here (pack_capacity_soh_percent, pack_
@@ -334,6 +339,7 @@ class HuaweiSolarBatteryHealthSensorEntity(SensorEntity):
                     "balance_baseline_dv", "balance_baseline_dt",
                     "balance_baseline_captured", "balance_baseline_epochs",
                     "balance_sample_soc_mean", "balance_sample_count",
+                    "balance_last_sample_ts",  # v2.3.2.0
                     "packs_included", "packs_excluded",
                 )
             }
@@ -344,6 +350,9 @@ class HuaweiSolarBatteryHealthSensorEntity(SensorEntity):
                     "efficiency_baseline_tier", "efficiency_current_tier",
                     "efficiency_window_count", "efficiency_baseline_epochs",
                     "efficiency_charge_ceiling",
+                    # v2.3.2.0 (BH-2320-04)
+                    "efficiency_loss_pct", "efficiency_deadband_pct",
+                    "efficiency_rejected_outlier_windows",
                 )
             }
 

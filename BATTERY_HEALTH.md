@@ -10,6 +10,14 @@
 > matters, and to raise an early warning if the battery ages faster than
 > expected. Track the change over time — do not over-interpret the absolute
 > number.
+>
+> **v2.3.2.0** reworked the corrections and the scoring windows after a
+> review against field data and the LiFePO4 literature (§2, §7c, §8 and
+> `AUDIT_2.3.2.0.md`). In short: cell temperatures instead of the BMS board
+> temperature, no warm-side or rate correction, a lifetime effective age for
+> the forecast, a 10-window efficiency baseline with a seasonal deadband, one
+> balance sample per rest period, and a thermal-rise baseline that actually
+> gets set.
 
 ---
 
@@ -29,15 +37,20 @@ library exposes the per-pack **SOH calibration status registers
 
 Consequences implemented here:
 - A discharge segment during which any SOH-calibration status register is
-  non-zero is flagged **golden** and gets a **4× weight boost** — it is the
-  BMS's own controlled full-cycle measurement, the best data we will ever see.
+  non-zero is **excluded** from the capacity estimate (since v2.0.6; the
+  original 4× "golden" boost was dropped because the BMS re-scales SOC during
+  its own calibration, which corrupts ΔkWh/ΔSOC). Efficiency anchors and
+  balance samples are not taken during a calibration either. Since v2.3.2.0
+  the calibration-status registers are read at most hourly, so the settle
+  window after a calibration is 65 min and anything closed in the hour before
+  a calibration is noticed is excluded retroactively.
 - Register **37758 (`storage_rated_capacity`, Wh)** is logged and watched: if
   it steps after a calibration event, that is very likely Huawei's own updated
   capacity estimate (unverified hypothesis — logged at WARNING, not yet used
   in any formula).
-- Practical tip: triggering a manual health check once a year (winter, when a
-  deep discharge is natural anyway) guarantees at least one golden anchor per
-  year even if your PV/load pattern never produces natural full cycles.
+- Practical tip: Huawei's own check (manual, or automatic one year after the
+  last one) keeps the BMS SOC scale honest; this integration does not use the
+  calibration cycle itself.
 
 ### Finding 2 — Module+ optimizers invalidate voltage-sag resistance
 Each LUNA2000-S1 module contains its own DC/DC energy optimizer. Every
@@ -95,51 +108,91 @@ BHI = w_cap·SOH_cap + w_eff·SOH_eff + w_bal·SOH_bal
 
 ### SOH_cap — capacity from harvested discharge segments
 A segment starts when `storage_charge_discharge_power < −50 W` and ends on
-idle/charging. Qualification: ΔSOC ≥ 10 (configurable), no data gap, no
-missing field, implied capacity within [8, 35] kWh.
+charging (rest does not end it; 6 h of rest does). Qualification: implied
+capacity within [8, 35] kWh (unit; packs scaled by pack count). The same
+segment logic runs once for the whole unit and once per pack, on each pack's
+own SOC and lifetime counters.
 
 ```
-implied_capacity_i = ΔkWh_i / (ΔSOC_i / 100)
-weight_i           = ΔSOC_i² × exp(−throughput_since_full/τ) × (4 if golden)
-(segments may span bridged data gaps; see §7)
-SOH_cap            = clip( trimmed_weighted_mean(implied) / C_rated × 100 )
+implied_capacity_i   = ΔkWh_i / (ΔSOC_i / 100)
+normalized_i         = implied_i / f_cold(T_i)          (v2.3.2.0)
+f_cold(T)            = 1 − min(10, 0.5 · max(0, 15 − T)) / 100
+T_i                  = mean CELL temperature during the segment
+                       (pack max/min sensors; BMS board only as fallback)
+weight_i             = ΔSOC_i² × exp(−throughput_since_full / 40 kWh)
+eligible             = not calibration, ΔSOC ≥ 15 (option), and within ±25 %
+                       of the window median
+estimate             = weighted trimmed mean(normalized) over eligible
+                       (10 % of weight trimmed from each tail, ≥ 5 segments)
+SOH_cap (per pack)   = clip(estimate / reference × 100, 0, 110)
+SOH_cap (reported)   = the WEAKEST pack's value; the unit-level value is an
+                       independent cross-check (attribute)
 ```
-Aggregation over a 90-day rolling window uses a **weighted trimmed mean**
-(10% of total weight cut from each tail once ≥5 segments exist) plus a
-reported spread — a single glitch segment cannot drag the estimate.
+
+* **No warm-side and no rate correction (v2.3.2.0).** LiFePO4 usable capacity
+  is nearly flat from ~20 to ~40 °C and drops noticeably only in the cold; at
+  the ≤ 0.25 C rates of a home battery the rate effect is ~1 %. The earlier
+  symmetric temperature factor, fed with the BMS board temperature (~9 °C
+  above the cells), booked a ~23 kWh battery as ~32 kWh.
+* The correction is applied when the estimate is computed, from each stored
+  segment's temperature, so a formula change applies to all stored segments.
+* **Reference** = the same estimator over the same eligible set, captured
+  automatically once ≥ 20 eligible segments span ≥ 45 days (so a fresh
+  reference reads exactly 100 %).
 
 ### SOH_eff — round-trip efficiency drift
-Anchors are ticks at SOC ≥ 97% and |power| ≤ 100 W. Between successive
-anchors with ≥ 30 kWh of charge:
+Anchors are rest ticks (|power| ≤ 100 W) at a BMS recalibration point
+(SOC ≥ 99 %, tier 1) or at the configured charge ceiling (tier 2, matched
+pairs, ≤ 21 days). Between successive anchors with ≥ 15 kWh of charge:
 ```
-η_window  = Δ(lifetime_discharge) / Δ(lifetime_charge)      (valid 0.50–1.05)
-baseline  = median of first 3 valid windows   (persisted; button resets it)
-current   = median of last 6 valid windows
-SOH_eff   = clip(100 − (baseline − current)·100 × 8)
+η_window  = Δ(lifetime_discharge) / Δ(lifetime_charge)    (valid 0.50–1.00)
+            rejected if > 1.5 % from the median of the last 10 windows
+            (once ≥ 5 exist)
+baseline  = median of the first 10 valid windows of the epoch
+current   = median of the last 6 valid windows
+loss      = max(0, (baseline − current)·100 − 0.25)        (deadband, %-pts)
+SOH_eff   = clip(100 − loss × 8)
 ```
-The baseline is captured automatically over the first weeks of operation —
-**the younger the battery when v1.1.5 is installed, the better the baseline.**
+The 0.25 %-point deadband exists because η depends on cell temperature: the
+field data fell ~0.2 %-pts from August to September with cooler cells, and
+without winter data a seasonal swing that size cannot be told apart from
+ageing. Raw `efficiency_baseline`, `efficiency_current` and
+`efficiency_loss_pct` stay visible.
 
 ### SOH_bal — pack balance
-Sampled at rest (|power| ≤ 50 W) and SOC ≥ 95%, ≥ 2 packs with
-`working_status == running` (offline packs are excluded, never compared
-against stale readings):
+One sample per **rest period** (v2.3.2.0): the pack must rest (|power| ≤ 50 W)
+at SOC ≥ ceiling − 10 (floor 60) for 10 min; the next sample needs a new rest
+period at least 4 h later. ≥ 2 online packs.
 ```
-score_V = 100 → 0 linearly over ΔV 0.05 → 0.50 V
-score_T = 100 → 0 linearly over ΔT 1.0 → 8.0 °C
-SOH_bal = median of last 20 samples of (score_V + score_T)/2
+baseline  = median ΔV, ΔT of the first 20 samples        (~2–3 weeks)
+dev_V     = max(0, ΔV − baseline_V),  score_V: 100 → 0 over 0.15 → 0.40 V
+dev_T     = max(0, ΔT − baseline_T),  score_T: 100 → 0 over 1.0 → 6.0 °C
+SOH_bal   = median of the last 20 samples of (score_V + score_T)/2
 ```
+Until 2.3.2.0 every qualifying tick (~1/min) was a sample, so score and
+baseline described ~20 minutes of a single rest period.
 
 ### Stress ratio & forecast (informational)
 ```
-stress(t) = Q10^((T−25)/10) × f(SOC),  f = 1 → 2.5 linearly above SOC 80
-stress_ratio = time-weighted mean over 90 days (hourly buckets;
-               outages > 15 min excluded from the denominator)
-predicted_SOH = 100 − 2.5·stress_ratio·√age_years − 0.004·EFC
-divergence    = SOH_cap − predicted_SOH        (negative = aging faster)
+S(t)          = Q10^((T_cell − 25)/10) × f(SOC),  Q10 = 2,
+                f = 1 → 2.5 linearly above SOC 80
+stress_ratio  = time-weighted mean of S over 90 days (display)
+effective age = ∫ S² dt over the battery's life                (v2.3.2.0)
+                (time before observation started counts at the observed
+                 mean S², frozen after 7 days of observation)
+predicted_SOH = 100 − 2.5·√(effective_age_years) − 0.004·EFC
+divergence    = SOH_cap − predicted_SOH        (negative = ageing faster)
 EFC           = lifetime_discharge / C_rated
 warranty %    = lifetime_discharge / 28 840 kWh × 100
 ```
+∫S²dt is the equivalent-time form of a √t law whose rate constant scales with
+S (Q = k_ref·√∫(k/k_ref)²dt). At constant S it equals the old
+`2.5·S·√age`; under changing conditions it accumulates, so the prediction can
+only fall once the prior is frozen. The old form (90-day S × √total age)
+projected one season onto the whole life and would have risen in winter.
+`cold_charge_hours` counts charging with cells below 10 °C (lithium-plating
+risk, not modelled in S) for visibility only.
+
 The warranty sensor is a **legal reference** (CH/EEA terms: 28.84 MWh to 60%
 retention), *not* "% of real battery life" — real LFP cycle life is typically
 far higher.
@@ -152,13 +205,13 @@ far higher.
 |---|---|---|
 | `storage_state_of_capacity` | 37760 | SOC (segments, gating, freshness) |
 | `storage_charge_discharge_power` | 37765 | +charge/−discharge W |
-| `storage_unit_1_battery_temperature` | 37022 | stress model |
+| `storage_unit_1_battery_temperature` | 37022 | BMS board temperature; fallback only (v2.3.2.0) |
 | `storage_total_charge` / `_discharge` | 37780/37782 | efficiency, EFC, energy |
 | `storage_rated_capacity` | 37758 | logged (recalibration watch) |
 | `storage_unit_1_battery_pack_{1..3}_voltage` | 38235/38277/38319 | balance |
-| `..._pack_{1..3}_maximum/minimum_temperature` | 38452+ | balance |
+| `..._pack_{1..3}_maximum/minimum_temperature` | 38452+ | balance; cell temperature for capacity and stress (v2.3.2.0) |
 | `..._pack_{1..3}_working_status` | 38228+ | pack online gating |
-| `..._pack_{1..3}_soh_calibration_status` + unit | 37920–37926 | golden segments |
+| `..._pack_{1..3}_soh_calibration_status` + unit | 37920–37926 | calibration exclusion |
 
 The subsystem **never writes** a register. It subscribes to the existing
 energy-storage coordinator (30 s cadence) with a register-name context, so it
@@ -222,9 +275,11 @@ only the aggregation applied to them changes. All other constants live in
 
 State is stored via HA's `Store` helper
 (`.storage/huawei_solar_battery_health_<serial>`), schema-versioned
-(`schema_version: 1`), saved debounced (≥ 5 min apart, plus on unload).
-Unknown schema versions start fresh rather than guessing. Restart behaviour:
-open segments are never resumed across a restart; the rolling windows are.
+(`schema_version: 4` since v2.3.2.0), saved debounced (≥ 5 min apart, plus on
+unload). Registered migrations run forward (3 → 4 keeps all learned history
+and triggers a one-time re-derivation, see §7c); versions without a migration
+start fresh rather than guessing. Restart behaviour: open segments are never
+resumed across a restart; the rolling windows are.
 
 ## 7. Failure handling (spec §9 heritage)
 
@@ -261,6 +316,7 @@ States, or the entity detail dialog) and read these counters:
 | Attribute | Meaning |
 |---|---|
 | `segment_count` | qualifying segments currently in the 90-day window |
+| `segments_used` | of those, eligible for the estimate (depth, calibration, outlier rules; v2.3.2.0) |
 | `discarded_segment_count` | segments started and thrown away |
 | `gap_bridged_count` | data gaps spanned mid-segment (v1.1.8+) |
 | `efficiency_window_count` | completed full-charge-to-full-charge windows |
@@ -289,9 +345,19 @@ measure the installation, not the battery:
 
 | Baseline | What it anchors | Captured |
 |---|---|---|
-| Capacity reference | what 100% SOH capacity means | automatically, once ≥20 segments span ≥45 days |
-| Pack-balance baseline | the normal resting ΔV/ΔT spread | automatically, after 20 resting samples |
-| Efficiency baseline | the normal round-trip η | automatically, after 3 valid windows |
+| Capacity reference (unit + each pack) | what 100% SOH capacity means | automatically, once ≥20 eligible segments span ≥45 days |
+| Pack-balance baseline | the normal resting ΔV/ΔT spread | automatically, after 20 rest periods (~2–3 weeks) |
+| Thermal-rise baseline | the normal rise above ambient | with or after the balance baseline, once samples span ≥3 days |
+| Efficiency baseline | the normal round-trip η | automatically, after 10 valid windows |
+
+**Upgrade to v2.3.2.0 (one time, automatic).** Capacity references (unit and
+packs) are re-derived from the stored segments with the new correction and
+estimator; the efficiency baseline is re-derived from the stored windows; the
+balance baseline and thermal rise re-learn over ~3 weeks (the last balance
+score is held meanwhile); the 90-day stress window restarts (it was integrated
+with the BMS temperature). Every previous value stays in the epoch history.
+If you ever saved the battery-health options, *Min segment ΔSOC* keeps the
+saved value (the old default was 10); set it to 15 to follow the new default.
 
 Rules that make this safe:
 
@@ -303,6 +369,8 @@ Rules that make this safe:
 * **Automatic epochs** start when the configured end-of-charge SOC changes,
   because that shifts both η and the SOC operating band systematically.
 * Capacity re-anchoring **refuses** unless enough segments span enough time.
+  Since v2.3.2.0 the button re-anchors the unit **and every pack**, from the
+  same eligible segments the estimate uses.
 
 ⚠️ Re-anchoring *after* real degradation has occurred will hide that
 degradation in the score. That is why the raw series and the epoch history
@@ -333,7 +401,10 @@ back on once the system is stable. A day without learning costs nothing.
 
 **Unplanned reboots** cannot be prepared for, so the engine suspends learning
 automatically for a settling period (default 5 minutes) after any integration
-start, coordinator recovery, or lifetime-counter reset.
+start, coordinator recovery, or lifetime-counter reset. Since v2.3.2.0 an
+ordinary coordinator recovery keeps the open discharge segment (it is bridged
+like any data gap ≤ 1 h); a counter reset or re-enabling learning still ends
+it.
 
 **Charge-ceiling guard:** because a ceiling change restarts baseline epochs, a
 reading below 20% is rejected as a reboot artefact, and any change must
@@ -377,29 +448,33 @@ index attributes is the number to watch if capacity segments stop completing.
 
 ## 8. Known limitations
 
-1. **Circularity:** SOH_cap depends on BMS SOC. Freshness weighting and the
-   SOC-correction guard mitigate but cannot remove this. Golden segments are
-   the strongest counterweight.
+1. **Circularity:** SOH_cap depends on BMS SOC. Freshness weighting, the
+   depth minimum and the outlier rules mitigate but cannot remove this. The
+   BMS SOC of LiFePO4 can be several percent off between full charges (flat
+   OCV, hysteresis), which is why segments shallower than 15 points are not
+   used.
 2. **Forecast is heuristic.** The √t + throughput model uses literature-typical
    LFP constants, not fitted cell data. It exists to make *divergence*
-   computable, not to predict warranty outcomes.
+   computable, not to predict warranty outcomes. It cannot foresee a late
+   "knee" (sudden acceleration of fade); a sustained negative divergence is
+   how one would show up.
 3. Only **storage unit 1** (up to 3 packs) is currently processed.
 4. Options changes require the automatic entry reload to take effect.
-4b. **Balance winter behaviour is not yet field-validated.** The
-   ceiling-relative sampling gate is designed by analogy to the efficiency
-   anchors, but the reference dataset covered only 6 summer weeks of pack
-   voltage/temperature at a single charge ceiling.
-4d. **Thermal-rise baselines need days, not samples.** Pack cooling runs at
-   roughly −0.4 °C/hour, so rise carries hours of load history; the baseline
-   defers until samples span several days.
-4c. **η temperature compensation was attempted and abandoned** — the available
-   BMS temperature range spanned only 3.2 °C, giving r = +0.18 and a 2% noise
-   reduction. Worth revisiting with a full winter of data.
-5. If PV/load patterns never produce ΔSOC ≥ 10 discharge segments, confidence
-   stays `low`/`stale` — by design. (Note: 10 is a segment *depth*, not an
-   absolute SOC floor: a 100% → 77% overnight run is a 23-point segment and
-   qualifies comfortably.) Trigger a manual Huawei health check to
-   feed the estimator a golden cycle.
+5. **Reversible capacity swings (anode overhang).** Measured capacity can move
+   by about a percent with the recent SOC history (strongest in the first
+   100–200 days and after a change of operating pattern) without any real
+   ageing. Treat changes below ~2 % as noise. A reference learned after a
+   summer at high SOC may read slightly above 100 % in winter.
+6. **Winter behaviour not yet field-validated** (revisit Feb–Mar 2027):
+   balance sampling at lower ceilings; temperature dependence of η (the
+   deadband covers the size seen Aug→Sep; per-window cell temperatures are now
+   recorded for this review); the cold-side capacity correction (0.5 %/°C
+   below 15 °C, literature-based, untested on this hardware).
+7. **Huawei rated-capacity register (37758)** is watched for a step after
+   Huawei's own calibration; not yet observed, not used in any formula.
+8. If PV/load patterns never produce ΔSOC ≥ 15 discharge segments,
+   confidence stays `low`/`stale` — by design. (15 is a segment *depth*, not
+   an absolute SOC floor: a 100% → 77% overnight run qualifies comfortably.)
 
 ## 9. Byproduct: one actionable aging lever
 

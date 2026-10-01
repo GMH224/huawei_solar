@@ -53,7 +53,9 @@ _LOGGER = logging.getLogger(__name__)
 #: honestly map onto the new per-identity structure -- an honest fresh
 #: start (now visibly recorded, see BH-09's schema_reset_ts/
 #: schema_reset_from_version) is more correct than silently guessing.
-SCHEMA_VERSION = 3
+#: v2.3.2.0: 3 -> 4, WITH a registered migration (_migrate_3_to_4) that
+#: keeps all learned history -- see that function.
+SCHEMA_VERSION = 4
 
 # v2.0.7 FIX (BH-09, ICS quality audit -- confirmed): a registry for
 # forward migrations, keyed by the OLD schema_version a migrator upgrades
@@ -71,6 +73,33 @@ SCHEMA_VERSION = 3
 # forever, which was BH-09's actual complaint -- no migration mechanism
 # existed at all, for any version, ever.
 _SCHEMA_MIGRATIONS: dict[int, Callable[[dict[str, Any]], dict[str, Any]]] = {}
+
+
+def _migrate_3_to_4(data: dict[str, Any]) -> dict[str, Any]:
+    """v2.3.2.0: keep everything learned; flag the one-time re-derivation.
+
+    Nothing is dropped except the stress buckets, which were integrated
+    with the BMS temperature (~9 C above the cells, BH-2320-01) and would
+    bias the 90-day stress ratio for 90 days. Segments, efficiency
+    windows, baselines, epochs and counters are kept as they are; the
+    engine re-derives the capacity references, the efficiency baseline
+    and the balance sampling epoch from them right after restore
+    (BatteryHealthEngine._apply_upgrade_2320), because that needs the
+    live objects and the new configuration.
+    """
+    out = dict(data)
+    out["schema_version"] = 4
+    out["stress"] = {"buckets": {}}
+    out["upgrade_2320_pending"] = True
+    return out
+
+
+_SCHEMA_MIGRATIONS[3] = _migrate_3_to_4
+
+#: v2.3.2.0: SOH-calibration status registers are re-read at most this
+#: often since v2.3.1.0 (const.SOH_CALIBRATION_MIN_TTL; a test pins the two
+#: equal -- this module stays free of Home Assistant imports).
+CALIBRATION_DETECTION_LATENCY_S = 3600.0
 
 # ── Plausibility bounds (samples outside are DISCARDED, never clipped) ───────
 SOC_MIN, SOC_MAX = 0.0, 100.0
@@ -195,7 +224,15 @@ class BatteryHealthConfig:
 
     # SOH_cap — segment harvesting
     capacity_window_days: float = 90.0
-    min_segment_delta_soc: float = 10.0
+    #: v2.3.2.0 (BH-2320-06): 10 -> 15. Field store (this installation,
+    #: 14.08-30.09): pack segments of 10-15 SOC points scatter with
+    #: stdev 0.475 kWh (6 %) against 0.091 kWh (1.2 %) for 30-50 points;
+    #: unit SOC is reported in whole percent, so a 10-point segment
+    #: carries up to +-5 % quantisation alone. Applied at aggregation too
+    #: (SegmentTracker._eligible), so stored shallow segments stop
+    #: counting immediately. A value stored explicitly in the options
+    #: (bh_min_segment_delta_soc) still wins.
+    min_segment_delta_soc: float = 15.0
     segment_rest_power_w: float = 50.0        # |power| below this = idle
     soc_backstep_tolerance: float = 0.11      # allowed upward SOC jitter (%)
     implied_capacity_min_kwh: float = 8.0     # consistency band — outside =
@@ -244,6 +281,26 @@ class BatteryHealthConfig:
     # partial, effect must never let a single adverse reading dominate
     # or invalidate an otherwise-good segment outright.
     capacity_norm_factor_floor: float = 0.5
+    # v2.3.2.0 (BH-2320-02): the Gaussian temperature factor and the rate
+    # factor above are NO LONGER APPLIED (fields kept so persisted options
+    # and old tests keep loading). LiFePO4/graphite usable capacity is
+    # nearly flat from ~20 to ~40 C and falls noticeably only in the cold;
+    # at <= 0.25 C the rate effect is ~1 %. The symmetric Gaussian
+    # penalised warm cells and, fed with the BMS temperature (~9 C above
+    # the cells), inflated the unit-level capacity to ~32 kWh. Replaced by
+    # a gentle, cold-side-only correction:
+    #   f = 1 - min(cold_max_pct, cold_pct_per_c * max(0, cold_ref - T))/100
+    #   C_normalized = C_raw / f
+    # so a segment at or above capacity_cold_ref_c is taken as measured.
+    capacity_cold_ref_c: float = 15.0
+    capacity_cold_pct_per_c: float = 0.5
+    capacity_cold_max_pct: float = 10.0
+    #: v2.3.2.0 (BH-2320-11): a segment whose normalised capacity is more
+    #: than this fraction away from the median of the current window is
+    #: left out of aggregation (kept in storage, reversible). Relative to
+    #: the window median, not the reference, so genuine long-term fade can
+    #: never be filtered out.
+    capacity_outlier_fraction: float = 0.25
     # v2.0.6 FIX (Tier 1, battery health architecture review): replaces
     # golden_weight_boost (see DischargeSegment.exclude_calibration's own
     # comment for the full reasoning behind this replacement -- the old
@@ -255,7 +312,13 @@ class BatteryHealthConfig:
     # literally sharing settling_period_s, since these are conceptually
     # different triggers (coordinator recovery vs. a calibration
     # completion) a future tuning pass may want to set independently.
-    calibration_settle_s: float = 300.0        # 5 minutes
+    #: v2.3.2.0 (BH-2320-10): 300 -> 3900 s. Since v2.3.1.0 the
+    #: calibration-status registers are re-read at most hourly
+    #: (const.SOH_CALIBRATION_MIN_TTL), so a calibration END can be noticed
+    #: up to CALIBRATION_DETECTION_LATENCY_S late; the settle window covers
+    #: that latency plus the original 5 minutes. The START latency is
+    #: covered by retro-exclusion (BatteryHealthEngine._on_calibration_start).
+    calibration_settle_s: float = 3900.0       # 65 minutes
     trim_fraction: float = 0.10               # weighted trimmed mean
 
     # SOH_eff — round-trip efficiency drift
@@ -272,10 +335,28 @@ class BatteryHealthConfig:
     eff_anchor_min_ceiling: float = 60.0      # below this, do not anchor at all
     eff_tier2_max_window_days: float = 21.0   # bound coulomb drift in tier 2
     eff_valid_min: float = 0.50               # plausibility band for η
-    eff_valid_max: float = 1.05
-    eff_baseline_windows: int = 3             # first N windows → baseline
+    #: v2.3.2.0 (BH-2320-04): 1.05 -> 1.00. Round-trip energy efficiency
+    #: above 1 is physically impossible; such a window is an anchor
+    #: mismatch (field store: the very first window was 1.0025).
+    eff_valid_max: float = 1.00
+    #: v2.3.2.0 (BH-2320-04): 3 -> 10. A median of 3 let two outliers
+    #: (field: 1.0025 and 0.9714) decide the baseline's neighbourhood.
+    eff_baseline_windows: int = 10            # first N windows → baseline
     eff_rolling_windows: int = 6              # last N windows → current
     eff_pts_per_pct_loss: float = 8.0         # SOH_eff slope
+    #: v2.3.2.0 (BH-2320-04): a window more than this many percent away
+    #: from the median of the last eff_outlier_reference windows (once at
+    #: least eff_outlier_min_windows exist) is not recorded.
+    eff_outlier_pct: float = 1.5
+    eff_outlier_min_windows: int = 5
+    eff_outlier_reference: int = 10
+    #: v2.3.2.0 (BH-2320-04): efficiency loss below this many percentage
+    #: points is reported as 0 (score 100). Field store: Aug -> Sep median
+    #: eta fell ~0.2 %-pts with cooler cells; cell resistance is
+    #: temperature dependent, and without winter data a seasonal swing of
+    #: this size cannot be told apart from ageing. Raw baseline/current
+    #: remain exposed. Revisit with winter data (BATTERY_HEALTH.md §8 4c).
+    eff_deadband_pct: float = 0.25
 
     # SOH_bal — pack balance (v1.2.0: baseline-relative)
     #: Absolute thresholds proved unusable on real hardware: a rock-stable
@@ -302,6 +383,16 @@ class BatteryHealthConfig:
     balance_dt_full_score: float = 1.0
     balance_dt_zero_score: float = 8.0
     balance_sample_count: int = 20            # median over last N samples
+    #: v2.3.2.0 (BH-2320-05): at most one balance sample per rest period.
+    #: Until 2.3.1.0 every qualifying tick (~1/min) was a sample, so the
+    #: 20-sample median and the 20-sample baseline both described the last
+    #: ~20 minutes of ONE rest period (field store: thermal-rise samples
+    #: spanned 0.5 h). A sample is now taken once the pack has rested for
+    #: balance_rest_settle_s, and the next one only after the rest ends AND
+    #: at least balance_min_sample_spacing_s has passed -- so 20 samples
+    #: span ~1-3 weeks of distinct rest periods.
+    balance_rest_settle_s: float = 600.0
+    balance_min_sample_spacing_s: float = 14400.0   # 4 h
 
     # Stress accumulator (model input — NOT part of BHI)
     q10: float = 2.0
@@ -321,6 +412,18 @@ class BatteryHealthConfig:
     # Aging forecast (heuristic model — documented as such)
     forecast_calendar_pct_per_sqrt_year: float = 2.5   # at stress_ratio = 1.0
     forecast_cycle_pct_per_efc: float = 0.004          # ≈ 20% over 5000 EFC
+    #: v2.3.2.0 (BH-2320-03): the calendar term now uses an EFFECTIVE age,
+    #: integrated over the battery's life (Q = k_ref * sqrt(∫ S(t)^2 dt),
+    #: the standard equivalent-time form of a sqrt(t) law whose rate
+    #: constant k = k_ref * S varies with conditions). Time before
+    #: observation started is filled with the observed mean S^2; that mean
+    #: is frozen after this much observed time so the forecast can only
+    #: fall from then on.
+    effective_age_prior_freeze_days: float = 7.0
+    #: v2.3.2.0 (N3, literature cross-check): charging graphite anodes
+    #: below roughly 10 C risks lithium plating, which the Arrhenius-only
+    #: stress term does not capture. Counted for visibility only.
+    cold_charge_temp_c: float = 10.0
 
     # Confidence
     confidence_min_segments: int = 5
@@ -460,6 +563,30 @@ class HealthSample:
     #: generation, so it can reveal all packs ageing together - something
     #: inter-pack spread is blind to by construction.
     ambient_temp_c: float | None = None
+    #: v2.3.2.0 (BH-2320-01): cell temperature used for capacity
+    #: normalisation and stress. Filled by BatteryHealthEngine.update() from
+    #: the packs' own max/min sensors; battery_temp_c (register 37022, the
+    #: BMS board) reads ~9 C above the cells on this hardware and is only
+    #: the fallback when no pack temperature is available.
+    cell_temp_c: float | None = None
+
+
+def _effective_temp_c(s: HealthSample) -> float | None:
+    """Cell temperature if known, else the BMS temperature (fallback)."""
+    return s.cell_temp_c if s.cell_temp_c is not None else s.battery_temp_c
+
+
+def _mean_pack_cell_temp(packs: list[PackSample]) -> float | None:
+    """Mean over packs of (max+min)/2 (or whichever one is present)."""
+    vals: list[float] = []
+    for p in packs:
+        if p.temp_max is not None and p.temp_min is not None:
+            vals.append((p.temp_max + p.temp_min) / 2.0)
+        elif p.temp_max is not None:
+            vals.append(p.temp_max)
+        elif p.temp_min is not None:
+            vals.append(p.temp_min)
+    return sum(vals) / len(vals) if vals else None
 
 
 def _valid_or_none(
@@ -529,6 +656,8 @@ def validate_sample(raw: HealthSample) -> HealthSample:
         raw.charge_ceiling_soc, 0.0, 100.0, "charge_ceiling")
     out.ambient_temp_c = _valid_or_none(
         raw.ambient_temp_c, TEMP_MIN_C, TEMP_MAX_C, "ambient_temp")
+    out.cell_temp_c = _valid_or_none(
+        raw.cell_temp_c, TEMP_MIN_C, TEMP_MAX_C, "cell_temp")
     for pack in raw.packs:
         out.packs.append(
             PackSample(
@@ -817,6 +946,20 @@ def _condition_bucket_key(
     return f"{temp_bucket}:{rate_bucket}"
 
 
+def cold_capacity_factor(cfg: BatteryHealthConfig, temp_c: float | None) -> float:
+    """v2.3.2.0 (BH-2320-02): fraction of usable capacity available at temp_c.
+
+    1.0 at or above cfg.capacity_cold_ref_c (and when the temperature is
+    unknown); below it, capacity_cold_pct_per_c percent per degree, capped
+    at capacity_cold_max_pct. Never below 1 - cap/100, never above 1.
+    """
+    if temp_c is None:
+        return 1.0
+    deficit = max(0.0, cfg.capacity_cold_ref_c - float(temp_c))
+    pct = min(max(0.0, cfg.capacity_cold_max_pct), max(0.0, cfg.capacity_cold_pct_per_c) * deficit)
+    return max(0.01, 1.0 - pct / 100.0)
+
+
 @dataclass
 class DischargeSegment:
     """One completed, qualifying discharge segment."""
@@ -907,23 +1050,17 @@ class DischargeSegment:
         product of two. This does not introduce any new unvalidated
         constant -- it reuses capacity_norm_factor_floor as the ceiling
         on the combined correction, not just each half of it.
+
+        v2.3.2.0 (BH-2320-02): REPLACED. The Gaussian temperature factor
+        and the rate factor are gone (see BatteryHealthConfig's
+        capacity_cold_ref_c comment and AUDIT_2.3.2.0.md §3.2 for the
+        literature and field evidence). Only a gentle cold-side correction
+        remains; a segment at or above capacity_cold_ref_c, or without a
+        temperature, is returned exactly as measured. Computed on demand
+        from the stored avg_temp_c, so a formula change applies to every
+        stored segment at once.
         """
-        f_temp = 1.0
-        if self.avg_temp_c is not None:
-            f_temp = math.exp(
-                -((self.avg_temp_c - cfg.capacity_temp_ref_c) ** 2)
-                / (cfg.capacity_temp_sigma_c ** 2)
-            )
-            f_temp = max(f_temp, cfg.capacity_norm_factor_floor)
-        f_rate = 1.0
-        power = abs(self.avg_power_w)
-        if power > 0:
-            f_rate = 1.0 / (
-                1.0 + (power / cfg.capacity_rate_ref_w) ** cfg.capacity_rate_gamma
-            )
-            f_rate = max(f_rate, cfg.capacity_norm_factor_floor)
-        combined = max(f_temp * f_rate, cfg.capacity_norm_factor_floor)
-        return self.implied_capacity_kwh / combined
+        return self.implied_capacity_kwh / cold_capacity_factor(cfg, self.avg_temp_c)
 
     def weight(self, cfg: BatteryHealthConfig) -> float:
         # v2.0.6 (Tier 1): full exclusion, not a boost -- see
@@ -1068,8 +1205,10 @@ class SegmentTracker:
         # same reasoning as the freshness bookkeeping immediately after
         # this: a missing value here shouldn't discard anything, just
         # not count toward the running mean.
-        if self._active and s.battery_temp_c is not None:
-            self._seg_temp_sum += s.battery_temp_c
+        # v2.3.2.0 (BH-2320-01): cell temperature, BMS only as fallback.
+        _seg_t = _effective_temp_c(s)
+        if self._active and _seg_t is not None:
+            self._seg_temp_sum += _seg_t
             self._seg_temp_count += 1
 
         soc, power = s.soc, s.power_w
@@ -1229,8 +1368,9 @@ class SegmentTracker:
         # otherwise never contribute to its own avg_temp_c.
         self._seg_temp_sum = 0.0
         self._seg_temp_count = 0
-        if s.battery_temp_c is not None:
-            self._seg_temp_sum = s.battery_temp_c
+        _seg_t = _effective_temp_c(s)  # v2.3.2.0 (BH-2320-01)
+        if _seg_t is not None:
+            self._seg_temp_sum = _seg_t
             self._seg_temp_count = 1
 
     def _discard(self, reason: str) -> None:
@@ -1310,44 +1450,50 @@ class SegmentTracker:
         self._agg_cache = None
 
     # ── aggregation ─────────────────────────────────────────────────────────
-    def soh_capacity(self) -> tuple[float | None, dict[str, Any]]:
-        """Weighted trimmed-mean SOH_cap plus diagnostic attributes.
+    def eligible_segments(self) -> list[DischargeSegment]:
+        """v2.3.2.0: the segments the capacity estimate is built from.
 
-        Cached (v1.1.6): recomputed only when the segment set or discard
-        counter changed since the last call — the aggregation is O(n log n)
-        and this runs on every coordinator tick.
+        One definition for the SOH figure, the automatic reference and the
+        manual re-anchor (until 2.3.1.0 these used three slightly different
+        sets -- BH-2320-09). Excluded: calibration-overlapping segments
+        (BH-04), segments shallower than min_segment_delta_soc
+        (BH-2320-06, applied retroactively), and segments whose normalised
+        capacity is more than capacity_outlier_fraction away from the
+        window median (BH-2320-11). Nothing is deleted; a later config
+        change brings them back.
         """
-        if self._agg_cache is not None:
-            soh, attrs = self._agg_cache
-            return soh, dict(attrs)
         cfg = self._cfg
-        segs = self.segments
-        attrs: dict[str, Any] = {
-            "segment_count": len(segs),
-            "excluded_calibration_segment_count": sum(1 for s in segs if s.exclude_calibration),
-            "discarded_segment_count": self.discarded_segments,
-            "gap_bridged_count": self.gap_bridged_count,
-            "stale_endpoint_skips": self.stale_endpoint_skips,
-        }
-        if not segs:
-            self._agg_cache = (None, dict(attrs))
-            return None, attrs
+        segs = [
+            s for s in self.segments
+            if not s.exclude_calibration
+            and s.delta_soc >= cfg.min_segment_delta_soc - 1e-9
+        ]
+        if len(segs) >= 5 and cfg.capacity_outlier_fraction > 0:
+            med = _median([s.normalized_capacity_kwh(cfg) for s in segs])
+            if med > 0:
+                segs = [
+                    s for s in segs
+                    if abs(s.normalized_capacity_kwh(cfg) / med - 1.0)
+                    <= cfg.capacity_outlier_fraction
+                ]
+        return segs
 
+    def _weighted_trimmed_mean(
+        self, segs: list[DischargeSegment],
+    ) -> tuple[float, float] | None:
+        """(mean, weighted stdev) of normalised capacity, or None.
+
+        Weighted by ΔSOC² × freshness; `trim_fraction` of the total weight
+        is trimmed from each tail once there are at least 5 segments.
+        """
+        cfg = self._cfg
         weighted = sorted(
-            # v2.0.6 FIX (Tier 3, battery health architecture review):
-            # was s.implied_capacity_kwh (raw) -- see DischargeSegment.
-            # normalized_capacity_kwh()'s own docstring for the full
-            # temperature/rate correction this applies.
             ((s.normalized_capacity_kwh(cfg), s.weight(cfg)) for s in segs),
             key=lambda t: t[0],
         )
         total_w = sum(w for _, w in weighted)
         if total_w <= 0:
-            self._agg_cache = (None, dict(attrs))
-            return None, attrs
-
-        # Trim `trim_fraction` of total weight from each tail (only when we
-        # have enough segments that trimming can't erase everything).
+            return None
         if len(weighted) >= 5:
             trim = total_w * cfg.trim_fraction
             kept: list[tuple[float, float]] = []
@@ -1369,53 +1515,76 @@ class SegmentTracker:
                     kept_rev.append((cap, w))
             weighted = list(reversed(kept_rev)) or weighted
             total_w = sum(w for _, w in weighted)
-
         mean_cap = sum(c * w for c, w in weighted) / total_w
         var = sum(w * (c - mean_cap) ** 2 for c, w in weighted) / total_w
+        return mean_cap, math.sqrt(var)
+
+    def reference_candidate(self) -> tuple[float, int, float] | None:
+        """(value, n, span_days) a reference would be set to now, or None.
+
+        Same estimator and same eligible set as the SOH figure itself
+        (BH-2320-09: the reference used to be a plain median while SOH was
+        a weighted trimmed mean, so a fresh reference read 99.8 %, not 100).
+        """
+        cfg = self._cfg
+        eligible = self.eligible_segments()
+        if len(eligible) < cfg.capacity_reference_min_segments:
+            return None
+        span_days = (
+            max(s.end_ts for s in eligible) - min(s.start_ts for s in eligible)
+        ) / SECONDS_PER_DAY
+        if span_days < cfg.capacity_reference_min_span_days:
+            return None
+        agg = self._weighted_trimmed_mean(eligible)
+        if agg is None:
+            return None
+        return agg[0], len(eligible), span_days
+
+    def soh_capacity(self) -> tuple[float | None, dict[str, Any]]:
+        """Weighted trimmed-mean SOH_cap plus diagnostic attributes.
+
+        Cached (v1.1.6): recomputed only when the segment set or discard
+        counter changed since the last call — the aggregation is O(n log n)
+        and this runs on every coordinator tick.
+        """
+        if self._agg_cache is not None:
+            soh, attrs = self._agg_cache
+            return soh, dict(attrs)
+        cfg = self._cfg
+        segs = self.segments
+        eligible = self.eligible_segments()
+        attrs: dict[str, Any] = {
+            "segment_count": len(segs),
+            "segments_used": len(eligible),
+            "excluded_calibration_segment_count": sum(1 for s in segs if s.exclude_calibration),
+            "discarded_segment_count": self.discarded_segments,
+            "gap_bridged_count": self.gap_bridged_count,
+            "stale_endpoint_skips": self.stale_endpoint_skips,
+        }
+        agg = self._weighted_trimmed_mean(eligible) if eligible else None
+        if agg is None:
+            self._agg_cache = (None, dict(attrs))
+            return None, attrs
+        mean_cap, spread = agg
         attrs["estimated_capacity_kwh"] = round(mean_cap, 2)
-        attrs["capacity_spread_kwh"] = round(math.sqrt(var), 2)
+        attrs["capacity_spread_kwh"] = round(spread, 2)
         # Finding J: record the SOC band these segments came from, so a
         # seasonal shift in operating range is not mistaken for capacity fade.
-        mids = [s.soc_midpoint for s in segs]
+        mids = [s.soc_midpoint for s in eligible]
         attrs["segment_soc_midpoint_mean"] = round(sum(mids) / len(mids), 1)
-        ceils = [s.charge_ceiling for s in segs if s.charge_ceiling is not None]
+        ceils = [s.charge_ceiling for s in eligible if s.charge_ceiling is not None]
         if ceils:
             attrs["segment_charge_ceiling_mean"] = round(sum(ceils) / len(ceils), 1)
 
-        # Finding H: capture a measured beginning-of-life reference once.
-        #
-        # v2.0.7 FIX (BH-04, ICS quality audit -- confirmed): this used
-        # to gate/compute directly off `segs` (every segment, including
-        # ones with exclude_calibration=True). Normal aggregation above
-        # already correctly zero-weights those via weight() -- see Tier
-        # 1's own comment on exclude_calibration -- but this block ran
-        # independently and had no such filter, so a calibration-
-        # contaminated segment could still define the reference every
-        # subsequent SOH% is measured against, even though it can never
-        # contribute to the measured SOH% itself. Filtering to the same
-        # eligible set aggregation already trusts, for the count/span
-        # gate AND the median itself, not just the median.
-        eligible = [s for s in segs if not s.exclude_calibration]
-        if (
-            self.reference_capacity_kwh is None
-            and len(eligible) >= cfg.capacity_reference_min_segments
-        ):
-            span_days = (
-                max(s.end_ts for s in eligible) - min(s.start_ts for s in eligible)
-            ) / SECONDS_PER_DAY
-            if span_days >= cfg.capacity_reference_min_span_days:
-                # v2.0.6 FIX (Tier 3): was s.implied_capacity_kwh (raw) --
-                # must match the SAME normalization mean_cap above now
-                # uses, since SOH% below is computed as mean_cap /
-                # reference. Comparing a normalized numerator against a
-                # raw-valued reference would be an inconsistent
-                # comparison, not just a smaller inaccuracy -- caught
-                # while making this exact change, not a separate,
-                # later-discovered issue.
+        # Finding H: capture a measured reference once (BH-04: eligible
+        # segments only; v2.3.2.0: same estimator as mean_cap).
+        if self.reference_capacity_kwh is None:
+            cand = self.reference_candidate()
+            if cand is not None:
+                value, n, span_days = cand
                 self.set_reference(
-                    _median(sorted(s.normalized_capacity_kwh(cfg) for s in eligible)),
-                    reason="auto: %d segments spanning %.0f days"
-                           % (len(eligible), span_days),
+                    value,
+                    reason="auto: %d segments spanning %.0f days" % (n, span_days),
                     ts=max(s.end_ts for s in eligible),
                 )
 
@@ -1427,6 +1596,23 @@ class SegmentTracker:
         soh = clip(mean_cap / reference * 100.0, 0.0, cfg.soh_capacity_clip_max)
         self._agg_cache = (soh, dict(attrs))
         return soh, attrs
+
+    def clear_reference(self, reason: str, ts: float | None = None) -> None:
+        """v2.3.2.0: drop the reference (epoch logged), so it is re-captured
+        automatically once enough eligible segments exist."""
+        prev = self.reference_capacity_kwh
+        if prev is None:
+            return
+        self.reference_epochs.append(
+            {"ts": ts, "value": None, "reason": reason, "previous": round(prev, 3)}
+        )
+        self.reference_capacity_kwh = None
+        self.reference_captured_ts = None
+        self._agg_cache = None
+        _LOGGER.warning(
+            "battery_health: capacity reference %.2f kWh cleared - %s. It is "
+            "re-captured automatically once enough segments exist.", prev, reason,
+        )
 
     def set_reference(
         self, value: float, reason: str, ts: float | None = None
@@ -1896,6 +2082,7 @@ class PackCapacityTracker:
                 lifetime_discharge_kwh=corrected_discharge,
                 charge_ceiling_soc=s.charge_ceiling_soc,
                 battery_temp_c=pack_temp_c,
+                cell_temp_c=pack_temp_c,
             )
             self.trackers[i].feed(
                 pack_sample,
@@ -2202,6 +2389,15 @@ class EfficiencyTracker:
         self._anchor: tuple[float, float, float, float, int] | None = None
         self.windows: deque[float] = deque(maxlen=64)
         self.window_tiers: deque[int] = deque(maxlen=64)
+        #: v2.3.2.0: close timestamp and cell temperature at the closing
+        #: anchor per window, parallel to `windows`. The timestamps let a
+        #: late-detected calibration remove windows retroactively
+        #: (BH-2320-10); the temperatures are recorded for the planned winter
+        #: review of temperature compensation (BATTERY_HEALTH.md §8 4c) and
+        #: are NOT used in any score. None for windows from before 2.3.2.0.
+        self.window_end_ts: deque[float | None] = deque(maxlen=64)
+        self.window_temp_c: deque[float | None] = deque(maxlen=64)
+        self.rejected_outlier_windows = 0
         self.baseline: float | None = None
         self.baseline_tier: int | None = None
         self._baseline_pool: list[float] = []
@@ -2301,21 +2497,115 @@ class EfficiencyTracker:
         if not (cfg.eff_valid_min <= eta <= cfg.eff_valid_max):
             _LOGGER.debug("battery_health: discarding implausible eta=%.3f", eta)
             return
+        if self._is_outlier(eta, list(self.windows)):
+            self.rejected_outlier_windows += 1
+            _LOGGER.debug("battery_health: discarding outlier eta=%.4f", eta)
+            return
+        self._record_window(eta, window_tier, s.timestamp, _effective_temp_c(s))
+
+    def _is_outlier(self, eta: float, history: list[float]) -> bool:
+        """v2.3.2.0 (BH-2320-04): eta far from the recent median."""
+        cfg = self._cfg
+        ref = history[-cfg.eff_outlier_reference:]
+        if len(ref) < cfg.eff_outlier_min_windows:
+            return False
+        med = _median(ref)
+        return med > 0 and abs(eta / med - 1.0) * 100.0 > cfg.eff_outlier_pct
+
+    def _record_window(
+        self, eta: float, window_tier: int, ts: float | None,
+        temp_c: float | None, quiet: bool = False,
+    ) -> None:
+        cfg = self._cfg
         self.windows.append(eta)
         self.window_tiers.append(window_tier)
+        self.window_end_ts.append(ts)
+        self.window_temp_c.append(temp_c)
         if self.baseline is None:
             self._baseline_pool.append(eta)
             if len(self._baseline_pool) >= cfg.eff_baseline_windows:
                 self.baseline = _median(self._baseline_pool)
                 self.baseline_tier = window_tier
                 self.baseline_epochs.append(
-                    {"ts": s.timestamp, "value": round(self.baseline, 5),
+                    {"ts": ts, "value": round(self.baseline, 5),
                      "tier": window_tier, "reason": "auto: first %d windows"
                      % len(self._baseline_pool)})
-                _LOGGER.info(
-                    "battery_health: efficiency baseline captured: eta=%.4f "
-                    "(median of %d tier-%d windows)",
-                    self.baseline, len(self._baseline_pool), window_tier)
+                if not quiet:
+                    _LOGGER.info(
+                        "battery_health: efficiency baseline captured: eta=%.4f "
+                        "(median of %d tier-%d windows)",
+                        self.baseline, len(self._baseline_pool), window_tier)
+
+    def rederive(self, reason: str, ts: float | None = None) -> None:
+        """v2.3.2.0 (BH-2320-04): rebuild the current epoch from its windows.
+
+        Replays the stored windows of the CURRENT epoch through today's
+        plausibility and outlier rules and baseline size, so the baseline
+        becomes the median of the first eff_baseline_windows surviving
+        windows -- or stays pending until that many exist. The previous
+        baseline is kept in baseline_epochs.
+        """
+        cfg = self._cfg
+        old = list(zip(
+            self.windows, self.window_tiers,
+            list(self.window_end_ts) + [None] * (len(self.windows) - len(self.window_end_ts)),
+            list(self.window_temp_c) + [None] * (len(self.windows) - len(self.window_temp_c)),
+        ))
+        prev = self.baseline
+        self.windows.clear()
+        self.window_tiers.clear()
+        self.window_end_ts.clear()
+        self.window_temp_c.clear()
+        self._baseline_pool.clear()
+        self.baseline = None
+        self.baseline_tier = None
+        dropped = 0
+        for eta, tier, wts, wt in old:
+            if not (cfg.eff_valid_min <= eta <= cfg.eff_valid_max) or self._is_outlier(
+                eta, list(self.windows)
+            ):
+                dropped += 1
+                continue
+            self._record_window(eta, tier, wts, wt, quiet=True)
+        if self.baseline_epochs and self.baseline is not None:
+            self.baseline_epochs[-1]["reason"] = reason
+            self.baseline_epochs[-1]["previous"] = (
+                None if prev is None else round(prev, 5))
+            if ts is not None and self.baseline_epochs[-1].get("ts") is None:
+                self.baseline_epochs[-1]["ts"] = ts
+        elif prev is not None:
+            self.baseline_epochs.append(
+                {"ts": ts, "value": None, "reason": reason + " (pending)",
+                 "previous": round(prev, 5)})
+        self.rejected_outlier_windows += dropped
+        _LOGGER.warning(
+            "battery_health: efficiency baseline re-derived (%s): %s -> %s "
+            "(%d windows kept, %d dropped as implausible/outlier)",
+            reason, "unset" if prev is None else f"{prev:.4f}",
+            "pending" if self.baseline is None else f"{self.baseline:.4f}",
+            len(self.windows), dropped)
+
+    def drop_windows_since(self, since_ts: float) -> int:
+        """v2.3.2.0 (BH-2320-10): remove windows closed at/after since_ts
+        (a calibration noticed late). The open anchor is dropped as well.
+        Windows without a timestamp (pre-2.3.2.0) are kept."""
+        keep = [
+            (e, t, ts, tc) for e, t, ts, tc in zip(
+                self.windows, self.window_tiers, self.window_end_ts, self.window_temp_c)
+            if ts is None or ts < since_ts
+        ] if len(self.window_end_ts) == len(self.windows) else None
+        self._anchor = None
+        if keep is None:
+            return 0
+        removed = len(self.windows) - len(keep)
+        if removed:
+            self.windows = deque((k[0] for k in keep), maxlen=64)
+            self.window_tiers = deque((k[1] for k in keep), maxlen=64)
+            self.window_end_ts = deque((k[2] for k in keep), maxlen=64)
+            self.window_temp_c = deque((k[3] for k in keep), maxlen=64)
+            if self.baseline is None:
+                self._baseline_pool = self._baseline_pool[: max(0, len(self._baseline_pool) - removed)]
+        return removed
 
     def invalidate_anchor(self) -> None:
         """Discard the open window. Called ONLY on a lifetime-counter reset.
@@ -2338,6 +2628,8 @@ class EfficiencyTracker:
         self._anchor = None
         self.windows.clear()
         self.window_tiers.clear()
+        self.window_end_ts.clear()
+        self.window_temp_c.clear()
         _LOGGER.warning(
             "battery_health: efficiency baseline epoch restarted (%s). "
             "Previous baseline %s retained in history.",
@@ -2354,6 +2646,8 @@ class EfficiencyTracker:
             "efficiency_baseline_tier": self.baseline_tier,
             "efficiency_baseline_epochs": len(self.baseline_epochs),
             "efficiency_charge_ceiling": self.last_ceiling,
+            "efficiency_rejected_outlier_windows": self.rejected_outlier_windows,
+            "efficiency_deadband_pct": cfg.eff_deadband_pct,
         }
         if self.baseline is None or not self.windows:
             return None, attrs
@@ -2362,7 +2656,10 @@ class EfficiencyTracker:
         attrs["efficiency_current"] = round(current, 4)
         tiers = list(self.window_tiers)[-cfg.eff_rolling_windows:]
         attrs["efficiency_current_tier"] = max(tiers) if tiers else None
-        loss_pct_points = max(0.0, (self.baseline - current) * 100.0)
+        raw_loss = (self.baseline - current) * 100.0
+        attrs["efficiency_loss_pct"] = round(raw_loss, 3)
+        # v2.3.2.0 (BH-2320-04): losses inside the seasonal deadband score 0.
+        loss_pct_points = max(0.0, raw_loss - max(0.0, cfg.eff_deadband_pct))
         soh = clip(100.0 - loss_pct_points * cfg.eff_pts_per_pct_loss, 0.0, 100.0)
         return soh, attrs
 
@@ -2376,6 +2673,9 @@ class EfficiencyTracker:
             "baseline_pool": list(self._baseline_pool),
             "baseline_epochs": self.baseline_epochs,
             "last_ceiling": self.last_ceiling,
+            "window_end_ts": list(self.window_end_ts),
+            "window_temp_c": list(self.window_temp_c),
+            "rejected_outlier_windows": self.rejected_outlier_windows,
         }
 
     def restore(self, data: dict[str, Any]) -> None:
@@ -2383,6 +2683,17 @@ class EfficiencyTracker:
         self._anchor = tuple(anchor) if anchor else None
         self.windows = deque(data.get("windows", []), maxlen=64)
         self.window_tiers = deque(data.get("window_tiers", []), maxlen=64)
+        # v2.3.2.0: parallel per-window metadata; pre-2.3.2.0 stores have
+        # none -> padded with None so the deques stay aligned with windows.
+        n = len(self.windows)
+        ends = list(data.get("window_end_ts") or [])[-n:] if n else []
+        temps = list(data.get("window_temp_c") or [])[-n:] if n else []
+        self.window_end_ts = deque([None] * (n - len(ends)) + ends, maxlen=64)
+        self.window_temp_c = deque([None] * (n - len(temps)) + temps, maxlen=64)
+        try:
+            self.rejected_outlier_windows = int(data.get("rejected_outlier_windows", 0))
+        except (TypeError, ValueError):
+            self.rejected_outlier_windows = 0
         self.baseline = data.get("baseline")
         self.baseline_tier = data.get("baseline_tier")
         # v2.2.0.1 FIX (external ICS audit ICS-014/ICS-022 -- confirmed):
@@ -2465,6 +2776,14 @@ class BalanceTracker:
         self._pool_dt: list[float] = []
         self._median_cache: float | None = None
         self.last_ceiling: float | None = None
+        # v2.3.2.0 (BH-2320-05): rest-period sampling state.
+        self._rest_since: float | None = None
+        self._sampled_this_rest = False
+        self.last_sample_ts: float | None = None
+        #: latest qualifying tick's spread, for display only (the deques
+        #: above hold one entry per rest period).
+        self.live_dv: float | None = None
+        self.live_dt: float | None = None
 
     def _gate_soc(self, s: HealthSample) -> float:
         """Minimum SOC for a balance sample, relative to the charge ceiling."""
@@ -2513,7 +2832,12 @@ class BalanceTracker:
                 self.last_ceiling = ceiling
 
         if s.soc < self._gate_soc(s) or abs(s.power_w) > cfg.balance_rest_power_w:
+            # v2.3.2.0: the rest period (if any) has ended.
+            self._rest_since = None
+            self._sampled_this_rest = False
             return
+        if self._rest_since is None:
+            self._rest_since = s.timestamp
 
         included, excluded, volts, temps = [], [], [], []
         temps_min: list[float] = []
@@ -2532,6 +2856,25 @@ class BalanceTracker:
 
         dv = max(volts) - min(volts)
         dt = max(temps) - min(temps)
+        self.live_dv, self.live_dt = dv, dt
+
+        # v2.3.2.0 (BH-2320-05): one sample per rest period, after the pack
+        # has settled, and never closer than balance_min_sample_spacing_s.
+        # Setting balance_min_sample_spacing_s <= 0 restores per-tick
+        # sampling (pre-2.3.2.0 behaviour).
+        if cfg.balance_min_sample_spacing_s > 0:
+            if self._sampled_this_rest:
+                return
+            if s.timestamp - self._rest_since < cfg.balance_rest_settle_s:
+                return
+            if (
+                self.last_sample_ts is not None
+                and s.timestamp - self.last_sample_ts < cfg.balance_min_sample_spacing_s
+            ):
+                return
+            self._sampled_this_rest = True
+        self.last_sample_ts = s.timestamp
+
         self.raw_dv.append(dv)
         self.raw_dt.append(dt)
         if len(temps_min) >= 2:
@@ -2553,6 +2896,12 @@ class BalanceTracker:
                     reason="auto: first %d samples" % len(self._pool_dv),
                     ts=s.timestamp)
             return   # no score until a baseline exists
+
+        # v2.3.2.0 (BH-2320-07): retry the thermal-rise baseline on every
+        # learned sample until it is set (it used to be tried only once,
+        # inside set_baseline(), and stayed unset forever if the samples did
+        # not yet span thermal_rise_baseline_min_span_days at that moment).
+        self.maybe_capture_thermal_baseline()
 
         base_dv = self.baseline_dv if cfg.balance_use_baseline else 0.0
         base_dt = self.baseline_dt if cfg.balance_use_baseline else 0.0
@@ -2579,24 +2928,10 @@ class BalanceTracker:
             {"ts": ts, "dv": round(dv, 3), "dt": round(dt, 2), "reason": reason,
              "previous_dv": prev[0], "previous_dt": prev[1]})
         self.baseline_dv, self.baseline_dt = dv, dt
-        # Only anchor thermal rise once the samples SPAN days. Pack cooling
-        # runs ~-0.4 C/h, so consecutive samples from a single afternoon carry
-        # that afternoon's load history, not the installation's norm.
-        if self.thermal_rise:
-            span_days = (
-                self.thermal_rise[-1][0] - self.thermal_rise[0][0]
-            ) / SECONDS_PER_DAY
-            if span_days >= self._cfg.thermal_rise_baseline_min_span_days:
-                n = len(self.thermal_rise[-1][1])
-                self.baseline_rise = [
-                    _median([r[1][i] for r in self.thermal_rise if len(r[1]) > i])
-                    for i in range(n)
-                ]
-            else:
-                _LOGGER.debug(
-                    "battery_health: thermal-rise baseline deferred - samples "
-                    "span %.1f of %.1f required days",
-                    span_days, self._cfg.thermal_rise_baseline_min_span_days)
+        # Only anchor thermal rise once the samples SPAN days (pack cooling
+        # runs ~-0.4 C/h). v2.3.2.0: moved to maybe_capture_thermal_baseline(),
+        # which feed() now retries until it succeeds.
+        self.maybe_capture_thermal_baseline()
         self.baseline_captured_ts = ts
         self._pool_dv.clear()
         self._pool_dt.clear()
@@ -2604,6 +2939,31 @@ class BalanceTracker:
         _LOGGER.warning(
             "battery_health: pack-balance baseline set to dV=%.3f V dT=%.2f C "
             "- %s. Raw dV/dT remain exposed and are unaffected.", dv, dt, reason)
+
+    def maybe_capture_thermal_baseline(self) -> bool:
+        """Set the thermal-rise baseline if unset and the samples span
+        enough days. Returns True when it was set by this call."""
+        if self.baseline_rise is not None or not self.thermal_rise:
+            return False
+        span_days = (
+            self.thermal_rise[-1][0] - self.thermal_rise[0][0]
+        ) / SECONDS_PER_DAY
+        if span_days < self._cfg.thermal_rise_baseline_min_span_days:
+            _LOGGER.debug(
+                "battery_health: thermal-rise baseline deferred - samples "
+                "span %.1f of %.1f required days",
+                span_days, self._cfg.thermal_rise_baseline_min_span_days)
+            return False
+        n = len(self.thermal_rise[-1][1])
+        self.baseline_rise = [
+            _median([r[1][i] for r in self.thermal_rise if len(r[1]) > i])
+            for i in range(n)
+        ]
+        _LOGGER.info(
+            "battery_health: thermal-rise baseline set (max %.2f C over %d "
+            "samples spanning %.1f days)",
+            max(self.baseline_rise), len(self.thermal_rise), span_days)
+        return True
 
     def new_epoch(self, reason: str, ts: float | None = None) -> None:
         prev = (self.baseline_dv, self.baseline_dt)
@@ -2628,8 +2988,15 @@ class BalanceTracker:
             "packs_included": self.last_included,
             "packs_excluded": self.last_excluded,
             # Ground truth - never re-zeroed by any recalibration.
-            "balance_raw_dv": round(self.raw_dv[-1], 3) if self.raw_dv else None,
-            "balance_raw_dt": round(self.raw_dt[-1], 2) if self.raw_dt else None,
+            # v2.3.2.0: live spread at the latest qualifying tick (falls back
+            # to the latest sample after a restart).
+            "balance_raw_dv": (
+                round(self.live_dv, 3) if self.live_dv is not None
+                else round(self.raw_dv[-1], 3) if self.raw_dv else None),
+            "balance_raw_dt": (
+                round(self.live_dt, 2) if self.live_dt is not None
+                else round(self.raw_dt[-1], 2) if self.raw_dt else None),
+            "balance_last_sample_ts": self.last_sample_ts,
             "balance_raw_dt_min_sensors": (
                 round(self.raw_dt_min[-1], 2) if self.raw_dt_min else None),
             # Deviation from the learned norm, in physical units - more
@@ -2686,7 +3053,24 @@ class BalanceTracker:
             "pool_dv": self._pool_dv,
             "pool_dt": self._pool_dt,
             "last_ceiling": self.last_ceiling,
+            "last_sample_ts": self.last_sample_ts,
         }
+
+    def restart_sampling(self, reason: str, ts: float | None = None) -> None:
+        """v2.3.2.0: new balance epoch AND empty sample buffers.
+
+        Used once on upgrade: the buffers written before 2.3.2.0 hold ~20
+        consecutive ticks of a single rest period (BH-2320-05), which must
+        not seed the new per-rest-period baseline or the thermal-rise span.
+        Epoch history is kept.
+        """
+        self.new_epoch(reason, ts=ts)
+        for d in (self.raw_dv, self.raw_dt, self.raw_dt_min, self.thermal_rise,
+                  self.sample_soc):
+            d.clear()
+        self.last_sample_ts = None
+        self._rest_since = None
+        self._sampled_this_rest = False
 
     def restore(self, data: dict[str, Any]) -> None:
         n = self._cfg.balance_sample_count
@@ -2718,6 +3102,10 @@ class BalanceTracker:
         self._pool_dt = _bounded_epoch_log(data.get("pool_dt", []))
         self.last_ceiling = data.get("last_ceiling")
         self._median_cache = None
+        lst = data.get("last_sample_ts")
+        self.last_sample_ts = float(lst) if isinstance(lst, (int, float)) else None
+        self._rest_since = None
+        self._sampled_this_rest = False
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -2737,10 +3125,21 @@ class StressAccumulator:
         self._total_sdt = 0.0
         self._total_dt = 0.0
         self._oldest_bucket: int | None = None
+        # v2.3.2.0 (BH-2320-03): lifetime (never pruned) accumulators for
+        # the effective-age forecast: Σ S²·Δt and Σ Δt since observation
+        # started, plus the frozen prior mean of S² (see effective_age_s()).
+        self.life_s2dt = 0.0
+        self.life_dt = 0.0
+        self.observation_start_ts: float | None = None
+        self.prior_mean_s2: float | None = None
+        # v2.3.2.0 (N3): seconds spent charging with cells below
+        # cfg.cold_charge_temp_c. Visibility only.
+        self.cold_charge_s = 0.0
 
     def feed(self, s: HealthSample) -> None:
         cfg = self._cfg
-        if s.battery_temp_c is None or s.soc is None:
+        temp_c = _effective_temp_c(s)   # v2.3.2.0 (BH-2320-01)
+        if temp_c is None or s.soc is None:
             # v2.0.7 FIX (BH-05, ICS quality audit -- confirmed): this was
             # `self._last_ts = None if self._last_ts is None else
             # self._last_ts` -- a no-op self-assignment that did nothing
@@ -2772,8 +3171,24 @@ class StressAccumulator:
                 cfg.stress_soc_max_factor - 1.0
             )
         stress = (
-            cfg.q10 ** ((s.battery_temp_c - cfg.stress_ref_temp_c) / 10.0) * soc_factor
+            cfg.q10 ** ((temp_c - cfg.stress_ref_temp_c) / 10.0) * soc_factor
         )
+        # v2.3.2.0 (BH-2320-03 / N3): lifetime accumulators.
+        if self.observation_start_ts is None:
+            self.observation_start_ts = s.timestamp - dt
+        self.life_s2dt += stress * stress * dt
+        self.life_dt += dt
+        if (
+            self.prior_mean_s2 is None
+            and self.life_dt >= cfg.effective_age_prior_freeze_days * SECONDS_PER_DAY
+        ):
+            self.prior_mean_s2 = self.life_s2dt / self.life_dt
+        if (
+            s.power_w is not None
+            and s.power_w > cfg.segment_rest_power_w
+            and temp_c < cfg.cold_charge_temp_c
+        ):
+            self.cold_charge_s += dt
         bucket = int(s.timestamp // 3600)
         acc = self._buckets.setdefault(bucket, [0.0, 0.0])
         acc[0] += stress * dt
@@ -2805,13 +3220,42 @@ class StressAccumulator:
             self._total_sdt = 0.0
             self._total_dt = 0.0
 
+    def effective_age_s(self, age_origin_ts: float | None) -> float | None:
+        """v2.3.2.0 (BH-2320-03): stress-weighted age, ∫ S² dt, in seconds.
+
+        Observed time contributes its measured S²·Δt. Time between
+        age_origin_ts (install date, else first seen) and the start of
+        observation contributes the observed mean S² -- frozen after
+        effective_age_prior_freeze_days, provisional before that. Gaps in
+        observation after it started count as nothing (conservative). None
+        until anything has been observed.
+        """
+        if self.life_dt <= 0 or self.observation_start_ts is None:
+            return None
+        mean_s2 = (
+            self.prior_mean_s2 if self.prior_mean_s2 is not None
+            else self.life_s2dt / self.life_dt
+        )
+        prior_s = 0.0
+        if age_origin_ts is not None:
+            prior_s = max(0.0, self.observation_start_ts - age_origin_ts)
+        return prior_s * mean_s2 + self.life_s2dt
+
     def stress_ratio(self) -> float | None:
         if self._total_dt <= 0:
             return None
         return self._total_sdt / self._total_dt
 
     def to_dict(self) -> dict[str, Any]:
-        return {"buckets": {str(k): v for k, v in self._buckets.items()}}
+        return {
+            "buckets": {str(k): v for k, v in self._buckets.items()},
+            # v2.3.2.0 (BH-2320-03 / N3)
+            "life_s2dt": self.life_s2dt,
+            "life_dt": self.life_dt,
+            "observation_start_ts": self.observation_start_ts,
+            "prior_mean_s2": self.prior_mean_s2,
+            "cold_charge_s": self.cold_charge_s,
+        }
 
     def restore(self, data: dict[str, Any]) -> None:
         # v2.2.0.1 FIX (external ICS audit ICS-014/ICS-022 -- confirmed):
@@ -2838,6 +3282,19 @@ class StressAccumulator:
         self._total_dt = sum(v[1] for v in self._buckets.values())
         self._oldest_bucket = min(self._buckets) if self._buckets else None
         self._last_ts = None
+
+        def _num(key: str, default: float | None) -> float | None:
+            v = data.get(key, default)
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                return default
+            v = float(v)
+            return v if math.isfinite(v) and v >= 0 else default
+
+        self.life_s2dt = _num("life_s2dt", 0.0) or 0.0
+        self.life_dt = _num("life_dt", 0.0) or 0.0
+        self.observation_start_ts = _num("observation_start_ts", None)
+        self.prior_mean_s2 = _num("prior_mean_s2", None)
+        self.cold_charge_s = _num("cold_charge_s", 0.0) or 0.0
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -2952,6 +3409,8 @@ class BatteryHealthEngine:
         # with three consumers, not one.
         self._calib_prev_active = False
         self._calib_settle_until: float | None = None
+        #: v2.3.2.0: which temperature fed capacity/stress on the last tick.
+        self._temp_source: str | None = None
         # v2.0.7 FIX (BH-09, ICS quality audit -- confirmed): visibility
         # for a schema-mismatch fresh-start, previously only a WARNING
         # log line with no lasting trace anywhere. Recorded regardless of
@@ -2965,6 +3424,15 @@ class BatteryHealthEngine:
     # ── main entry point ────────────────────────────────────────────────────
     def update(self, raw: HealthSample) -> HealthReport:
         s = validate_sample(raw)
+        # v2.3.2.0 (BH-2320-01): cell temperature from the packs' own
+        # sensors; the BMS board temperature (battery_temp_c) stays
+        # available for display and is only the fallback.
+        if s.cell_temp_c is None:
+            s.cell_temp_c = _mean_pack_cell_temp(s.packs)
+        if s.cell_temp_c is not None:
+            self._temp_source = "pack_cells"
+        elif s.battery_temp_c is not None:
+            self._temp_source = "bms_fallback"
         if self.first_seen_ts is None:
             self.first_seen_ts = s.timestamp
             self.dirty = True
@@ -3006,6 +3474,11 @@ class BatteryHealthEngine:
         # the sample, since the edge can occur at any time and doesn't
         # depend on soc/power/discharge being present.
         calib_active = s.soh_calibration_active
+        if calib_active and not self._calib_prev_active:
+            # v2.3.2.0 (BH-2320-10): the status registers are re-read at
+            # most hourly, so the calibration may have started up to
+            # CALIBRATION_DETECTION_LATENCY_S ago.
+            self._on_calibration_start(s.timestamp)
         if self._calib_prev_active and not calib_active:
             self._calib_settle_until = s.timestamp + self.cfg.calibration_settle_s
             _LOGGER.info(
@@ -3085,6 +3558,26 @@ class BatteryHealthEngine:
         self._last_report = self._evaluate(s.timestamp)
         return self._last_report
 
+    def _on_calibration_start(self, now: float) -> None:
+        """v2.3.2.0 (BH-2320-10): retro-exclude what a late-noticed
+        calibration may have touched: capacity segments (unit and packs)
+        that ended within the detection latency, and efficiency windows
+        closed in that time. Segments are flagged, not deleted."""
+        since = now - CALIBRATION_DETECTION_LATENCY_S
+        flagged = 0
+        for tracker in [self.segments, *self.pack_capacity.trackers]:
+            for seg in tracker.segments:
+                if seg.end_ts >= since and not seg.exclude_calibration:
+                    seg.exclude_calibration = True
+                    flagged += 1
+            tracker._agg_cache = None
+        dropped = self.efficiency.drop_windows_since(since)
+        self.dirty = True
+        _LOGGER.info(
+            "battery_health: SOH calibration start detected; excluded %d "
+            "segment(s) and %d efficiency window(s) from the preceding %.0f s",
+            flagged, dropped, CALIBRATION_DETECTION_LATENCY_S)
+
     def set_learning_enabled(self, enabled: bool) -> None:
         """Maintenance inhibit (v1.2.1).
 
@@ -3105,7 +3598,9 @@ class BatteryHealthEngine:
                 "are frozen. Sensors continue to display. Re-enable once the "
                 "system is stable.")
 
-    def mark_recovery(self, reason: str, now: float | None = None) -> None:
+    def mark_recovery(
+        self, reason: str, now: float | None = None, hard: bool = True,
+    ) -> None:
         """Suspend learning for the settling period after a recovery.
 
         v2.0.7 FIX (BH-03, ICS quality audit -- confirmed): used to call
@@ -3127,7 +3622,15 @@ class BatteryHealthEngine:
         base = now if now is not None else time_module.time()
         self._settling_until = base + self.cfg.settling_period_s
         self.settling_events += 1
-        self.segments.discard_active(reason)
+        if hard:
+            self.segments.discard_active(reason)
+        else:
+            # v2.3.2.0 (BH-2320-08): an ordinary coordinator recovery is a
+            # data gap, not a boundary -- keep the open segment and let the
+            # normal bridge rule (max_gap_bridge_s) decide on resume, as
+            # v1.1.8 designed. Counter resets and learning re-enable stay
+            # hard boundaries.
+            self.segments.mark_gap()
         _LOGGER.info(
             "battery_health: settling for %.0f s after %s - measurement "
             "continues, learning paused",
@@ -3169,42 +3672,79 @@ class BatteryHealthEngine:
         self.balance.reset_baseline()
         self.dirty = True
 
-    def reanchor_capacity_reference(self) -> bool:
+    def _capacity_trackers(self) -> list[tuple[str, "SegmentTracker"]]:
+        return [("unit", self.segments)] + [
+            (label, t) for label, t in zip(
+                self.pack_capacity.slot_labels, self.pack_capacity.trackers)
+        ]
+
+    def reanchor_capacity_reference(
+        self, reason: str = "manual re-anchor", clear_if_insufficient: bool = False,
+        now: float | None = None,
+    ) -> bool:
         """Re-anchor SOH capacity to the current measured estimate.
 
-        Refuses when there is not enough data to anchor on, so a reference
-        cannot be captured from noise. Returns True if applied.
+        v2.3.2.0 (BH-2320-09): re-anchors the unit AND every pack (the
+        button used to touch the unit only), using exactly the eligible
+        set and estimator the SOH figure uses -- calibration segments
+        excluded (they were included here before). A tracker without
+        enough eligible segments spanning enough days is left unchanged,
+        or -- when clear_if_insufficient (upgrade path) -- has its
+        reference cleared so it is re-captured automatically. Returns True
+        if at least one reference was set.
         """
-        segs = self.segments.segments
-        if len(segs) < self.cfg.capacity_reference_min_segments:
+        applied = []
+        refused = []
+        for label, tracker in self._capacity_trackers():
+            cand = tracker.reference_candidate()
+            if cand is None:
+                refused.append(label)
+                if clear_if_insufficient:
+                    tracker.clear_reference(
+                        reason + ": not enough eligible segments yet", ts=now)
+                continue
+            value, n, span_days = cand
+            ts = max(seg.end_ts for seg in tracker.eligible_segments())
+            tracker.set_reference(
+                value,
+                reason="%s: %d segments spanning %.0f days" % (reason, n, span_days),
+                ts=ts,
+            )
+            applied.append(label)
+        if refused:
             _LOGGER.warning(
-                "battery_health: refusing to re-anchor capacity reference - "
-                "%d of %d required segments available",
-                len(segs), self.cfg.capacity_reference_min_segments)
-            return False
-        span_days = (
-            max(s.end_ts for s in segs) - min(s.start_ts for s in segs)
-        ) / SECONDS_PER_DAY
-        if span_days < self.cfg.capacity_reference_min_span_days:
-            _LOGGER.warning(
-                "battery_health: refusing to re-anchor capacity reference - "
-                "segments span only %.0f of the %.0f days required to average "
-                "out seasonal operating-range effects",
-                span_days, self.cfg.capacity_reference_min_span_days)
-            return False
-        self.segments.set_reference(
-            # v2.0.6 FIX (Tier 3): was s.implied_capacity_kwh (raw) -- must
-            # match the same normalization soh_capacity()'s own auto-
-            # capture path now uses (see that method's own comment on
-            # this identical fix), or a manual re-anchor would silently
-            # reintroduce the inconsistent-comparison bug the auto path
-            # was just fixed for.
-            _median(sorted(s.normalized_capacity_kwh(self.cfg) for s in segs)),
-            reason="manual re-anchor", ts=max(s.end_ts for s in segs))
-        self.dirty = True
-        return True
+                "battery_health: capacity reference not re-anchored for %s - "
+                "fewer than %d eligible segments or a span under %.0f days",
+                ", ".join(refused), self.cfg.capacity_reference_min_segments,
+                self.cfg.capacity_reference_min_span_days)
+        if applied:
+            self.dirty = True
+        return bool(applied)
 
-    # ── evaluation ──────────────────────────────────────────────────────────
+    def _apply_upgrade_2320(self, now: float) -> None:
+        """v2.3.2.0: one-time re-derivation after the 3 -> 4 migration.
+
+        Agreed with the operator: automatic, once, all history kept.
+          * capacity references (unit + packs): re-anchored from the stored
+            segments with the new normalisation and estimator, or cleared
+            for automatic re-capture if a tracker lacks data;
+          * efficiency: current epoch replayed with the new outlier rule
+            and a 10-window baseline;
+          * balance: new sampling epoch, sample buffers emptied (old ones
+            were per-tick);
+          * stress buckets were already emptied by the migration.
+        """
+        reason = "2.3.2.0 upgrade"
+        self.reanchor_capacity_reference(reason, clear_if_insufficient=True, now=now)
+        self.efficiency.rederive(reason, ts=now)
+        self.balance.restart_sampling(reason, ts=now)
+        self.dirty = True
+        _LOGGER.warning(
+            "battery_health: 2.3.2.0 upgrade applied - capacity references "
+            "re-derived, efficiency baseline re-derived, balance sampling "
+            "restarted (re-learns over ~3 weeks). Previous values are kept "
+            "in the epoch history.")
+
     def _evaluate(self, now: float) -> HealthReport:
         cfg = self.cfg
         r = HealthReport()
@@ -3391,14 +3931,30 @@ class BatteryHealthEngine:
             r.attributes["battery_age_source"] = (
                 "install_date" if cfg.battery_install_ts is not None
                 else "first_seen")
-            stress = r.stress_ratio if r.stress_ratio is not None else 1.0
+            # v2.3.2.0 (BH-2320-03): calendar term from the lifetime
+            # effective age ∫S²dt (equivalent-time form of the sqrt law), not
+            # from the last 90 days' stress times total age -- that projected
+            # one season onto the whole life and would have let the forecast
+            # RISE in winter. Falls back to the reference-condition age
+            # (stress 1.0) until anything has been observed.
+            eff_age_s = self.stress.effective_age_s(age_origin)
+            if eff_age_s is None:
+                eff_age_years = age_years
+            else:
+                eff_age_years = max(0.0, eff_age_s / (365.25 * SECONDS_PER_DAY))
+            r.attributes["effective_age_days"] = round(
+                eff_age_years * 365.25, 1)
+            r.attributes["effective_age_prior_frozen"] = (
+                self.stress.prior_mean_s2 is not None)
             calendar_loss = (
-                cfg.forecast_calendar_pct_per_sqrt_year * stress * math.sqrt(age_years)
+                cfg.forecast_calendar_pct_per_sqrt_year * math.sqrt(eff_age_years)
             )
             cycle_loss = cfg.forecast_cycle_pct_per_efc * (r.efc or 0.0)
             r.predicted_soh = round(clip(100.0 - calendar_loss - cycle_loss, 0.0, 100.0), 1)
             if r.soh_capacity is not None:
                 r.health_divergence = round(r.soh_capacity - r.predicted_soh, 1)
+        r.attributes["cold_charge_hours"] = round(self.stress.cold_charge_s / 3600.0, 2)
+        r.attributes["temperature_source"] = self._temp_source
 
         # Confidence
         # v2.0.12 FIX (Battery Phase 5B, this release -- confidence as a
@@ -3597,3 +4153,14 @@ class BatteryHealthEngine:
         self._charge_counter.restore(data.get("charge_counter", {}))
         self._discharge_counter.restore(data.get("discharge_counter", {}))
         self.dirty = False
+        # v2.3.2.0: one-time re-derivation flagged by _migrate_3_to_4. The
+        # flag is not written back by to_dict(), so this runs exactly once
+        # (the manager persists the engine right after restore when dirty).
+        if data.get("upgrade_2320_pending"):
+            try:
+                self._apply_upgrade_2320(time_module.time())
+            except Exception:  # noqa: BLE001 -- never lose the restored state
+                _LOGGER.exception(
+                    "battery_health: 2.3.2.0 upgrade re-derivation failed; "
+                    "continuing with the restored state unchanged")
+            self.dirty = True

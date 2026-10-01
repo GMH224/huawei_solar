@@ -1,7 +1,7 @@
 # CLAUDE.md — Huawei Solar Integration
 
 > **Maintained by Claude (Anthropic) on behalf of the community.**
-> Current version: **2.3.1.0** — see `manifest.json`.
+> Current version: **2.3.2.0** — see `manifest.json`.
 > Releases 2.0.0 – 2.2.0.2 are documented in their own `AUDIT_<version>.md`
 > files rather than in §8 below; 2.3.0.0 onwards are recorded in both.
 
@@ -394,6 +394,36 @@ fix that calls `_evict()` from `record_failure()` and `record_timeout()`.
 ---
 
 ## 8. Changelog
+
+### v2.3.2.0 (2026-10-01)
+**Battery-health review: corrections, baselines and forecast (no Modbus change)**
+
+Triggered by a 32.8 kWh capacity reference on a 20.7 kWh battery; reviewed
+against the operator's store and the LiFePO4 literature. Calculation only:
+register set, cadence and writes unchanged.
+
+- **BH-2320-01:** cell temperature (pack max/min sensors) for capacity and
+  stress; the BMS board register 37022 reads ~8–9 °C high and is fallback only.
+- **BH-2320-02:** cold-only capacity correction (0.5 %/°C below 15 °C, cap
+  10 %); warm-side Gaussian and rate correction removed (unit capacity
+  ~32 → ~23.1 kWh).
+- **BH-2320-03:** forecast from lifetime effective age ∫S²dt (prior frozen
+  after 7 days) — can no longer rise in winter.
+- **BH-2320-04:** η ≤ 1.00, outlier filter, 10-window baseline, 0.25 %-pt
+  seasonal deadband; per-window cell temperature recorded for the winter review.
+- **BH-2320-05/07:** balance sampled once per rest period; thermal-rise
+  baseline retried until set (was never set).
+- **BH-2320-06/09/11:** min segment ΔSOC 15 (retroactive); one eligible set and
+  one estimator for SOH and reference (fresh reference = 100 %); re-anchor
+  button covers unit and packs; median-relative outlier exclusion.
+- **BH-2320-08:** ordinary coordinator recovery bridges the open segment.
+- **BH-2320-10:** calibration settle 65 min + retro-exclusion of the last hour
+  (status registers read hourly since 2.3.1.0).
+- **BH-2320-12:** schema 3 → 4 with a migration; one-time automatic re-learn
+  on upgrade, all previous values kept in the epoch logs.
+- New `tests/test_ics_2320_fixes.py` (55 + 1 field-replay test); 6 deliberate
+  edits in `test_battery_health.py`, version pins in 5 files. Full record:
+  `AUDIT_2.3.2.0.md`; formulas: `BATTERY_HEALTH.md` §2.
 
 ### v2.3.1.0 (2026-09-30)
 **Stage 2: bus-side fixes from the 49.7 h 2.3.0.2 capture + HA log**
@@ -3374,3 +3404,8 @@ for f in list(base.glob('*.json')) + list(base.glob('translations/*.json')):
 | HS-2310-002 | Med | `__init__.py`, `bus_policy.py` | Library re-sent timed-out/busy requests inside our request | Duplicate work on an overloaded dongle; late answers; writes re-sent |
 | HS-2310-003 | Med | `update_coordinator.py`, `adaptive_modbus.py` | Power reads shed; one resolved busy throttled the bus 10 min | `unknown` power sensors during daytime shed runs |
 | HS-2310-005 | Med | `config_flow.py` | Reconfigure unloaded the entry; cancel never reloaded it | Plant offline after an abandoned reconfigure |
+| BH-2320-01/02 | High | `battery_health.py` | BMS board temperature + symmetric Gaussian/rate correction | Unit capacity booked ~32 kWh for a ~23 kWh battery; stress ×1.8 |
+| BH-2320-03 | Med | `battery_health.py` | 90-day stress × √(total age) | Forecast would rise in winter; divergence mostly artefact |
+| BH-2320-04 | Med | `battery_health.py` | Efficiency baseline = median of 3 (two outliers), η > 1 accepted | Efficiency score moved with season/outliers |
+| BH-2320-05/07 | Med | `battery_health.py` | Balance sampled per tick; thermal baseline tried once | Balance = one 20-min rest; thermal-rise baseline never set |
+| BH-2320-08 | Med | `battery_health_manager.py` | Coordinator recovery hard-discarded the open segment | One failed read lost that night's unit segment |
