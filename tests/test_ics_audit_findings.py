@@ -111,8 +111,8 @@ class TestGuardKeyUsesSharedEndpoint(unittest.TestCase):
         def resolve(bus_endpoint: str, serial_number: str) -> str:
             return bus_endpoint or serial_number
 
-        bus_endpoint = "192.168.7.22:502"
-        inv1_serial, inv2_serial = "HV2220098926", "HV2220080950"
+        bus_endpoint = "192.0.2.22:502"
+        inv1_serial, inv2_serial = "HV0000000001", "HV0000000002"
 
         # What update_coordinator.py's own coordinators resolve to:
         other_coordinator_key = resolve(bus_endpoint, inv1_serial)

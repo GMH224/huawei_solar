@@ -276,7 +276,7 @@ class TestHVC001DiagnosticsEndToEnd(unittest.TestCase):
     def test_diagnostics_entry_point_does_not_raise_nameerror(self):
         import asyncio
 
-        inverter_serial = "HV2220098926"
+        inverter_serial = "HV0000000001"
         dd = _make_fake_inverter_device_data(self.diag, inverter_serial)
         entry = pytypes.SimpleNamespace(
             data={}, entry_id="abc123",
@@ -307,7 +307,7 @@ class TestHVC001DiagnosticsEndToEnd(unittest.TestCase):
         than assumed serializable."""
         import asyncio
 
-        dd = _make_fake_inverter_device_data(self.diag, "HV2220098926")
+        dd = _make_fake_inverter_device_data(self.diag, "HV0000000001")
         entry = pytypes.SimpleNamespace(
             data={}, entry_id="abc123",
             runtime_data={self.diag.DATA_DEVICE_DATAS: [dd]},
@@ -324,7 +324,7 @@ class TestHVC001DiagnosticsEndToEnd(unittest.TestCase):
     def test_serial_bearing_register_is_redacted_not_leaked(self):
         import asyncio
 
-        inverter_serial = "HV2220098926"
+        inverter_serial = "HV0000000001"
         pack_serial = "PACKSERIAL001"
         dd = _make_fake_inverter_device_data(self.diag, inverter_serial)
         entry = pytypes.SimpleNamespace(
@@ -360,7 +360,7 @@ class TestHVC001DiagnosticsEndToEnd(unittest.TestCase):
         this fix did not accidentally change non-serial handling."""
         import asyncio
 
-        dd = _make_fake_inverter_device_data(self.diag, "HV2220098926")
+        dd = _make_fake_inverter_device_data(self.diag, "HV0000000001")
         entry = pytypes.SimpleNamespace(
             data={}, entry_id="abc123",
             runtime_data={self.diag.DATA_DEVICE_DATAS: [dd]},

@@ -241,9 +241,11 @@ class TestReferenceConsistency(unittest.TestCase):  # BH-2320-09
 
 # ═════════════════════════════════════════════════════════════════════════
 class TestEfficiency(unittest.TestCase):  # BH-2320-04
-    FIELD_WINDOWS = [1.0025, 0.9714, 0.9896, 0.9913, 0.9844, 0.9894, 0.9865,
-                     0.9912, 0.9874, 0.9893, 0.9911, 0.9886, 0.9882, 0.9894,
-                     0.9892, 0.9868, 0.988, 0.9869, 0.9871, 0.9896, 0.9874]
+    # Synthetic windows with the SHAPE of an operator store (21 windows, one
+    # eta > 1 first, one low outlier second); no field values are shipped.
+    FIELD_WINDOWS = [1.003, 0.972, 0.988, 0.989, 0.99, 0.9885, 0.9895,
+                     0.988, 0.989, 0.99, 0.9885, 0.9895, 0.988, 0.989,
+                     0.99, 0.9885, 0.9895, 0.988, 0.989, 0.99, 0.9885]
 
     def _eng(self, **kw):
         return bh.BatteryHealthEngine(bh.BatteryHealthConfig(**kw))
@@ -297,8 +299,8 @@ class TestEfficiency(unittest.TestCase):  # BH-2320-04
         self.assertAlmostEqual(soh, 100.0 - (0.5 - 0.25) * 8.0, places=6)
 
     def test_rederive_field_windows(self):
-        """The 21 stored windows of the field store re-derive to the median
-        of the first 10 surviving ones (1.0025 dropped)."""
+        """21 store-shaped windows re-derive to the median of the first 10
+        surviving ones (the eta > 1 window dropped)."""
         eng = self._eng()
         ef = eng.efficiency
         ef.windows.extend(self.FIELD_WINDOWS)
@@ -581,7 +583,7 @@ def _v3_store() -> dict:
                   {"ts": 1.0, "value": 7.84 + 0.08 * k, "reason": "auto", "previous": None}]}
              for k in range(3)]
     return {
-        "schema_version": 3, "first_seen_ts": 1786633440.0,
+        "schema_version": 3, "first_seen_ts": 1786600000.0,
         "held_subscores": {"balance": [100.0, 1790837000.0],
                            "capacity": [99.8, 1790837000.0],
                            "efficiency": [98.1, 1790837000.0]},
@@ -594,16 +596,16 @@ def _v3_store() -> dict:
         "pack_capacity": {"trackers": packs, "slot_labels": ["u1p1", "u1p2", "u1p3"]},
         "efficiency": {"anchor": None, "windows": TestEfficiency.FIELD_WINDOWS,
                        "window_tiers": [1] * 21, "baseline": 0.98958,
-                       "baseline_tier": 1, "baseline_pool": [1.0025, 0.9714, 0.9896],
+                       "baseline_tier": 1, "baseline_pool": [1.003, 0.972, 0.988],
                        "baseline_epochs": [{"ts": 1.0, "value": 0.98958, "tier": 1,
                                             "reason": "auto: first 3 windows"}],
                        "last_ceiling": 100.0},
         "balance": {"scores": [100.0] * 20, "raw_dv": [0.1] * 20, "raw_dt": [2.2] * 20,
                     "raw_dt_min": [2.1] * 20,
-                    "thermal_rise": [[1786634240.0 + 90 * i, [3.6, 5.8, 4.7]] for i in range(20)],
+                    "thermal_rise": [[1786601000.0 + 90 * i, [3.6, 5.8, 4.7]] for i in range(20)],
                     "baseline_rise": None, "sample_soc": [100.0] * 20,
                     "included": [1, 2, 3], "excluded": [], "baseline_dv": 0.0,
-                    "baseline_dt": 2.2, "baseline_captured_ts": 1786634240.0,
+                    "baseline_dt": 2.2, "baseline_captured_ts": 1786601000.0,
                     "baseline_epochs": [{"ts": 1.0, "dv": 0.0, "dt": 2.2, "reason": "auto"}],
                     "pool_dv": [], "pool_dt": [], "last_ceiling": 100.0},
         "stress": {"buckets": {"496287": [3600.0 * 3.3, 3600.0]}},
@@ -638,7 +640,7 @@ class TestMigration(unittest.TestCase):  # BH-2320-12
         self.assertEqual(len(eng.balance.raw_dv), 0)           # per-tick buffers dropped
         self.assertIsNone(eng.balance.baseline_dv)
         self.assertEqual(len(eng.balance.baseline_epochs), 2)
-        self.assertAlmostEqual(eng.efficiency.baseline, 0.98935, delta=1e-4)
+        self.assertAlmostEqual(eng.efficiency.baseline, 0.98875, delta=1e-4)  # median of synthetic windows
         self.assertTrue(eng.dirty)
         r = eng._evaluate(1790837286.0)
         self.assertAlmostEqual(r.soh_capacity, 100.0, delta=0.05)

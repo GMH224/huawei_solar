@@ -439,7 +439,7 @@ class TestDefectX4DiagnosticsRedaction(unittest.TestCase):
                 return value
             return f"**REDACTED-{pseudonym(str(value))}**"
 
-        real_serial = "HV2220098926"
+        real_serial = "HV0000000001"
         redacted = redact(real_serial)
         self.assertNotEqual(redacted, real_serial)
         self.assertNotIn(real_serial, redacted)
