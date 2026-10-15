@@ -27,8 +27,8 @@ A `home-assistant.log` capture from the v1.3.8 boot in question contained:
 ```
 04:10:52.596 WARNING [homeassistant.components.sensor] Setup of sensor platform huawei_solar is taking over 10 seconds.
 04:11:18.923 WARNING [homeassistant.bootstrap] Waiting for integrations to complete setup: {('huawei_solar', ...): ...}
-04:11:29.644 ERROR   [custom_components.huawei_solar] Error fetching HV2220080950_config_data_update_coordinator data: Timeout communicating with HV2220080950: no response in 20 s (consecutive: 1)
-04:11:29.743 ERROR   [custom_components.huawei_solar] Error fetching HV2220098926_battery_data_update_coordinator data: Timeout communicating with HV2220098926: no response in 21 s (consecutive: 1)
+04:11:29.644 ERROR   [custom_components.huawei_solar] Error fetching HV0000000002_config_data_update_coordinator data: Timeout communicating with HV0000000002: no response in 20 s (consecutive: 1)
+04:11:29.743 ERROR   [custom_components.huawei_solar] Error fetching HV0000000001_battery_data_update_coordinator data: Timeout communicating with HV0000000001: no response in 21 s (consecutive: 1)
 ```
 
 Two things this pinpointed:

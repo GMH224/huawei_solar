@@ -51,8 +51,8 @@ self.guard = ModbusGuard.get_or_create(endpoint)
 ```
 
 `ModbusGuard.get_or_create()` is a registry lookup keyed by the exact
-string passed in. `bus_endpoint` (e.g. `"192.168.7.22:502"`) and a
-device's `serial_number` (e.g. `"HV2220098926"`) are different strings —
+string passed in. `bus_endpoint` (e.g. `"192.0.2.22:502"`) and a
+device's `serial_number` (e.g. `"HV0000000001"`) are different strings —
 so this coordinator was resolving to an entirely separate `ModbusGuard`
 object from the one every other coordinator on the same physical bus
 shares, for both inverters. The code's own comment states the intended
@@ -239,7 +239,7 @@ full 11-test suite passes.
    enabled, trigger a reload and check for `ModbusGuard[...]` log lines
    referencing the synchronized-power-coordinator's traffic — they should
    now show the SAME endpoint key (`bus_endpoint`, e.g.
-   `192.168.7.22:502`) as every other coordinator's guard messages, not a
+   `192.0.2.22:502`) as every other coordinator's guard messages, not a
    device serial number. This is the direct confirmation that J1 is fixed.
 5. Continue the startup-timing investigation from `AUDIT_1.3.10.md` §9:
    time the "still starting up" banner and check whether the broader

@@ -10,7 +10,7 @@
 
 ## 1. The report
 
-A screenshot of the `Inverter 5K` device page (`HV2220080950`) showed every
+A screenshot of the `Inverter 5K` device page (`HV0000000002`) showed every
 sensor as `Unknown` after more than an hour of runtime, alongside adaptive
 diagnostics indicating chronic distress: RTT p95 of 6,251.6ms, 613.2s of
 cumulative bus wait, 62 delayed requests, back-off cycle 70+. A Home
@@ -22,7 +22,7 @@ The log showed, recurring every 15-45 seconds without a single successful
 cycle:
 
 ```
-2026-08-05 10:42:29.094 DEBUG [custom_components.huawei_solar.modbus_keepalive] ModbusKeepAlive[HV2220080950]: unexpected error in run loop: 'NewType' object is not subscriptable
+2026-08-05 10:42:29.094 DEBUG [custom_components.huawei_solar.modbus_keepalive] ModbusKeepAlive[HV0000000002]: unexpected error in run loop: 'NewType' object is not subscriptable
 ```
 
 Traced to `_get_keepalive_register()`:
@@ -178,7 +178,7 @@ unchanged — only its real-library bootstrapping mechanics were touched.
 
 The chronic adaptive-controller distress visible in the field screenshot
 (RTT p95 6.25s, 613s cumulative wait, back-off cycle 70+) for
-`HV2220080950` is a real, separate observation, discussed directly with
+`HV0000000002` is a real, separate observation, discussed directly with
 the operator during this investigation and explicitly not attributed to
 Defect S. Whether it reflects a genuinely weaker device on the shared bus,
 firmware or hardware characteristics specific to that inverter, or
@@ -224,7 +224,7 @@ assistant, explicitly filed as a future consideration, not acted on now.
    appears in the log at all, for any device, over a reasonable observation
    window (it previously recurred every 15-45 seconds, so its absence
    should be obvious quickly). This is the direct test of Defect S.
-5. Separately, continue observing `HV2220080950`'s adaptive diagnostics
+5. Separately, continue observing `HV0000000002`'s adaptive diagnostics
    (RTT, back-off cycle count, bus wait) to determine whether §7's open
    question is a persistent characteristic of that specific device or
    something that resolves on its own — this release does not claim to

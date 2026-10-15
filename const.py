@@ -362,7 +362,7 @@ ADAPTIVE_FIRMWARE_CHANGE_DECAY_FACTOR: float = 0.25
 # for the first time in this project):
 #
 #   GAP's EFFECT on error rate is regime-dependent. Binned by effective
-#   gap, pooled across the whole capture for devdc46 (18,326 night /
+#   gap, pooled across the whole capture for dev0001 (18,326 night /
 #   34,393 day bus events):
 #       gap bin      night err%    day err%
 #       150-200 ms      0.144        0.345

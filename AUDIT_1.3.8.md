@@ -102,7 +102,7 @@ still blocked on an earlier device's optimizer first-refresh — whatever
 code had not yet run, including a later device's configuration coordinator
 construction, would simply never execute. Confirmed from the field capture
 (see `AUDIT_1.3.7.md` §2): the affected coordinator
-(`devdc46_config_data_update_coordinator`) produced zero requests for the
+(`dev0001_config_data_update_coordinator`) produced zero requests for the
 full length of a subsequent 9.25 h capture, having polled normally
 beforehand, with its last recorded request timestamped within minutes of
 the incident's onset — exactly the signature a mid-setup cancellation would

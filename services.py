@@ -385,7 +385,7 @@ DATA_INSTALL_DATE = "install_date"
 #: but explicit upper bounds for the two free-form strings below --
 #: neither had any size budget at all. A real Huawei battery pack
 #: serial is a few dozen characters at most (see this exact file's own
-#: test fixtures -- e.g. "PACKSERIAL001", "HV2220098926"); 64 leaves
+#: test fixtures -- e.g. "PACKSERIAL001", "HV0000000001"); 64 leaves
 #: generous headroom. A full ISO-8601 datetime with fractional seconds
 #: and a UTC offset is under 35 characters; 40 leaves headroom for
 #: that too. This is a config/service-call input (requires access to

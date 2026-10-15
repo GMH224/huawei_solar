@@ -10,9 +10,9 @@ Explicitly requested with full rigor: "we cannot use current version."
 ## 1. The report
 
 Following v1.3.16's deployment, screenshots showed `Inverter 10K`
-(`HV2220098926`) with most sensors `Unknown` — efficiency, daily yield,
+(`HV0000000001`) with most sensors `Unknown` — efficiency, daily yield,
 alarms, off-grid status, internal temperature, DSP data collection —
-while `Inverter 5K` (`HV2220080950`), on the same shared bus, showed real,
+while `Inverter 5K` (`HV0000000002`), on the same shared bus, showed real,
 current values. A Home Assistant debug log covering the same window was
 provided, followed by a second, more complete capture of the same
 incident.
@@ -20,8 +20,8 @@ incident.
 ## 2. Diagnosis
 
 The second log capture made the mechanism unambiguous. Tracing
-`HV2220098926_battery_data_update_coordinator` and
-`HV2220098926_data_update_coordinator` continuously for over ten minutes:
+`HV0000000001_battery_data_update_coordinator` and
+`HV0000000001_data_update_coordinator` continuously for over ten minutes:
 
 ```
 back-off cycle 1 — sleeping 9.6 s   →  Finished ... in 9.617 seconds (success: True)

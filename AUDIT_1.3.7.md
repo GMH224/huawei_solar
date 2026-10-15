@@ -33,14 +33,14 @@ inferred from the operator's screenshot alone (project rule: don't ship on
 a prediction).
 
 A 9.25 h `bus_diagnostics` capture taken the following day contains **zero**
-records from the affected coordinator (`devdc46_config_data_update_coordinator`),
+records from the affected coordinator (`dev0001_config_data_update_coordinator`),
 across the entire capture. The immediately preceding capture (same session,
 pre-outage) shows it polling normally — 78.7 requests/hour, consistent with
 its configured interval. Its last recorded request is timestamped within
 minutes of the incident's stated onset. Every sibling coordinator on the
-same config entry (`devdc46_data_update_coordinator`,
-`devdc46_battery_data_update_coordinator`,
-`devdc46_power_meter_data_update_coordinator`) is present and polling
+same config entry (`dev0001_data_update_coordinator`,
+`dev0001_battery_data_update_coordinator`,
+`dev0001_power_meter_data_update_coordinator`) is present and polling
 normally throughout the same 9.25 h window. This rules out a bus-wide or
 entry-wide failure: the fault is specific to one coordinator's setup path,
 not the connection, the entry, or the device.

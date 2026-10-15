@@ -17,11 +17,11 @@ investigation had one.
 
 ## 2. Diagnosis from the debug trace
 
-Key timestamps from the captured reload (`Bus endpoint: 192.168.7.22:502`
+Key timestamps from the captured reload (`Bus endpoint: 192.0.2.22:502`
 at `04:42:29.873` marks the start of `async_setup_entry`):
 
 ```
-04:42:29.873  Bus endpoint: 192.168.7.22:502                    (t0)
+04:42:29.873  Bus endpoint: 192.0.2.22:502                    (t0)
 04:42:34.279  SynchronizedPowerCoordinator enabled               (+4.4s — v1.3.8's fix confirmed: fires immediately, not after a blocking read)
 04:42:44.282  "sensor platform taking over 10 seconds"           (+14.4s)
 04:42:49.853  power_meter first fetch: 7.001s
@@ -32,14 +32,14 @@ at `04:42:29.873` marks the start of `async_setup_entry`):
 Immediately preceding the two ~20s fetches:
 
 ```
-ModbusGuard[192.168.7.22:502]: queue full (2/1) — shedding request
-HV2220080950_config_data_update_coordinator: request shed by bus guard (ModbusGuard[192.168.7.22:502] queue full (2/1)); not recorded as an inverter failure
-HV2220080950_config_data_update_coordinator: Modbus timeout #1
+ModbusGuard[192.0.2.22:502]: queue full (2/1) — shedding request
+HV0000000002_config_data_update_coordinator: request shed by bus guard (ModbusGuard[192.0.2.22:502] queue full (2/1)); not recorded as an inverter failure
+HV0000000002_config_data_update_coordinator: Modbus timeout #1
 Retry after triggered. Scheduling next update in 10 second(s)
-Error fetching HV2220080950_config_data_update_coordinator data: Timeout communicating with HV2220080950: no response in 20 s (consecutive: 1)
-Finished fetching HV2220080950_config_data_update_coordinator data in 10.004 seconds (success: False)
+Error fetching HV0000000002_config_data_update_coordinator data: Timeout communicating with HV0000000002: no response in 20 s (consecutive: 1)
+Finished fetching HV0000000002_config_data_update_coordinator data in 10.004 seconds (success: False)
 ...
-HV2220080950_config_data_update_coordinator: communication restored (after 1 timeout(s) / 1 failure(s))
+HV0000000002_config_data_update_coordinator: communication restored (after 1 timeout(s) / 1 failure(s))
 ```
 
 This is a direct, named mechanism, not an inference: `ModbusGuard`'s
@@ -57,7 +57,7 @@ coordinator types across their first poll to avoid exactly this kind of
 collision — but the offsets are **fixed per coordinator type, identical
 across every device**. This installation has two daisy-chained SUN2000
 inverters sharing one `ModbusGuard` endpoint (both route through
-`192.168.7.22:502`). Both inverters' `configuration` coordinators wake for
+`192.0.2.22:502`). Both inverters' `configuration` coordinators wake for
 their first poll at the identical +10s offset from their own setup; both
 `energy_storage` coordinators both at +14s; and so on for all four types.
 The stagger scheme has no representation of "a second device exists on

@@ -40,7 +40,7 @@ checking what actually went into it.
 **Fix.** `sanitise_label()` pseudonymises any underscore-separated token
 containing a run of 6+ digits, applied **inside `record()`** rather than at the
 call site — so every future caller is protected by default rather than having
-to know. Distinct inverters remain distinguishable (`dev8c0f_` vs `devdc46_`)
+to know. Distinct inverters remain distinguishable (`dev0002_` vs `dev0001_`)
 and the diagnostically useful part of the label survives.
 
 **A second-order note worth recording:** the first sanitiser used an anchored

@@ -1357,14 +1357,14 @@ run. Found in the field (a "5K" inverter's diagnostics page showing every
 sensor as `Unknown`), traced to a real bug in this project's own
 integration code.**
 
-**The report.** A screenshot of `Inverter 5K`'s (`HV2220080950`)
+**The report.** A screenshot of `Inverter 5K`'s (`HV0000000002`)
 diagnostics page showed every sensor `Unknown` after over an hour running,
 alongside chronic adaptive-controller distress (RTT p95 6.25s, 613s
 cumulative bus wait, back-off cycle 70+). A Home Assistant log covering the
 same window showed, recurring every 15-45 seconds without exception:
 
 ```
-ModbusKeepAlive[HV2220080950]: unexpected error in run loop: 'NewType' object is not subscriptable
+ModbusKeepAlive[HV0000000002]: unexpected error in run loop: 'NewType' object is not subscriptable
 ```
 
 **Root cause.** `_get_keepalive_register()` used
@@ -1838,16 +1838,16 @@ that cost ~20s per collision — the largest identified remaining
 contributor to the multi-minute startup window.**
 
 **The evidence.** Debug logging on a v1.3.9 reload (two inverters,
-`HV2220098926` and `HV2220080950`, sharing one `ModbusGuard` endpoint,
-`192.168.7.22:502`) showed, right where the config and battery
+`HV0000000001` and `HV0000000002`, sharing one `ModbusGuard` endpoint,
+`192.0.2.22:502`) showed, right where the config and battery
 coordinators' first fetches stalled:
 
 ```
-ModbusGuard[192.168.7.22:502]: queue full (2/1) — shedding request
-HV2220080950_config_data_update_coordinator: request shed by bus guard (queue full (2/1))
-HV2220080950_config_data_update_coordinator: Modbus timeout #1
+ModbusGuard[192.0.2.22:502]: queue full (2/1) — shedding request
+HV0000000002_config_data_update_coordinator: request shed by bus guard (queue full (2/1))
+HV0000000002_config_data_update_coordinator: Modbus timeout #1
 Retry after triggered. Scheduling next update in 10 second(s)
-Error fetching HV2220080950_config_data_update_coordinator data: Timeout... no response in 20 s
+Error fetching HV0000000002_config_data_update_coordinator data: Timeout... no response in 20 s
 ```
 
 `config_data_update_coordinator`'s first fetch took 19.454s;
@@ -2541,7 +2541,7 @@ was absent, so the leak shipped.
 - `sanitise_label()` now pseudonymises any underscore-separated token
   containing a run of 6+ digits, applied inside `record()` so every future
   caller is covered by default rather than having to know to be careful.
-- Two inverters remain distinguishable (`dev8c0f_` vs `devdc46_`) and the
+- Two inverters remain distinguishable (`dev0002_` vs `dev0001_`) and the
   useful part of the label survives.
 - **Note on the first attempt:** an anchored regex (`\b...\b`) silently
   matched nothing, because "_" is a word character so `\b` never fires at the

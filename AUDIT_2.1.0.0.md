@@ -220,7 +220,7 @@ is untouched.
 
 **Evidence for conditioning gap.** From the 4-day random-excitation
 capture (module 11: `WELL_IDENTIFIED`, so the levers are separately
-estimable for the first time in this project), pooled for `devdc46`
+estimable for the first time in this project), pooled for `dev0001`
 (18,326 night / 34,393 day bus events):
 
 | Effective gap | Night error rate | Day error rate |
@@ -315,7 +315,7 @@ harder tests, all on the 4-day capture:
 
 | Test | Result |
 |---|---|
-| `dev8c0f` service vs. `devdc46` request *rate* in prior 60 s (30× range, not binary) | Flat: 7.8 → 6.9 ms median; p90 *decreases* with more activity |
+| `dev0002` service vs. `dev0001` request *rate* in prior 60 s (30× range, not binary) | Flat: 7.8 → 6.9 ms median; p90 *decreases* with more activity |
 | Same, stratified by day/night to rule out regime confounding | Day (n = 962 / 4,088 / 593): flat 6.7–7.3 ms |
 | Reverse direction, using **error rate** — the outcome the learner actually gates on (n = 22,756 / 27,113 / 2,850) | Error rate *falls* with other-device activity (0.668 % → 0.035 %); service flat 6.7–7.4 ms |
 

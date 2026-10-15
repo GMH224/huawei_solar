@@ -10,7 +10,7 @@ trade-off and tolerance stated up front, three production files changed.
 ## 1. The request and the evidence behind it
 
 A 107-minute field capture (analyzed live, not from a test file) showed
-`HV2220098926`'s battery pack temperature registers refreshing at a
+`HV0000000001`'s battery pack temperature registers refreshing at a
 median of ~9 minutes apart, worst case ~1308s (21.8 minutes), and
 `BMS temperature` specifically never successfully read even once across
 the entire capture. The operator, having reviewed this data directly, made
